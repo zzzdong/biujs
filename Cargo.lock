@@ -87,13 +87,14 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "biujs"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "criterion",
  "env_logger",
  "log",
  "oxc_allocator",
  "oxc_ast",
+ "oxc_diagnostics",
  "oxc_parser",
  "oxc_span",
  "oxc_syntax",

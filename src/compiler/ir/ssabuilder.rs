@@ -74,27 +74,41 @@ impl<'a> SSABuilder<'a> {
 
     /// 预处理：扫描所有块，为每个Throw指令添加从throw块到对应SEH handler的异常边
     fn add_exception_edges_for_throws(&mut self) {
-        // SEH scope栈：存储当前活跃的handler块ID
-        let mut seh_scope: Vec<BlockId> = Vec::new();
-        // 记录每个throw块对应的handler
+        let mut seh_scope: Vec<(BlockId, Option<BlockId>)> = Vec::new();
         let mut throw_edges: Vec<(BlockId, BlockId)> = Vec::new();
+
+        // Track the outer SEH scope for each finally block (the scope BEFORE its PushSeh)
+        // This is used for ResumeException: when finally propagates an exception,
+        // it goes to these outer handlers
+        let mut finally_outer_scope: HashMap<BlockId, Vec<(BlockId, Option<BlockId>)>> = HashMap::new();
 
         for block in self.cfg.blocks() {
             for inst in block.instructions() {
                 match inst {
-                    Instruction::PushSeh { handler } => {
-                        seh_scope.push(*handler);
+                    Instruction::PushSeh { handler, finally } => {
+                        if let Some(finally_blk) = finally {
+                            finally_outer_scope.insert(*finally_blk, seh_scope.clone());
+                        }
+                        seh_scope.push((*handler, *finally));
                     }
                     Instruction::PopSeh => {
                         seh_scope.pop();
                     }
                     Instruction::Throw { .. } => {
-                        // 为SEH作用域中所有handler添加异常边（从内到外）
-                        for &handler in &seh_scope {
-                            throw_edges.push((block.id(), handler));
+                        for (catch_handler, finally_handler) in &seh_scope {
+                            throw_edges.push((block.id(), *catch_handler));
+                            if let Some(finally_blk) = finally_handler {
+                                throw_edges.push((block.id(), *finally_blk));
+                            }
                         }
-                        // Throw是终结指令，之后指令是死代码，停止SEH跟踪
                         break;
+                    }
+                    Instruction::ResumeException { .. } => {
+                        if let Some(outer_scope) = finally_outer_scope.get(&block.id()) {
+                            for (catch_handler, _) in outer_scope {
+                                throw_edges.push((block.id(), *catch_handler));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -293,7 +307,11 @@ impl<'a> SSABuilder<'a> {
                         }
                     }
                     Instruction::Throw { args, .. } => {
-                        // 只当target_block_id是此throw块的异常handler时才添加phi参数
+                        if is_exception_handler {
+                            args.extend(arg_values.iter().map(|&arg| Value::Variable(arg)));
+                        }
+                    }
+                    Instruction::ResumeException { args } => {
                         if is_exception_handler {
                             args.extend(arg_values.iter().map(|&arg| Value::Variable(arg)));
                         }
@@ -641,6 +659,12 @@ impl<'a> SSABuilder<'a> {
             Instruction::LoadException { dst } => {
                 SSABuilder::rename_definition(dst, new_versions);
             }
+            Instruction::ResumeException { .. } => {
+                // No variables to rename
+            }
+            Instruction::DelayedJump { .. } => {
+                // No variables to rename
+            }
             Instruction::TypeOf { dst, src } => {
                 SSABuilder::rename_definition(dst, new_versions);
                 SSABuilder::rename_use(src, stacks);
@@ -655,6 +679,18 @@ impl<'a> SSABuilder<'a> {
                 for arg in args.iter_mut() {
                     SSABuilder::rename_use(arg, stacks);
                 }
+            }
+            Instruction::LoadThis { dst } => {
+                SSABuilder::rename_definition(dst, new_versions);
+            }
+            Instruction::MakeFuncObj { dst, func_id } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                SSABuilder::rename_use(func_id, stacks);
+            }
+            Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                SSABuilder::rename_use(func_id, stacks);
+                SSABuilder::rename_use(captured_this, stacks);
             }
         }
     }

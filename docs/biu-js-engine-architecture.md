@@ -7,11 +7,27 @@
 
 ## 一、设计原则
 
-1. **去掉动态不安全特性**：排除 `eval`、`Function(code)`、`with`
-2. **保留完整原型链**：`[[Prototype]]`、`Object.setPrototypeOf`、`__proto__`、`Object.create` 全部支持
-3. **ES6 核心完整**：class、箭头函数、Promise、generator、async/await、模块、Proxy（延期）
-4. **嵌入式优先**：无运行时编译器、可剥离编译期组件、小型运行时
-5. **增量验证**：第一天就跑通 `parse → IR → bytecode → execute` 的完整链路
+1. **静态编译模型**：AOT 编译，无运行时编译器
+   - 排除 `eval`、`Function(code)`、`with`（与静态编译不兼容）
+   - 排除 `var`、`arguments`（与静态帧索引冲突）
+   - 仅支持 `let`/`const`，强制块级作用域
+
+2. **寄存器式 VM**：基于寄存器的执行引擎
+   - 静态帧索引替代动态作用域链
+   - SSA 形式 IR，支持 Phi 节点
+   - 线性寄存器分配
+
+3. **完整原型链支持**：`[[Prototype]]`、`Object.setPrototypeOf`、`Object.create` 全部支持
+   - 所有对象类型统一使用 `Rc<RefCell<dyn JSObject>>`
+   - 完整的属性描述符系统
+
+4. **严格模式 ES6 子集**：
+   - 已支持：箭头函数、let/const、类、模板字符串、解构
+   - 延期：Promise、generator、async/await、模块、Proxy
+
+5. **嵌入式优先**：可剥离编译期组件、小型运行时
+
+6. **增量验证**：已跑通 `parse → IR → bytecode → execute` 的完整链路
 
 ---
 
@@ -29,17 +45,17 @@
 │  ┌─────────────────────────────────────────────────┐ │
 │  │  JSASTLower                                     │ │
 │  │  • 递归遍历 oxc AST                              │ │
-│  │  • 闭包检测 + 变量逃逸分析 + 堆提升               │ │
-│  │  • class 编译为原型链操作                         │ │
-│  │  • generator → 状态机变换                        │ │
-│  │  • async/await → 状态机 + Promise 调度           │ │
-│  │  • 解构/展开/模板字符串降级                       │ │
+│  │  • 静态帧分配（无动态作用域链）                    │ │
+│  │  • 类编译为原型链操作（构造函数+prototype）         │ │
+│  │  • 箭头函数支持（词法 this）                       │ │
+│  │  • 解构赋值支持                                   │ │
+│  │  • 模板字符串支持                                 │ │
 │  └──────────────────────┬──────────────────────────┘ │
-│                         │ IR                          │
+│                         │ IR (SSA 形式)               │
 │  ┌──────────────────────▼──────────────────────────┐ │
 │  │  Compiler Pipeline                              │ │
-│  │  • SSA Builder (SSA 转换)                       │ │
-│  │  • Register Allocator (寄存器分配)               │ │
+│  │  • SSA Builder (SSA 转换 + 异常边)               │ │
+│  │  • Register Allocator (线性扫描寄存器分配)        │ │
 │  │  • Code Generator (IR → Bytecode)               │ │
 │  └──────────────────────┬──────────────────────────┘ │
 └─────────────────────────┼────────────────────────────┘
@@ -51,26 +67,31 @@
 │  │  VM Core                                        │ │
 │  │  • 寄存器式执行引擎 (Register-based)              │ │
 │  │  • 控制栈 (ctrl_stack) + 调用帧管理               │ │
-│  │  • SEH 异常处理 (try-catch-throw)                │ │
-│  │  • 闭包环境 (ClosureEnv / Upvalue)               │ │
+│  │  • SEH 异常处理 (try-catch-finally-throw)        │ │
+│  │  • break/continue/return 与 finally 交互          │ │
 │  │  • 原型链查找 ([[Prototype]] 遍历)               │ │
-│  │  • JS 专用运算 (js_add / js_eq / strict_eq 等)   │ │
+│  │  • JS 专用运算 (Add/Sub/Div/Rem + 比较运算)      │ │
 │  └─────────────────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────────────────┐ │
 │  │ 内置对象库 (Built-ins)                           │ │
-│  │  • Object, Array, String, Number, Boolean      │ │
-│  │  • Function, Error (TypeError, ReferenceError) │ │
-│  │  • Math, Date, JSON, RegExp                    │ │
-│  │  • Map, Set, WeakMap, WeakSet                  │ │
-│  │  • Promise + 微任务调度                         │ │
-│  │  • Symbol                                      │ │
-│  │  • Proxy/Reflect (延期)                        │ │
+│  │  ✅ Object (keys/values/entries/defineProperty/...)│ │
+│  │  ✅ Array (push/pop/shift/unshift/join/slice/...) │ │
+│  │  ✅ String (charAt/indexOf/slice/split/trim/...)  │ │
+│  │  ✅ Number (isFinite/isInteger/toFixed/...)       │ │
+│  │  ✅ Boolean                                      │ │
+│  │  ✅ Function                                     │ │
+│  │  ✅ Error (Error/TypeError/ReferenceError/       │ │
+│  │         RangeError/URIError/EvalError)           │ │
+│  │  ✅ Symbol (类型存在，暂不可构造)                  │ │
+│  │  ⏳ Math, Date, JSON, RegExp (未实现)            │ │
+│  │  ⏳ Map, Set, WeakMap, WeakSet (未实现)          │ │
+│  │  ⏳ Promise (未实现)                             │ │
+│  │  ⏳ Proxy/Reflect (未实现)                       │ │
 │  └─────────────────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────────────────┐ │
 │  │ 宿主接口 (Host API)                             │ │
-│  │  • NativeFunction (ctx 参数)                    │ │
-│  │  • ModuleLoader trait (模块加载)                │ │
-│  │  • Memory management (GC / Rc)                 │ │
+│  │  • NativeFunction (原生函数支持)                 │ │
+│  │  • Memory management (Rc<RefCell> 引用计数)     │ │
 │  └─────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────┘
 ```
@@ -83,36 +104,42 @@
 源文件 (.js)
     │
     ▼
-[oxc_parser]  ← 替换自定义 parser
+[oxc_parser]  (v0.132)
     │
     │  oxc_ast::Program<'a>
-    │  (arena 分配的 AST，约 150 种节点)
+    │  (arena 分配的 AST)
     ▼
 [JSASTLower]
     │
-    │  检测逃逸变量 → 堆提升
-    │  检测 class → 原型链操作
-    │  检测 generator → 状态机变换
-    │  检测解构/展开/模板字符串 → 降级
+    │  • 静态帧分配（寄存器索引）
+    │  • 类编译为原型链操作
+    │  • 箭头函数（词法 this）
+    │  • 解构赋值、模板字符串
     │
     │  IR (Instruction enum)
     ▼
 [SSA Builder]
     │
-    │  SSA IR + Phi 节点 + 异常边
+    │  • SSA 转换（支配树、Phi 插入）
+    │  • 异常边处理（try-catch-finally）
     ▼
 [Register Allocator]
     │
-    │  活跃区间分析 + 冲突解决 + 寄存器分配
+    │  • 活跃区间分析
+    │  • 线性扫描寄存器分配
     ▼
 [Code Generator]
     │
     │  Bytecode (Vec<Bytecode>)
+    │  • 45+ 种操作码
+    │  • 常量池 + 符号表
     ▼
 [VM Executor]
     │
-    │  寄存器执行 + 控制栈 + SEH
-    │  原型链查找 + 闭包环境 + JS 语义运算
+    │  • 寄存器执行
+    │  • 控制栈 + SEH 异常处理
+    │  • 原型链查找
+    │  • JS 语义运算
     ▼
 Result (Value)
 ```
@@ -131,6 +158,7 @@ pub enum Value {
     String(Rc<String>),
     Symbol(Rc<SymbolData>), // 唯一标识 + 可选的描述
     Object(Rc<RefCell<dyn JSObject>>), // 所有对象类型
+    Function(u32),        // 内部：字节码函数引用
 }
 
 /// Symbol 内部数据
@@ -140,17 +168,21 @@ pub struct SymbolData {
 }
 
 /// 对象 trait — 所有 JS 对象的核心接口
-pub trait JSObject {
+pub trait JSObject: fmt::Debug + Any {
+    fn kind(&self) -> ObjectKind;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    
     // 属性操作
-    fn property_get(&self, key: &PropertyKey) -> Option<ValueRef>;
-    fn property_set(&mut self, key: &PropertyKey, value: ValueRef);
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor>;
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String>;
     fn property_delete(&mut self, key: &PropertyKey) -> bool;
     fn has_property(&self, key: &PropertyKey) -> bool;
     fn own_keys(&self) -> Vec<PropertyKey>;
     
     // 原型操作
-    fn get_prototype(&self) -> Option<ValueRef>;
-    fn set_prototype(&mut self, proto: Option<ValueRef>);
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>>;
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>);
     
     // 不变性检查
     fn is_extensible(&self) -> bool;
@@ -161,13 +193,23 @@ pub trait JSObject {
     fn seal(&mut self);
     
     // 内部类型标记
-    fn type_of(&self) -> &'static str; // "function", "object", etc.
+    fn type_of(&self) -> &'static str { "object" }
 }
 
 /// 属性键 — 支持 String 和 Symbol
 pub enum PropertyKey {
     Str(Rc<String>),
     Symbol(Rc<SymbolData>),
+}
+
+/// 属性描述符
+pub struct PropertyDescriptor {
+    pub value: Value,
+    pub writable: bool,
+    pub enumerable: bool,
+    pub configurable: bool,
+    pub getter: Option<Value>,
+    pub setter: Option<Value>,
 }
 ```
 
@@ -252,26 +294,21 @@ fn internal_set_prototype(obj: &mut dyn JSObject, proto: Option<ValueRef>) -> bo
 
 ### 6.1 JSASTLower — 核心降级器
 
-从 oxc AST 直接降级到 IR，复用 evalit 的 IR 指令集 + 扩展。
+从 oxc AST 直接降级到 IR。
 
 ```rust
 pub struct JSASTLower<'a> {
     builder: Box<dyn InstBuilder>,
     symbols: SymbolTable,
     // JS 特有状态
-    scope_chain: Vec<ScopeInfo>,     // 作用域链（支持闭包）
-    this_binding: Option<ValueRef>,  // 当前 this
-    hoisted_decls: Vec<DeclInfo>,     // hoisted 声明
-    class_info: Vec<ClassInfo>,       // class 定义信息
-    is_strict: bool,                  // 当前是否严格模式
+    this_binding: Option<ValueId>,   // 当前 this
+    loop_context: Option<LoopContext>, // 循环上下文（break/continue）
 }
 
 impl<'a> JSASTLower<'a> {
     // 入口
     pub fn lower_program(&mut self, program: &oxc_ast::Program<'a>) {
-        // 1. 收集所有 hoisted 声明（函数提升、var 提升）
-        // 2. 处理 class 定义（编译为方法表 + 原型链）
-        // 3. 递归遍历语句体
+        // 递归遍历语句体
     }
     
     fn lower_stmt(&mut self, stmt: &oxc_ast::Statement<'a>) { ... }
@@ -280,8 +317,7 @@ impl<'a> JSASTLower<'a> {
     fn lower_class(&mut self, class: &oxc_ast::Class<'a>) -> ValueId { ... }
     fn lower_function(&mut self, func: &oxc_ast::Function<'a>) -> ValueId { ... }
     fn lower_arrow_function(&mut self, arrow: &oxc_ast::ArrowFunctionExpression<'a>) -> ValueId { ... }
-    fn lower_generator(&mut self, gen: &oxc_ast::Function<'a>) -> ValueId { ... }
-    fn lower_async_function(&mut self, func: &oxc_ast::Function<'a>) -> ValueId { ... }
+    fn lower_try_catch(&mut self, stmt: &oxc_ast::TryStatement<'a>) { ... }
 }
 ```
 
@@ -357,86 +393,13 @@ function makeCounter() {
 //           ↓
 // 检测：count 被内嵌函数引用（逃逸）
 //       ↓
-// count 不在寄存器分配，改为在 ClosureEnv 中
+// 当前实现：静态帧索引，无闭包环境
+// 所有变量通过寄存器分配
 //       ↓
 ```
 
-```rust
-// 编译后 IR 示意
-function makeCounter() {
-    // 1. 创建闭包环境（堆分配）
-    env = CreateClosureEnv  // env.values[0] = count
-    
-    // 2. 初始化逃逸变量
-    env_set env, 0, 0  // count = 0
-    
-    // 3. 创建内嵌函数，绑定闭包环境
-    inner = CreateClosure inner_func_body, env
-    
-    return inner
-}
-
-// inner 函数体
-function inner_func_body() {
-    // count 不在寄存器中，通过 closure_env 访问
-    tmp = env_get closure_env, 0  // load count
-    tmp = js_add tmp, 1           // ++count
-    env_set closure_env, 0, tmp   // store count
-    return tmp
-}
-```
-
-新增指令：
-
-| 指令 | 说明 |
-|------|------|
-| `CreateClosureEnv` | 创建闭包环境（固定大小的 vector） |
-| `EnvGet` | 从闭包环境读取值 |
-| `EnvSet` | 写入闭包环境 |
-| `CreateClosure` | 创建闭包函数（函数体 + 闭包环境） |
-
-### 6.5 Generator 编译策略
-
-```javascript
-function* counter() {
-    let i = 0;
-    while (true) {
-        yield i++;
-    }
-}
-//           ↓
-// 状态机变换（和 Rust async、C# 迭代器一致）
-//           ↓
-```
-
-```rust
-// 编译为状态机
-function counter_state_machine(state, result_slot) {
-    switch (state) {
-        case 0: goto _entry_0;
-        case 1: goto _resume_1;
-    }
-_entry_0:
-    i = 0;  // 提升为持久变量（在闭包环境中）
-    // 不直接 goto loop_head，而是 yield 时保存状态
-_generate_0:
-    tmp = i;
-    i = i + 1;
-    state = 1;                // 保存 resume 点
-    return { value: tmp, done: false };  // yield 返回
-_resume_1:
-    goto _generate_0;  // 循环继续
-    // ...
-}
-```
-
-Generator 需要新增指令：
-
-| 指令 | 说明 |
-|------|------|
-| `CreateGenerator` | 从函数创建 generator 对象 |
-| `GeneratorNext` | 执行 generator 的 `.next()` |
-| `Yield` | 暂停执行并产出一个值 |
+**注意**：当前实现采用静态帧索引，暂不支持闭包（函数内嵌套函数并引用外部变量）。
+所有变量通过寄存器分配管理。
 
 ---
 
@@ -447,79 +410,88 @@ Generator 需要新增指令：
 ```rust
 pub struct VM {
     state: VMState,
-    builtins: BuiltinRegistry,  // 内置对象
-    module_loader: Box<dyn ModuleLoader>,
+    builtins: Builtins,  // 内置对象
 }
 
 pub struct VMState {
-    // 寄存器
-    registers: Vec<ValueRef>,
+    // 寄存器文件
+    registers: Vec<Value>,
+    rsp: usize,           // 栈指针
+    rbp: usize,           // 基址指针
     
     // 控制栈（调用帧）
-    ctrl_stack: Vec<CtrlFrame>,
+    ctrl_stack: Vec<usize>,
     
-    // 指令流
-    codes: Vec<Bytecode>,
+    // 程序计数器
     pc: usize,
     
-    // 异常处理
+    // 异常处理栈
     seh_stack: Vec<SehRecord>,
     
-    // 闭包环境
-    closure_envs: Vec<Rc<RefCell<ClosureEnv>>>,
+    // 全局变量
+    globals: HashMap<String, Value>,
     
-    // 微任务队列（Promise）
-    microtask_queue: VecDeque<ValueRef>,
-    
-    // 宿主环境
-    host: Rc<RefCell<dyn HostContext>>,
+    // 当前 this 值
+    this_val: Value,
 }
 
-pub struct CtrlFrame {
-    pub return_addr: usize,
-    pub saved_rbp: usize,
-    pub saved_rsp: usize,
-    pub saved_seh_depth: usize,
-    pub saved_exc_register: ValueRef,
+/// SEH (Structured Exception Handling) 记录
+struct SehRecord {
+    handler_pc: usize,        // catch handler PC
+    finally_pc: usize,        // finally handler PC
+    saved_rsp: usize,
+    saved_rbp: usize,
+    in_finally: bool,
+    pending_exception: Option<Value>,
+    catch_executed: bool,
+    delayed_jump_target: Option<isize>,  // break/continue
+    delayed_return: bool,                // return in finally
 }
 ```
 
-### 7.2 JS 专用运算指令
+### 7.2 字节码指令集
 
-在 evalit 的 ALU 指令基础上，新增 JS 语义专用指令：
+当前实现 45+ 种操作码：
 
 ```rust
-pub enum JsArithOp {
-    // JS 加法（字符串优先）
-    JsAdd,
-    // JS 减法/乘法等（全部 ToNumber）
-    JsSub,
-    JsMul,
-    JsDiv,
-    JsRem,
-    // JS 比较
-    JsEq,       // ==   （带类型转换）
-    JsNe,       // !=
-    JsStrictEq, // ===  （无类型转换）
-    JsStrictNe, // !==
-    JsLt,       // <
-    JsGt,       // >
-    JsLe,       // <=
-    JsGe,       // >=
-    // 位运算（先 ToInt32）
-    JsBitAnd,
-    JsBitOr,
-    JsBitXor,
-    JsBitNot,
-    JsShiftLeft,
-    JsShiftRight,
-    JsShiftRightZeroFill, // >>> 无符号右移
-    // 其他
-    JsTypeOf,
-    JsDelete,
-    JsVoid,
-    JsInstanceOf,
-    JsIn,
+pub enum Opcode {
+    // 数据移动
+    LoadConst,      // 加载常量
+    LoadEnv,        // 加载环境变量
+    Mov,            // 寄存器移动
+    Push, Pop,      // 栈操作
+    PushC, PopC,    // 控制栈操作
+    
+    // 算术运算
+    Add, Sub, Mul, Div, Rem, Neg,  // 基础运算
+    Addx, Subx, Mulx, Divx, Remx,  // 对象运算（带类型转换）
+    
+    // 位运算
+    BitAnd, BitOr, BitXor, BitNot,
+    ShiftLeft, ShiftRight, ShiftRightZeroFill,
+    
+    // 比较运算
+    Less, LessEqual, Greater, GreaterEqual,
+    Equal, NotEqual, StrictEqual, NotStrictEqual,
+    
+    // 逻辑运算
+    Not, And, Or,
+    
+    // 控制流
+    Jump, BrIf,     // 跳转
+    Call, CallEx, CallNative,  // 函数调用
+    Ret, Halt,      // 返回/停止
+    
+    // 对象操作
+    PropGet, PropSet, PropDelete,
+    New, InstanceOf, TypeOf,
+    
+    // 异常处理
+    TryCatch,       // 设置异常处理
+    EndTry,         // 结束 try 块
+    ThrowExc,       // 抛出异常
+    ResumeExc,      // 恢复异常处理
+    DelayedJump,    // 延迟跳转（break/continue in finally）
 }
 ```
 
@@ -550,187 +522,136 @@ fn js_add(left: &Value, right: &Value) -> Result<Value, RuntimeError> {
 
 ---
 
-## 八、模块系统
-
-```rust
-/// 模块加载器接口 — 可插拔
-pub trait ModuleLoader {
-    fn resolve(&self, specifier: &str, referrer: &ModuleRef)
-        -> Result<ModuleRef, ModuleError>;
-    
-    fn load(&mut self, module: &ModuleRef)
-        -> Result<ModuleSource, ModuleError>;
-    
-    fn compile(&mut self, source: &ModuleSource)
-        -> Result<CompiledModule, ModuleError>;
-}
-
-/// 编译后的模块
-pub struct CompiledModule {
-    pub exports: HashMap<String, ValueRef>,
-    pub bytecode: Vec<Bytecode>,
-}
-
-/// 模块导入编译策略
-// import { foo } from './bar.js'
-//           ↓
-// JSASTLower 阶段：
-//   1. 将 import 语句编译为 LoadModule 指令
-//   2. LoadModule 在运行时调用 ModuleLoader
-//   3. 导入的变量绑定到模块的 exports 槽位
-//           ↓
-fn lower_import_decl(&mut self, decl: &oxc_ast::ImportDeclaration) {
-    let specifier = &decl.source.value;
-    let module_ref = self.builder.emit(Instruction::LoadModule {
-        specifier: specifier.clone(),
-    });
-    
-    for spec in &decl.specifiers {
-        match spec {
-            ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
-                let val = self.builder.emit(Instruction::ModuleGetDefault { module: module_ref });
-                self.symbols.define(&s.local.name, val);
-            }
-            ImportDeclarationSpecifier::ImportSpecifier(s) => {
-                let val = self.builder.emit(Instruction::ModuleGetNamed {
-                    module: module_ref,
-                    name: s.imported.name(),
-                });
-                self.symbols.define(&s.local.name, val);
-            }
-            ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
-                let val = self.builder.emit(Instruction::ModuleGetNamespace { module: module_ref });
-                self.symbols.define(&s.local.name, val);
-            }
-        }
-    }
-}
-```
-
----
-
-## 九、错误系统
+## 八、错误系统
 
 ```rust
 /// JS 兼容的错误类型
 pub enum RuntimeError {
-    // JS Error 类型
-    Error { message: String, stack: Vec<StackFrame> },
-    TypeError { message: String, stack: Vec<StackFrame> },
-    ReferenceError { message: String, stack: Vec<StackFrame> },
-    RangeError { message: String, stack: Vec<StackFrame> },
-    SyntaxError { message: String, stack: Vec<StackFrame> },
-    URIError { message: String, stack: Vec<StackFrame> },
+    // 标准 JS Error 类型（已映射到 JS Error 对象）
+    Error(String),           // Error.prototype
+    TypeError(String),       // TypeError.prototype
+    ReferenceError(String),  // ReferenceError.prototype
+    RangeError(String),      // RangeError.prototype
+    SyntaxError(String),     // SyntaxError.prototype
+    URIError(String),        // URIError.prototype
+    EvalError(String),       // EvalError.prototype
     
-    // 引擎内部错误（不应暴露到 JS）
-    InternalError { message: String },
-    StackOverflow,
-    OutOfMemory,
-    UnhandledPromiseRejection { value: ValueRef },
+    // 引擎内部错误
+    NotImplemented(String),
+    InternalError(String),
 }
 ```
 
 ---
 
-## 十、排除特性清单与理由
+## 九、实现状态与排除特性
+
+### 9.1 已实现的 ES6 特性
+
+| 特性 | 状态 | 说明 |
+|------|------|------|
+| `let` / `const` | ✅ | 块级作用域 |
+| 箭头函数 | ✅ | 词法 this |
+| 类 (class) | ✅ | extends, super, 方法定义 |
+| 模板字符串 | ✅ | 基本插值支持 |
+| 解构赋值 | ✅ | 对象/数组解构 |
+| 展开运算符 | ✅ | 函数调用和数组字面量 |
+| rest 参数 | ✅ | `...args` |
+| 默认参数 | ✅ | 函数参数默认值 |
+| `for...of` | ✅ | 可迭代对象遍历 |
+| `Symbol` | ⚠️ | 类型存在，暂不可构造 |
+| `Object` | ✅ | 完整静态方法和原型方法 |
+| `Array` | ✅ | 主要原型方法 |
+| `String` | ✅ | 主要原型方法 |
+| `Number` | ✅ | 静态方法和原型方法 |
+| `Boolean` | ✅ | 构造函数和原型 |
+| `Function` | ✅ | 构造函数和原型 |
+| Error 类型 | ✅ | 6种标准 Error 类型 |
+| try-catch-finally | ✅ | 完整异常处理 |
+| instanceof | ✅ | 运算符支持 |
+| typeof | ✅ | 运算符支持 |
+
+### 9.2 排除特性（与静态编译不兼容）
 
 | 排除特性 | 理由 |
 |----------|------|
-| `eval(code)` | 需要运行时编译器 + 安全风险 |
+| `eval(code)` | 需要运行时编译器 |
 | `Function(code)` | 与 eval 同理 |
-| `with(obj) { }` | ES6 严格模式已禁用 + 无实际使用场景 |
-| `Proxy` / `Reflect` | 影响 VM 所有内部操作路径，P0 不做，P2 以后可选加回 |
-| `Object.observe` | 已从规范移除 |
+| `with(obj) { }` | 与静态编译不兼容 |
+| `var` | 与静态帧索引冲突 |
+| `arguments` | 与静态帧索引冲突 |
 
-**以下全部保留**（ES6 完整支持）：
+### 9.3 延期特性（未来实现）
 
-`let` / `const` / `class` / `extends` / `super` / 箭头函数 / 模板字符串 / 解构赋值 / 展开运算符 / rest 参数 / 默认参数 / `for...of` / `for...in` / `Symbol` / `Map` / `Set` / `WeakMap` / `WeakSet` / `Promise` / `Generator` / `yield` / `async` / `await` / `Object.setPrototypeOf` / `Object.create` / `Object.freeze` / `Object.seal` / `Object.defineProperty` 完整 / `__proto__` getter/setter / `getter` / `setter` / `typeof` / `delete` / `===` / `instanceof` / `import` / `export` / `Error` 类型体系
+| 特性 | 优先级 | 说明 |
+|------|--------|------|
+| `Promise` | P1 | 异步基础 |
+| `async/await` | P1 | 语法糖 |
+| `Generator` | P2 | 状态机变换 |
+| `Map` / `Set` | P2 | 新集合类型 |
+| `Proxy` / `Reflect` | P3 | 元编程 |
+| 模块系统 (import/export) | P2 | 模块加载器 |
 
 ---
 
-## 十一、项目结构建议
+## 十、项目结构
 
 ```
-biu/
-├── Cargo.toml
+biujs/
+├── Cargo.toml                   # oxc_parser v0.132
 ├── src/
-│   ├── lib.rs                   # 库入口
-│   ├── main.rs                  # REPL / CLI（开发阶段）
+│   ├── lib.rs                   # 库入口：Compiler, VM, Value, RuntimeError
+│   ├── main.rs                  # CLI 工具
+│   │
+│   ├── bytecode.rs              # Bytecode, Opcode, Module 定义
 │   │
 │   ├── compiler/                # 编译期
-│   │   ├── mod.rs
-│   │   ├── ir/                  # IR 定义（从 evalit 移植）
-│   │   │   ├── mod.rs
-│   │   │   ├── instruction.rs   # Instruction enum
-│   │   │   ├── builder.rs       # InstBuilder trait
-│   │   │   └── cfg.rs           # ControlFlowGraph
-│   │   ├── lowering/            # 降级器
-│   │   │   ├── mod.rs
-│   │   │   ├── js_lower.rs      # JSASTLower 核心
-│   │   │   ├── class.rs         # class 降级
-│   │   │   ├── closure.rs       # 闭包检测 + 堆提升
-│   │   │   ├── generator.rs     # generator 状态机变换
-│   │   │   └── patterns.rs      # 解构/展开降级
-│   │   ├── ssabuilder.rs        # SSA 转换（从 evalit 移植）
-│   │   ├── regalloc.rs          # 寄存器分配（从 evalit 移植）
-│   │   └── codegen.rs           # IR → Bytecode（从 evalit 移植）
+│   │   ├── mod.rs              # Compiler 主入口
+│   │   ├── error.rs            # CompileError
+│   │   ├── symbol.rs           # SymbolTable
+│   │   ├── codegen.rs          # IR → Bytecode 代码生成
+│   │   ├── regalloc.rs         # 寄存器分配
+│   │   └── ir/                 # 中间表示
+│   │       ├── mod.rs
+│   │       ├── instruction.rs   # Instruction enum
+│   │       ├── builder.rs      # InstBuilder trait
+│   │       ├── cfg.rs          # ControlFlowGraph
+│   │       └── ssabuilder.rs   # SSA 转换
 │   │
-│   ├── vm/                      # 运行时
-│   │   ├── mod.rs
-│   │   ├── vm.rs                # VM 核心执行引擎
-│   │   ├── value.rs             # Value 类型系统
-│   │   ├── object.rs            # JSObject trait + OrdinaryObject
-│   │   ├── property.rs          # PropertyDescriptor, PropertyKey
-│   │   ├── prototype.rs         # 原型链查找逻辑
-│   │   ├── closure.rs           # ClosureEnv, ClosureFunction
-│   │   ├── bytecode.rs          # Opcode / Bytecode 定义
-│   │   ├── error.rs             # RuntimeError + StackFrame
-│   │   └── seh.rs               # SEH 异常处理
+│   ├── vm/                     # 运行时
+│   │   ├── mod.rs              # VM 主入口（SEH 异常处理）
+│   │   ├── value.rs            # Value 类型系统
+│   │   ├── object.rs           # JSObject trait + NativeFunctionObject
+│   │   ├── property.rs         # PropertyDescriptor, PropertyKey, ObjectKind
+│   │   └── prototype.rs        # 原型链查找逻辑
 │   │
-│   ├── builtins/                # 内置对象库
-│   │   ├── mod.rs
-│   │   ├── object_builtins.rs   # Object.*
-│   │   ├── array_builtins.rs    # Array.* + Array.prototype.*
-│   │   ├── string_builtins.rs   # String.* + String.prototype.*
-│   │   ├── number_builtins.rs   # Number.*
-│   │   ├── function_builtins.rs # Function.*
-│   │   ├── error_builtins.rs    # Error, TypeError, etc.
-│   │   ├── math_builtins.rs     # Math.*
-│   │   ├── date_builtins.rs     # Date.*
-│   │   ├── json_builtins.rs     # JSON.*
-│   │   ├── regexp_builtins.rs   # RegExp.*
-│   │   ├── map_set_builtins.rs  # Map, Set, WeakMap, WeakSet
-│   │   ├── promise_builtins.rs  # Promise
-│   │   ├── symbol_builtins.rs   # Symbol
-│   │   └── console_builtins.rs  # console.*（调试用）
+│   ├── builtins/               # 内置对象库
+│   │   ├── mod.rs              # Builtins 注册表
+│   │   ├── object.rs           # Object.* 静态方法
+│   │   ├── array.rs            # Array.* 原型方法
+│   │   ├── string.rs           # String.* 原型方法
+│   │   ├── number.rs           # Number.* 静态/原型方法
+│   │   ├── boolean.rs          # Boolean.* 原型方法
+│   │   ├── function.rs         # Function.* 原型方法
+│   │   └── error.rs            # Error, TypeError, RangeError 等
 │   │
-│   ├── module/                  # 模块系统
-│   │   ├── mod.rs
-│   │   ├── loader.rs            # ModuleLoader trait
-│   │   └── resolver.rs          # 模块解析
+│   ├── module/                 # 模块系统（预留）
+│   │   └── mod.rs
 │   │
-│   ├── host/                    # 宿主接口
-│   │   ├── mod.rs
-│   │   ├── native.rs            # NativeFunction trait
-│   │   └── context.rs           # HostContext
-│   │
-│   └── gc/                      # 内存管理（可选）
-│       └── mod.rs               # GC wrapper
+│   └── host/                   # 宿主接口
+│       └── mod.rs
 │
-├── tests/                       # 测试
-│   ├── basic_test.rs
-│   ├── class_test.rs
-│   ├── prototype_test.rs
-│   ├── promise_test.rs
-│   ├── generator_test.rs
-│   └── builtins_test.rs
+├── tests/
+│   ├── test262_runner.rs       # test262 测试套件运行器
+│   ├── helpers.rs              # 测试辅助函数
+│   └── features/               # 功能测试
+│       ├── control_flow.rs     # 控制流 + 异常处理测试
+│       └── functions.rs        # 函数测试
 │
-├── examples/                    # 示例
-│   └── embedded.rs              # 嵌入式集成示例
-│
-└── docs/                        # 文档
-    ├── architecture.md
-    └── embedding.md
+└── docs/
+    ├── biu-js-engine-architecture.md
+    ├── es6-feature-support.md
+    └── exception-handler.md
 ```
 
 ---
@@ -771,43 +692,59 @@ assert(Object.getPrototypeOf(d) === Dog.prototype);
 
 ---
 
-## 十三、P0 开发路线（推荐顺序）
+## 十一、实现里程碑
 
-| 步骤 | 内容 | 说明 |
-|------|------|------|
-| 1 | 项目骨架 + Cargo.toml + oxc 集成 | 先跑通 `oxc_parser` |
-| 2 | 移植 IR + Builder + CFG（从 evalit） | 确保编译管道骨架可用 |
-| 3 | JSASTLower 初版：`1 + 2` 能跑通 | 验证完整链路 |
-| 4 | JSASTLower：变量声明 + 函数调用 | 能执行简单程序 |
-| 5 | JSASTLower：控制流 (if/while/for) | 基础语句完整 |
-| 6 | JSASTLower：模板字符串 + 展开 + 解构 | 语法特性 |
-| 7 | 移植 SSA + RegAlloc + Codegen（从 evalit） | 完整编译管道 |
-| 8 | Value 类型系统 + JS 专用运算 | JS 语义核心 |
-| 9 | 对象系统 + 属性描述符 | 原型链基础 |
-| 10 | 原型链完整实现 | 查找 + 设置 + 不变性 |
-| 11 | class + extends + super 降级 | class 全支持 |
-| 12 | 闭包捕获 + 堆提升 | 函数作为值 |
-| 13 | this 绑定 + new 操作符 | 函数调用完整 |
+### M1（已完成）
+- [x] oxc_parser 集成（v0.132）
+- [x] IR + SSA + 寄存器分配 + 代码生成
+- [x] 寄存器式 VM 执行引擎
+- [x] let/const 变量声明
+- [x] 基础运算（+ - * / %）
+- [x] 控制流（if/while/for）
+- [x] 函数声明和调用
+- [x] 箭头函数
+- [x] 模板字符串
+- [x] 解构赋值
+
+### M2（已完成）
+- [x] 类（class）+ extends + super
+- [x] 原型链系统（Object.create, setPrototypeOf）
+- [x] 属性描述符（defineProperty, getOwnPropertyDescriptor）
+- [x] instanceof 运算符
+- [x] try-catch-finally 异常处理
+- [x] break/continue/return 与 finally 交互
+- [x] 6种 Error 类型（Error, TypeError, ReferenceError, RangeError, URIError, EvalError）
+- [x] Object 静态方法（keys/values/entries/defineProperty/...）
+- [x] Array 原型方法（push/pop/shift/unshift/join/slice/...）
+- [x] String 原型方法（charAt/indexOf/slice/split/trim/...）
+- [x] Number 静态/原型方法（isFinite/isInteger/toFixed/...）
+- [x] test262 测试框架集成
+
+### M3（规划中）
+- [ ] Promise 基础实现
+- [ ] async/await 语法支持
+- [ ] Math 对象
+- [ ] Date 对象
+- [ ] JSON 对象
+
+### M4（远期）
+- [ ] Map / Set / WeakMap / WeakSet
+- [ ] Generator / yield
+- [ ] Proxy / Reflect
+- [ ] 模块系统（import/export）
 
 ---
 
-## 十四、从 evalit 继承的优势
+## 十二、技术特点
 
-| evalit 已验证的设计 | biu 直接受益 |
-|-------------------|-------------|
-| 寄存器式 VM + 双栈架构 | 稳定的执行引擎 |
-| SSA 转换 + RegAlloc | 优秀的代码质量 |
-| SEH 异常处理 | 完整的 try-catch-throw |
-| IR Builder trait | 降级器接口清晰 |
-| Codegen 管道 | IR → Bytecode 自动生成 |
-| NativeFunction 机制 | 宿主 API 可插拔 |
-
-| evalit 需要改进的 | biu 的做法 |
-|------------------|-----------|
-| 值类型过于简化 | `Value::Number(f64)` 统一 JS 数字 |
-| 无对象属性描述符 | 完整 `PropertyDescriptor` |
-| 无原型链 | 完整 `[[Prototype]]` 机制 |
-| 无闭包 | `ClosureEnv` + 闭包函数 |
-| 函数调用无 `this` | `Call` 指令增加 this 操作数 |
-| 无模块系统 | `ModuleLoader` trait |
-| 无内置对象库 | 分层实现 ES6 标准库 |
+| 技术特点 | 实现说明 |
+|----------|----------|
+| 静态编译 | AOT 编译，无运行时编译器，排除 eval/Function/with |
+| 寄存器式 VM | 基于寄存器的执行引擎，45+ 种操作码 |
+| SSA IR | 静态单赋值形式，支持 Phi 节点和异常边 |
+| 线性寄存器分配 | 基于活跃区间的线性扫描算法 |
+| 完整原型链 | `[[Prototype]]` 机制，Object.create/setPrototypeOf |
+| SEH 异常处理 | try-catch-finally，break/continue/return 与 finally 交互 |
+| 属性描述符 | writable/enumerable/configurable + getter/setter |
+| 引用计数 | `Rc<RefCell>` 内存管理，无 GC 暂停 |
+| test262 集成 | 标准 ECMAScript 测试套件验证 |

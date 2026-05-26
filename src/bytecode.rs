@@ -150,6 +150,8 @@ pub enum Opcode {
     BrIf,
     /// not dst, src
     Not,
+    /// bitnot dst, src (bitwise NOT ~)
+    BitNot,
     /// neg dst, src
     Neg,
     /// addx dst, src1, src2 (object addition)
@@ -208,7 +210,7 @@ pub enum Opcode {
     PropSet,
     /// call_method dst, obj, method
     CallMethod,
-    /// try offset (SEH: register handler at offset)
+    /// try catch_offset, finally_offset (SEH: register handler at offset)
     Try,
     /// end_try (SEH: unregister handler)
     EndTry,
@@ -216,10 +218,20 @@ pub enum Opcode {
     ThrowExc,
     /// load_exception dst (SEH: load caught exception)
     LoadException,
+    /// resume_exception (SEH: re-throw pending exception after finally)
+    ResumeExc,
+    /// delayed_jump target, seh_depth (execute finally blocks then jump)
+    DelayedJump,
     /// create_closure dst, func_id
     CreateClosure,
     /// new dst, constructor
     New,
+    /// load_this dst
+    LoadThis,
+    /// make_func_obj dst, func_id
+    MakeFuncObj,
+    /// make_arrow_func_obj dst, func_id, captured_this
+    MakeArrowFuncObj,
 }
 
 impl fmt::Display for Opcode {
@@ -243,6 +255,7 @@ impl fmt::Display for Opcode {
             Opcode::LoadEnv => write!(f, "load_env"),
             Opcode::Mov => write!(f, "mov"),
             Opcode::Not => write!(f, "not"),
+            Opcode::BitNot => write!(f, "bitnot"),
             Opcode::Neg => write!(f, "neg"),
             Opcode::Addx => write!(f, "addx"),
             Opcode::Subx => write!(f, "subx"),
@@ -276,8 +289,13 @@ impl fmt::Display for Opcode {
             Opcode::EndTry => write!(f, "end_try"),
             Opcode::ThrowExc => write!(f, "throw"),
             Opcode::LoadException => write!(f, "load_exception"),
+            Opcode::ResumeExc => write!(f, "resume_exception"),
+            Opcode::DelayedJump => write!(f, "delayed_jump"),
             Opcode::CreateClosure => write!(f, "create_closure"),
             Opcode::New => write!(f, "new"),
+            Opcode::LoadThis => write!(f, "load_this"),
+            Opcode::MakeFuncObj => write!(f, "make_func_obj"),
+            Opcode::MakeArrowFuncObj => write!(f, "make_arrow_func_obj"),
         }
     }
 }

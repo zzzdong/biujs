@@ -3,29 +3,67 @@
 //! Uses test262-harness crate with `Harness::new(path)` to target specific
 //! test subdirectories matching biujs's current capabilities.
 //!
-//! ## biujs supported features (v0.1):
-//! - Numbers, strings, booleans
-//! - Arithmetic: +, -, *, /, %
-//! - Comparison: >, <, >=, <=, ==, !=
-//! - Logical: !, &&, ||
-//! - typeof
-//! - let variables
-//! - if/else, while, for loops
-//! - function declarations
+//! ## Target
+//!
+//! **ES6 (ECMAScript 2015)** – with the following explicit exclusions:
+//!   - `eval` – No dynamic code evaluation.
+//!   - `with` – No dynamic scope binding.
+//!   - `Proxy`, `Reflect`, `Symbol` – Meta-programming not supported.
+//!   - Arrow functions, generators, async – Not yet implemented.
+//!   - `Map`, `Set`, `Promise`, `RegExp`, `Date` – Not yet implemented.
 //!
 //! ## Strategy
 //!
 //! test262 tests universally use `throw new Test262Error(...)`, `var`, `eval()`,
 //! built-in objects, etc. We aggressively filter to only run tests whose source
 //! code can be parsed and executed by biujs.
+//!
+//! ## biujs currently supported features:
+//! - Numbers, strings, booleans, null, undefined
+//! - Arithmetic: +, -, *, /, %
+//! - Comparison: >, <, >=, <=, ==, !=, ===, !==
+//! - Logical: !, &&, ||
+//! - Bitwise: &, |, ^, ~, <<, >>, >>>
+//! - typeof
+//! - let variables, assignments
+//! - if/else, while, for loops (with break/continue)
+//! - function declarations and calls
+//! - class declarations and expressions
+//! - `new` operator with constructors
+//! - `this` binding in strict mode
 
 use biujs::{Compiler, VM};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use test262_harness::Harness;
 
 /// Root directory for test262 tests (contains language/expressions/ etc.)
 fn test262_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test262/test")
+}
+
+/// Root directory for test262 harness files
+fn test262_harness_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test262/harness")
+}
+
+/// Cached harness file contents
+static HARNESS_ASSERT: OnceLock<String> = OnceLock::new();
+static HARNESS_STRICT: OnceLock<String> = OnceLock::new();
+
+/// Load harness files and cache them
+fn load_harness() -> (String, String) {
+    let assert_content = HARNESS_ASSERT.get_or_init(|| {
+        let path = test262_harness_root().join("assert.js");
+        std::fs::read_to_string(&path).unwrap_or_default()
+    });
+    
+    let strict_content = HARNESS_STRICT.get_or_init(|| {
+        let path = test262_harness_root().join("sta.js");
+        std::fs::read_to_string(&path).unwrap_or_default()
+    });
+    
+    (assert_content.clone(), strict_content.clone())
 }
 
 /// Check if test262 directory exists
@@ -43,45 +81,23 @@ fn should_skip_source(source: &str) -> Option<&'static str> {
         return Some("no test262 metadata");
     }
 
-    // Every feature below is NOT supported by biujs.
+    // Patterns NOT supported by biujs (ES6 target, no eval/with).
     // Order matters: check the most common patterns first.
     let unsupported_patterns: &[&str] = &[
-        // Error handling
-        "throw",
-        "try",
-        "catch",
-        "finally",
-        // OOP
-        "class ",
-        "new ",
-        "instanceof",
-        "prototype",
-        "this",
         // Functions (biujs only supports `function name() {}` declarations)
         "=>",          // arrow functions
         "...",         // spread/rest (though `...` in string literals is fine)
         // Declarations
         "var ",
         "const ",
-        // Built-ins
+        // Built-ins NOT yet implemented
         "eval(",
-        "isNaN(",
         "parseInt(",
         "parseFloat(",
-        "Array",
-        "Object",
-        "String",
-        "Number",
-        "Boolean",
         "Math.",
         "JSON",
         "Date",
         "RegExp",
-        "Error",
-        "TypeError",
-        "RangeError",
-        "ReferenceError",
-        "SyntaxError",
         "Symbol(",
         "Proxy",
         "Promise",
@@ -93,8 +109,6 @@ fn should_skip_source(source: &str) -> Option<&'static str> {
         // Harness infrastructure
         "$DONOTEVALUATE",
         "$ERROR",
-        "assert.",
-        "Test262Error",
         "print(",
         // Misc unsupported
         "delete ",
@@ -107,22 +121,6 @@ fn should_skip_source(source: &str) -> Option<&'static str> {
         "switch",
         "do ",
         "label:",
-        ".toString(",
-        ".valueOf(",
-        // String methods
-        ".charAt",
-        ".indexOf",
-        ".substring",
-        ".slice",
-        ".split",
-        ".replace",
-        ".trim",
-        ".length",
-        ".concat",
-        // Property access patterns biujs can't handle
-        ".length",
-        "[0]",
-        "[1]",
         // Template literals (biujs has partial support but tests are complex)
         "`",
     ];
@@ -174,10 +172,10 @@ fn run_suite(subdir: &str) -> (u32, u32, u32, Vec<(String, String)>) {
             continue;
         }
 
-        // Also skip tests with features that biujs doesn't support
+        // Also skip tests with features not yet implemented in biujs (ES6 target)
         let skip_features = [
             "async-iteration", "async-functions", "generators", "modules",
-            "class", "arrow-function", "destructuring-binding", "for-of",
+            "arrow-function", "destructuring-binding", "for-of",
             "Symbol", "template", "const", "default-parameters",
             "Proxy", "Promise", "Map", "Set", "Proxy", "object-rest",
             "object-spread", "rest-parameters", "spread-syntax", "super",
@@ -213,8 +211,12 @@ fn run_suite(subdir: &str) -> (u32, u32, u32, Vec<(String, String)>) {
             .clone()
             .unwrap_or_else(|| test.path.display().to_string());
 
+        // Inject harness files before the test source
+        let (assert_harness, sta_harness) = load_harness();
+        let full_source = format!("{}\n{}\n{}", sta_harness, assert_harness, source);
+
         let mut compiler = Compiler::new();
-        match compiler.compile(source) {
+        match compiler.compile(&full_source) {
             Ok(module) => {
                 let mut vm = VM::new();
                 match vm.run(&module) {
@@ -483,4 +485,156 @@ fn test262_identifiers() {
 #[test]
 fn test262_types() {
     test_subdirectory("language/types", "type coercion and behavior");
+}
+
+// ---- Built-in Objects ----
+
+#[test]
+fn test262_builtin_boolean() {
+    test_subdirectory("built-ins/Boolean", "Boolean");
+}
+
+#[test]
+fn test262_builtin_number() {
+    test_subdirectory("built-ins/Number", "Number");
+}
+
+#[test]
+fn test262_builtin_string() {
+    test_subdirectory("built-ins/String", "String");
+}
+
+#[test]
+fn test262_builtin_object() {
+    test_subdirectory("built-ins/Object", "Object");
+}
+
+#[test]
+fn test262_builtin_array() {
+    test_subdirectory("built-ins/Array", "Array");
+}
+
+#[test]
+fn test262_builtin_error() {
+    test_subdirectory("built-ins/Error", "Error");
+}
+
+#[test]
+fn test262_builtin_native_errors() {
+    test_subdirectory("built-ins/NativeErrors", "NativeErrors (TypeError, etc.)");
+}
+
+#[test]
+fn test262_statement_try() {
+    test_subdirectory("language/statements/try", "try-catch-finally statements");
+}
+
+#[test]
+fn test262_builtin_string_prototype() {
+    test_subdirectory("built-ins/String/prototype", "String.prototype methods");
+}
+
+#[test]
+fn test262_builtin_array_prototype() {
+    test_subdirectory("built-ins/Array/prototype", "Array.prototype methods");
+}
+
+#[test]
+fn test262_builtin_number_prototype() {
+    test_subdirectory("built-ins/Number/prototype", "Number.prototype methods");
+}
+
+// ---- Class ----
+
+#[test]
+fn test262_class_statements() {
+    test_subdirectory("language/statements/class", "class declarations");
+}
+
+#[test]
+fn test262_class_expressions() {
+    test_subdirectory("language/expressions/class", "class expressions");
+}
+
+// ---- Expressions (Additional) ----
+
+#[test]
+fn test262_new_expression() {
+    test_subdirectory("language/expressions/new", "new operator");
+}
+
+#[test]
+fn test262_this_expression() {
+    test_subdirectory("language/expressions/this", "this keyword");
+}
+
+#[test]
+fn test262_delete_expression() {
+    test_subdirectory("language/expressions/delete", "delete operator");
+}
+
+#[test]
+fn test262_void_expression() {
+    test_subdirectory("language/expressions/void", "void operator");
+}
+
+#[test]
+fn test262_instanceof_expression() {
+    test_subdirectory("language/expressions/instanceof", "instanceof operator");
+}
+
+#[test]
+fn test262_in_expression() {
+    test_subdirectory("language/expressions/in", "in operator");
+}
+
+#[test]
+fn test262_grouping_expression() {
+    test_subdirectory("language/expressions/grouping", "grouping (parenthesized)");
+}
+
+#[test]
+fn test262_comma_expression() {
+    test_subdirectory("language/expressions/comma", "comma operator");
+}
+
+#[test]
+fn test262_conditional_expression() {
+    test_subdirectory("language/expressions/conditional", "conditional (ternary)");
+}
+
+#[test]
+fn test262_call_expression() {
+    test_subdirectory("language/expressions/call", "function calls");
+}
+
+#[test]
+fn test262_member_expression() {
+    test_subdirectory("language/expressions/member", "property access");
+}
+
+// ---- Literals (Additional) ----
+
+#[test]
+fn test262_null_literal() {
+    test_subdirectory("language/literals/null", "null literal");
+}
+
+// ---- Statements (Additional) ----
+
+#[test]
+fn test262_throw_statement() {
+    test_subdirectory("language/statements/throw", "throw statements");
+}
+
+#[test]
+fn test262_return_statement() {
+    test_subdirectory("language/statements/return", "return statements");
+}
+
+// ---- Built-in Objects (Additional) ----
+
+#[test]
+fn test262_builtin_function() {
+    test_subdirectory("built-ins/Function", "Function constructor");
 }

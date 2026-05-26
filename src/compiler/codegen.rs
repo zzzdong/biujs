@@ -233,6 +233,21 @@ impl Codegen {
                     } => {
                         self.gen_new(constructor, &args, dst);
                     }
+                    Instruction::LoadThis { dst } => {
+                        let dst = self.gen_operand(dst);
+                        self.codes.push(Bytecode::single(Opcode::LoadThis, dst));
+                    }
+                    Instruction::MakeFuncObj { dst, func_id } => {
+                        let dst = self.gen_operand(dst);
+                        let func_id = self.gen_operand(func_id);
+                        self.codes.push(Bytecode::double(Opcode::MakeFuncObj, dst, func_id));
+                    }
+                    Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
+                        let dst = self.gen_operand(dst);
+                        let func_id = self.gen_operand(func_id);
+                        let captured_this = self.gen_operand(captured_this);
+                        self.codes.push(Bytecode::triple(Opcode::MakeArrowFuncObj, dst, func_id, captured_this));
+                    }
 
                     // Control Flow Instructions
                     Instruction::Return { value } => {
@@ -398,15 +413,29 @@ impl Codegen {
                         }
                         self.codes.push(Bytecode::empty(Opcode::Halt));
                     }
-                    Instruction::PushSeh { handler } => {
+                    Instruction::PushSeh { handler, finally } => {
                         let handler_id = handler.as_usize() as isize;
                         let pos = self.codes.len();
                         patchs.push(Box::new(move |this: &mut Self| {
+                            // Patch catch handler offset
                             this.codes[pos].operands[0] = Operand::new_immd(
                                 this.block_map[&handler_id] - pos as isize,
                             );
+                            // Patch finally handler offset if present
+                            if let Some(finally_blk) = finally {
+                                let finally_id = finally_blk.as_usize() as isize;
+                                this.codes[pos].operands[1] = Operand::new_immd(
+                                    this.block_map[&finally_id] - pos as isize,
+                                );
+                            }
                         }));
-                        self.codes.push(Bytecode::single(Opcode::Try, Operand::new_immd(0)));
+                        // Use triple to hold both catch and finally offsets
+                        self.codes.push(Bytecode::triple(
+                            Opcode::Try,
+                            Operand::new_immd(0),
+                            Operand::new_immd(0),
+                            Operand::new_immd(0),
+                        ));
                     }
                     Instruction::PopSeh => {
                         self.codes.push(Bytecode::empty(Opcode::EndTry));
@@ -466,6 +495,68 @@ impl Codegen {
                         let reg = self.gen_operand(dst);
                         self.codes
                             .push(Bytecode::single(Opcode::LoadException, reg));
+                    }
+                    Instruction::ResumeException { args } => {
+                        let handlers: Vec<BlockId> = self
+                            .throw_to_handlers
+                            .get(&block.id())
+                            .map(|h| h.clone())
+                            .unwrap_or_default();
+                        for &succ_id in cfg.get_successors(block.id()) {
+                            if !handlers.contains(&succ_id) {
+                                continue;
+                            }
+                            if let Some(succ_block) = cfg.get_block(succ_id) {
+                                let params = succ_block.params();
+                                if params.is_empty() {
+                                    continue;
+                                }
+                                for (param, arg) in params.iter().zip(args.iter()) {
+                                    let arg_op = self.gen_operand(*arg);
+                                    if let Some(param_reg) = self.reg_alloc.get_register(param) {
+                                        self.codes.push(Bytecode::double(
+                                            Opcode::Mov,
+                                            param_reg.into(),
+                                            arg_op,
+                                        ));
+                                    } else if let Some(stack_offset) =
+                                        self.reg_alloc.get_stack_offset(param)
+                                    {
+                                        self.codes.push(Bytecode::double(
+                                            Opcode::Mov,
+                                            Operand::Stack(stack_offset as isize),
+                                            arg_op,
+                                        ));
+                                    } else {
+                                        let param_reg =
+                                            self.reg_alloc.alloc(*param, self.inst_index).0;
+                                        self.codes.push(Bytecode::double(
+                                            Opcode::Mov,
+                                            param_reg.into(),
+                                            arg_op,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        self.codes.push(Bytecode::empty(Opcode::ResumeExc));
+                    }
+                    Instruction::DelayedJump { target, seh_depth } => {
+                        let target_op = Operand::new_immd(target.as_usize() as isize);
+                        let seh_depth_op = Operand::new_immd(seh_depth as isize);
+
+                        let pos = self.codes.len();
+                        patchs.push(Box::new(move |this: &mut Self| {
+                            let target = this.codes[pos].operands[0].as_immd() as usize;
+                            let offset = this.block_map[&(target as isize)] - pos as isize;
+                            this.codes[pos].operands[0] = Operand::new_immd(offset);
+                        }));
+
+                        self.codes.push(Bytecode::double(
+                            Opcode::DelayedJump,
+                            target_op,
+                            seh_depth_op,
+                        ));
                     }
                 }
 
@@ -652,7 +743,13 @@ impl Codegen {
     fn gen_prop_call(&mut self, object: Value, property: Value, args: &[Value], result: Value) {
         let callable = self.gen_operand(object);
 
-        // 1. Push arguments onto the stack
+        // 1. Backup used registers
+        let in_use_registers = self.reg_alloc.in_use_registers();
+        for reg in in_use_registers.iter().copied() {
+            self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
+        }
+
+        // 2. Push arguments onto the stack
         self.store_args(args, self.inst_index);
 
         // 2. Set up new stack frame
@@ -694,7 +791,12 @@ impl Codegen {
             Operand::new_immd(args.len() as isize),
         ));
 
-        // 7. Move return value to destination register
+        // 7. Restore backed-up registers
+        for reg in in_use_registers.iter().rev().copied() {
+            self.codes.push(Bytecode::single(Opcode::Pop, reg.into()));
+        }
+
+        // 8. Move return value to destination register
         let result_reg = self.gen_operand(result);
         self.codes.push(Bytecode::double(
             Opcode::Mov,
@@ -726,8 +828,20 @@ impl Codegen {
             Operand::new_register(Register::Rsp),
         ));
 
-        // 4. Call the constructor with New opcode
-        self.codes.push(Bytecode::single(Opcode::New, callable));
+        // 4. Call the constructor with New opcode (passing arg count)
+        self.codes.push(Bytecode::double(
+            Opcode::New,
+            callable,
+            Operand::new_immd(args.len() as isize),
+        ));
+
+        // 4.5. Load this (the newly created object) into Rv
+        // This ensures that new Foo() returns the new object even if
+        // the constructor body has no explicit return
+        self.codes.push(Bytecode::single(
+            Opcode::LoadThis,
+            Operand::new_register(Register::Rv),
+        ));
 
         // 5. Restore stack pointer to current base pointer
         self.codes.push(Bytecode::double(

@@ -302,6 +302,7 @@ pub enum Instruction {
     // Exception Handling Instructions
     PushSeh {
         handler: BlockId,
+        finally: Option<BlockId>,
     },
     PopSeh,
     Throw {
@@ -310,6 +311,15 @@ pub enum Instruction {
     },
     LoadException {
         dst: Value,
+    },
+    ResumeException {
+        args: Vec<Value>,
+    },
+    /// Delayed jump for break/continue inside try-finally.
+    /// Pops SEH records and executes finally blocks before jumping to target.
+    DelayedJump {
+        target: BlockId,
+        seh_depth: usize, // Number of SEH records to pop
     },
 
     // JS-specific Instructions
@@ -322,6 +332,19 @@ pub enum Instruction {
         constructor: Value,
         args: Vec<Value>,
     },
+    LoadThis {
+        dst: Value,
+    },
+    MakeFuncObj {
+        dst: Value,
+        func_id: Value,
+    },
+    /// MakeArrowFuncObj - Create a function object for arrow function with captured `this`
+    MakeArrowFuncObj {
+        dst: Value,
+        func_id: Value,
+        captured_this: Value,
+    },
 }
 
 impl Instruction {
@@ -333,6 +356,7 @@ impl Instruction {
                 | Instruction::Jump { .. }
                 | Instruction::BrIf { .. }
                 | Instruction::Throw { .. }
+                | Instruction::DelayedJump { .. }
         )
     }
 
@@ -459,6 +483,8 @@ impl Instruction {
                 (vec![], used)
             }
             Instruction::LoadException { dst } => (vec![*dst], vec![]),
+            Instruction::ResumeException { .. } => (vec![], vec![]),
+            Instruction::DelayedJump { .. } => (vec![], vec![]),
             Instruction::TypeOf { dst, src } => (vec![*dst], vec![*src]),
             Instruction::New {
                 dst,
@@ -468,6 +494,11 @@ impl Instruction {
                 let mut used = vec![*constructor];
                 used.extend(args.iter().cloned());
                 (vec![*dst], used)
+            }
+            Instruction::LoadThis { dst } => (vec![*dst], vec![]),
+            Instruction::MakeFuncObj { dst, func_id } => (vec![*dst], vec![*func_id]),
+            Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
+                (vec![*dst], vec![*func_id, *captured_this])
             }
         }
     }
@@ -640,8 +671,12 @@ impl std::fmt::Display for Instruction {
                 Some(v) => write!(f, "halt {v}"),
                 None => write!(f, "halt"),
             },
-            Instruction::PushSeh { handler } => {
-                write!(f, "push_seh {handler}")
+            Instruction::PushSeh { handler, finally } => {
+                write!(f, "push_seh {handler}")?;
+                if let Some(finally_blk) = finally {
+                    write!(f, ", finally {finally_blk}")?;
+                }
+                Ok(())
             }
             Instruction::PopSeh => write!(f, "pop_seh"),
             Instruction::Throw { value, args } => {
@@ -660,6 +695,12 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::LoadException { dst } => {
                 write!(f, "{dst} = load_exception")
+            }
+            Instruction::ResumeException { .. } => {
+                write!(f, "resume_exception")
+            }
+            Instruction::DelayedJump { target, seh_depth } => {
+                write!(f, "delayed_jump {target} (seh_depth={seh_depth})")
             }
             Instruction::TypeOf { dst, src } => {
                 write!(f, "{dst} = typeof {src}")
@@ -681,6 +722,15 @@ impl std::fmt::Display for Instruction {
                     write!(f, ")")?;
                 }
                 Ok(())
+            }
+            Instruction::LoadThis { dst } => {
+                write!(f, "{dst} = load_this")
+            }
+            Instruction::MakeFuncObj { dst, func_id } => {
+                write!(f, "{dst} = make_func_obj {func_id}")
+            }
+            Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
+                write!(f, "{dst} = make_arrow_func_obj {func_id} {captured_this}")
             }
         }
     }

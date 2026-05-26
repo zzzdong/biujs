@@ -1,18 +1,63 @@
 [package]
 name = "biujs"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 edition = "2024"
+authors = ["zzzdong <kuwater@163.com>"]
+description = "A lightweight, embeddable JavaScript engine with ES6 support"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zzzdong/biujs"
+homepage = "https://github.com/zzzdong/biujs"
+keywords = ["javascript", "es6", "engine", "embedded", "vm"]
+categories = ["embedded", "compilers"]
 
 [dependencies]
+# OXC parser - JavaScript/TypeScript parser
 oxc_parser = "0.132"
 oxc_ast = "0.132"
 oxc_span = "0.132"
 oxc_allocator = "0.132"
 oxc_syntax = "0.132"
-log = "0.4"
+oxc_diagnostics = "0.132"
+
+# Graph algorithms for CFG
 petgraph = "0.8"
-env_logger = "0.11"
+
+# Logging
+log = "0.4"
+env_logger = { version = "0.11", optional = true }
 
 [dev-dependencies]
+# Benchmarking
 criterion = "0.6"
+
+# Test262 harness
 test262-harness = "0.1.1"
+
+[features]
+default = ["cli"]
+
+# CLI tool support
+cli = ["dep:env_logger"]
+
+# Enable all features
+full = ["cli"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[[bin]]
+name = "biujs"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[lib]
+name = "biujs"
+path = "src/lib.rs"

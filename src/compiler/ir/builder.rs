@@ -149,6 +149,19 @@ pub trait InstBuilder {
         dst
     }
 
+    fn call_property_dynamic(&mut self, object: Value, property: Value, args: Vec<Value>) -> Value {
+        let dst = self.alloc();
+
+        self.emit(Instruction::PropertyCall {
+            object,
+            property,
+            args,
+            result: dst,
+        });
+
+        dst
+    }
+
     fn load_external_variable(&mut self, name: String) -> Value {
         let result = self.alloc();
 
@@ -293,8 +306,26 @@ pub trait InstBuilder {
         dst
     }
 
-    fn push_seh(&mut self, handler: BlockId) {
-        self.emit(Instruction::PushSeh { handler });
+    fn load_this(&mut self) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::LoadThis { dst });
+        dst
+    }
+
+    fn make_func_obj(&mut self, func_id: Value) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::MakeFuncObj { dst, func_id });
+        dst
+    }
+
+    fn make_arrow_func_obj(&mut self, func_id: Value, captured_this: Value) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::MakeArrowFuncObj { dst, func_id, captured_this });
+        dst
+    }
+
+    fn push_seh(&mut self, handler: BlockId, finally: Option<BlockId>) {
+        self.emit(Instruction::PushSeh { handler, finally });
     }
 
     fn pop_seh(&mut self) {
@@ -316,6 +347,14 @@ pub trait InstBuilder {
         let dst = self.alloc();
         self.emit(Instruction::LoadException { dst });
         dst
+    }
+
+    fn resume_exception(&mut self) {
+        self.emit(Instruction::ResumeException { args: vec![] });
+    }
+
+    fn delayed_jump(&mut self, target: BlockId, seh_depth: usize) {
+        self.emit(Instruction::DelayedJump { target, seh_depth });
     }
 
     /// 封存当前块并切换到目标块
