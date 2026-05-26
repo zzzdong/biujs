@@ -2,7 +2,7 @@
 
 > **Last updated**: 2026-05-26  
 > **Engine version**: 0.1.0  
-> **Total tests**: 423 (195 unit + 174 feature + 54 test262)
+> **Total tests**: 479 (188 unit + 225 feature + 66 test262)
 
 ## Project Goal
 
@@ -19,6 +19,7 @@
 This engine uses a **static compilation model** with register-based VM:
 - Static frame indexing replaces dynamic scope chain lookups
 - Register allocation benefits from predictable `let`/`const` scoping
+- Closure capture uses **create-time value snapshot** semantics — captured variables (including Objects via `Rc` sharing) are copied at closure creation, not referenced via a scope chain. This is a deliberate simplification compatible with the static model.
 - Features incompatible with this architecture are excluded:
   - `eval()` - dynamic code evaluation breaks static analysis
   - `with` - dynamic property lookup breaks static binding
@@ -246,7 +247,7 @@ This engine uses a **static compilation model** with register-based VM:
 | Arguments | ✅ | recent | Named params |
 | Recursion | ✅ | recent | Name registered in own scope |
 | Nested functions | ✅ | recent | Function hoisting inside function |
-| Arrow functions | ⚠️ | M1 | No `this` capture |
+| Arrow functions | ✅ | M1 | Lexical `this` capture + closure variable capture (value snapshot) |
 | `this` binding | ✅ | recent | Strict mode only |
 
 ---
@@ -381,12 +382,12 @@ This engine uses a **static compilation model** with register-based VM:
 | Statements | ~12 | 10 | 1 | 1 |
 | Objects & Prototypes | ~10 | 10 | 0 | 0 |
 | Arrays | ~6 | 6 | 0 | 0 |
-| Functions & Closures | ~8 | 6 | 1 | 1 |
+| Functions & Closures | ~8 | 7 | 0 | 1 |
 | ES6 Classes | ~3 | 2 | 0 | 1 |
 | Built-in Objects | ~8 | 7 | 1 | 0 |
 | Type Coercion | ~10 | 10 | 0 | 0 |
 | Module System | ~0 | 0 | 0 | 0 |
-| **Total** | **~112** | **92** | **14** | **5** |
+| **Total** | **~112** | **93** | **13** | **5** |
 
 ### Out of Scope (By Design)
 
@@ -415,7 +416,6 @@ These features are intentionally **not supported** as they are incompatible with
 | Labeled statements | Out of scope |
 | Generator functions (`function*`) | Out of scope |
 | Async functions (`async`/`await`) | Out of scope |
-| Closure (lexical capture) | Out of scope |
 | Class `extends` / `super` | Out of scope |
 | Class static methods | Out of scope |
 | Class getters/setters | Out of scope |
@@ -432,10 +432,10 @@ These features are intentionally **not supported** as they are incompatible with
 
 | Test Suite | Count |
 |------------|-------|
-| Unit tests (value, vm, etc.) | 195 |
-| Feature integration tests | 174 |
-| test262 conformance tests | 72 |
-| **Total** | **441** |
+| Unit tests (value, vm, etc.) | 188 |
+| Feature integration tests | 225 |
+| test262 conformance tests | 66 |
+| **Total** | **479** |
 
 ---
 
@@ -467,3 +467,5 @@ These features are intentionally **not supported** as they are incompatible with
 | 2026-05-26 | ✅ String.prototype methods: charAt, charCodeAt, concat, includes, indexOf, slice, substring, toUpperCase, toLowerCase, trim, split |
 | 2026-05-26 | ✅ Object static methods: entries, getOwnPropertyNames, getPrototypeOf, setPrototypeOf, create, hasOwn, is |
 | 2026-05-26 | ✅ 18 new test262 test suites (72 total tests) |
+| 2026-05-26 | ✅ Arrow function closure variable capture with `ClosureVar` runtime stack |
+| 2026-05-26 | ✅ 5 closure capture feature tests with value assertions |

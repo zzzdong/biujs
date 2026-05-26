@@ -324,6 +324,10 @@ pub trait InstBuilder {
         dst
     }
 
+    fn closure_var(&mut self, name: Value, value: Value) {
+        self.emit(Instruction::ClosureVar { name, value });
+    }
+
     fn push_seh(&mut self, handler: BlockId, finally: Option<BlockId>) {
         self.emit(Instruction::PushSeh { handler, finally });
     }

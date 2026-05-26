@@ -37,6 +37,14 @@ impl<T> SymbolTable<T> {
     pub fn leave_scope(&mut self) {
         self.scopes.pop();
     }
+
+    pub fn remove(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.variables.remove(name).is_some() {
+                return;
+            }
+        }
+    }
 }
 
 impl<T: Clone> Clone for SymbolTable<T> {

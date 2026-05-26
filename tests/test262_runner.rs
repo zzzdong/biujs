@@ -9,7 +9,8 @@
 //!   - `eval` – No dynamic code evaluation.
 //!   - `with` – No dynamic scope binding.
 //!   - `Proxy`, `Reflect`, `Symbol` – Meta-programming not supported.
-//!   - Arrow functions, generators, async – Not yet implemented.
+//!   - Arrow functions, generators, async – Partially implemented (arrow functions
+//!     with this capture and closure variable capture are supported).
 //!   - `Map`, `Set`, `Promise`, `RegExp`, `Date` – Not yet implemented.
 //!
 //! ## Strategy
@@ -20,17 +21,21 @@
 //!
 //! ## biujs currently supported features:
 //! - Numbers, strings, booleans, null, undefined
+//! - Symbols (Symbol(), Symbol.for(), Symbol.keyFor())
 //! - Arithmetic: +, -, *, /, %
 //! - Comparison: >, <, >=, <=, ==, !=, ===, !==
 //! - Logical: !, &&, ||
 //! - Bitwise: &, |, ^, ~, <<, >>, >>>
 //! - typeof
 //! - let variables, assignments
+//! - var, const declarations
 //! - if/else, while, for loops (with break/continue)
 //! - function declarations and calls
+//! - arrow functions with this capture and closure variable capture
 //! - class declarations and expressions
 //! - `new` operator with constructors
 //! - `this` binding in strict mode
+//! - default parameter values
 
 use biujs::{Compiler, VM};
 use std::path::PathBuf;
@@ -84,12 +89,8 @@ fn should_skip_source(source: &str) -> Option<&'static str> {
     // Patterns NOT supported by biujs (ES6 target, no eval/with).
     // Order matters: check the most common patterns first.
     let unsupported_patterns: &[&str] = &[
-        // Functions (biujs only supports `function name() {}` declarations)
-        "=>",          // arrow functions
+        // Functions
         "...",         // spread/rest (though `...` in string literals is fine)
-        // Declarations
-        "var ",
-        "const ",
         // Built-ins NOT yet implemented
         "eval(",
         "parseInt(",
@@ -98,7 +99,6 @@ fn should_skip_source(source: &str) -> Option<&'static str> {
         "JSON",
         "Date",
         "RegExp",
-        "Symbol(",
         "Proxy",
         "Promise",
         "Map(",
@@ -175,8 +175,8 @@ fn run_suite(subdir: &str) -> (u32, u32, u32, Vec<(String, String)>) {
         // Also skip tests with features not yet implemented in biujs (ES6 target)
         let skip_features = [
             "async-iteration", "async-functions", "generators", "modules",
-            "arrow-function", "destructuring-binding", "for-of",
-            "Symbol", "template", "const", "default-parameters",
+            "destructuring-binding", "for-of",
+            "default-parameters",
             "Proxy", "Promise", "Map", "Set", "Proxy", "object-rest",
             "object-spread", "rest-parameters", "spread-syntax", "super",
             "optional-chaining", "nullish-coalescing", "logical-assignment",
@@ -637,4 +637,11 @@ fn test262_return_statement() {
 #[test]
 fn test262_builtin_function() {
     test_subdirectory("built-ins/Function", "Function constructor");
+}
+
+// ---- Arrow Functions ----
+
+#[test]
+fn test262_arrow_functions() {
+    test_subdirectory("language/expressions/arrow-function", "arrow functions");
 }

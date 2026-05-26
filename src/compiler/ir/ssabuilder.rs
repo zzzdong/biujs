@@ -692,6 +692,9 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_use(func_id, stacks);
                 SSABuilder::rename_use(captured_this, stacks);
             }
+            Instruction::ClosureVar { name: _, value } => {
+                SSABuilder::rename_use(value, stacks);
+            }
         }
     }
 

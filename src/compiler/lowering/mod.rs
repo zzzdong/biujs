@@ -210,6 +210,7 @@ impl<'a> JSASTLower<'a> {
                 method_func.body.as_ref().unwrap(),
                 None,
                 false,
+                &[],
             );
 
             if is_constructor {
@@ -982,15 +983,37 @@ impl<'a> JSASTLower<'a> {
         // Arrow functions with expression body need automatic return
         let is_expression_body = arrow.expression;
 
-        // Lower the arrow function body (without this capture - handled at runtime)
-        // lower_function_inner returns Value::Function(func_id)
-        let func_val = self.lower_function_inner(Some(name), params, &arrow.body, None, is_expression_body);
-        
+        // Determine which outer variables need to be captured.
+        // We collect all referenced identifiers and subtract those declared inside the arrow body.
+        let param_names: std::collections::HashSet<String> = params.iter().map(|p| p.name.to_string()).collect();
+        let mut referenced = std::collections::HashSet::new();
+        let mut declared = std::collections::HashSet::new();
+        // Parameters are considered "declared" locally
+        for p in &param_names {
+            declared.insert(p.clone());
+        }
+        self.collect_free_idents_from_body(&arrow.body, &mut referenced, &mut declared);
+        let free_idents: std::collections::HashSet<&str> = referenced.iter()
+            .filter(|name| !declared.contains(**name))
+            .copied()
+            .collect();
+
+        // Lower the arrow function body
+        let func_val = self.lower_function_inner(Some(name), params, &arrow.body, None, is_expression_body, &free_idents.iter().map(|s| String::from(*s)).collect::<Vec<String>>());
+
         // At runtime, capture the current `this` value
         let captured_this = self.builder.load_this();
-        
-        // Create arrow function object with captured `this`
-        // func_val should be Value::Function(func_id)
+
+        // Capture each free variable that exists in the current symbol table
+        for name in &free_idents {
+            if let Some(var) = self.symbols.lookup(name) {
+                let name_const = self.builder.make_constant(crate::bytecode::Constant::String(std::sync::Arc::new(String::from(*name))));
+                let value = var.0;
+                self.builder.closure_var(name_const, value);
+            }
+        }
+
+        // Create arrow function object with captured `this` and captured vars
         self.builder.make_arrow_func_obj(func_val, captured_this)
     }
 
@@ -1009,7 +1032,7 @@ impl<'a> JSASTLower<'a> {
             .collect();
 
         if let Some(body) = &func.body {
-            self.lower_function_inner(Some(name), params, body, None, false)
+            self.lower_function_inner(Some(name), params, body, None, false, &[])
         } else {
             Value::Primitive(Primitive::Null)
         }
@@ -1068,7 +1091,7 @@ impl<'a> JSASTLower<'a> {
             .collect();
 
         if let Some(body) = &func.body {
-            let func_id_val = self.lower_function_inner(Some(name.clone()), params, body, None, false);
+            let func_id_val = self.lower_function_inner(Some(name.clone()), params, body, None, false, &[]);
             Some((name, func_id_val))
         } else {
             None
@@ -1079,6 +1102,8 @@ impl<'a> JSASTLower<'a> {
     /// For arrow functions:
     /// - `captured_this` contains the lexically captured `this` value
     /// - `auto_return` indicates if the body is an expression that should be auto-returned
+    /// - `captured_names` lists variable names captured by closure — these will be excluded from
+    ///   the inner function's symbol table so they resolve via LoadEnv at runtime
     fn lower_function_inner(
         &mut self,
         name: Option<String>,
@@ -1086,6 +1111,7 @@ impl<'a> JSASTLower<'a> {
         body: &FunctionBody<'_>,
         captured_this: Option<Value>,
         auto_return: bool,
+        captured_names: &[String],
     ) -> Value {
         // During hoisting, there may be no current block yet
         let curr = self.builder.try_current_block();
@@ -1095,8 +1121,11 @@ impl<'a> JSASTLower<'a> {
 
         let mut func = IrFunction::new(func_id, func_sig);
 
-        // Save current symbols for closure capture
-        let symbols = self.symbols.clone();
+        // Clone outer symbols but exclude captured names so they fall through to LoadEnv
+        let mut symbols = self.symbols.clone();
+        for name in captured_names {
+            symbols.remove(name);
+        }
 
         let mut func_builder = FunctionBuilder::new(self.builder.module_mut(), &mut func);
         let mut func_lower = JSASTLower::new(&mut func_builder, symbols);
@@ -1308,6 +1337,244 @@ impl<'a> JSASTLower<'a> {
             if self.current_block_is_terminated() {
                 break;
             }
+        }
+    }
+
+    /// Recursively collect referenced and declared identifiers from a function body.
+    /// `referenced` tracks names used in expressions; `declared` tracks names declared locally.
+    fn collect_free_idents_from_body<'b>(
+        &self,
+        body: &FunctionBody<'b>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+        declared: &mut std::collections::HashSet<String>,
+    ) {
+        for stmt in &body.statements {
+            self.collect_free_idents_from_statement(stmt, referenced, declared);
+        }
+    }
+
+    fn collect_free_idents_from_statement<'b>(
+        &self,
+        stmt: &Statement<'b>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+        declared: &mut std::collections::HashSet<String>,
+    ) {
+        match stmt {
+            Statement::ExpressionStatement(expr_stmt) => {
+                self.collect_free_idents_from_expression(&expr_stmt.expression, referenced, declared);
+            }
+            Statement::ReturnStatement(ret) => {
+                if let Some(arg) = &ret.argument {
+                    self.collect_free_idents_from_expression(arg, referenced, declared);
+                }
+            }
+            Statement::VariableDeclaration(decl) => {
+                for d in &decl.declarations {
+                    let name = self.binding_pattern_name(&d.id);
+                    declared.insert(name);
+                    if let Some(init) = &d.init {
+                        self.collect_free_idents_from_expression(init, referenced, declared);
+                    }
+                }
+            }
+            Statement::BlockStatement(block) => {
+                for s in &block.body {
+                    self.collect_free_idents_from_statement(s, referenced, declared);
+                }
+            }
+            Statement::IfStatement(if_stmt) => {
+                self.collect_free_idents_from_expression(&if_stmt.test, referenced, declared);
+                self.collect_free_idents_from_statement(&if_stmt.consequent, referenced, declared);
+                if let Some(alt) = &if_stmt.alternate {
+                    self.collect_free_idents_from_statement(alt, referenced, declared);
+                }
+            }
+            Statement::ForStatement(for_stmt) => {
+                if let Some(init) = &for_stmt.init {
+                    match init {
+                        ForStatementInit::VariableDeclaration(decl) => {
+                            for d in &decl.declarations {
+                                let name = self.binding_pattern_name(&d.id);
+                                declared.insert(name);
+                                if let Some(init) = &d.init {
+                                    self.collect_free_idents_from_expression(init, referenced, declared);
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Some(expr) = init.as_expression() {
+                                self.collect_free_idents_from_expression(expr, referenced, declared);
+                            }
+                        }
+                    }
+                }
+                if let Some(test) = &for_stmt.test {
+                    self.collect_free_idents_from_expression(test, referenced, declared);
+                }
+                if let Some(update) = &for_stmt.update {
+                    self.collect_free_idents_from_expression(update, referenced, declared);
+                }
+                self.collect_free_idents_from_statement(&for_stmt.body, referenced, declared);
+            }
+            Statement::WhileStatement(while_stmt) => {
+                self.collect_free_idents_from_expression(&while_stmt.test, referenced, declared);
+                self.collect_free_idents_from_statement(&while_stmt.body, referenced, declared);
+            }
+            Statement::ThrowStatement(throw) => {
+                self.collect_free_idents_from_expression(&throw.argument, referenced, declared);
+            }
+            Statement::TryStatement(try_stmt) => {
+                for s in &try_stmt.block.body {
+                    self.collect_free_idents_from_statement(s, referenced, declared);
+                }
+                if let Some(handler) = &try_stmt.handler {
+                    for s in &handler.body.body {
+                        self.collect_free_idents_from_statement(s, referenced, declared);
+                    }
+                }
+                if let Some(finalizer) = &try_stmt.finalizer {
+                    for s in &finalizer.body {
+                        self.collect_free_idents_from_statement(s, referenced, declared);
+                    }
+                }
+            }
+            Statement::SwitchStatement(switch) => {
+                self.collect_free_idents_from_expression(&switch.discriminant, referenced, declared);
+                for case in &switch.cases {
+                    if let Some(test) = &case.test {
+                        self.collect_free_idents_from_expression(test, referenced, declared);
+                    }
+                    for s in &case.consequent {
+                        self.collect_free_idents_from_statement(s, referenced, declared);
+                    }
+                }
+            }
+            Statement::FunctionDeclaration(func) => {
+                if let Some(id) = &func.id {
+                    declared.insert(id.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_free_idents_from_expression<'b>(
+        &self,
+        expr: &Expression<'b>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+        declared: &mut std::collections::HashSet<String>,
+    ) {
+        match expr {
+            Expression::Identifier(ident) => {
+                match ident.name.as_str() {
+                    "undefined" | "NaN" | "Infinity" | "this" => {}
+                    _ => {
+                        referenced.insert(ident.name.as_str());
+                    }
+                }
+            }
+            Expression::BinaryExpression(bin) => {
+                self.collect_free_idents_from_expression(&bin.left, referenced, declared);
+                self.collect_free_idents_from_expression(&bin.right, referenced, declared);
+            }
+            Expression::UnaryExpression(unary) => {
+                self.collect_free_idents_from_expression(&unary.argument, referenced, declared);
+            }
+            Expression::LogicalExpression(logical) => {
+                self.collect_free_idents_from_expression(&logical.left, referenced, declared);
+                self.collect_free_idents_from_expression(&logical.right, referenced, declared);
+            }
+            Expression::AssignmentExpression(assign) => {
+                match &assign.left {
+                    AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                        referenced.insert(ident.name.as_str());
+                    }
+                    _ => {}
+                }
+                self.collect_free_idents_from_expression(&assign.right, referenced, declared);
+            }
+            Expression::CallExpression(call) => {
+                self.collect_free_idents_from_expression(&call.callee, referenced, declared);
+                for arg in &call.arguments {
+                    if let Some(expr) = arg.as_expression() {
+                        self.collect_free_idents_from_expression(expr, referenced, declared);
+                    }
+                }
+            }
+            Expression::ConditionalExpression(cond) => {
+                self.collect_free_idents_from_expression(&cond.test, referenced, declared);
+                self.collect_free_idents_from_expression(&cond.consequent, referenced, declared);
+                self.collect_free_idents_from_expression(&cond.alternate, referenced, declared);
+            }
+            Expression::StaticMemberExpression(member) => {
+                self.collect_free_idents_from_expression(&member.object, referenced, declared);
+            }
+            Expression::ComputedMemberExpression(member) => {
+                self.collect_free_idents_from_expression(&member.object, referenced, declared);
+                self.collect_free_idents_from_expression(&member.expression, referenced, declared);
+            }
+            Expression::PrivateFieldExpression(member) => {
+                self.collect_free_idents_from_expression(&member.object, referenced, declared);
+            }
+            Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    self.collect_free_idents_from_expression(e, referenced, declared);
+                }
+            }
+            Expression::ParenthesizedExpression(paren) => {
+                self.collect_free_idents_from_expression(&paren.expression, referenced, declared);
+            }
+            Expression::TemplateLiteral(tpl) => {
+                for exp in &tpl.expressions {
+                    self.collect_free_idents_from_expression(exp, referenced, declared);
+                }
+            }
+            Expression::UpdateExpression(update) => {
+                match &update.argument {
+                    SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                        referenced.insert(ident.name.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            Expression::ArrayExpression(arr) => {
+                for elem in &arr.elements {
+                    if let Some(expr) = elem.as_expression() {
+                        self.collect_free_idents_from_expression(expr, referenced, declared);
+                    }
+                }
+            }
+            Expression::ObjectExpression(obj) => {
+                for prop in &obj.properties {
+                    if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                        self.collect_free_idents_from_expression(&p.value, referenced, declared);
+                    }
+                }
+            }
+            Expression::NewExpression(new) => {
+                self.collect_free_idents_from_expression(&new.callee, referenced, declared);
+                for arg in &new.arguments {
+                    if let Some(expr) = arg.as_expression() {
+                        self.collect_free_idents_from_expression(expr, referenced, declared);
+                    }
+                }
+            }
+            Expression::ArrowFunctionExpression(arrow) => {
+                // Recurse into nested arrow bodies so outer arrows can discover
+                // variables that need capturing (e.g. `(y) => (z) => x + y + z`)
+                // Also mark the inner arrow's params as declared
+                for param in &arrow.params.items {
+                    let name = self.binding_pattern_name(&param.pattern);
+                    declared.insert(name);
+                }
+                for stmt in &arrow.body.statements {
+                    self.collect_free_idents_from_statement(stmt, referenced, declared);
+                }
+            }
+            Expression::FunctionExpression(_) => {
+                // Don't recurse into regular function expressions
+            }
+            _ => {}
         }
     }
 }

@@ -345,6 +345,11 @@ pub enum Instruction {
         func_id: Value,
         captured_this: Value,
     },
+    /// ClosureVar - Push a captured variable for the next MakeArrowFuncObj
+    ClosureVar {
+        name: Value,
+        value: Value,
+    },
 }
 
 impl Instruction {
@@ -499,6 +504,9 @@ impl Instruction {
             Instruction::MakeFuncObj { dst, func_id } => (vec![*dst], vec![*func_id]),
             Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
                 (vec![*dst], vec![*func_id, *captured_this])
+            }
+            Instruction::ClosureVar { name, value } => {
+                (vec![], vec![*name, *value])
             }
         }
     }
@@ -731,6 +739,9 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
                 write!(f, "{dst} = make_arrow_func_obj {func_id} {captured_this}")
+            }
+            Instruction::ClosureVar { name, value } => {
+                write!(f, "closure_var {name}, {value}")
             }
         }
     }

@@ -79,6 +79,8 @@ impl VM {
                         }
                         let return_pc = self.state.popc()?;
                         let saved_seh_depth = self.state.popc()?;
+                        let saved_closure_depth = self.state.popc()?;
+                        self.state.closure_var_stack.truncate(saved_closure_depth);
                         self.state.seh_stack.truncate(saved_seh_depth);
                         self.state.jump(return_pc);
                     }
@@ -104,6 +106,7 @@ impl VM {
                     Some(location) => {
                         // Strict mode: this = undefined for regular function calls
                         self.state.this_val = Value::Undefined;
+                        self.state.pushc(self.state.closure_var_stack.len())?;
                         self.state.pushc(self.state.seh_stack.len())?;
                         self.state.pushc(self.state.pc + 1)?;
                         self.state.jump(*location);
@@ -123,6 +126,7 @@ impl VM {
                         Some(location) => {
                             // Strict mode: this = undefined
                             self.state.this_val = Value::Undefined;
+                            self.state.pushc(self.state.closure_var_stack.len())?;
                             self.state.pushc(self.state.seh_stack.len())?;
                             self.state.pushc(self.state.pc + 1)?;
                             self.state.jump(*location);
@@ -142,6 +146,7 @@ impl VM {
                                 self.state.this_val = Value::Undefined;
                                 match module.symtab.get(&FunctionId::new(id)) {
                                     Some(location) => {
+                                        self.state.pushc(self.state.closure_var_stack.len())?;
                                         self.state.pushc(self.state.seh_stack.len())?;
                                         self.state.pushc(self.state.pc + 1)?;
                                         self.state.jump(*location);
@@ -162,11 +167,19 @@ impl VM {
                                         let id = func_obj.func_id;
                                         // Check if this is an arrow function with captured this
                                         let captured_this = func_obj.captured_this.clone();
+                                        let captured_vars = func_obj.captured_vars.clone();
                                         drop(borrowed);
                                         // For arrow functions, use captured this; otherwise undefined
                                         self.state.this_val = captured_this.unwrap_or(Value::Undefined);
+                                        // Push captured variables onto closure_var_stack
+                                        for (name, value) in &captured_vars {
+                                            let mut map = std::collections::HashMap::new();
+                                            map.insert(name.clone(), value.clone());
+                                            self.state.closure_var_stack.push(map);
+                                        }
                                         match module.symtab.get(&FunctionId::new(id)) {
                                             Some(location) => {
+                                                self.state.pushc(self.state.closure_var_stack.len())?;
                                                 self.state.pushc(self.state.seh_stack.len())?;
                                                 self.state.pushc(self.state.pc + 1)?;
                                                 self.state.jump(*location);
@@ -333,15 +346,30 @@ impl VM {
                 let name = &module.constants[name_index as usize];
                 match name {
                     Constant::String(name) => {
-                        // Look up in global environment
-                        match self.state.get_global(name) {
+                        // Search closure_var_stack first (newest entries first)
+                        let mut found = None;
+                        for map in self.state.closure_var_stack.iter().rev() {
+                            if let Some(value) = map.get(name.as_str()) {
+                                found = Some(value.clone());
+                                break;
+                            }
+                        }
+                        match found {
                             Some(value) => {
                                 self.set_value(operands[0], value)?;
                             }
                             None => {
-                                return Err(RuntimeError::ReferenceError(format!(
-                                    "undefined variable: {name}"
-                                )));
+                                // Fall back to global environment
+                                match self.state.get_global(name) {
+                                    Some(value) => {
+                                        self.set_value(operands[0], value)?;
+                                    }
+                                    None => {
+                                        return Err(RuntimeError::ReferenceError(format!(
+                                            "undefined variable: {name}"
+                                        )));
+                                    }
+                                }
                             }
                         }
                     }
@@ -691,6 +719,7 @@ impl VM {
                         self.state.this_val = obj_val;
                         match module.symtab.get(&FunctionId::new(id)) {
                             Some(location) => {
+                                self.state.pushc(self.state.closure_var_stack.len())?;
                                 self.state.pushc(self.state.seh_stack.len())?;
                                 self.state.pushc(self.state.pc + 1)?;
                                 self.state.jump(*location);
@@ -710,11 +739,19 @@ impl VM {
                                 let id = func_obj.func_id;
                                 // Check if this is an arrow function with captured this
                                 let captured_this = func_obj.captured_this.clone();
+                                let captured_vars = func_obj.captured_vars.clone();
                                 drop(borrowed);
                                 // For arrow functions, use captured this; for regular methods, use obj_val
                                 self.state.this_val = captured_this.unwrap_or(obj_val);
+                                // Push captured variables onto closure_var_stack
+                                for (name, value) in &captured_vars {
+                                    let mut map = std::collections::HashMap::new();
+                                    map.insert(name.clone(), value.clone());
+                                    self.state.closure_var_stack.push(map);
+                                }
                                 match module.symtab.get(&FunctionId::new(id)) {
                                     Some(location) => {
+                                        self.state.pushc(self.state.closure_var_stack.len())?;
                                         self.state.pushc(self.state.seh_stack.len())?;
                                         self.state.pushc(self.state.pc + 1)?;
                                         self.state.jump(*location);
@@ -769,6 +806,7 @@ impl VM {
                     catch_executed: false,
                     delayed_jump_target: None,
                     delayed_return: false,
+                    saved_closure_depth: self.state.closure_var_stack.len(),
                 };
                 self.state.seh_stack.push(record);
             }
@@ -918,9 +956,10 @@ impl VM {
                 // 4. Set this_val to the new object
                 self.state.this_val = new_obj_val;
 
-                // 5. Save SEH depth and return PC, then jump to constructor
+                // 5. Save closure depth, SEH depth and return PC, then jump to constructor
                 match module.symtab.get(&FunctionId::new(func_id)) {
                     Some(location) => {
+                        self.state.pushc(self.state.closure_var_stack.len())?;
                         self.state.pushc(self.state.seh_stack.len())?;
                         self.state.pushc(self.state.pc + 1)?;
                         self.state.jump(*location);
@@ -957,8 +996,35 @@ impl VM {
                     )),
                 };
                 let captured_this = self.get_value(operands[2])?;
-                let obj_val = crate::vm::object::new_arrow_function_object(func_id, "<arrow>", captured_this);
+                // Collect all pending captured variables from closure_var_stack
+                // The variables were pushed by ClosureVar instructions in order
+                let mut captured_vars: Vec<(String, Value)> = Vec::new();
+                while let Some(vars) = self.state.closure_var_stack.last() {
+                    if vars.is_empty() {
+                        break;
+                    }
+                    // Pop the outermost entry (most recently pushed group)
+                    let entry = self.state.closure_var_stack.pop().unwrap();
+                    // Insert at front to maintain original order
+                    for (k, v) in entry {
+                        captured_vars.push((k, v));
+                    }
+                }
+                let obj_val = crate::vm::object::new_arrow_function_object(
+                    func_id, "<arrow>", captured_this, captured_vars,
+                );
                 self.set_value(operands[0], obj_val)?;
+            }
+            Opcode::ClosureVar => {
+                let name_index = operands[0].as_immd() as usize;
+                let name = match &module.constants[name_index] {
+                    Constant::String(s) => s.as_str().to_string(),
+                };
+                let value = self.get_value(operands[1])?;
+                // Push as a single-entry map onto closure_var_stack
+                let mut map = HashMap::new();
+                map.insert(name, value);
+                self.state.closure_var_stack.push(map);
             }
             Opcode::CallNative => {
                 let callable = self.get_value(operands[0])?;
@@ -1244,6 +1310,8 @@ struct State {
     seh_stack: Vec<SehRecord>,
     globals: HashMap<String, Value>,
     this_val: Value,
+    /// Stack of captured variable maps for active closure scopes
+    closure_var_stack: Vec<HashMap<String, Value>>,
     rsp: usize,
     rbp: usize,
     pc: usize,
@@ -1258,6 +1326,7 @@ impl State {
             seh_stack: Vec::new(),
             globals: HashMap::new(),
             this_val: Value::Undefined,
+            closure_var_stack: Vec::new(),
             rsp: 0,
             rbp: 0,
             pc: 0,
@@ -1370,6 +1439,8 @@ struct SehRecord {
     delayed_jump_target: Option<isize>,
     /// delayed return flag (for return inside try-finally)
     delayed_return: bool,
+    /// saved closure var stack depth when return was deferred by finally
+    saved_closure_depth: usize,
 }
 
 #[derive(Debug)]

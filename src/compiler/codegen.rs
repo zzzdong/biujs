@@ -248,6 +248,11 @@ impl Codegen {
                         let captured_this = self.gen_operand(captured_this);
                         self.codes.push(Bytecode::triple(Opcode::MakeArrowFuncObj, dst, func_id, captured_this));
                     }
+                    Instruction::ClosureVar { name, value } => {
+                        let name = name.to_operand();
+                        let value = self.gen_operand(value);
+                        self.codes.push(Bytecode::double(Opcode::ClosureVar, name, value));
+                    }
 
                     // Control Flow Instructions
                     Instruction::Return { value } => {

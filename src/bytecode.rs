@@ -232,6 +232,8 @@ pub enum Opcode {
     MakeFuncObj,
     /// make_arrow_func_obj dst, func_id, captured_this
     MakeArrowFuncObj,
+    /// closure_var name, value — push a captured variable for the next MakeArrowFuncObj
+    ClosureVar,
 }
 
 impl fmt::Display for Opcode {
@@ -296,6 +298,7 @@ impl fmt::Display for Opcode {
             Opcode::LoadThis => write!(f, "load_this"),
             Opcode::MakeFuncObj => write!(f, "make_func_obj"),
             Opcode::MakeArrowFuncObj => write!(f, "make_arrow_func_obj"),
+            Opcode::ClosureVar => write!(f, "closure_var"),
         }
     }
 }

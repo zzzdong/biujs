@@ -604,6 +604,8 @@ pub struct FunctionObject {
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
     /// For arrow functions: captured `this` value
     pub captured_this: Option<Value>,
+    /// Captured outer variables as (name, value) pairs
+    pub captured_vars: Vec<(String, Value)>,
 }
 
 impl FunctionObject {
@@ -614,17 +616,24 @@ impl FunctionObject {
             properties: BTreeMap::new(),
             prototype: None,
             captured_this: None,
+            captured_vars: Vec::new(),
         }
     }
 
-    /// Create an arrow function object with captured `this`
-    pub fn new_arrow(func_id: u32, name: &str, captured_this: Value) -> Self {
+    /// Create an arrow function object with captured `this` and optional captured vars
+    pub fn new_arrow(
+        func_id: u32,
+        name: &str,
+        captured_this: Value,
+        captured_vars: Vec<(String, Value)>,
+    ) -> Self {
         Self {
             func_id,
             name: name.to_string(),
             properties: BTreeMap::new(),
             prototype: None,
             captured_this: Some(captured_this),
+            captured_vars,
         }
     }
 }
@@ -720,14 +729,17 @@ pub fn new_function_object(func_id: u32, name: &str) -> Value {
     Value::Object(obj_ref)
 }
 
-/// Create a `Value::Object` wrapping an Arrow FunctionObject with captured `this`
-pub fn new_arrow_function_object(func_id: u32, name: &str, captured_this: Value) -> Value {
-    let func_obj = FunctionObject::new_arrow(func_id, name, captured_this);
+/// Create a `Value::Object` wrapping an Arrow FunctionObject with captured `this` and vars
+pub fn new_arrow_function_object(
+    func_id: u32,
+    name: &str,
+    captured_this: Value,
+    captured_vars: Vec<(String, Value)>,
+) -> Value {
+    let func_obj = FunctionObject::new_arrow(func_id, name, captured_this, captured_vars);
     let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
     
     // Arrow functions don't have a prototype property
-    // They also don't have their own `this`, so we don't set up prototype
-    
     Value::Object(obj_ref)
 }
 

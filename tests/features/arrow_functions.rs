@@ -147,3 +147,66 @@ fn arrow_function_closure() {
     println!("arrow_function_closure result: {:?}", result);
     assert!(result.is_ok());
 }
+
+// ============================================================
+// Closure variable capture — real value assertions
+// ============================================================
+
+#[test]
+fn arrow_captures_outer_variable() {
+    let code = r#"
+        function makeAdder(x) {
+            return (y) => x + y;
+        }
+        makeAdder(5)(3);
+    "#;
+    assert_eq!(eval_number(code), 8.0);
+}
+
+#[test]
+fn arrow_captures_multiple_variables() {
+    let code = r#"
+        function makeOp(a, b) {
+            return (c) => a + b + c;
+        }
+        makeOp(1, 2)(3);
+    "#;
+    assert_eq!(eval_number(code), 6.0);
+}
+
+#[test]
+fn arrow_captures_string_variable() {
+    let code = r#"
+        function makeGreeter(greeting) {
+            return (name) => greeting + " " + name;
+        }
+        makeGreeter("Hello")("World");
+    "#;
+    assert_eq!(eval_string(code), "Hello World");
+}
+
+#[test]
+fn arrow_captures_outer_arrow_closure() {
+    let code = r#"
+        function factory(x) {
+            return (y) => (z) => x + y + z;
+        }
+        factory(1)(2)(3);
+    "#;
+    assert_eq!(eval_number(code), 6.0);
+}
+
+#[test]
+fn arrow_closure_does_not_capture_inner_vars() {
+    let code = r#"
+        function outer() {
+            let outerVar = 10;
+            return () => {
+                let innerVar = 20;
+                return outerVar + innerVar;
+            };
+        }
+        outer()();
+    "#;
+    assert_eq!(eval_number(code), 30.0);
+}
