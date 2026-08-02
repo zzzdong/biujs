@@ -73,6 +73,60 @@ fn object_vs_primitive_coercion() {
     assert_eq!(eval_bool("[1,2] == '1,2'"), true);
 }
 
+/// User-defined valueOf / toString must be honoured during coercion (ToPrimitive).
+#[test]
+fn user_defined_valueof_toString() {
+    assert_eq!(eval_number("({ valueOf: () => 42 }) + 1"), 43.0);
+    assert_eq!(eval_string("({ toString: () => 'hi' }) + '!'"), "hi!");
+    assert_eq!(eval_bool("({ valueOf: () => 7 }) == 7"), true);
+    assert_eq!(eval_bool("({ toString: () => '7' }) == 7"), true);
+    // `Add` uses the "default" hint, so `valueOf` is tried first -> 1 -> "1".
+    assert_eq!(
+        eval_string("'' + ({ toString: () => 'a', valueOf: () => 1 })"),
+        "1"
+    );
+}
+
+/// Object + string uses ToPrimitive (not a raw "[object Object]" fallback).
+#[test]
+fn object_plus_string_concat() {
+    assert_eq!(eval_string("[1,2] + '-end'"), "1,2-end");
+    assert_eq!(eval_string("'x' + ({ toString: () => 'y' })"), "xy");
+}
+
+/// Relational comparison coerces objects via ToPrimitive.
+#[test]
+fn object_relational_coercion() {
+    assert!(eval_bool("({ valueOf: () => 5 }) < 10"));
+    assert!(eval_bool("10 > ({ valueOf: () => 5 })"));
+}
+
+/// A very deep expression (far more than the register count) must compile and run
+/// without panicking (register allocator spills to the stack instead).
+#[test]
+fn deep_expression_no_panic() {
+    let mut js = String::from("0");
+    for i in 1..200 {
+        js.push_str(" + ");
+        js.push_str(&i.to_string());
+    }
+    let expected: f64 = (0..200).map(|i| i as f64).sum();
+    assert_eq!(eval_number(&js), expected);
+}
+
+/// A function call with many (>8) arguments must not panic.
+#[test]
+fn many_arguments_no_panic() {
+    let params: Vec<String> = (0..12).map(|i| format!("a{i}")).collect();
+    let args: Vec<String> = (1..=12).map(|i| i.to_string()).collect();
+    let js = format!(
+        "function f({}) {{ return a11; }}\nf({})",
+        params.join(","),
+        args.join(",")
+    );
+    assert_eq!(eval_number(&js), 12.0);
+}
+
 #[test]
 fn chained_comparisons() {
     assert!(eval_bool("0 <= 5"));

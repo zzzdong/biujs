@@ -188,10 +188,8 @@ impl JSObject for OrdinaryObject {
             if !self.extensible {
                 return Err("Cannot add property to non-extensible object".to_string());
             }
-            self.properties.insert(
-                key,
-                PropertyDescriptor::data_descriptor(value),
-            );
+            self.properties
+                .insert(key, PropertyDescriptor::data_descriptor(value));
             Ok(true)
         }
     }
@@ -340,8 +338,7 @@ impl ArrayObject {
         if self.elements.is_empty() {
             return Value::Undefined;
         }
-        Some(self.elements.remove(0))
-            .unwrap_or(Value::Undefined)
+        Some(self.elements.remove(0)).unwrap_or(Value::Undefined)
     }
 
     pub fn unshift(&mut self, value: Value) -> f64 {
@@ -384,7 +381,12 @@ impl ArrayObject {
         Self::from_vec(new_elements)
     }
 
-    pub fn splice(&mut self, start: usize, delete_count: usize, insert_items: &[Value]) -> Vec<Value> {
+    pub fn splice(
+        &mut self,
+        start: usize,
+        delete_count: usize,
+        insert_items: &[Value],
+    ) -> Vec<Value> {
         let end = (start + delete_count).min(self.elements.len());
         let removed: Vec<Value> = self.elements.drain(start..end).collect();
         let mut pos = start;
@@ -488,7 +490,10 @@ impl JSObject for ArrayObject {
     fn has_property(&self, key: &PropertyKey) -> bool {
         match key {
             PropertyKey::Str(s) if s.as_str() == "length" => true,
-            PropertyKey::Str(s) => s.parse::<usize>().ok().map_or(false, |i| i < self.elements.len()),
+            PropertyKey::Str(s) => s
+                .parse::<usize>()
+                .ok()
+                .map_or(false, |i| i < self.elements.len()),
             _ => false,
         }
     }
@@ -656,7 +661,8 @@ impl JSObject for FunctionObject {
     }
 
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        self.properties.insert(key, PropertyDescriptor::data_descriptor(value));
+        self.properties
+            .insert(key, PropertyDescriptor::data_descriptor(value));
         Ok(true)
     }
 
@@ -711,21 +717,24 @@ impl JSObject for FunctionObject {
 pub fn new_function_object(func_id: u32, name: &str) -> Value {
     let func_obj = FunctionObject::new(func_id, name);
     let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
-    
+
     // Create a prototype object for this function
     let proto_obj = new_ordinary_object();
-    
+
     // Set the prototype property on the function object
     if let Value::Object(ref proto_ref) = proto_obj {
-        obj_ref.borrow_mut().property_set(
-            crate::vm::property::PropertyKey::from("prototype"),
-            proto_obj.clone()
-        ).ok();
-        
+        obj_ref
+            .borrow_mut()
+            .property_set(
+                crate::vm::property::PropertyKey::from("prototype"),
+                proto_obj.clone(),
+            )
+            .ok();
+
         // Note: We don't set constructor property on prototype to avoid circular reference
         // This is a simplification - in a full implementation, we'd need to handle this differently
     }
-    
+
     Value::Object(obj_ref)
 }
 
@@ -738,7 +747,7 @@ pub fn new_arrow_function_object(
 ) -> Value {
     let func_obj = FunctionObject::new_arrow(func_id, name, captured_this, captured_vars);
     let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
-    
+
     // Arrow functions don't have a prototype property
     Value::Object(obj_ref)
 }

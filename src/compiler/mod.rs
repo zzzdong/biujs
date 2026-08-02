@@ -13,8 +13,8 @@ use crate::bytecode::{FunctionId, Module, Register};
 use crate::compiler::error::CompileError;
 use crate::compiler::ir::{FuncSignature, FunctionBuilder, IrFunction, IrUnit, SSABuilder};
 use crate::compiler::lowering::JSASTLower;
-use crate::compiler::symbol::SymbolTable;
 use crate::compiler::parser::parse_js;
+use crate::compiler::symbol::SymbolTable;
 
 use codegen::Codegen;
 use oxc_allocator::Allocator;
@@ -41,7 +41,7 @@ impl Compiler {
                 CompileError::syntax(
                     format!("{}", parse_errors),
                     first_err.line,
-                    first_err.column
+                    first_err.column,
                 )
             } else {
                 CompileError::syntax("Parse error", 1, 1)

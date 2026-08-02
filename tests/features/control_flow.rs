@@ -12,8 +12,14 @@ fn if_statement() {
 
 #[test]
 fn if_else_statement() {
-    assert_eq!(eval_number("let x = 5; if (x > 3) { x = 10; } else { x = 20; } x"), 10.0);
-    assert_eq!(eval_number("let x = 1; if (x > 3) { x = 10; } else { x = 20; } x"), 20.0);
+    assert_eq!(
+        eval_number("let x = 5; if (x > 3) { x = 10; } else { x = 20; } x"),
+        10.0
+    );
+    assert_eq!(
+        eval_number("let x = 1; if (x > 3) { x = 10; } else { x = 20; } x"),
+        20.0
+    );
 }
 
 #[test]

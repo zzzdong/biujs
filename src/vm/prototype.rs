@@ -184,10 +184,7 @@ pub fn internal_has_property(
 // ─────────────────────────────────────────────────────────
 
 /// ES6 [[Delete]](P) — delete an own property.
-pub fn internal_delete(
-    obj: Rc<RefCell<dyn JSObject>>,
-    key: &PropertyKey,
-) -> Result<bool, String> {
+pub fn internal_delete(obj: Rc<RefCell<dyn JSObject>>, key: &PropertyKey) -> Result<bool, String> {
     let mut borrowed = obj.borrow_mut();
     Ok(borrowed.property_delete(key))
 }

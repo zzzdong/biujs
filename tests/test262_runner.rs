@@ -62,12 +62,12 @@ fn load_harness() -> (String, String) {
         let path = test262_harness_root().join("assert.js");
         std::fs::read_to_string(&path).unwrap_or_default()
     });
-    
+
     let strict_content = HARNESS_STRICT.get_or_init(|| {
         let path = test262_harness_root().join("sta.js");
         std::fs::read_to_string(&path).unwrap_or_default()
     });
-    
+
     (assert_content.clone(), strict_content.clone())
 }
 
@@ -90,7 +90,7 @@ fn should_skip_source(source: &str) -> Option<&'static str> {
     // Order matters: check the most common patterns first.
     let unsupported_patterns: &[&str] = &[
         // Functions
-        "...",         // spread/rest (though `...` in string literals is fine)
+        "...", // spread/rest (though `...` in string literals is fine)
         // Built-ins NOT yet implemented
         "eval(",
         "parseInt(",
@@ -174,18 +174,38 @@ fn run_suite(subdir: &str) -> (u32, u32, u32, Vec<(String, String)>) {
 
         // Also skip tests with features not yet implemented in biujs (ES6 target)
         let skip_features = [
-            "async-iteration", "async-functions", "generators", "modules",
-            "destructuring-binding", "for-of",
+            "async-iteration",
+            "async-functions",
+            "generators",
+            "modules",
+            "destructuring-binding",
+            "for-of",
             "default-parameters",
-            "Proxy", "Promise", "Map", "Set", "Proxy", "object-rest",
-            "object-spread", "rest-parameters", "spread-syntax", "super",
-            "optional-chaining", "nullish-coalescing", "logical-assignment",
-            "numeric-separator", "exponentiation", "dynamic-import",
-            "import.meta", "import-assertions", "tail-call-optimization",
+            "Proxy",
+            "Promise",
+            "Map",
+            "Set",
+            "Proxy",
+            "object-rest",
+            "object-spread",
+            "rest-parameters",
+            "spread-syntax",
+            "super",
+            "optional-chaining",
+            "nullish-coalescing",
+            "logical-assignment",
+            "numeric-separator",
+            "exponentiation",
+            "dynamic-import",
+            "import.meta",
+            "import-assertions",
+            "tail-call-optimization",
         ];
-        let has_unsupported_feature = test.desc.features.iter().any(|f| {
-            skip_features.iter().any(|sf| f.contains(sf))
-        });
+        let has_unsupported_feature = test
+            .desc
+            .features
+            .iter()
+            .any(|f| skip_features.iter().any(|sf| f.contains(sf)));
         if has_unsupported_feature {
             skipped += 1;
             continue;
@@ -193,10 +213,11 @@ fn run_suite(subdir: &str) -> (u32, u32, u32, Vec<(String, String)>) {
 
         // Skip async/module/generated tests
         let has_bad_flag = test.desc.flags.iter().any(|f| {
-            matches!(f, 
-                test262_harness::Flag::Async | 
-                test262_harness::Flag::Module | 
-                test262_harness::Flag::Generated
+            matches!(
+                f,
+                test262_harness::Flag::Async
+                    | test262_harness::Flag::Module
+                    | test262_harness::Flag::Generated
             )
         });
         if has_bad_flag {
@@ -240,7 +261,11 @@ fn run_suite(subdir: &str) -> (u32, u32, u32, Vec<(String, String)>) {
 /// Generic test runner that prints results for a specific subdirectory
 fn test_subdirectory(subdir: &str, label: &str) {
     if !has_tests() {
-        eprintln!("test262 not found at {:?}, skipping {}", test262_root(), label);
+        eprintln!(
+            "test262 not found at {:?}, skipping {}",
+            test262_root(),
+            label
+        );
         return;
     }
 
@@ -309,7 +334,10 @@ fn test262_equals() {
 
 #[test]
 fn test262_does_not_equals() {
-    test_subdirectory("language/expressions/does-not-equals", "does-not-equals (!=)");
+    test_subdirectory(
+        "language/expressions/does-not-equals",
+        "does-not-equals (!=)",
+    );
 }
 
 #[test]
@@ -334,17 +362,26 @@ fn test262_strict_equals() {
 
 #[test]
 fn test262_strict_does_not_equals() {
-    test_subdirectory("language/expressions/strict-does-not-equals", "strict-does-not-equals (!==)");
+    test_subdirectory(
+        "language/expressions/strict-does-not-equals",
+        "strict-does-not-equals (!==)",
+    );
 }
 
 #[test]
 fn test262_greater_than_or_equal() {
-    test_subdirectory("language/expressions/greater-than-or-equal", "greater-than-or-equal (>=)");
+    test_subdirectory(
+        "language/expressions/greater-than-or-equal",
+        "greater-than-or-equal (>=)",
+    );
 }
 
 #[test]
 fn test262_less_than_or_equal() {
-    test_subdirectory("language/expressions/less-than-or-equal", "less-than-or-equal (<=)");
+    test_subdirectory(
+        "language/expressions/less-than-or-equal",
+        "less-than-or-equal (<=)",
+    );
 }
 
 #[test]
@@ -389,7 +426,10 @@ fn test262_right_shift() {
 
 #[test]
 fn test262_unsigned_right_shift() {
-    test_subdirectory("language/expressions/unsigned-right-shift", "unsigned-right-shift (>>>)");
+    test_subdirectory(
+        "language/expressions/unsigned-right-shift",
+        "unsigned-right-shift (>>>)",
+    );
 }
 
 // ---- Literals ----
@@ -413,22 +453,34 @@ fn test262_boolean_literals() {
 
 #[test]
 fn test262_postfix_increment() {
-    test_subdirectory("language/expressions/postfix-increment", "postfix-increment (x++)");
+    test_subdirectory(
+        "language/expressions/postfix-increment",
+        "postfix-increment (x++)",
+    );
 }
 
 #[test]
 fn test262_postfix_decrement() {
-    test_subdirectory("language/expressions/postfix-decrement", "postfix-decrement (x--)");
+    test_subdirectory(
+        "language/expressions/postfix-decrement",
+        "postfix-decrement (x--)",
+    );
 }
 
 #[test]
 fn test262_prefix_increment() {
-    test_subdirectory("language/expressions/prefix-increment", "prefix-increment (++x)");
+    test_subdirectory(
+        "language/expressions/prefix-increment",
+        "prefix-increment (++x)",
+    );
 }
 
 #[test]
 fn test262_prefix_decrement() {
-    test_subdirectory("language/expressions/prefix-decrement", "prefix-decrement (--x)");
+    test_subdirectory(
+        "language/expressions/prefix-decrement",
+        "prefix-decrement (--x)",
+    );
 }
 
 // ---- Statements ----

@@ -11,7 +11,7 @@ fn debug_propset_error_step1() {
         }
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 1 Result: {:?}", result);
     assert!(result.is_ok());
@@ -27,7 +27,7 @@ fn debug_propset_error_step2() {
         }
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 2 Result: {:?}", result);
     assert!(result.is_ok());
@@ -46,7 +46,7 @@ fn debug_propset_error_step3a() {
         };
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 3a Result: {:?}", result);
     assert!(result.is_ok());
@@ -63,7 +63,7 @@ fn debug_propset_error_step3a1() {
         let proto = Test262Error.prototype;
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 3a1 Result: {:?}", result);
     assert!(result.is_ok());
@@ -80,7 +80,7 @@ fn debug_propset_error_step3a2() {
         Test262Error.prototype.x = 1;
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 3a2 Result: {:?}", result);
     assert!(result.is_ok());
@@ -99,7 +99,7 @@ fn debug_propset_error_step3a3() {
         };
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 3a3 Result: {:?}", result);
     assert!(result.is_ok());
@@ -115,7 +115,7 @@ fn debug_propset_error_step3b() {
         }
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 3b Result: {:?}", result);
     assert!(result.is_ok());
@@ -135,7 +135,7 @@ fn debug_propset_error_step3c() {
         };
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 3c Result: {:?}", result);
     // This is expected to fail - let's see the error
@@ -162,7 +162,7 @@ fn debug_propset_error_step4() {
         }
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 4 Result: {:?}", result);
     assert!(result.is_ok());
@@ -196,7 +196,7 @@ fn debug_propset_error_step5() {
         };
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 5 Result: {:?}", result);
     assert!(result.is_ok());
@@ -232,7 +232,7 @@ fn debug_propset_error_step6() {
         assert.sameValue(1, 1);
         "done"
     "#;
-    
+
     let result = eval_js(js);
     println!("Step 6 Result: {:?}", result);
     // This should pass since 1 === 1

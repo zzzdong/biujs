@@ -11,19 +11,24 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
+use crate::RuntimeError;
 use crate::vm::object::JSObject;
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
-use crate::RuntimeError;
 
 pub use crate::vm::ObjectKind;
 
 pub use array::array_constructor;
 pub use boolean::boolean_constructor;
-pub use error::{error_constructor, setup_error_prototype, create_error_object, runtime_error_to_js_error, ErrorType};
+pub use error::{
+    ErrorType, create_error_object, error_constructor, runtime_error_to_js_error,
+    setup_error_prototype,
+};
 pub use function::{function_constructor, setup_function_prototype};
-pub use number::{number_constructor, number_is_finite, number_is_integer, number_is_nan,
-    number_to_exponential, number_to_fixed, number_to_precision};
+pub use number::{
+    number_constructor, number_is_finite, number_is_integer, number_is_nan, number_to_exponential,
+    number_to_fixed, number_to_precision,
+};
 pub use object::object_constructor;
 pub use string::string_constructor;
 pub use symbol::symbol_constructor;
@@ -110,7 +115,9 @@ impl Builtins {
         ];
 
         for (name, proto) in error_constructors {
-            let fn_val = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::with_prototype(name, Rc::clone(&proto)))));
+            let fn_val = Value::Object(Rc::new(RefCell::new(
+                NativeFunctionObject::with_prototype(name, Rc::clone(&proto)),
+            )));
 
             // Set Error.prototype property on the constructor
             if let Value::Object(ref obj_ref) = fn_val {
@@ -191,11 +198,17 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
         "Object.values" => object::object_values(args),
         "Symbol.for" => symbol::symbol_for(args),
         "Symbol.keyFor" => symbol::symbol_key_for(args),
-        _ => Err(RuntimeError::TypeError(format!("unknown static method: {name}"))),
+        _ => Err(RuntimeError::TypeError(format!(
+            "unknown static method: {name}"
+        ))),
     }
 }
 
-pub fn call_prototype_method(obj: &Value, method_name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn call_prototype_method(
+    obj: &Value,
+    method_name: &str,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     match method_name {
         "toString" => dispatch_to_string(obj),
         "valueOf" => dispatch_value_of(obj),
@@ -223,7 +236,9 @@ pub fn call_prototype_method(obj: &Value, method_name: &str, args: &[Value]) -> 
         "unshift" => array::array_unshift(obj, args),
         "join" => array::array_join(obj, args),
         "splice" => array::array_splice(obj, args),
-        _ => Err(RuntimeError::TypeError(format!("unknown prototype method: {method_name}"))),
+        _ => Err(RuntimeError::TypeError(format!(
+            "unknown prototype method: {method_name}"
+        ))),
     }
 }
 
@@ -289,22 +304,34 @@ fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
             let borrowed = obj_ref.borrow();
             match borrowed.kind() {
                 ObjectKind::Array => {
-                    if let Some(arr) = borrowed.as_any().downcast_ref::<crate::vm::object::ArrayObject>() {
+                    if let Some(arr) = borrowed
+                        .as_any()
+                        .downcast_ref::<crate::vm::object::ArrayObject>()
+                    {
                         Ok(Value::string(&arr.join_elements()))
                     } else {
-                        Ok(Value::string(&format!("[object {}]", borrowed.class_name())))
+                        Ok(Value::string(&format!(
+                            "[object {}]",
+                            borrowed.class_name()
+                        )))
                     }
                 }
                 ObjectKind::Boolean => {
                     // Boolean wrapper — unwrap
-                    if let Some(inner) = borrowed.as_any().downcast_ref::<crate::vm::object::OrdinaryObject>() {
+                    if let Some(inner) = borrowed
+                        .as_any()
+                        .downcast_ref::<crate::vm::object::OrdinaryObject>()
+                    {
                         if let Some(v) = inner.property_get(&PropertyKey::from_str("__value__")) {
                             return Ok(Value::string(&v.value.to_js_string()));
                         }
                     }
                     Ok(Value::string("false"))
                 }
-                _ => Ok(Value::string(&format!("[object {}]", borrowed.class_name()))),
+                _ => Ok(Value::string(&format!(
+                    "[object {}]",
+                    borrowed.class_name()
+                ))),
             }
         }
         Value::Bool(b) => Ok(Value::string(&b.to_string())),
@@ -322,21 +349,36 @@ fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
 }
 
 fn number_to_string(n: f64) -> String {
-    if n.is_nan() { "NaN".to_string() }
-    else if n == 0.0 || n == -0.0 { "0".to_string() }
-    else if n.is_infinite() {
-        if n.is_sign_positive() { "Infinity".to_string() } else { "-Infinity".to_string() }
+    if n.is_nan() {
+        "NaN".to_string()
+    } else if n == 0.0 || n == -0.0 {
+        "0".to_string()
+    } else if n.is_infinite() {
+        if n.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        }
     } else {
         let s = n.to_string();
-        if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() }
-        else { s }
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
     }
 }
 
 fn number_to_string_radix(n: f64, radix: u32) -> String {
-    if n.is_nan() { return "NaN".to_string(); }
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
     if n.is_infinite() {
-        return if n.is_sign_positive() { "Infinity".to_string() } else { "-Infinity".to_string() };
+        return if n.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
     }
     if radix < 2 || radix > 36 {
         // Default to base 10
@@ -362,7 +404,9 @@ fn number_to_string_radix(n: f64, radix: u32) -> String {
 }
 
 fn radix_format(mut n: u64, radix: u32) -> String {
-    if n == 0 { return "0".to_string(); }
+    if n == 0 {
+        return "0".to_string();
+    }
     let digits = "0123456789abcdefghijklmnopqrstuvwxyz".as_bytes();
     let mut result = Vec::new();
     while n > 0 {
@@ -381,7 +425,9 @@ fn radix_format_frac(mut frac: f64, radix: u32, max_digits: usize) -> String {
         let digit = frac.trunc() as usize;
         result.push(digits[digit.min(35)]);
         frac -= digit as f64;
-        if frac.abs() < 1e-12 { break; }
+        if frac.abs() < 1e-12 {
+            break;
+        }
     }
     String::from_utf8(result).unwrap_or_default()
 }
@@ -396,7 +442,10 @@ fn dispatch_value_of(obj: &Value) -> Result<Value, RuntimeError> {
 // Prototype object backing
 // ─────────────────────────────────────────────────────────
 
-fn new_proto(parent: Option<Rc<RefCell<dyn JSObject>>>, _class_name: &str) -> Rc<RefCell<dyn JSObject>> {
+fn new_proto(
+    parent: Option<Rc<RefCell<dyn JSObject>>>,
+    _class_name: &str,
+) -> Rc<RefCell<dyn JSObject>> {
     Rc::new(RefCell::new(ProtoObject::new(parent)))
 }
 
@@ -408,33 +457,61 @@ struct ProtoObject {
 
 impl ProtoObject {
     fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
-        Self { properties: BTreeMap::new(), prototype }
+        Self {
+            properties: BTreeMap::new(),
+            prototype,
+        }
     }
 }
 
 impl JSObject for ProtoObject {
-    fn kind(&self) -> ObjectKind { ObjectKind::Ordinary }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Ordinary
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.properties.get(key).cloned()
     }
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        self.properties.insert(key, PropertyDescriptor::data_descriptor(value));
+        self.properties
+            .insert(key, PropertyDescriptor::data_descriptor(value));
         Ok(true)
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool { self.properties.remove(key).is_some() }
-    fn has_property(&self, key: &PropertyKey) -> bool { self.properties.contains_key(key) }
-    fn own_keys(&self) -> Vec<PropertyKey> { self.properties.keys().cloned().collect() }
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> { self.prototype.clone() }
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) { self.prototype = proto; }
-    fn is_extensible(&self) -> bool { true }
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        self.properties.remove(key).is_some()
+    }
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        self.properties.contains_key(key)
+    }
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.properties.keys().cloned().collect()
+    }
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.prototype.clone()
+    }
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.prototype = proto;
+    }
+    fn is_extensible(&self) -> bool {
+        true
+    }
     fn prevent_extensions(&mut self) {}
-    fn is_frozen(&self) -> bool { false }
+    fn is_frozen(&self) -> bool {
+        false
+    }
     fn freeze(&mut self) {}
-    fn is_sealed(&self) -> bool { false }
+    fn is_sealed(&self) -> bool {
+        false
+    }
     fn seal(&mut self) {}
-    fn class_name(&self) -> &'static str { "Object" }
+    fn class_name(&self) -> &'static str {
+        "Object"
+    }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -442,21 +519,25 @@ impl JSObject for ProtoObject {
 // ─────────────────────────────────────────────────────────
 
 pub fn set_static_method<F>(obj: &Value, name: &str, _f: F)
-where F: Fn(&[Value]) -> Result<Value, RuntimeError> + 'static,
+where
+    F: Fn(&[Value]) -> Result<Value, RuntimeError> + 'static,
 {
     if let Value::Object(obj_ref) = obj {
         let key = PropertyKey::from_str(name);
-        let _ = obj_ref.borrow_mut().property_set(key, Value::string(&format!("__native_method__{name}")));
+        let _ = obj_ref
+            .borrow_mut()
+            .property_set(key, Value::string(&format!("__native_method__{name}")));
     }
 }
 
 /// Set a prototype method on an object (used for prototype methods like Error.prototype.toString)
 pub fn set_prototype_method<F>(proto: &Rc<RefCell<dyn JSObject>>, name: &str, _f: F)
-where F: Fn(&Value, &[Value]) -> Result<Value, RuntimeError> + 'static,
+where
+    F: Fn(&Value, &[Value]) -> Result<Value, RuntimeError> + 'static,
 {
     let key = PropertyKey::from_str(name);
     let method_val = Value::Object(Rc::new(RefCell::new(
-        crate::vm::object::NativeFunctionObject::new(&format!("__proto_method__{name}"))
+        crate::vm::object::NativeFunctionObject::new(&format!("__proto_method__{name}")),
     )));
     let _ = proto.borrow_mut().property_set(key, method_val);
 }
@@ -473,8 +554,13 @@ pub fn native_function_name(val: &Value) -> Option<String> {
         Value::Object(obj_ref) => {
             let borrowed = obj_ref.borrow();
             if borrowed.kind() == ObjectKind::NativeFunction {
-                borrowed.as_any().downcast_ref::<crate::vm::object::NativeFunctionObject>().map(|f| f.name.clone())
-            } else { None }
+                borrowed
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::NativeFunctionObject>()
+                    .map(|f| f.name.clone())
+            } else {
+                None
+            }
         }
         _ => None,
     }

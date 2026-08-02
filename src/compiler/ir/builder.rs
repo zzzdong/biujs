@@ -175,10 +175,6 @@ pub trait InstBuilder {
     fn call_function(&mut self, func: FunctionId, args: Vec<Value>) -> Value {
         let result = self.alloc();
 
-        if args.len() > 8 {
-            panic!("too many arguments");
-        }
-
         self.emit(Instruction::Call {
             func: Value::Function(func),
             args,
@@ -191,10 +187,6 @@ pub trait InstBuilder {
     fn make_call(&mut self, func: Value, args: Vec<Value>) -> Value {
         let result = self.alloc();
 
-        if args.len() > 8 {
-            panic!("too many arguments");
-        }
-
         self.emit(Instruction::CallEx {
             callable: func,
             args,
@@ -206,10 +198,6 @@ pub trait InstBuilder {
 
     fn make_call_native(&mut self, func: Value, args: Vec<Value>) -> Value {
         let result = self.alloc();
-
-        if args.len() > 8 {
-            panic!("too many arguments");
-        }
 
         self.emit(Instruction::CallNative { func, args, result });
 
@@ -320,7 +308,11 @@ pub trait InstBuilder {
 
     fn make_arrow_func_obj(&mut self, func_id: Value, captured_this: Value) -> Value {
         let dst = self.alloc();
-        self.emit(Instruction::MakeArrowFuncObj { dst, func_id, captured_this });
+        self.emit(Instruction::MakeArrowFuncObj {
+            dst,
+            func_id,
+            captured_this,
+        });
         dst
     }
 

@@ -1,4 +1,4 @@
-use crate::helpers::{eval_bool, eval_string, eval_js};
+use crate::helpers::{eval_bool, eval_js, eval_string};
 
 // ============================================================
 // Symbol constructor
@@ -18,7 +18,7 @@ fn symbol_constructor_with_description() {
     // Symbol with description
     let result = eval_string("Symbol('test').toString()");
     assert_eq!(result, "Symbol(test)");
-    
+
     let result = eval_string("Symbol('hello world').toString()");
     assert_eq!(result, "Symbol(hello world)");
 }
@@ -35,11 +35,11 @@ fn symbol_constructor_with_various_types() {
     // Symbol with number description
     let result = eval_string("Symbol(123).toString()");
     assert_eq!(result, "Symbol(123)");
-    
+
     // Symbol with boolean description
     let result = eval_string("Symbol(true).toString()");
     assert_eq!(result, "Symbol(true)");
-    
+
     // Symbol with undefined description
     let result = eval_string("Symbol(undefined).toString()");
     assert_eq!(result, "Symbol()");
@@ -54,7 +54,7 @@ fn symbol_uniqueness() {
     // Each Symbol() call creates a unique symbol
     let result = eval_bool("Symbol() === Symbol()");
     assert_eq!(result, false);
-    
+
     let result = eval_bool("Symbol('foo') === Symbol('foo')");
     assert_eq!(result, false);
 }
@@ -67,7 +67,7 @@ fn symbol_uniqueness() {
 fn symbol_typeof() {
     let result = eval_string("typeof Symbol()");
     assert_eq!(result, "symbol");
-    
+
     let result = eval_string("typeof Symbol('test')");
     assert_eq!(result, "symbol");
 }
@@ -136,7 +136,7 @@ fn symbol_keyfor() {
     "#;
     let result = eval_string(code);
     assert_eq!(result, "registered");
-    
+
     // Symbol.keyFor returns undefined for non-registered symbols
     let code2 = r#"
         const sym = Symbol('not-registered');

@@ -130,8 +130,8 @@ fn bitwise_not() {
     assert_eq!(eval_number("~-1"), 0.0);
     assert_eq!(eval_number("~5"), -6.0);
     assert_eq!(eval_number("~-5"), 4.0);
-    
+
     // Test with expressions
     assert_eq!(eval_number("~(1 + 2)"), -4.0);
-    assert_eq!(eval_number("~~5"), 5.0);  // Double negation
+    assert_eq!(eval_number("~~5"), 5.0); // Double negation
 }

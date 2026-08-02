@@ -9,7 +9,7 @@ fn debug_instanceof_step_by_step() {
     "#;
     let result1 = eval_js(js1);
     println!("Step 1 - typeof Foo.prototype: {:?}", result1);
-    
+
     // Step 2: Create object and check its type
     let js2 = r#"
         function Foo() {}
@@ -18,7 +18,7 @@ fn debug_instanceof_step_by_step() {
     "#;
     let result2 = eval_js(js2);
     println!("Step 2 - typeof obj: {:?}", result2);
-    
+
     // Step 3: Check if we can access obj.constructor
     let js3 = r#"
         function Foo() {}
@@ -27,7 +27,7 @@ fn debug_instanceof_step_by_step() {
     "#;
     let result3 = eval_js(js3);
     println!("Step 3 - obj.constructor === Foo: {:?}", result3);
-    
+
     // Step 4: Check instanceof directly
     let js4 = r#"
         function Foo() {}

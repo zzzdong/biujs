@@ -125,17 +125,18 @@ impl SemanticAnalyzer {
             }
             Statement::FunctionDeclaration(func) => {
                 if let Some(id) = &func.id {
-                    self.current_scope().insert(id.name.to_string(), BindingKind::Function);
+                    self.current_scope()
+                        .insert(id.name.to_string(), BindingKind::Function);
                 }
-                
+
                 self.enter_scope();
-                
+
                 if let Some(body) = &func.body {
                     for stmt in &body.statements {
                         self.visit_statement(stmt);
                     }
                 }
-                
+
                 self.leave_scope();
             }
             Statement::IfStatement(if_stmt) => {
@@ -151,7 +152,7 @@ impl SemanticAnalyzer {
             }
             Statement::ForStatement(for_stmt) => {
                 self.enter_scope();
-                
+
                 if let Some(init) = &for_stmt.init {
                     if let ForStatementInit::VariableDeclaration(decl) = init {
                         let kind = match decl.kind {
@@ -167,14 +168,14 @@ impl SemanticAnalyzer {
                         }
                     }
                 }
-                
+
                 if let Some(test) = &for_stmt.test {
                     self.visit_expression(test);
                 }
                 if let Some(update) = &for_stmt.update {
                     self.visit_expression(update);
                 }
-                
+
                 self.visit_statement(&for_stmt.body);
                 self.leave_scope();
             }
@@ -185,7 +186,7 @@ impl SemanticAnalyzer {
                     self.visit_statement(stmt);
                 }
                 self.leave_scope();
-                
+
                 if let Some(catch) = &try_stmt.handler {
                     self.enter_scope();
                     for stmt in &catch.body.body {
@@ -193,7 +194,7 @@ impl SemanticAnalyzer {
                     }
                     self.leave_scope();
                 }
-                
+
                 if let Some(finally) = &try_stmt.finalizer {
                     self.enter_scope();
                     for stmt in &finally.body {
@@ -264,7 +265,10 @@ impl SemanticAnalyzer {
                 if let Some(kind) = self.lookup_binding(&ident.name) {
                     if kind == BindingKind::Const {
                         self.add_error(
-                            format!("TypeError: Assignment to constant variable '{}'", ident.name),
+                            format!(
+                                "TypeError: Assignment to constant variable '{}'",
+                                ident.name
+                            ),
                             span,
                         );
                     }
@@ -281,7 +285,10 @@ impl SemanticAnalyzer {
                 if let Some(kind) = self.lookup_binding(&ident.name) {
                     if kind == BindingKind::Const {
                         self.add_error(
-                            format!("TypeError: Assignment to constant variable '{}'", ident.name),
+                            format!(
+                                "TypeError: Assignment to constant variable '{}'",
+                                ident.name
+                            ),
                             span,
                         );
                     }

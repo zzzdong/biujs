@@ -95,6 +95,13 @@ impl LiveInterval {
 
         self.ranges.extend(other.ranges.clone());
     }
+
+    /// Whether `index` falls within one of this interval's live ranges.
+    pub fn covers(&self, index: usize) -> bool {
+        self.ranges
+            .iter()
+            .any(|r| index >= r.start && index <= r.end)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +143,11 @@ impl Liveness {
             .max()
             .unwrap_or(0)
             + 1
+    }
+
+    /// Allocate a fresh stack slot index for a spilled variable.
+    fn new_stack_slot(&self) -> usize {
+        self.stack_size()
     }
 }
 
@@ -438,31 +450,41 @@ impl RegAlloc {
     }
 
     pub fn alloc(&mut self, value: Variable, index: usize) -> (Register, Option<Action>) {
-        let interval = self.liveness.intervals.get(&value).unwrap();
+        // Extract the fields we need so the borrow of `self.liveness` is released
+        // before we potentially mutate it via `must_alloc`.
+        let (preset_reg, stack) = {
+            let interval = self.liveness.intervals.get(&value).unwrap();
+            (interval.reg, interval.stack)
+        };
 
         match self.reg_set.find(value) {
             Some(register) => (register, None),
-            None => match interval.reg {
+            None => match preset_reg {
                 Some(register) => {
                     self.reg_set.use_register(register, value, true);
                     (register, None)
                 }
                 None => {
-                    let reg = self.reg_set.must_alloc(value);
+                    let (reg, spill) = self.reg_set.must_alloc(value, index, &mut self.liveness);
 
                     // 如果变量在栈上，并且在当前索引处开始一个新的活跃范围，需要从栈恢复
-                    if interval.stack.is_some()
-                        && interval.ranges.iter().any(|range| range.start == index)
-                    {
-                        let spill = Action::Restore {
-                            stack: interval.stack.unwrap(),
-                            register: reg,
-                        };
-
-                        return (reg, Some(spill));
+                    if let Some(stack) = stack {
+                        if self
+                            .liveness
+                            .intervals
+                            .get(&value)
+                            .map(|iv| iv.ranges.iter().any(|r| r.start == index))
+                            .unwrap_or(false)
+                        {
+                            let restore = Action::Restore {
+                                stack,
+                                register: reg,
+                            };
+                            return (reg, Some(restore));
+                        }
                     }
 
-                    (reg, None)
+                    (reg, spill)
                 }
             },
         }
@@ -605,14 +627,69 @@ impl RegisterSet {
         Self { registers }
     }
 
-    fn must_alloc(&mut self, value: Variable) -> Register {
-        let reg = self
+    /// Allocate a register for `value`, spilling an existing live variable to the
+    /// stack if no register is free (instead of panicking). Returns the chosen
+    /// register and, if a victim was spilled, the matching `Action::Spill`.
+    fn must_alloc(
+        &mut self,
+        value: Variable,
+        index: usize,
+        liveness: &mut Liveness,
+    ) -> (Register, Option<Action>) {
+        if let Some(reg) = self.registers.iter_mut().find(|reg| reg.variable.is_none()) {
+            reg.variable = Some(value);
+            return (reg.register, None);
+        }
+
+        // No free register: evict a victim. Prefer a register whose current
+        // variable is dead at `index` (so spilling it is cheap); otherwise evict
+        // any in-use register. The victim is assigned a fresh stack slot and a
+        // Spill action is emitted so its value is preserved.
+        let victim_var = self
             .registers
+            .iter()
+            .filter_map(|reg| reg.variable)
+            .find(|var| {
+                liveness
+                    .intervals
+                    .get(var)
+                    .map(|iv| !iv.covers(index))
+                    .unwrap_or(false)
+            })
+            .or_else(|| self.registers.iter().filter_map(|reg| reg.variable).next());
+
+        let victim_var = match victim_var {
+            Some(v) => v,
+            None => {
+                // Should be unreachable: a register is always occupied here.
+                let reg = self.registers.iter_mut().next().unwrap();
+                reg.variable = Some(value);
+                return (reg.register, None);
+            }
+        };
+
+        let slot = liveness.new_stack_slot();
+        liveness.set_stack(victim_var, slot);
+        let victim_reg = self
+            .registers
+            .iter()
+            .find(|reg| reg.variable == Some(victim_var))
+            .unwrap()
+            .register;
+        // The victim register is now reused by the new value.
+        self.registers
             .iter_mut()
-            .find(|reg| reg.variable.is_none())
-            .unwrap();
-        reg.variable = Some(value);
-        reg.register
+            .find(|reg| reg.register == victim_reg)
+            .unwrap()
+            .variable = Some(value);
+
+        (
+            victim_reg,
+            Some(Action::Spill {
+                register: victim_reg,
+                stack: slot,
+            }),
+        )
     }
 
     fn release(&mut self, value: Variable) -> Option<Register> {

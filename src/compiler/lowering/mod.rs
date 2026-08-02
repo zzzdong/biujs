@@ -117,6 +117,7 @@ impl<'a> JSASTLower<'a> {
             Statement::ExpressionStatement(expr_stmt) => {
                 Some(self.lower_expression(&expr_stmt.expression))
             }
+            Statement::TryStatement(try_stmt) => self.lower_try(try_stmt),
             _ => {
                 self.lower_statement(stmt);
                 None
@@ -138,7 +139,9 @@ impl<'a> JSASTLower<'a> {
             Statement::BreakStatement(_) => self.lower_break(),
             Statement::ContinueStatement(_) => self.lower_continue(),
             Statement::ThrowStatement(throw) => self.lower_throw(throw),
-            Statement::TryStatement(try_stmt) => self.lower_try(try_stmt),
+            Statement::TryStatement(try_stmt) => {
+                self.lower_try(try_stmt);
+            }
             Statement::FunctionDeclaration(_) => {} // already hoisted
             Statement::ClassDeclaration(class) => self.lower_class_declaration(class),
             Statement::EmptyStatement(_) => {}
@@ -451,7 +454,15 @@ impl<'a> JSASTLower<'a> {
         self.builder.seal_block(self.builder.current_block());
     }
 
-    fn lower_try(&mut self, try_stmt: &TryStatement<'_>) {
+    fn lower_try(&mut self, try_stmt: &TryStatement<'_>) -> Option<Value> {
+        // Variable that accumulates the result of the try (or catch) block so that
+        // the whole try statement can act as an expression and return its final value.
+        let result_var = self.builder.alloc();
+        self.builder.assign(
+            result_var,
+            Value::Primitive(crate::bytecode::Primitive::Undefined),
+        );
+
         let try_body = self.create_block("try_body");
         let catch_blk = self.create_block("catch");
         let finally_blk = self.create_block("finally");
@@ -477,7 +488,9 @@ impl<'a> JSASTLower<'a> {
 
         // Try body
         self.builder.switch_to_block(try_body);
-        self.lower_block_like(&try_stmt.block.body);
+        if let Some(v) = self.lower_block_like_with_result(&try_stmt.block.body) {
+            self.builder.assign(result_var, v);
+        }
         // Decrement SEH depth after try body
         self.seh_depth -= 1;
         if !self.current_block_is_terminated() {
@@ -503,7 +516,9 @@ impl<'a> JSASTLower<'a> {
                 let dst = self.builder.alloc();
                 self.builder.assign(dst, exc_val);
                 self.symbols.insert(name, Variable::new(dst));
-                self.lower_block_like(&catch_clause.body.body);
+                if let Some(v) = self.lower_block_like_with_result(&catch_clause.body.body) {
+                    self.builder.assign(result_var, v);
+                }
                 self.symbols.leave_scope();
             }
             if !self.current_block_is_terminated() {
@@ -529,6 +544,7 @@ impl<'a> JSASTLower<'a> {
         }
 
         self.builder.switch_to_block(after_finally);
+        Some(result_var)
     }
 
     // ──────────────────────── Expression Lowering ────────────────────────
@@ -985,7 +1001,8 @@ impl<'a> JSASTLower<'a> {
 
         // Determine which outer variables need to be captured.
         // We collect all referenced identifiers and subtract those declared inside the arrow body.
-        let param_names: std::collections::HashSet<String> = params.iter().map(|p| p.name.to_string()).collect();
+        let param_names: std::collections::HashSet<String> =
+            params.iter().map(|p| p.name.to_string()).collect();
         let mut referenced = std::collections::HashSet::new();
         let mut declared = std::collections::HashSet::new();
         // Parameters are considered "declared" locally
@@ -993,13 +1010,24 @@ impl<'a> JSASTLower<'a> {
             declared.insert(p.clone());
         }
         self.collect_free_idents_from_body(&arrow.body, &mut referenced, &mut declared);
-        let free_idents: std::collections::HashSet<&str> = referenced.iter()
+        let free_idents: std::collections::HashSet<&str> = referenced
+            .iter()
             .filter(|name| !declared.contains(**name))
             .copied()
             .collect();
 
         // Lower the arrow function body
-        let func_val = self.lower_function_inner(Some(name), params, &arrow.body, None, is_expression_body, &free_idents.iter().map(|s| String::from(*s)).collect::<Vec<String>>());
+        let func_val = self.lower_function_inner(
+            Some(name),
+            params,
+            &arrow.body,
+            None,
+            is_expression_body,
+            &free_idents
+                .iter()
+                .map(|s| String::from(*s))
+                .collect::<Vec<String>>(),
+        );
 
         // At runtime, capture the current `this` value
         let captured_this = self.builder.load_this();
@@ -1007,7 +1035,11 @@ impl<'a> JSASTLower<'a> {
         // Capture each free variable that exists in the current symbol table
         for name in &free_idents {
             if let Some(var) = self.symbols.lookup(name) {
-                let name_const = self.builder.make_constant(crate::bytecode::Constant::String(std::sync::Arc::new(String::from(*name))));
+                let name_const = self
+                    .builder
+                    .make_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
+                        String::from(*name),
+                    )));
                 let value = var.0;
                 self.builder.closure_var(name_const, value);
             }
@@ -1091,7 +1123,8 @@ impl<'a> JSASTLower<'a> {
             .collect();
 
         if let Some(body) = &func.body {
-            let func_id_val = self.lower_function_inner(Some(name.clone()), params, body, None, false, &[]);
+            let func_id_val =
+                self.lower_function_inner(Some(name.clone()), params, body, None, false, &[]);
             Some((name, func_id_val))
         } else {
             None
@@ -1129,7 +1162,7 @@ impl<'a> JSASTLower<'a> {
 
         let mut func_builder = FunctionBuilder::new(self.builder.module_mut(), &mut func);
         let mut func_lower = JSASTLower::new(&mut func_builder, symbols);
-        
+
         // Set up arrow function this capture if provided
         func_lower.arrow_this_var = captured_this;
 
@@ -1340,6 +1373,24 @@ impl<'a> JSASTLower<'a> {
         }
     }
 
+    /// Like `lower_block_like` but returns the value of the last expression statement
+    /// in the (linear) sequence, used to propagate block results as expression values.
+    fn lower_block_like_with_result(&mut self, stmts: &[Statement<'_>]) -> Option<Value> {
+        let mut last_result: Option<Value> = None;
+        for stmt in stmts {
+            if let Statement::ExpressionStatement(expr_stmt) = stmt {
+                last_result = Some(self.lower_expression(&expr_stmt.expression));
+            } else {
+                self.lower_statement(stmt);
+                last_result = None;
+            }
+            if self.current_block_is_terminated() {
+                break;
+            }
+        }
+        last_result
+    }
+
     /// Recursively collect referenced and declared identifiers from a function body.
     /// `referenced` tracks names used in expressions; `declared` tracks names declared locally.
     fn collect_free_idents_from_body<'b>(
@@ -1361,7 +1412,11 @@ impl<'a> JSASTLower<'a> {
     ) {
         match stmt {
             Statement::ExpressionStatement(expr_stmt) => {
-                self.collect_free_idents_from_expression(&expr_stmt.expression, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &expr_stmt.expression,
+                    referenced,
+                    declared,
+                );
             }
             Statement::ReturnStatement(ret) => {
                 if let Some(arg) = &ret.argument {
@@ -1397,13 +1452,17 @@ impl<'a> JSASTLower<'a> {
                                 let name = self.binding_pattern_name(&d.id);
                                 declared.insert(name);
                                 if let Some(init) = &d.init {
-                                    self.collect_free_idents_from_expression(init, referenced, declared);
+                                    self.collect_free_idents_from_expression(
+                                        init, referenced, declared,
+                                    );
                                 }
                             }
                         }
                         _ => {
                             if let Some(expr) = init.as_expression() {
-                                self.collect_free_idents_from_expression(expr, referenced, declared);
+                                self.collect_free_idents_from_expression(
+                                    expr, referenced, declared,
+                                );
                             }
                         }
                     }
@@ -1439,7 +1498,11 @@ impl<'a> JSASTLower<'a> {
                 }
             }
             Statement::SwitchStatement(switch) => {
-                self.collect_free_idents_from_expression(&switch.discriminant, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &switch.discriminant,
+                    referenced,
+                    declared,
+                );
                 for case in &switch.cases {
                     if let Some(test) = &case.test {
                         self.collect_free_idents_from_expression(test, referenced, declared);
@@ -1465,14 +1528,12 @@ impl<'a> JSASTLower<'a> {
         declared: &mut std::collections::HashSet<String>,
     ) {
         match expr {
-            Expression::Identifier(ident) => {
-                match ident.name.as_str() {
-                    "undefined" | "NaN" | "Infinity" | "this" => {}
-                    _ => {
-                        referenced.insert(ident.name.as_str());
-                    }
+            Expression::Identifier(ident) => match ident.name.as_str() {
+                "undefined" | "NaN" | "Infinity" | "this" => {}
+                _ => {
+                    referenced.insert(ident.name.as_str());
                 }
-            }
+            },
             Expression::BinaryExpression(bin) => {
                 self.collect_free_idents_from_expression(&bin.left, referenced, declared);
                 self.collect_free_idents_from_expression(&bin.right, referenced, declared);
@@ -1529,14 +1590,12 @@ impl<'a> JSASTLower<'a> {
                     self.collect_free_idents_from_expression(exp, referenced, declared);
                 }
             }
-            Expression::UpdateExpression(update) => {
-                match &update.argument {
-                    SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                        referenced.insert(ident.name.as_str());
-                    }
-                    _ => {}
+            Expression::UpdateExpression(update) => match &update.argument {
+                SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                    referenced.insert(ident.name.as_str());
                 }
-            }
+                _ => {}
+            },
             Expression::ArrayExpression(arr) => {
                 for elem in &arr.elements {
                     if let Some(expr) = elem.as_expression() {

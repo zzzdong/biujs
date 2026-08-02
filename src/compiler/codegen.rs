@@ -240,18 +240,29 @@ impl Codegen {
                     Instruction::MakeFuncObj { dst, func_id } => {
                         let dst = self.gen_operand(dst);
                         let func_id = self.gen_operand(func_id);
-                        self.codes.push(Bytecode::double(Opcode::MakeFuncObj, dst, func_id));
+                        self.codes
+                            .push(Bytecode::double(Opcode::MakeFuncObj, dst, func_id));
                     }
-                    Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
+                    Instruction::MakeArrowFuncObj {
+                        dst,
+                        func_id,
+                        captured_this,
+                    } => {
                         let dst = self.gen_operand(dst);
                         let func_id = self.gen_operand(func_id);
                         let captured_this = self.gen_operand(captured_this);
-                        self.codes.push(Bytecode::triple(Opcode::MakeArrowFuncObj, dst, func_id, captured_this));
+                        self.codes.push(Bytecode::triple(
+                            Opcode::MakeArrowFuncObj,
+                            dst,
+                            func_id,
+                            captured_this,
+                        ));
                     }
                     Instruction::ClosureVar { name, value } => {
                         let name = name.to_operand();
                         let value = self.gen_operand(value);
-                        self.codes.push(Bytecode::double(Opcode::ClosureVar, name, value));
+                        self.codes
+                            .push(Bytecode::double(Opcode::ClosureVar, name, value));
                     }
 
                     // Control Flow Instructions
@@ -423,15 +434,13 @@ impl Codegen {
                         let pos = self.codes.len();
                         patchs.push(Box::new(move |this: &mut Self| {
                             // Patch catch handler offset
-                            this.codes[pos].operands[0] = Operand::new_immd(
-                                this.block_map[&handler_id] - pos as isize,
-                            );
+                            this.codes[pos].operands[0] =
+                                Operand::new_immd(this.block_map[&handler_id] - pos as isize);
                             // Patch finally handler offset if present
                             if let Some(finally_blk) = finally {
                                 let finally_id = finally_blk.as_usize() as isize;
-                                this.codes[pos].operands[1] = Operand::new_immd(
-                                    this.block_map[&finally_id] - pos as isize,
-                                );
+                                this.codes[pos].operands[1] =
+                                    Operand::new_immd(this.block_map[&finally_id] - pos as isize);
                             }
                         }));
                         // Use triple to hold both catch and finally offsets
@@ -493,8 +502,7 @@ impl Codegen {
                             }
                         }
                         let val = self.gen_operand(value);
-                        self.codes
-                            .push(Bytecode::single(Opcode::ThrowExc, val));
+                        self.codes.push(Bytecode::single(Opcode::ThrowExc, val));
                     }
                     Instruction::LoadException { dst } => {
                         let reg = self.gen_operand(dst);
@@ -840,14 +848,6 @@ impl Codegen {
             Operand::new_immd(args.len() as isize),
         ));
 
-        // 4.5. Load this (the newly created object) into Rv
-        // This ensures that new Foo() returns the new object even if
-        // the constructor body has no explicit return
-        self.codes.push(Bytecode::single(
-            Opcode::LoadThis,
-            Operand::new_register(Register::Rv),
-        ));
-
         // 5. Restore stack pointer to current base pointer
         self.codes.push(Bytecode::double(
             Opcode::MovC,
@@ -910,16 +910,30 @@ impl Codegen {
             Value::Function(id) => Operand::new_symbol(id.as_usize() as u32),
             Value::Block(id) => Operand::new_immd(id.as_usize() as isize),
             Value::Variable(var) => {
-                let (register, unspill) = self.reg_alloc.alloc(var, self.inst_index);
-                trace!("allocating {value} -> {register}, unspill = {unspill:?}");
+                let (register, action) = self.reg_alloc.alloc(var, self.inst_index);
+                trace!("allocating {value} -> {register}, action = {action:?}");
 
-                if let Some(Action::Restore { stack, register }) = unspill {
-                    trace!("unspilling({value}) [rbp+{stack}] -> {register}");
-                    self.codes.push(Bytecode::double(
-                        Opcode::Mov,
-                        register.into(),
-                        Operand::Stack(stack as isize),
-                    ));
+                if let Some(action) = action {
+                    match action {
+                        Action::Restore { stack, register } => {
+                            trace!("unspilling({value}) [rbp+{stack}] -> {register}");
+                            self.codes.push(Bytecode::double(
+                                Opcode::Mov,
+                                register.into(),
+                                Operand::Stack(stack as isize),
+                            ));
+                        }
+                        Action::Spill { register, stack } => {
+                            // A victim variable was evicted from `register`; preserve
+                            // its value on the stack before the register is reused.
+                            trace!("spilling [rbp+{stack}] <- {register}");
+                            self.codes.push(Bytecode::double(
+                                Opcode::Mov,
+                                Operand::Stack(stack as isize),
+                                register.into(),
+                            ));
+                        }
+                    }
                 }
 
                 Operand::new_register(register)

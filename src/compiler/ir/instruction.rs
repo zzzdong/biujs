@@ -502,12 +502,12 @@ impl Instruction {
             }
             Instruction::LoadThis { dst } => (vec![*dst], vec![]),
             Instruction::MakeFuncObj { dst, func_id } => (vec![*dst], vec![*func_id]),
-            Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
-                (vec![*dst], vec![*func_id, *captured_this])
-            }
-            Instruction::ClosureVar { name, value } => {
-                (vec![], vec![*name, *value])
-            }
+            Instruction::MakeArrowFuncObj {
+                dst,
+                func_id,
+                captured_this,
+            } => (vec![*dst], vec![*func_id, *captured_this]),
+            Instruction::ClosureVar { name, value } => (vec![], vec![*name, *value]),
         }
     }
 }
@@ -737,7 +737,11 @@ impl std::fmt::Display for Instruction {
             Instruction::MakeFuncObj { dst, func_id } => {
                 write!(f, "{dst} = make_func_obj {func_id}")
             }
-            Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
+            Instruction::MakeArrowFuncObj {
+                dst,
+                func_id,
+                captured_this,
+            } => {
                 write!(f, "{dst} = make_arrow_func_obj {func_id} {captured_this}")
             }
             Instruction::ClosureVar { name, value } => {

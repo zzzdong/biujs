@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fmt,
-};
+use std::{collections::BTreeMap, fmt};
 
 use petgraph::{
     algo::dominators::Dominators,

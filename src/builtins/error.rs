@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::RuntimeError;
 use crate::vm::object::{JSObject, OrdinaryObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
-use crate::RuntimeError;
 
 // ─────────────────────────────────────────────────────────
 // Error types
@@ -50,16 +50,12 @@ pub fn create_error_object(
 
     // Set message property
     let msg = message.unwrap_or_default();
-    obj.property_set(
-        PropertyKey::from_str("message"),
-        Value::string(&msg),
-    ).ok();
+    obj.property_set(PropertyKey::from_str("message"), Value::string(&msg))
+        .ok();
 
     // Set name property
-    obj.property_set(
-        PropertyKey::from_str("name"),
-        Value::string(name),
-    ).ok();
+    obj.property_set(PropertyKey::from_str("name"), Value::string(name))
+        .ok();
 
     Value::Object(Rc::new(RefCell::new(obj)))
 }
@@ -77,16 +73,15 @@ pub fn error_constructor(error_type: ErrorType, args: &[Value]) -> Result<Value,
 
     // Set message property
     let msg = message.unwrap_or_default();
-    obj.property_set(
-        PropertyKey::from_str("message"),
-        Value::string(&msg),
-    ).ok();
+    obj.property_set(PropertyKey::from_str("message"), Value::string(&msg))
+        .ok();
 
     // Set name property
     obj.property_set(
         PropertyKey::from_str("name"),
         Value::string(error_type.name()),
-    ).ok();
+    )
+    .ok();
 
     Ok(Value::Object(Rc::new(RefCell::new(obj))))
 }
@@ -101,41 +96,31 @@ pub fn runtime_error_to_js_error(
     builtins: &crate::builtins::Builtins,
 ) -> Value {
     match err {
-        RuntimeError::TypeError(msg) => {
-            create_error_object(
-                Some(msg.clone()),
-                Rc::clone(&builtins.type_error_prototype),
-                "TypeError",
-            )
-        }
-        RuntimeError::ReferenceError(msg) => {
-            create_error_object(
-                Some(msg.clone()),
-                Rc::clone(&builtins.reference_error_prototype),
-                "ReferenceError",
-            )
-        }
-        RuntimeError::RangeError(msg) => {
-            create_error_object(
-                Some(msg.clone()),
-                Rc::clone(&builtins.range_error_prototype),
-                "RangeError",
-            )
-        }
-        RuntimeError::InternalError(msg) => {
-            create_error_object(
-                Some(msg.clone()),
-                Rc::clone(&builtins.error_prototype),
-                "Error",
-            )
-        }
-        RuntimeError::NotImplemented(msg) => {
-            create_error_object(
-                Some(format!("Not implemented: {}", msg)),
-                Rc::clone(&builtins.error_prototype),
-                "Error",
-            )
-        }
+        RuntimeError::TypeError(msg) => create_error_object(
+            Some(msg.clone()),
+            Rc::clone(&builtins.type_error_prototype),
+            "TypeError",
+        ),
+        RuntimeError::ReferenceError(msg) => create_error_object(
+            Some(msg.clone()),
+            Rc::clone(&builtins.reference_error_prototype),
+            "ReferenceError",
+        ),
+        RuntimeError::RangeError(msg) => create_error_object(
+            Some(msg.clone()),
+            Rc::clone(&builtins.range_error_prototype),
+            "RangeError",
+        ),
+        RuntimeError::InternalError(msg) => create_error_object(
+            Some(msg.clone()),
+            Rc::clone(&builtins.error_prototype),
+            "Error",
+        ),
+        RuntimeError::NotImplemented(msg) => create_error_object(
+            Some(format!("Not implemented: {}", msg)),
+            Rc::clone(&builtins.error_prototype),
+            "Error",
+        ),
         RuntimeError::Thrown(val) => val.clone(),
     }
 }
@@ -151,12 +136,14 @@ pub fn error_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> {
             let borrowed = obj_ref.borrow();
 
             // Get name property, default to "Error"
-            let name = borrowed.property_get(&PropertyKey::from_str("name"))
+            let name = borrowed
+                .property_get(&PropertyKey::from_str("name"))
                 .map(|d| d.value.to_js_string())
                 .unwrap_or_else(|| "Error".to_string());
 
             // Get message property, default to empty string
-            let message = borrowed.property_get(&PropertyKey::from_str("message"))
+            let message = borrowed
+                .property_get(&PropertyKey::from_str("message"))
                 .map(|d| d.value.to_js_string())
                 .unwrap_or_default();
 

@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::vm::object::{NativeFunctionObject, JSObject};
+use crate::RuntimeError;
+use crate::vm::object::{JSObject, NativeFunctionObject};
 use crate::vm::property::PropertyKey;
 use crate::vm::value::Value;
-use crate::RuntimeError;
 
 /// Function constructor
 /// In ES6 without eval, calling `new Function(str)` throws a SyntaxError
@@ -52,11 +52,16 @@ pub fn function_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> 
                 "anonymous".to_string()
             }
         }
-        _ => return Err(RuntimeError::TypeError(
-            "Function.prototype.toString called on non-function".to_string(),
-        )),
+        _ => {
+            return Err(RuntimeError::TypeError(
+                "Function.prototype.toString called on non-function".to_string(),
+            ));
+        }
     };
-    Ok(Value::string(&format!("function {}() {{ [native code] }}", name)))
+    Ok(Value::string(&format!(
+        "function {}() {{ [native code] }}",
+        name
+    )))
 }
 
 /// Register static methods on the Function constructor
@@ -70,7 +75,8 @@ pub fn register_function_statics(
         obj.property_set(
             PropertyKey::from_str("prototype"),
             Value::Object(Rc::clone(function_prototype)),
-        ).ok();
+        )
+        .ok();
     }
 }
 
@@ -81,29 +87,25 @@ pub fn setup_function_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     // These are placeholder prototypes — actual implementation requires this-aware calling
     p.property_set(
         PropertyKey::from_str("call"),
-        Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::new("call"),
-        ))),
-    ).ok();
+        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("call")))),
+    )
+    .ok();
 
     p.property_set(
         PropertyKey::from_str("apply"),
-        Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::new("apply"),
-        ))),
-    ).ok();
+        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("apply")))),
+    )
+    .ok();
 
     p.property_set(
         PropertyKey::from_str("bind"),
-        Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::new("bind"),
-        ))),
-    ).ok();
+        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("bind")))),
+    )
+    .ok();
 
     p.property_set(
         PropertyKey::from_str("toString"),
-        Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::new("toString"),
-        ))),
-    ).ok();
+        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("toString")))),
+    )
+    .ok();
 }

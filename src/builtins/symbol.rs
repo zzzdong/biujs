@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::RuntimeError;
 use crate::vm::object::{JSObject, NativeFunctionObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::{SymbolData, Value};
-use crate::RuntimeError;
 
 // Global counter for unique Symbol IDs
 static SYMBOL_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -39,9 +39,11 @@ pub fn symbol_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
             Value::Bool(b) => Some(b.to_string()),
             Value::Number(n) => Some(format_number(*n)),
             Value::String(s) => Some(s.to_string()),
-            Value::Symbol(_) => return Err(RuntimeError::TypeError(
-                "Cannot convert a Symbol value to a string".to_string()
-            )),
+            Value::Symbol(_) => {
+                return Err(RuntimeError::TypeError(
+                    "Cannot convert a Symbol value to a string".to_string(),
+                ));
+            }
             _ => Some("[object Object]".to_string()),
         }
     };
@@ -58,7 +60,7 @@ pub fn symbol_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 pub fn symbol_for(args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
-            "Symbol.for requires a key argument".to_string()
+            "Symbol.for requires a key argument".to_string(),
         ));
     }
 
@@ -69,9 +71,11 @@ pub fn symbol_for(args: &[Value]) -> Result<Value, RuntimeError> {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => format_number(*n),
-        Value::Symbol(_) => return Err(RuntimeError::TypeError(
-            "Cannot use Symbol as key for Symbol.for".to_string()
-        )),
+        Value::Symbol(_) => {
+            return Err(RuntimeError::TypeError(
+                "Cannot use Symbol as key for Symbol.for".to_string(),
+            ));
+        }
         _ => args[0].to_string(),
     };
 
@@ -83,14 +87,14 @@ pub fn symbol_for(args: &[Value]) -> Result<Value, RuntimeError> {
                 return Ok(existing.clone());
             }
         } // Release borrow
-        
+
         // Create new symbol and register it
         let id = SYMBOL_COUNTER.fetch_add(1, Ordering::SeqCst);
         let symbol_data = SymbolData::new(Some(key.clone()), id);
         let symbol = Value::Symbol(Rc::new(symbol_data));
-        
+
         registry.borrow_mut().insert(key, symbol.clone());
-        
+
         Ok(symbol)
     })
 }
@@ -99,7 +103,7 @@ pub fn symbol_for(args: &[Value]) -> Result<Value, RuntimeError> {
 pub fn symbol_key_for(args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
-            "Symbol.keyFor requires a symbol argument".to_string()
+            "Symbol.keyFor requires a symbol argument".to_string(),
         ));
     }
 
@@ -107,7 +111,7 @@ pub fn symbol_key_for(args: &[Value]) -> Result<Value, RuntimeError> {
         Value::Symbol(sym) => {
             with_registry(|registry| {
                 let borrowed = registry.borrow();
-                
+
                 // Find the key for this symbol
                 for (key, value) in borrowed.iter() {
                     if let Value::Symbol(existing_sym) = value {
@@ -116,13 +120,13 @@ pub fn symbol_key_for(args: &[Value]) -> Result<Value, RuntimeError> {
                         }
                     }
                 }
-                
+
                 // Symbol not found in registry (not created by Symbol.for)
                 Ok(Value::Undefined)
             })
         }
         _ => Err(RuntimeError::TypeError(
-            "Symbol.keyFor requires a symbol argument".to_string()
+            "Symbol.keyFor requires a symbol argument".to_string(),
         )),
     }
 }
@@ -176,22 +180,18 @@ pub fn register_symbol_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
 pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Rc<RefCell<dyn JSObject>>) {
     if let Value::Object(obj) = symbol_fn {
         // Symbol.for
-        let for_fn = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::new("Symbol.for")
-        )));
-        obj.borrow_mut().property_set(
-            PropertyKey::from_str("for"),
-            for_fn,
-        );
+        let for_fn = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+            "Symbol.for",
+        ))));
+        obj.borrow_mut()
+            .property_set(PropertyKey::from_str("for"), for_fn);
 
         // Symbol.keyFor
-        let key_for_fn = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::new("Symbol.keyFor")
-        )));
-        obj.borrow_mut().property_set(
-            PropertyKey::from_str("keyFor"),
-            key_for_fn,
-        );
+        let key_for_fn = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+            "Symbol.keyFor",
+        ))));
+        obj.borrow_mut()
+            .property_set(PropertyKey::from_str("keyFor"), key_for_fn);
 
         // Set Symbol.prototype
         obj.borrow_mut().property_set(
@@ -230,7 +230,7 @@ pub fn symbol_to_string(obj: &Value) -> Result<Value, RuntimeError> {
             Ok(Value::string(&desc))
         }
         _ => Err(RuntimeError::TypeError(
-            "Symbol.prototype.toString requires a Symbol".to_string()
+            "Symbol.prototype.toString requires a Symbol".to_string(),
         )),
     }
 }
@@ -240,7 +240,7 @@ pub fn symbol_value_of(obj: &Value) -> Result<Value, RuntimeError> {
     match obj {
         Value::Symbol(_) => Ok(obj.clone()),
         _ => Err(RuntimeError::TypeError(
-            "Symbol.prototype.valueOf requires a Symbol".to_string()
+            "Symbol.prototype.valueOf requires a Symbol".to_string(),
         )),
     }
 }
@@ -248,14 +248,12 @@ pub fn symbol_value_of(obj: &Value) -> Result<Value, RuntimeError> {
 /// Symbol.prototype.description getter
 pub fn symbol_description(obj: &Value) -> Result<Value, RuntimeError> {
     match obj {
-        Value::Symbol(sym) => {
-            match &sym.description {
-                Some(desc) => Ok(Value::String(Rc::new(desc.clone()))),
-                None => Ok(Value::Undefined),
-            }
-        }
+        Value::Symbol(sym) => match &sym.description {
+            Some(desc) => Ok(Value::String(Rc::new(desc.clone()))),
+            None => Ok(Value::Undefined),
+        },
         _ => Err(RuntimeError::TypeError(
-            "Symbol.prototype.description requires a Symbol".to_string()
+            "Symbol.prototype.description requires a Symbol".to_string(),
         )),
     }
 }

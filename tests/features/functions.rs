@@ -1,4 +1,4 @@
-use crate::helpers::{eval_number, eval_js, eval_string};
+use crate::helpers::{eval_js, eval_number, eval_string};
 use biujs::Value;
 
 // ============================================================

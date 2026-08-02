@@ -16,7 +16,7 @@ fn test_nested_function_catch_scope() {
         }
         f({})
     "#;
-    
+
     let result = eval_js(js);
     println!("Result: {:?}", result);
     assert!(result.is_ok(), "Test failed: {:?}", result);
@@ -38,7 +38,7 @@ fn test_nested_function_catch_property() {
         }
         f({x: 42})
     "#;
-    
+
     let result = eval_js(js);
     println!("Result: {:?}", result);
     assert!(result.is_ok(), "Test failed: {:?}", result);
@@ -61,7 +61,7 @@ fn test_with_assert_samevalue() {
         }
         f({})
     "#;
-    
+
     let result = eval_js(js);
     println!("Result: {:?}", result);
     assert!(result.is_ok(), "Test failed: {:?}", result);
@@ -77,7 +77,7 @@ fn test_instanceof_basic() {
         var err = new Test262Error("test");
         err.message
     "#;
-    
+
     let result = eval_js(js);
     println!("instanceof test Result (no instanceof): {:?}", result);
     assert!(result.is_ok(), "Test failed: {:?}", result);
@@ -93,7 +93,7 @@ fn test_instanceof_check() {
         var err = new Test262Error("test");
         err instanceof Test262Error
     "#;
-    
+
     let result = eval_js(js);
     println!("instanceof check Result: {:?}", result);
     assert!(result.is_ok(), "Test failed: {:?}", result);

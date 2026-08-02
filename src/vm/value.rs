@@ -113,6 +113,40 @@ impl Value {
         matches!(self, Value::Object(_))
     }
 
+    /// Whether this value is a primitive (not an object/function).
+    pub fn is_primitive(&self) -> bool {
+        !self.is_object()
+    }
+
+    /// Whether this value is a string primitive.
+    pub fn is_string(&self) -> bool {
+        matches!(self, Value::String(_))
+    }
+
+    /// Whether this value is callable (a user function id or a function object).
+    pub fn is_callable(&self) -> bool {
+        match self {
+            Value::Function(_) => true,
+            Value::Object(obj) => obj.borrow().kind() == crate::vm::property::ObjectKind::Function,
+            _ => false,
+        }
+    }
+
+    /// Whether this value is a *user-defined* (bytecode) callable, as opposed to a
+    /// native builtin. Used to decide whether coercion can re-entrantly call it.
+    pub fn is_user_function(&self) -> bool {
+        match self {
+            // User-defined bytecode functions.
+            Value::Function(_) => true,
+            Value::Object(obj) => {
+                // Native functions live under `ObjectKind::NativeFunction`; user
+                // functions are `ObjectKind::Function`.
+                obj.borrow().kind() == crate::vm::property::ObjectKind::Function
+            }
+            _ => false,
+        }
+    }
+
     /// Unwrap the object reference, panicking if not an Object variant
     pub fn as_object(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
         match self {
@@ -168,7 +202,11 @@ impl Value {
             Value::Undefined => f64::NAN,
             Value::Null => 0.0,
             Value::Bool(b) => {
-                if *b { 1.0 } else { 0.0 }
+                if *b {
+                    1.0
+                } else {
+                    0.0
+                }
             }
             Value::Number(n) => *n,
             Value::String(s) => {
@@ -193,16 +231,18 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Number(n) => format_number(*n),
             Value::String(s) => s.to_string(),
-            Value::Symbol(sym) => {
-                match &sym.description {
-                    Some(desc) => format!("Symbol({desc})"),
-                    None => "Symbol()".to_string(),
-                }
-            }
+            Value::Symbol(sym) => match &sym.description {
+                Some(desc) => format!("Symbol({desc})"),
+                None => "Symbol()".to_string(),
+            },
             Value::Object(obj) => {
                 let kind = obj.borrow().kind();
                 if kind == crate::vm::property::ObjectKind::Array {
-                    if let Some(arr) = obj.borrow().as_any().downcast_ref::<crate::vm::object::ArrayObject>() {
+                    if let Some(arr) = obj
+                        .borrow()
+                        .as_any()
+                        .downcast_ref::<crate::vm::object::ArrayObject>()
+                    {
                         arr.join_elements()
                     } else {
                         "[object Array]".to_string()
@@ -454,7 +494,10 @@ mod tests {
     #[test]
     fn test_typeof_string() {
         assert_eq!(Value::String(Rc::new("".to_string())).type_of(), "string");
-        assert_eq!(Value::String(Rc::new("hello".to_string())).type_of(), "string");
+        assert_eq!(
+            Value::String(Rc::new("hello".to_string())).type_of(),
+            "string"
+        );
     }
 
     #[test]
@@ -522,24 +565,22 @@ mod tests {
 
     #[test]
     fn test_to_number_string() {
-        assert_eq!(
-            Value::String(Rc::new("42".to_string())).to_number(),
-            42.0
+        assert_eq!(Value::String(Rc::new("42".to_string())).to_number(), 42.0);
+        assert_eq!(Value::String(Rc::new("3.14".to_string())).to_number(), 3.14);
+        assert!(
+            Value::String(Rc::new("hello".to_string()))
+                .to_number()
+                .is_nan()
         );
-        assert_eq!(
-            Value::String(Rc::new("3.14".to_string())).to_number(),
-            3.14
-        );
-        assert!(Value::String(Rc::new("hello".to_string()))
-            .to_number()
-            .is_nan());
     }
 
     #[test]
     fn test_to_number_symbol() {
-        assert!(Value::Symbol(Rc::new(SymbolData::new(None, 1)))
-            .to_number()
-            .is_nan());
+        assert!(
+            Value::Symbol(Rc::new(SymbolData::new(None, 1)))
+                .to_number()
+                .is_nan()
+        );
     }
 
     #[test]
@@ -554,11 +595,23 @@ mod tests {
     #[test]
     fn test_to_primitive_non_object() {
         // Non-object values return themselves
-        assert!(matches!(Value::Undefined.to_primitive("default"), Value::Undefined));
+        assert!(matches!(
+            Value::Undefined.to_primitive("default"),
+            Value::Undefined
+        ));
         assert!(matches!(Value::Null.to_primitive("default"), Value::Null));
-        assert!(matches!(Value::Bool(true).to_primitive("default"), Value::Bool(true)));
-        assert!(matches!(Value::Number(42.0).to_primitive("default"), Value::Number(42.0)));
-        assert!(matches!(Value::string("hello").to_primitive("default"), Value::String(_)));
+        assert!(matches!(
+            Value::Bool(true).to_primitive("default"),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            Value::Number(42.0).to_primitive("default"),
+            Value::Number(42.0)
+        ));
+        assert!(matches!(
+            Value::string("hello").to_primitive("default"),
+            Value::String(_)
+        ));
     }
 
     #[test]
@@ -604,10 +657,7 @@ mod tests {
         assert!(arr.abstract_eq(&Value::Number(1.0)));
 
         // [1,2] == 1 → ToPrimitive("1,2") → Number("1,2") = NaN → false
-        let arr2 = new_array_object_from_vec(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-        ]);
+        let arr2 = new_array_object_from_vec(vec![Value::Number(1.0), Value::Number(2.0)]);
         assert!(!arr2.abstract_eq(&Value::Number(1.0)));
     }
 
@@ -679,10 +729,14 @@ mod tests {
 
     #[test]
     fn test_strict_eq_string() {
-        assert!(Value::String(Rc::new("hello".to_string()))
-            .strict_eq(&Value::String(Rc::new("hello".to_string()))));
-        assert!(!Value::String(Rc::new("hello".to_string()))
-            .strict_eq(&Value::String(Rc::new("world".to_string()))));
+        assert!(
+            Value::String(Rc::new("hello".to_string()))
+                .strict_eq(&Value::String(Rc::new("hello".to_string())))
+        );
+        assert!(
+            !Value::String(Rc::new("hello".to_string()))
+                .strict_eq(&Value::String(Rc::new("world".to_string())))
+        );
     }
 
     #[test]
@@ -781,8 +835,14 @@ mod tests {
         assert_eq!(cloned, v);
         // They share the same Rc
         assert!(Rc::ptr_eq(
-            match &v { Value::String(s) => s, _ => unreachable!() },
-            match &cloned { Value::String(s) => s, _ => unreachable!() },
+            match &v {
+                Value::String(s) => s,
+                _ => unreachable!(),
+            },
+            match &cloned {
+                Value::String(s) => s,
+                _ => unreachable!(),
+            },
         ));
     }
 }

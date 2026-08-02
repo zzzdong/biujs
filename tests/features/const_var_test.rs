@@ -143,5 +143,8 @@ fn test_const_in_function_no_reassignment() {
         test()
     "#;
     let result = eval_js(js);
-    assert!(result.is_err(), "const reassignment in function should fail");
+    assert!(
+        result.is_err(),
+        "const reassignment in function should fail"
+    );
 }

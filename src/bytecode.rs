@@ -623,7 +623,10 @@ mod tests {
     fn test_operand_display() {
         assert_eq!(format!("{}", Operand::new_immd(42)), "42");
         assert_eq!(format!("{}", Operand::new_register(Register::R0)), "r0");
-        assert_eq!(format!("{}", Operand::new_primitive(Primitive::Null)), "null");
+        assert_eq!(
+            format!("{}", Operand::new_primitive(Primitive::Null)),
+            "null"
+        );
         assert_eq!(format!("{}", Operand::new_stack(-8)), "[rbp-8]");
         assert_eq!(format!("{}", Operand::new_symbol(5)), "sym_5");
     }
@@ -805,12 +808,7 @@ mod tests {
 
     #[test]
     fn test_module_new() {
-        let module = Module::new(
-            Some("test".to_string()),
-            vec![],
-            HashMap::new(),
-            vec![],
-        );
+        let module = Module::new(Some("test".to_string()), vec![], HashMap::new(), vec![]);
         assert_eq!(module.name, Some("test".to_string()));
         assert!(module.constants.is_empty());
         assert!(module.symtab.is_empty());

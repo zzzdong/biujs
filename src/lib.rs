@@ -1,15 +1,15 @@
+pub mod builtins;
 pub mod bytecode;
 pub mod compiler;
-pub mod vm;
-pub mod builtins;
 pub mod host;
 pub mod module;
+pub mod vm;
 
 pub use compiler::Compiler;
 pub use compiler::error::CompileError;
+pub use vm::RuntimeError;
 pub use vm::VM;
 pub use vm::Value;
-pub use vm::RuntimeError;
 
 #[cfg(test)]
 mod tests {
@@ -190,7 +190,8 @@ mod tests {
     #[test]
     fn test_class_debug() {
         // Test class with this
-        let result = eval(r#"
+        let result = eval(
+            r#"
             class Foo {
                 constructor(x) {
                     this.x = x;
@@ -201,14 +202,16 @@ mod tests {
             }
             let f = new Foo(42);
             f.getX()
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::Number(42.0));
     }
 
     #[test]
     fn test_class_debug2() {
         // Test a.getValue() only
-        let result = eval(r#"
+        let result = eval(
+            r#"
             class Box {
                 constructor(v) {
                     this.value = v;
@@ -220,14 +223,16 @@ mod tests {
             let a = new Box(1);
             let b = new Box(2);
             a.getValue()
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::Number(1.0));
     }
 
     #[test]
     fn test_class_debug3() {
         // Test b.getValue() only
-        let result = eval(r#"
+        let result = eval(
+            r#"
             class Box {
                 constructor(v) {
                     this.value = v;
@@ -239,14 +244,16 @@ mod tests {
             let a = new Box(1);
             let b = new Box(2);
             b.getValue()
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::Number(2.0));
     }
 
     #[test]
     fn test_class_debug4() {
         // Test two calls separately
-        let result = eval(r#"
+        let result = eval(
+            r#"
             class Box {
                 constructor(v) {
                     this.value = v;
@@ -258,14 +265,16 @@ mod tests {
             let a = new Box(1);
             let b = new Box(2);
             a.getValue() + 0
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::Number(1.0));
     }
 
     #[test]
     fn test_class_debug5() {
         // Test what new returns
-        let result = eval(r#"
+        let result = eval(
+            r#"
             class Box {
                 constructor(v) {
                     this.value = v;
@@ -274,14 +283,16 @@ mod tests {
             let a = new Box(1);
             let b = new Box(2);
             a.value
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::Number(1.0));
     }
 
     #[test]
     fn test_class_debug6() {
         // Exact same as failing feature test 'class_method'
-        let result = eval(r#"
+        let result = eval(
+            r#"
             class Counter {
                 constructor(init) {
                     this.count = init;
@@ -296,14 +307,16 @@ mod tests {
             let c = new Counter(10);
             c.increment();
             c.getCount()
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::Number(999.0));
     }
 
     #[test]
     fn test_class_debug6a() {
         // Without increment, just direct this.count read
-        let result = eval(r#"
+        let result = eval(
+            r#"
             class Counter {
                 constructor(init) {
                     this.count = init;
@@ -314,14 +327,16 @@ mod tests {
             }
             let c = new Counter(10);
             c.getCount()
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::Number(10.0));
     }
 
     #[test]
     fn test_class_debug7() {
         // Exact same as failing feature test 'class_multiple_instances'
-        let result = eval(r#"
+        let result = eval(
+            r#"
             class Box {
                 constructor(v) {
                     this.value = v;
@@ -333,7 +348,8 @@ mod tests {
             let a = new Box(1);
             let b = new Box(2);
             a.getValue() + b.getValue()
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::Number(3.0));
     }
 
@@ -392,10 +408,12 @@ mod tests {
     #[test]
     fn test_error_catch_received_error_object() {
         // Test: create error object and access message directly
-        let result = eval(r#"
+        let result = eval(
+            r#"
             let err = new Error("test msg");
             err.message
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::string("test msg"));
 
         // Test: throw an Error object and access its message
@@ -403,51 +421,53 @@ mod tests {
         // property access on catch block variables. The Error object
         // is correctly created and thrown, but e.message returns the
         // object itself instead of the message property.
-        // TODO: Fix property access in catch blocks
-        /*
-        let result2 = eval(r#"
+        let result2 = eval(
+            r#"
             try {
                 throw new Error("caught error");
             } catch (e) {
                 e.message
             }
-        "#);
+        "#,
+        );
         assert_eq!(result2, Value::string("caught error"));
-        */
     }
 
     #[test]
     fn test_catch_simple_string() {
         // Test: throw a string and catch it
-        let result = eval(r#"
+        let result = eval(
+            r#"
             try {
                 throw "simple string";
             } catch (e) {
                 e
             }
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::string("simple string"));
     }
 
     #[test]
     fn test_error_catch_error_name() {
         // Test: create TypeError and access name directly
-        let result = eval(r#"
+        let result = eval(
+            r#"
             let err = new TypeError("type issue");
             err.name
-        "#);
+        "#,
+        );
         assert_eq!(result, Value::string("TypeError"));
 
-        // TODO: Fix property access in catch blocks
-        /*
-        let result2 = eval(r#"
+        let result2 = eval(
+            r#"
             try {
                 throw new TypeError("type issue");
             } catch (e) {
                 e.name
             }
-        "#);
+        "#,
+        );
         assert_eq!(result2, Value::string("TypeError"));
-        */
     }
 }

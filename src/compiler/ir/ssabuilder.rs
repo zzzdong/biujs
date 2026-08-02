@@ -80,7 +80,8 @@ impl<'a> SSABuilder<'a> {
         // Track the outer SEH scope for each finally block (the scope BEFORE its PushSeh)
         // This is used for ResumeException: when finally propagates an exception,
         // it goes to these outer handlers
-        let mut finally_outer_scope: HashMap<BlockId, Vec<(BlockId, Option<BlockId>)>> = HashMap::new();
+        let mut finally_outer_scope: HashMap<BlockId, Vec<(BlockId, Option<BlockId>)>> =
+            HashMap::new();
 
         for block in self.cfg.blocks() {
             for inst in block.instructions() {
@@ -687,7 +688,11 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_definition(dst, new_versions);
                 SSABuilder::rename_use(func_id, stacks);
             }
-            Instruction::MakeArrowFuncObj { dst, func_id, captured_this } => {
+            Instruction::MakeArrowFuncObj {
+                dst,
+                func_id,
+                captured_this,
+            } => {
                 SSABuilder::rename_definition(dst, new_versions);
                 SSABuilder::rename_use(func_id, stacks);
                 SSABuilder::rename_use(captured_this, stacks);

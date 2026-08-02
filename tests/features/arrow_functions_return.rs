@@ -129,7 +129,10 @@ fn arrow_function_this_capture_in_returned_factory() {
         getter();
     "#;
     let result = eval_js(code);
-    println!("arrow_function_this_capture_in_returned_factory result: {:?}", result);
+    println!(
+        "arrow_function_this_capture_in_returned_factory result: {:?}",
+        result
+    );
     // Should return 42, but may return Undefined if 'this' is not captured correctly
     assert!(result.is_ok());
 }
