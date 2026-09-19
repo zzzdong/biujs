@@ -244,7 +244,18 @@ impl<'a> JSASTLower<'a> {
         let mut static_infos: Vec<(String, &Function)> = Vec::new();
         let mut accessor_infos: Vec<(String, bool, &Function)> = Vec::new();
 
+        let mut instance_fields: Vec<&PropertyDefinition<'_>> = Vec::new();
+        let mut static_fields: Vec<&PropertyDefinition<'_>> = Vec::new();
+
         for element in &class.body.body {
+            if let oxc_ast::ast::ClassElement::PropertyDefinition(property_def) = element {
+                if property_def.r#static {
+                    static_fields.push(property_def);
+                } else {
+                    instance_fields.push(property_def);
+                }
+                continue;
+            }
             if let oxc_ast::ast::ClassElement::MethodDefinition(method_def) = element {
                 let is_get = method_def.kind == oxc_ast::ast::MethodDefinitionKind::Get;
                 let is_set = method_def.kind == oxc_ast::ast::MethodDefinitionKind::Set;
@@ -299,6 +310,11 @@ impl<'a> JSASTLower<'a> {
                 false,
                 &[],
                 false,
+                if is_constructor {
+                    &instance_fields
+                } else {
+                    &[]
+                },
             );
 
             if is_constructor {
@@ -348,6 +364,16 @@ impl<'a> JSASTLower<'a> {
                 .call_property(object_fn, "setPrototypeOf", vec![func_obj, parent]);
         }
 
+        // 6c. Static fields (`static x = 1`) are evaluated once, here.
+        for field in static_fields {
+            let value = match &field.value {
+                Some(init) => self.lower_expression(init),
+                None => Value::Primitive(Primitive::Undefined),
+            };
+            let name = self.property_key_to_string(&field.key);
+            self.builder.set_property(func_obj, name.as_str(), value);
+        }
+
         // 7. Static methods live directly on the constructor.
         for (method_name, method_func) in static_infos.iter() {
             let func_val = self.lower_function_inner(
@@ -358,6 +384,7 @@ impl<'a> JSASTLower<'a> {
                 false,
                 &[],
                 false,
+                &[],
             );
             self.builder.set_property(func_obj, method_name, func_val);
         }
@@ -380,6 +407,7 @@ impl<'a> JSASTLower<'a> {
                 false,
                 &[],
                 false,
+                &[],
             );
             if let Some(entry) = accessors.iter_mut().find(|(n, _, _)| n == name) {
                 if *is_get {
@@ -1771,6 +1799,7 @@ impl<'a> JSASTLower<'a> {
                 .map(|s| String::from(*s))
                 .collect::<Vec<String>>(),
             true,
+            &[],
         );
 
         // At runtime, capture the current `this` value
@@ -1801,7 +1830,7 @@ impl<'a> JSASTLower<'a> {
             .unwrap_or_else(|| "<anonymous>".to_string());
 
         if let Some(body) = &func.body {
-            self.lower_function_inner(Some(name), &func.params.items, body, None, false, &[], false)
+            self.lower_function_inner(Some(name), &func.params.items, body, None, false, &[], false, &[])
         } else {
             Value::Primitive(Primitive::Null)
         }
@@ -1864,6 +1893,7 @@ impl<'a> JSASTLower<'a> {
                 false,
                 &[],
                 false,
+                &[],
             );
             Some((name, func_id_val))
         } else {
@@ -1886,6 +1916,7 @@ impl<'a> JSASTLower<'a> {
         auto_return: bool,
         captured_names: &[String],
         is_arrow: bool,
+        instance_fields: &[&PropertyDefinition<'_>],
     ) -> Value {
         // During hoisting, there may be no current block yet
         let curr = self.builder.try_current_block();
@@ -2000,6 +2031,37 @@ impl<'a> JSASTLower<'a> {
             func_lower
                 .symbols
                 .insert(func_name.clone(), Variable::new(dst));
+        }
+
+        // Instance fields (`x = 1` in a class body) are initialized at the start
+        // of the constructor. For a derived class the spec places them right
+        // after `super()`; emitting them first is close enough for the common
+        // case and keeps the lowering local.
+        for field in instance_fields {
+            let this = func_lower.builder.load_this();
+            let value = match &field.value {
+                Some(init) => func_lower.lower_expression(init),
+                None => Value::Primitive(Primitive::Undefined),
+            };
+            match &field.key {
+                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
+                    func_lower
+                        .builder
+                        .set_property(this, id.name.as_str(), value);
+                }
+                oxc_ast::ast::PropertyKey::StringLiteral(lit) => {
+                    func_lower
+                        .builder
+                        .set_property(this, lit.value.as_str(), value);
+                }
+                _ => {
+                    // Computed or numeric key: fall back to its string form.
+                    let key_name = func_lower.property_key_to_string(&field.key);
+                    func_lower
+                        .builder
+                        .set_property(this, key_name.as_str(), value);
+                }
+            }
         }
 
         // Lower body statements (skip nested function declarations, already hoisted)

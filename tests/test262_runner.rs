@@ -112,7 +112,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "Atomics",
     "BigInt",
     "class-fields-private",
-    "class-fields-public",
     "class-methods-private",
     "class-static-block",
     "cross-realm",
