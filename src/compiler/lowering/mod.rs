@@ -1325,6 +1325,19 @@ impl<'a> JSASTLower<'a> {
                     .set_property(object, member.property.name.as_str(), value);
                 value
             }
+            // Destructuring assignment (`[a, b] = arr`, `({x} = obj)`). A
+            // compound operator makes no sense here, so only `=` is honoured;
+            // the RHS is evaluated first, per spec order.
+            AssignmentTarget::ArrayAssignmentTarget(target) => {
+                let rhs = self.lower_expression(&assign.right);
+                self.bind_array_assignment_target(target, rhs);
+                rhs
+            }
+            AssignmentTarget::ObjectAssignmentTarget(target) => {
+                let rhs = self.lower_expression(&assign.right);
+                self.bind_object_assignment_target(target, rhs);
+                rhs
+            }
             _ => {
                 log::warn!("unimplemented assignment target: {:?}", assign.left);
                 self.lower_expression(&assign.right)
@@ -1465,8 +1478,9 @@ impl<'a> JSASTLower<'a> {
                     let value = self.lower_expression(&p.value);
                     self.builder.set_property(object, &key, value);
                 }
-                ObjectPropertyKind::SpreadProperty(_) => {
-                    log::warn!("spread in object not yet supported");
+                ObjectPropertyKind::SpreadProperty(spread) => {
+                    let src = self.lower_expression(&spread.argument);
+                    self.emit_object_spread(object, src);
                 }
             }
         }
@@ -2062,6 +2076,237 @@ impl<'a> JSASTLower<'a> {
             self.builder.index_set(rest_obj.clone(), k.clone(), v);
             self.builder.jump(cond_blk);
         }
+
+        self.builder.switch_to_block(after_blk);
+    }
+
+    // ------------------- Destructuring assignment targets -------------------
+
+    /// Bind an assignment target to `value` (`[a, b] = arr`, `({x} = obj)`).
+    fn bind_assignment_target(&mut self, target: &AssignmentTarget<'_>, value: Value) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                self.store_into_identifier(ident.name.as_str(), value);
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                let object = self.lower_expression(&member.object);
+                self.builder
+                    .set_property(object, member.property.name.as_str(), value);
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                let object = self.lower_expression(&member.object);
+                let index = self.lower_expression(&member.expression);
+                self.builder.index_set(object, index, value);
+            }
+            AssignmentTarget::ArrayAssignmentTarget(target) => {
+                self.bind_array_assignment_target(target, value);
+            }
+            AssignmentTarget::ObjectAssignmentTarget(target) => {
+                self.bind_object_assignment_target(target, value);
+            }
+            _ => {
+                log::warn!("unsupported assignment target in destructuring");
+            }
+        }
+    }
+
+    /// `[a, b, ...rest] = value`
+    fn bind_array_assignment_target(
+        &mut self,
+        target: &ArrayAssignmentTarget<'_>,
+        value: Value,
+    ) {
+        let it = self.builder.make_iterator(value);
+        for element in &target.elements {
+            match element {
+                // Elision hole: step the iterator, discard the value.
+                None => {
+                    self.builder.iterate_next(it);
+                }
+                Some(element) => {
+                    let (item, has_next) = self.builder.iterate_next(it);
+                    self.bind_element_maybe_default(element, item, has_next);
+                }
+            }
+        }
+        if let Some(rest) = &target.rest {
+            let rest_arr = self.builder.make_array();
+            self.emit_rest_collect(rest_arr, it);
+            self.bind_assignment_target(&rest.target, rest_arr);
+        }
+    }
+
+    /// `({a, b: target, ...rest} = value)`
+    fn bind_object_assignment_target(
+        &mut self,
+        target: &ObjectAssignmentTarget<'_>,
+        value: Value,
+    ) {
+        let mut consumed: Vec<Value> = Vec::new();
+        for prop in &target.properties {
+            match prop {
+                // Shorthand `{a}` — optionally `{a = default}`.
+                AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                    let name = p.binding.name.to_string();
+                    let kv = self.builder.load_constant(crate::bytecode::Constant::String(
+                        std::sync::Arc::new(name.clone().into()),
+                    ));
+                    consumed.push(kv);
+                    let prop_val = self.builder.get_property(value.clone(), &name);
+                    match &p.init {
+                        Some(init) => {
+                            let result = self.builder.alloc();
+                            self.builder.assign(result, prop_val);
+                            let undefined = Value::Primitive(Primitive::Undefined);
+                            let is_undef = self
+                                .builder
+                                .binop(Opcode::StrictEqual, result.clone(), undefined);
+                            let default_val =
+                                self.eval_default_on(&[is_undef], init, result.clone());
+                            self.store_into_identifier(&name, default_val);
+                        }
+                        None => self.store_into_identifier(&name, prop_val),
+                    }
+                }
+                // `{k: target}` (also `{"k": target}` and `{[k]: target}`).
+                AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                    let (key_value, key_name, computed) =
+                        self.lower_binding_property_key(&p.name, p.computed);
+                    consumed.push(key_value.clone());
+                    let prop_val = if computed {
+                        self.builder.index_get(value.clone(), key_value)
+                    } else {
+                        self.builder
+                            .get_property(value.clone(), key_name.unwrap_or_default().as_str())
+                    };
+                    match &p.binding {
+                        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                            let result = self.builder.alloc();
+                            self.builder.assign(result, prop_val);
+                            let undefined = Value::Primitive(Primitive::Undefined);
+                            let is_undef = self
+                                .builder
+                                .binop(Opcode::StrictEqual, result.clone(), undefined);
+                            let default_val =
+                                self.eval_default_on(&[is_undef], &d.init, result.clone());
+                            self.bind_assignment_target(&d.binding, default_val);
+                        }
+                        other => self.bind_assignment_target_maybe(other, prop_val),
+                    }
+                }
+            }
+        }
+        if let Some(rest) = &target.rest {
+            let rest_obj = self.builder.make_object();
+            self.emit_rest_object(rest_obj, value.clone(), consumed);
+            self.bind_assignment_target(&rest.target, rest_obj);
+        }
+    }
+
+    /// Bind one array element that may carry a default value.
+    fn bind_element_maybe_default(
+        &mut self,
+        element: &AssignmentTargetMaybeDefault<'_>,
+        item: Value,
+        has_next: Value,
+    ) {
+        match element {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                // Default when the element is missing or explicitly undefined.
+                let result = self.builder.alloc();
+                self.builder.assign(result, item);
+                let undefined = Value::Primitive(Primitive::Undefined);
+                let is_undef = self
+                    .builder
+                    .binop(Opcode::StrictEqual, result.clone(), undefined);
+                let no_next = self.builder.unaryop(Opcode::Not, has_next);
+                let missing = self.builder.binop(Opcode::BitOr, no_next, is_undef);
+                let default_val = self.eval_default_on(&[missing], &d.init, result.clone());
+                self.bind_assignment_target(&d.binding, default_val);
+            }
+            other => self.bind_assignment_target_maybe(other, item),
+        }
+    }
+
+    /// Same as `bind_assignment_target`, for the `MaybeDefault` wrapper.
+    fn bind_assignment_target_maybe(
+        &mut self,
+        target: &AssignmentTargetMaybeDefault<'_>,
+        value: Value,
+    ) {
+        match target {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                let result = self.builder.alloc();
+                self.builder.assign(result, value);
+                let undefined = Value::Primitive(Primitive::Undefined);
+                let is_undef = self
+                    .builder
+                    .binop(Opcode::StrictEqual, result.clone(), undefined);
+                let default_val = self.eval_default_on(&[is_undef], &d.init, result.clone());
+                self.bind_assignment_target(&d.binding, default_val);
+            }
+            AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(ident) => {
+                self.store_into_identifier(ident.name.as_str(), value);
+            }
+            AssignmentTargetMaybeDefault::StaticMemberExpression(member) => {
+                let object = self.lower_expression(&member.object);
+                self.builder
+                    .set_property(object, member.property.name.as_str(), value);
+            }
+            AssignmentTargetMaybeDefault::ComputedMemberExpression(member) => {
+                let object = self.lower_expression(&member.object);
+                let index = self.lower_expression(&member.expression);
+                self.builder.index_set(object, index, value);
+            }
+            AssignmentTargetMaybeDefault::ArrayAssignmentTarget(target) => {
+                self.bind_array_assignment_target(target, value);
+            }
+            AssignmentTargetMaybeDefault::ObjectAssignmentTarget(target) => {
+                self.bind_object_assignment_target(target, value);
+            }
+            _ => {
+                log::warn!("unsupported assignment target in destructuring");
+            }
+        }
+    }
+
+    /// Assign `value` to the identifier `name`, routing through the global
+    /// environment when `name` is a script-scope global.
+    fn store_into_identifier(&mut self, name: &str, value: Value) {
+        if self.global_names.contains(name) {
+            self.builder.store_external_variable(name.to_string(), value);
+            return;
+        }
+        match self.symbols.lookup(name) {
+            Some(var) => {
+                self.builder.assign(var.0, value);
+                self.sync_global(name, value);
+            }
+            None => self.builder.store_external_variable(name.to_string(), value),
+        }
+    }
+
+    /// Copy every own enumerable key of `src` onto `target` (`{...src}`).
+    fn emit_object_spread(&mut self, target: Value, src: Value) {
+        let obj_fn = self.builder.load_external_variable("Object".to_string());
+        let keys = self
+            .builder
+            .call_property(obj_fn, "keys", vec![src.clone()]);
+        let it = self.builder.make_iterator(keys);
+
+        let cond_blk = self.create_block("ospr_cond");
+        let body_blk = self.create_block("ospr_body");
+        let after_blk = self.create_block("ospr_after");
+
+        self.builder.jump(cond_blk);
+        self.builder.switch_to_block(cond_blk);
+        let (k, has_next) = self.builder.iterate_next(it);
+        self.builder.br_if(has_next, body_blk, after_blk);
+
+        self.builder.switch_to_block(body_blk);
+        let v = self.builder.index_get(src.clone(), k.clone());
+        self.builder.index_set(target.clone(), k, v);
+        self.builder.jump(cond_blk);
 
         self.builder.switch_to_block(after_blk);
     }

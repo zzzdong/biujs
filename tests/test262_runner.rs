@@ -127,8 +127,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "modules",
     "nullish-coalescing",
     "numeric-separator",
-    "object-rest",
-    "object-spread",
     "optional-chaining",
     "Promise",
     "Proxy",
