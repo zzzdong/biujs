@@ -295,32 +295,35 @@ impl LiveIntervalAnalyzer {
 
             // 从后向前遍历基本块
             for block in block_layout.iter_rev(cfg) {
-                // 计算当前块的live_out（从后继块的live_in获取）
-                let mut new_live_out = Self::compute_block_liveness(cfg, block, &live_in_sets);
+                // live_out(B) = ∪ live_in(successors)。这里直接使用后继块的
+                // live_in；后继块的块参数在计算其 live_in 时已被移除，因此不会
+                // 泄漏到本块的 live_out 中。
+                let new_live_out = Self::compute_block_liveness(cfg, block, &live_in_sets);
 
-                // 块参数在块入口处被定义，应该从活跃变量集合中移除
-                // （它们的值来自前驱块的跳转实参，那些实参变量才是活跃的）
-                for param in block.params() {
-                    new_live_out.remove(param);
-                }
-
-                // 从后向前扫描指令
+                // live_in(B) = (live_out - defs) ∪ uses —— 从后向前扫描指令，
+                // 在 live_out 的副本上就地修改。之前 live_in 和 live_out 存的是
+                // 同一个集合，导致"在本块定义、在后继块使用"的变量区间在定义点
+                // 就被截断，寄存器分组据此把实际同时活跃的变量放进同一个寄存器，
+                // 造成跨块的值被静默覆盖。
+                let mut new_live_in = new_live_out.clone();
                 for inst in block.instructions().iter().rev() {
                     let (defined, used) = inst.defined_and_used_vars();
 
-                    // 先从live_out中移除定义的变量
+                    // 定义杀掉活跃性
                     for var in defined {
-                        new_live_out.remove(&var);
+                        new_live_in.remove(&var);
                     }
 
-                    // 添加使用的变量到live_out（这些变量在此指令之前必须是活跃的）
+                    // 使用产生活跃性
                     for var in used {
-                        new_live_out.insert(var);
+                        new_live_in.insert(var);
                     }
                 }
 
-                // live_in就是扫描完所有指令后的live_out
-                let new_live_in: HashSet<Variable> = new_live_out.clone();
+                // 块参数在块入口处定义（值来自前驱的跳转实参），不属于 live_in。
+                for param in block.params() {
+                    new_live_in.remove(param);
+                }
 
                 // 检查是否有变化
                 let old_live_in = live_in_sets.get(&block.id()).unwrap();
@@ -380,12 +383,53 @@ impl LiveIntervalAnalyzer {
             let block_start = block_starts[block_id];
             let block_end = block_start + block.instructions().len();
 
-            // 获取当前块的live_out集合
+            // 本块内被使用的变量集合（含跳转实参），提前算好避免平方复杂度
+            let mut used_here: HashSet<Variable> = HashSet::new();
+            for inst in block.instructions() {
+                let (_, used) = inst.defined_and_used_vars();
+                used_here.extend(used);
+            }
+
+            // live_out 中的变量在块尾仍然存活：把它们的区间延伸到块的末尾。
+            // 对于"本块定义、后继块使用"的变量，这是其寄存器不被复用的关键。
             if let Some(live_out) = live_out_sets.get(&block.id()) {
-                // 更新live_out中变量的存活周期
                 for &var in live_out {
                     if let Some(interval) = liveness.intervals.get_mut(&var) {
                         interval.update_end(block_end);
+                    }
+                }
+            }
+
+            // live-through 变量（live-out 但本块没有出现）同样必须被认为覆盖
+            // 本块 —— 它的值在块内一直保存在寄存器里，区间上不能留下"空洞"，
+            // 否则分组会认为别的变量可以复用同一个寄存器。
+            if let Some(live_out) = live_out_sets.get(&block.id()) {
+                let mut to_extend: Vec<Variable> = Vec::new();
+                for &var in live_out {
+                    if used_here.contains(&var) {
+                        continue;
+                    }
+                    let covers_block = liveness
+                        .intervals
+                        .get(&var)
+                        .map(|iv| {
+                            iv.ranges
+                                .iter()
+                                .any(|r| r.start <= block_start && r.end >= block_end.saturating_sub(1))
+                        })
+                        .unwrap_or(false);
+                    if !covers_block {
+                        to_extend.push(var);
+                    }
+                }
+                for var in to_extend {
+                    if let Some(interval) = liveness.intervals.get_mut(&var) {
+                        interval.ranges.push(LiveRange {
+                            start: block_start,
+                            end: block_end.saturating_sub(1),
+                        });
+                        // 保持区间按起点有序：`update_end` 依赖最后一个区间
+                        interval.ranges.sort_by_key(|r| r.start);
                     }
                 }
             }

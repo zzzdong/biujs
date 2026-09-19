@@ -170,15 +170,32 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
     if let Some(desc) = borrowed.property_get(&key) {
         // Create a descriptor object
         let mut desc_obj = crate::vm::object::OrdinaryObject::new();
-        desc_obj
-            .property_set(PropertyKey::from_str("value"), desc.value.clone())
-            .map_err(|e| RuntimeError::TypeError(e))?;
-        desc_obj
-            .property_set(
-                PropertyKey::from_str("writable"),
-                Value::Bool(desc.writable),
-            )
-            .map_err(|e| RuntimeError::TypeError(e))?;
+        if desc.is_accessor_descriptor() {
+            // Accessor descriptor: report get/set, never value/writable.
+            let undefined = Value::Undefined;
+            desc_obj
+                .property_set(
+                    PropertyKey::from_str("get"),
+                    desc.getter.clone().unwrap_or(undefined.clone()),
+                )
+                .map_err(|e| RuntimeError::TypeError(e))?;
+            desc_obj
+                .property_set(
+                    PropertyKey::from_str("set"),
+                    desc.setter.clone().unwrap_or(undefined),
+                )
+                .map_err(|e| RuntimeError::TypeError(e))?;
+        } else {
+            desc_obj
+                .property_set(PropertyKey::from_str("value"), desc.value.clone())
+                .map_err(|e| RuntimeError::TypeError(e))?;
+            desc_obj
+                .property_set(
+                    PropertyKey::from_str("writable"),
+                    Value::Bool(desc.writable),
+                )
+                .map_err(|e| RuntimeError::TypeError(e))?;
+        }
         desc_obj
             .property_set(
                 PropertyKey::from_str("enumerable"),

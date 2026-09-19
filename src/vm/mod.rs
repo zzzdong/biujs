@@ -480,8 +480,8 @@ impl VM {
             Ok(())
         })();
 
-        let rv = self.state.get_register(Register::Rv)?;
         outcome?;
+        let rv = self.state.get_register(Register::Rv)?;
 
         // Restore the caller's execution context.
         self.state.pc = saved_pc;

@@ -843,6 +843,12 @@ impl<'a> JSASTLower<'a> {
         }
 
         if let Some(var) = self.symbols.lookup(ident.name.as_str()) {
+            // Script-scope globals live in the global environment and can be
+            // written by *any* function (or via `window.x` style access), so a
+            // cached register copy would go stale. Re-read them with LoadEnv.
+            if self.global_names.contains(ident.name.as_str()) {
+                return self.builder.load_external_variable(ident.name.to_string());
+            }
             var.0
         } else {
             // Try loading as external/global variable
@@ -974,6 +980,18 @@ impl<'a> JSASTLower<'a> {
 
         match &update.argument {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                // Script-scope globals must round-trip through the global
+                // environment: the cached register copy may be stale after a
+                // nested function stored to the same global.
+                if self.global_names.contains(ident.name.as_str()) {
+                    let current = self
+                        .builder
+                        .load_external_variable(ident.name.to_string());
+                    let new_val = self.builder.binop(op, current, one);
+                    self.builder
+                        .store_external_variable(ident.name.to_string(), new_val);
+                    return if update.prefix { new_val } else { current };
+                }
                 match self.symbols.lookup(ident.name.as_str()) {
                     Some(var) => {
                         let current = var.0;
@@ -1103,6 +1121,24 @@ impl<'a> JSASTLower<'a> {
     fn lower_assignment(&mut self, assign: &AssignmentExpression<'_>) -> Value {
         match &assign.left {
             AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                // Script-scope globals: the global environment is authoritative.
+                // Writes go through StoreEnv and reads (for compound ops) via a
+                // fresh LoadEnv, so nested functions observe the same value.
+                if self.global_names.contains(ident.name.as_str()) {
+                    let rhs = self.lower_expression(&assign.right);
+                    let value = if assign.operator == AssignmentOperator::Assign {
+                        rhs
+                    } else {
+                        let current = self
+                            .builder
+                            .load_external_variable(ident.name.to_string());
+                        self.compound_binop(assign.operator, current, rhs)
+                            .unwrap_or(rhs)
+                    };
+                    self.builder
+                        .store_external_variable(ident.name.to_string(), value);
+                    return value;
+                }
                 match self.symbols.lookup(ident.name.as_str()) {
                     Some(var) => {
                         let current = var.0;
