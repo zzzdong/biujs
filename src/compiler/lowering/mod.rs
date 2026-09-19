@@ -328,25 +328,32 @@ impl<'a> JSASTLower<'a> {
     fn lower_variable_declaration(&mut self, decl: &VariableDeclaration<'_>) {
         for declarator in &decl.declarations {
             let name = self.binding_pattern_name(&declarator.id);
-            let dst = self.builder.alloc();
 
             let value = match &declarator.init {
                 Some(init) => Some(self.lower_expression(init)),
                 None => None,
             };
 
-            if let Some(value) = value {
-                self.builder.assign(dst, value);
-                if self.at_script_scope() {
-                    self.define_global(&name, value);
+            if let BindingPattern::BindingIdentifier(_) = &declarator.id {
+                let dst = self.builder.alloc();
+                if let Some(value) = value {
+                    self.builder.assign(dst, value);
+                    if self.at_script_scope() {
+                        self.define_global(&name, value);
+                    }
+                } else if self.at_script_scope() {
+                    // `let x;` — publish the (undefined) binding so nested
+                    // reads resolve to undefined instead of ReferenceError.
+                    self.define_global(&name, Value::Primitive(Primitive::Undefined));
                 }
-            } else if self.at_script_scope() {
-                // `var x;` — publish the (undefined) binding so nested reads
-                // resolve to undefined instead of throwing ReferenceError.
-                self.define_global(&name, Value::Primitive(Primitive::Undefined));
+                // else: dst stays as default (undefined)
+                self.symbols.insert(name, Variable::new(dst));
+            } else if let Some(value) = value {
+                // Destructuring declaration: `[a, b] = value` / `{x} = value`.
+                self.bind_pattern(&declarator.id, value, true);
+            } else {
+                log::warn!("destructuring declaration without initializer");
             }
-            // else: dst stays as default (undefined)
-            self.symbols.insert(name, Variable::new(dst));
         }
     }
 
@@ -1666,9 +1673,12 @@ impl<'a> JSASTLower<'a> {
         for (idx, param) in params.iter().enumerate() {
             let arg = func_lower.builder.load_arg(idx);
             let param_name = func_lower.binding_pattern_name(&param.pattern);
-            func_lower
-                .symbols
-                .insert(param_name, Variable::new(arg));
+
+            if let BindingPattern::BindingIdentifier(_) = &param.pattern {
+                func_lower
+                    .symbols
+                    .insert(param_name, Variable::new(arg));
+            }
 
             if let Some(init) = &param.initializer {
                 let undefined = Value::Primitive(Primitive::Undefined);
@@ -1686,9 +1696,15 @@ impl<'a> JSASTLower<'a> {
 
                 func_lower.builder.switch_to_block(merge_blk);
             }
+
+            // Destructuring parameter (`function f([a, b]) {}`): bind after
+            // the default-value prologue so defaults feed into the pattern.
+            if !matches!(&param.pattern, BindingPattern::BindingIdentifier(_)) {
+                func_lower.bind_pattern(&param.pattern, arg, false);
+            }
         }
 
-        // Every ordinary function has its own `arguments` binding. It has to be
+        // Every ordinary function (`...args`): binds a fresh array of every argument `arguments` binding. It has to be
         // installed eagerly (not on first use) so that nested arrow functions,
         // which clone this symbol table, resolve `arguments` lexically.
         if !is_arrow {
@@ -1808,6 +1824,264 @@ impl<'a> JSASTLower<'a> {
                 "<destructured>".to_string()
             }
         }
+    }
+
+    // ----------------------- Destructuring -----------------------
+
+    /// Bind a destructuring `pattern` to an already-evaluated `value`.
+    ///
+    /// Array patterns iterate their source (iterator protocol); object
+    /// patterns read properties; `AssignmentPattern` nodes supply defaults
+    /// via an `undefined` check. Leaf identifiers become locals, and -- when
+    /// `publish_global` is set -- are also published to the global
+    /// environment (script-scope declarations).
+    fn bind_pattern(&mut self, pattern: &BindingPattern<'_>, value: Value, publish_global: bool) {
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => {
+                self.symbols.insert(id.name.to_string(), Variable::new(value));
+                if publish_global && self.at_script_scope() {
+                    self.builder
+                        .store_external_variable(id.name.to_string(), value.clone());
+                    self.global_names.insert(id.name.to_string());
+                }
+            }
+            BindingPattern::AssignmentPattern(ap) => {
+                let result = self.builder.alloc();
+                self.builder.assign(result, value.clone());
+                let undefined = Value::Primitive(Primitive::Undefined);
+                let is_undef = self
+                    .builder
+                    .binop(Opcode::StrictEqual, result.clone(), undefined);
+                let default_val = self.eval_default_on(&[is_undef], &ap.right, result.clone());
+                self.bind_pattern(&ap.left, default_val, publish_global);
+            }
+            BindingPattern::ObjectPattern(op) => {
+                let mut consumed: Vec<Value> = Vec::new();
+                for prop in &op.properties {
+                    let (key_value, key_name, computed) =
+                        self.lower_binding_property_key(&prop.key, prop.computed);
+                    consumed.push(key_value.clone());
+
+                    let prop_val = if computed {
+                        self.builder.index_get(value.clone(), key_value)
+                    } else {
+                        self.builder
+                            .get_property(value.clone(), key_name.unwrap_or_default().as_str())
+                    };
+                    self.bind_pattern(&prop.value, prop_val, publish_global);
+                }
+
+                if let Some(rest) = &op.rest {
+                    let rest_obj = self.builder.make_object();
+                    self.emit_rest_object(rest_obj, value.clone(), consumed);
+                    self.bind_pattern(&rest.argument, rest_obj, publish_global);
+                }
+            }
+            BindingPattern::ArrayPattern(ap) => {
+                let it = self.builder.make_iterator(value);
+
+                for element in &ap.elements {
+                    match element {
+                        // Elision hole: step the iterator, discard the value.
+                        None => {
+                            self.builder.iterate_next(it);
+                        }
+                        Some(pat) => {
+                            let (item, has_next) = self.builder.iterate_next(it);
+                            self.bind_array_element_pattern(pat, item, has_next, publish_global);
+                        }
+                    }
+                }
+
+                if let Some(rest) = &ap.rest {
+                    let rest_arr = self.builder.make_array();
+                    self.emit_rest_collect(rest_arr, it);
+                    self.bind_pattern(&rest.argument, rest_arr, publish_global);
+                }
+                // The iterator completed normally; no IteratorClose needed.
+            }
+            _ => {
+                log::warn!("unsupported binding pattern in destructuring");
+            }
+        }
+    }
+
+    /// Bind one element of an array pattern, honouring defaults.
+    fn bind_array_element_pattern(
+        &mut self,
+        pat: &BindingPattern<'_>,
+        item: Value,
+        has_next: Value,
+        publish_global: bool,
+    ) {
+        match pat {
+            BindingPattern::AssignmentPattern(ap) => {
+                // `x = default`: take the default when the element is missing
+                // (iterator exhausted) or explicitly undefined. The two
+                // conditions combine with a bitwise OR on booleans.
+                let result = self.builder.alloc();
+                self.builder.assign(result, item);
+                let undefined = Value::Primitive(Primitive::Undefined);
+                let is_undef = self
+                    .builder
+                    .binop(Opcode::StrictEqual, result.clone(), undefined);
+                let no_next = self.builder.unaryop(Opcode::Not, has_next);
+                let missing = self.builder.binop(Opcode::BitOr, no_next, is_undef);
+                let default_val = self.eval_default_on(&[missing], &ap.right, result.clone());
+                self.bind_pattern(&ap.left, default_val, publish_global);
+            }
+            other => self.bind_pattern(other, item, publish_global),
+        }
+    }
+
+    /// Evaluate `default_expr` when any of `conds` is truthy; return the merged
+    /// value (same IR variable on both paths, filled by SSA phi).
+    fn eval_default_on(
+        &mut self,
+        conds: &[Value],
+        default_expr: &Expression<'_>,
+        result: Value,
+    ) -> Value {
+        let default_blk = self.create_block("destr_default");
+        let merge_blk = self.create_block("destr_merge");
+
+        for (i, cond) in conds.iter().enumerate() {
+            let is_last = i + 1 == conds.len();
+            let false_target = if is_last {
+                merge_blk
+            } else {
+                self.create_block("destr_cond")
+            };
+            self.builder.br_if(*cond, default_blk, false_target);
+            if !is_last {
+                self.builder.switch_to_block(false_target);
+            }
+        }
+
+        self.builder.switch_to_block(default_blk);
+        let default_val = self.lower_expression(default_expr);
+        self.builder.assign(result.clone(), default_val);
+        self.builder.jump(merge_blk);
+
+        self.builder.switch_to_block(merge_blk);
+        result
+    }
+
+    /// Evaluate a `BindingProperty` key: returns (runtime key value, static
+    /// property name, use index access).
+    fn lower_binding_property_key(
+        &mut self,
+        key: &PropertyKey<'_>,
+        computed: bool,
+    ) -> (Value, Option<String>, bool) {
+        match key {
+            PropertyKey::StaticIdentifier(id) => {
+                let kv = self.builder.load_constant(crate::bytecode::Constant::String(
+                    std::sync::Arc::new(id.name.to_string().into()),
+                ));
+                (kv, Some(id.name.to_string()), false)
+            }
+            PropertyKey::StringLiteral(lit) => {
+                let name = lit.value.to_string();
+                let kv = self.builder.load_constant(crate::bytecode::Constant::String(
+                    std::sync::Arc::new(name.clone().into()),
+                ));
+                (kv, Some(name), false)
+            }
+            PropertyKey::NumericLiteral(lit) => {
+                let name = crate::builtins::number_to_string(lit.value);
+                let kv = self.builder.load_constant(crate::bytecode::Constant::String(
+                    std::sync::Arc::new(name.clone().into()),
+                ));
+                (kv, Some(name), false)
+            }
+            _ => {
+                let kv = self.lower_property_key_expression(key);
+                (kv, None, true || computed)
+            }
+        }
+    }
+
+    /// Lower a computed property key expression.
+    fn lower_property_key_expression(&mut self, key: &PropertyKey<'_>) -> Value {
+        match key {
+            PropertyKey::Identifier(id) => self.lower_identifier(id),
+            PropertyKey::StringLiteral(lit) => self.builder.load_constant(
+                crate::bytecode::Constant::String(std::sync::Arc::new(
+                    lit.value.to_string().into(),
+                )),
+            ),
+            PropertyKey::NumericLiteral(lit) => self.lower_numeric_literal(lit),
+            PropertyKey::TemplateLiteral(tpl) => self.lower_template_literal(tpl),
+            _ => {
+                log::warn!("unsupported computed property key");
+                self.builder
+                    .load_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
+                        "".into(),
+                    )))
+            }
+        }
+    }
+
+    /// `restObj = {}` minus the consumed keys, filled from `value`.
+    fn emit_rest_object(&mut self, rest_obj: Value, value: Value, consumed: Vec<Value>) {
+        let consumed_arr = self.builder.make_array();
+        for k in &consumed {
+            self.builder.array_push(consumed_arr, k.clone());
+        }
+
+        let obj_fn = self.builder.load_external_variable("Object".to_string());
+        let keys = self
+            .builder
+            .call_property(obj_fn, "keys", vec![value.clone()]);
+        let it = self.builder.make_iterator(keys);
+
+        let cond_blk = self.create_block("rest_cond");
+        let body_blk = self.create_block("rest_body");
+        let put_blk = self.create_block("rest_put");
+        let after_blk = self.create_block("rest_after");
+
+        self.builder.jump(cond_blk);
+        self.builder.switch_to_block(cond_blk);
+        let (k, has_next) = self.builder.iterate_next(it);
+        self.builder.br_if(has_next, body_blk, after_blk);
+
+        self.builder.switch_to_block(body_blk);
+        if consumed.is_empty() {
+            let v = self.builder.index_get(value.clone(), k.clone());
+            self.builder.index_set(rest_obj.clone(), k.clone(), v);
+            self.builder.jump(cond_blk);
+        } else {
+            let taken = self
+                .builder
+                .call_property(consumed_arr, "includes", vec![k.clone()]);
+            // taken -> skip (back to cond); not taken -> put and continue.
+            self.builder.br_if(taken, cond_blk, put_blk);
+            self.builder.switch_to_block(put_blk);
+            let v = self.builder.index_get(value.clone(), k.clone());
+            self.builder.index_set(rest_obj.clone(), k.clone(), v);
+            self.builder.jump(cond_blk);
+        }
+
+        self.builder.switch_to_block(after_blk);
+    }
+
+    /// Collect the remaining iterator elements into `rest_arr`.
+    fn emit_rest_collect(&mut self, rest_arr: Value, it: Value) {
+        let cond_blk = self.create_block("restcol_cond");
+        let body_blk = self.create_block("restcol_body");
+        let after_blk = self.create_block("restcol_after");
+
+        self.builder.jump(cond_blk);
+        self.builder.switch_to_block(cond_blk);
+        let (item, has_next) = self.builder.iterate_next(it);
+        self.builder.br_if(has_next, body_blk, after_blk);
+
+        self.builder.switch_to_block(body_blk);
+        self.builder.array_push(rest_arr, item);
+        self.builder.jump(cond_blk);
+
+        self.builder.switch_to_block(after_blk);
     }
 
     fn catch_clause_param_name(&self, catch: &CatchClause<'_>) -> String {

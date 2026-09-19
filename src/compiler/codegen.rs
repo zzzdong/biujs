@@ -283,6 +283,44 @@ impl Codegen {
                         let src = self.gen_operand(src);
                         self.codes.push(Bytecode::double(Opcode::ToString, dst, src));
                     }
+                    Instruction::MakeRest { dst, from } => {
+                        let dst = self.gen_operand(dst);
+                        self.codes.push(Bytecode::double(
+                            Opcode::MakeRest,
+                            dst,
+                            Operand::new_immd(from as isize),
+                        ));
+                    }
+                    Instruction::CallSpread {
+                        result,
+                        callee,
+                        this,
+                        args,
+                    } => {
+                        let callee = self.gen_operand(callee);
+                        let this = self.gen_operand(this);
+                        let args = self.gen_operand(args);
+                        self.codes
+                            .push(Bytecode::triple(Opcode::CallSpread, callee, this, args));
+                        // The result travels in Rv (same as CallMethod).
+                        let result = self.gen_operand(result);
+                        self.codes.push(Bytecode::double(
+                            Opcode::Mov,
+                            result,
+                            Operand::new_register(Register::Rv),
+                        ));
+                    }
+                    Instruction::NewSpread {
+                        dst,
+                        constructor,
+                        args,
+                    } => {
+                        let dst = self.gen_operand(dst);
+                        let ctor = self.gen_operand(constructor);
+                        let args = self.gen_operand(args);
+                        self.codes
+                            .push(Bytecode::triple(Opcode::NewSpread, dst, ctor, args));
+                    }
                     Instruction::IterateNext {
                         iter,
                         item,

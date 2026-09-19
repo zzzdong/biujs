@@ -236,6 +236,36 @@ pub trait InstBuilder {
         result
     }
 
+    /// Call `callee` with `this` and a dynamic argument list (`args` array).
+    fn call_spread(&mut self, callee: Value, this: Value, args: Value) -> Value {
+        let result = self.alloc();
+        self.emit(Instruction::CallSpread {
+            result,
+            callee,
+            this,
+            args,
+        });
+        result
+    }
+
+    /// `new ctor(...args)` with a dynamic argument list.
+    fn new_spread(&mut self, constructor: Value, args: Value) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::NewSpread {
+            dst,
+            constructor,
+            args,
+        });
+        dst
+    }
+
+    /// Rest parameter: bind `dst` to `arguments[from..]` as a fresh array.
+    fn make_rest(&mut self, from: usize) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::MakeRest { dst, from });
+        dst
+    }
+
     /// ES ToString conversion (objects via ToPrimitive with a "string" hint).
     fn to_string(&mut self, src: Value) -> Value {
         let dst = self.alloc();

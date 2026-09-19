@@ -308,6 +308,24 @@ pub enum Instruction {
         dst: Value,
         src: Value,
     },
+    /// Rest parameter: collect arguments[from..] into a fresh array.
+    MakeRest {
+        dst: Value,
+        from: usize,
+    },
+    /// Call with a dynamic argument list taken from an array value.
+    CallSpread {
+        result: Value,
+        callee: Value,
+        this: Value,
+        args: Value,
+    },
+    /// `new` with a dynamic argument list taken from an array value.
+    NewSpread {
+        dst: Value,
+        constructor: Value,
+        args: Value,
+    },
 
     // Control Flow Instructions
     Return {
@@ -507,6 +525,18 @@ impl Instruction {
             } => (vec![*item, *has_next], vec![*iter]),
             Instruction::IteratorClose { iter } => (vec![], vec![*iter]),
             Instruction::ToString { dst, src } => (vec![*dst], vec![*src]),
+            Instruction::MakeRest { dst, .. } => (vec![*dst], vec![]),
+            Instruction::CallSpread {
+                result,
+                callee,
+                this,
+                args,
+            } => (vec![*result], vec![*callee, *this, *args]),
+            Instruction::NewSpread {
+                dst,
+                constructor,
+                args,
+            } => (vec![*dst], vec![*constructor, *args]),
             Instruction::MakeArray { dst } => (vec![*dst], vec![]),
             Instruction::ArrayPush { array, value } => (vec![], vec![*array, *value]),
             Instruction::MakeObject { dst } => (vec![*dst], vec![]),
@@ -704,6 +734,24 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::ToString { dst, src } => {
                 write!(f, "{dst} = to_string {src}")
+            }
+            Instruction::MakeRest { dst, from } => {
+                write!(f, "{dst} = make_rest {from}")
+            }
+            Instruction::CallSpread {
+                result,
+                callee,
+                this,
+                args,
+            } => {
+                write!(f, "{result} = call_spread {callee}, {this}, {args}")
+            }
+            Instruction::NewSpread {
+                dst,
+                constructor,
+                args,
+            } => {
+                write!(f, "{dst} = new_spread {constructor}, {args}")
             }
             Instruction::IterateNext {
                 iter,

@@ -1143,6 +1143,57 @@ impl VM {
                 let iter_val = self.get_value(operands[0])?;
                 self.iterator_close(iter_val, module)?;
             }
+            Opcode::MakeRest => {
+                // Collect the tail of the incoming arguments into a fresh
+                // array: args[from..] where arg i lives at [rbp - (i + 1)].
+                let from = operands[1].as_immd().max(0) as usize;
+                let argc = self.state.frame_argc.last().copied().unwrap_or(0);
+                let rbp = self.state.rbp as isize;
+                let mut arr = ArrayObject::new();
+                if argc > from {
+                    for i in from..argc {
+                        let index = rbp - (i as isize) - 1;
+                        let val = self
+                            .state
+                            .data_stack
+                            .get(index.max(0) as usize)
+                            .cloned()
+                            .unwrap_or(Value::Undefined);
+                        arr.push(val);
+                    }
+                }
+                arr.set_prototype(Some(Rc::clone(&self.builtins.array_prototype)));
+                self.set_value(operands[0], Value::Object(Rc::new(RefCell::new(arr))))?;
+            }
+            Opcode::CallSpread => {
+                // operands: (callee, this, args-array); result goes to Rv.
+                let callee = self.get_value(operands[0])?;
+                let this = self.get_value(operands[1])?;
+                let args_val = self.get_value(operands[2])?;
+                let args = self
+                    .array_like_elements(&args_val)
+                    .ok_or_else(|| {
+                        RuntimeError::TypeError(
+                            "CallSpread: arguments must be array-like".to_string(),
+                        )
+                    })?;
+                let result = self.invoke(&callee, this, &args, module)?;
+                self.state.set_register(Register::Rv, result)?;
+            }
+            Opcode::NewSpread => {
+                // operands: (dst, constructor, args-array)
+                let ctor = self.get_value(operands[1])?;
+                let args_val = self.get_value(operands[2])?;
+                let args = self
+                    .array_like_elements(&args_val)
+                    .ok_or_else(|| {
+                        RuntimeError::TypeError(
+                            "NewSpread: arguments must be array-like".to_string(),
+                        )
+                    })?;
+                let constructed = self.construct(&ctor, &args, module)?;
+                self.set_value(operands[0], constructed)?;
+            }
             Opcode::ToString => {
                 let src = self.get_value(operands[1])?;
                 let s = match self.to_primitive(&src, "string", module) {
@@ -2585,6 +2636,184 @@ impl VM {
             let _ = self.invoke(&return_fn, iterator, &[], module);
         }
         Ok(())
+    }
+
+    /// `[[Construct]]` variant of `invoke`: same frame mechanics, but the
+    /// `this` binding is the freshly created object and the frame is flagged
+    /// so `Ret` applies the construct return semantics.
+    fn invoke_construct(
+        &mut self,
+        callee: &Value,
+        new_obj: Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(name) = crate::builtins::native_function_name(callee) {
+            return self.call_native_by_name(&name, new_obj, args, module);
+        }
+
+        let (func_id, captured_vars) = match callee {
+            Value::Function(id) => (*id, Vec::new()),
+            Value::Object(obj_ref) => {
+                let borrowed = obj_ref.borrow();
+                match borrowed
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::FunctionObject>()
+                {
+                    Some(func_obj) => (func_obj.func_id, func_obj.captured_vars.clone()),
+                    None => {
+                        return Err(RuntimeError::TypeError("not a constructor".to_string()));
+                    }
+                }
+            }
+            _ => return Err(RuntimeError::TypeError("not a constructor".to_string())),
+        };
+
+        let saved_pc = self.state.pc;
+        let saved_rsp = self.state.rsp;
+        let saved_rbp = self.state.rbp;
+        let saved_closure = self.state.closure_var_stack.len();
+        let saved_seh = self.state.seh_stack.len();
+        let saved_this = self.state.this_val.clone();
+        let saved_this_depth = self.state.this_stack.len();
+        let saved_construct = self.state.construct_stack.len();
+
+        for arg in args.iter().rev() {
+            self.state.push(arg.clone())?;
+        }
+        self.state.rbp = self.state.rsp;
+        let return_pc = module.instructions.len();
+
+        self.state.enter_frame(args.len())?;
+        self.state.this_val = new_obj;
+        for (name, value) in &captured_vars {
+            let mut map = std::collections::HashMap::new();
+            map.insert(name.clone(), value.clone());
+            self.state.closure_var_stack.push(map);
+        }
+
+        match module.symtab.get(&FunctionId::new(func_id)) {
+            Some(location) => {
+                self.state.set_register(Register::Rv, Value::Undefined)?;
+                self.state.pushc(self.state.closure_var_stack.len())?;
+                self.state.pushc(self.state.seh_stack.len())?;
+                self.state.pushc(return_pc)?;
+                self.state.construct_stack.push(true);
+                self.state.jump(*location);
+            }
+            None => {
+                return Err(RuntimeError::ReferenceError(format!(
+                    "undefined function: {func_id}"
+                )));
+            }
+        }
+
+        let outcome = (|| -> Result<(), RuntimeError> {
+            while self.step(module)? {}
+            Ok(())
+        })();
+
+        outcome?;
+        let rv = self.state.get_register(Register::Rv)?;
+
+        self.state.pc = saved_pc;
+        self.state.rsp = saved_rsp;
+        self.state.rbp = saved_rbp;
+        self.state.closure_var_stack.truncate(saved_closure);
+        self.state.seh_stack.truncate(saved_seh);
+        self.state.this_stack.truncate(saved_this_depth);
+        self.state.frame_argc.truncate(saved_this_depth);
+        self.state.this_val = saved_this;
+        self.state.construct_stack.truncate(saved_construct);
+        Ok(rv)
+    }
+
+    /// `[[Construct]]` (ES6 7.3.19): create the instance, run the constructor
+    /// with `this` bound to it, and apply the construct return semantics.
+    fn construct(
+        &mut self,
+        constructor_val: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        // Native constructors (Object, Array, Error, ...): create the instance
+        // with the right prototype, call the native, and use its result
+        // (except for Error constructors, which keep the instance so
+        // `instanceof` keeps working; the native fills name/message onto it).
+        if let Some(name) = crate::builtins::native_function_name(constructor_val) {
+            if name.contains('.') {
+                return Err(RuntimeError::TypeError("not a constructor".to_string()));
+            }
+            let proto = match constructor_val {
+                Value::Object(obj_ref) => {
+                    let borrowed = obj_ref.borrow();
+                    borrowed
+                        .property_get(&PropertyKey::from_str("prototype"))
+                        .map(|d| d.value)
+                }
+                _ => return Err(RuntimeError::TypeError("not a constructor".to_string())),
+            };
+            let mut new_obj = crate::vm::object::OrdinaryObject::new();
+            if let Some(Value::Object(p)) = &proto {
+                new_obj.set_prototype(Some(Rc::clone(p)));
+            } else {
+                new_obj.set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
+            }
+            let new_obj_val = Value::Object(Rc::new(RefCell::new(new_obj)));
+
+            return match crate::builtins::call_native(&name, args) {
+                Ok(result) => {
+                    if name.ends_with("Error") {
+                        if let Value::Object(result_ref) = &result {
+                            let result_borrowed = result_ref.borrow();
+                            for prop in ["name", "message"] {
+                                if let Some(pd) =
+                                    result_borrowed.property_get(&PropertyKey::from_str(prop))
+                                {
+                                    if let Value::Object(target_ref) = &new_obj_val {
+                                        let _ = target_ref.borrow_mut().property_set(
+                                            PropertyKey::from_str(prop),
+                                            pd.value,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(new_obj_val)
+                    } else {
+                        Ok(result)
+                    }
+                }
+                Err(e) => Err(e),
+            };
+        }
+
+        // Bytecode constructor: resolve the prototype from the (boxed)
+        // constructor's `prototype` property, create the instance, and run the
+        // constructor body via the [[Construct]] frame flag.
+        let boxed_ctor = match constructor_val {
+            Value::Function(id) => self.materialize_function(*id),
+            other => other.clone(),
+        };
+        let prototype = match &boxed_ctor {
+            Value::Object(obj_ref) => obj_ref
+                .borrow()
+                .property_get(&PropertyKey::from_str("prototype"))
+                .map(|d| d.value),
+            _ => {
+                return Err(RuntimeError::TypeError("not a constructor".to_string()));
+            }
+        };
+
+        let mut new_obj = crate::vm::object::OrdinaryObject::new();
+        if let Some(Value::Object(proto_obj)) = &prototype {
+            new_obj.set_prototype(Some(Rc::clone(proto_obj)));
+        } else {
+            new_obj.set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
+        }
+        let new_obj_val = Value::Object(Rc::new(RefCell::new(new_obj)));
+
+        self.invoke_construct(&boxed_ctor, new_obj_val, args, module)
     }
 
     fn call_builtin_method(

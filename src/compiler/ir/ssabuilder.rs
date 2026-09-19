@@ -633,6 +633,29 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_definition(dst, new_versions);
                 SSABuilder::rename_use(src, stacks);
             }
+            Instruction::MakeRest { dst, .. } => {
+                SSABuilder::rename_definition(dst, new_versions);
+            }
+            Instruction::CallSpread {
+                result,
+                callee,
+                this,
+                args,
+            } => {
+                SSABuilder::rename_definition(result, new_versions);
+                SSABuilder::rename_use(callee, stacks);
+                SSABuilder::rename_use(this, stacks);
+                SSABuilder::rename_use(args, stacks);
+            }
+            Instruction::NewSpread {
+                dst,
+                constructor,
+                args,
+            } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                SSABuilder::rename_use(constructor, stacks);
+                SSABuilder::rename_use(args, stacks);
+            }
             Instruction::PropertySet {
                 object,
                 property,

@@ -615,7 +615,7 @@ fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
     }
 }
 
-fn number_to_string(n: f64) -> String {
+pub fn number_to_string(n: f64) -> String {
     if n.is_nan() {
         "NaN".to_string()
     } else if n == 0.0 || n == -0.0 {

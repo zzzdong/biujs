@@ -117,9 +117,7 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "class-static-block",
     "cross-realm",
     "dynamic-import",
-    "destructuring-binding",
     "exponentiation",
-    "for-of",
     "generators",
     "import.meta",
     "import-assertions",
@@ -137,10 +135,8 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "Reflect",
     "reflect-metadata",
     "regexp-",
-    "rest-parameters",
     "Set",
     "SharedArrayBuffer",
-    "spread-syntax",
     "String.prototype.replaceAll",
     "super",
     "symbol-description",
@@ -173,11 +169,9 @@ const UNSUPPORTED_PATTERNS: &[&str] = &[
     "with (",
     "with(",
     "label:",
-    "`", // template literals: only partially supported
     "=>*",
     "function*",
     "async ",
-    "...", // rest / spread syntax
 ];
 
 fn should_skip(test: &Test) -> Option<String> {
@@ -402,6 +396,13 @@ fn run_suite(subdir: &str) -> SuiteResult {
 
 /// Every test262 subdirectory relevant to biujs's supported feature set.
 const SUITES: &[&str] = &[
+    "language/statements/for-of",
+    "language/statements/for-in",
+    "language/destructuring",
+    "language/expressions/assignment/destructuring",
+    "language/functions/rest-parameters",
+    "built-ins/Array/prototype/Symbol.iterator",
+    "built-ins/String/prototype/Symbol.iterator",
     // ── Expressions: operators ──
     "language/expressions/addition",
     "language/expressions/assignment",

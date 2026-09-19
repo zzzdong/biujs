@@ -266,6 +266,12 @@ pub enum Opcode {
     IterClose,
     /// to_string dst, src — ES ToString (objects via ToPrimitive("string"))
     ToString,
+    /// make_rest dst, from_index — collect arguments[from_index..] into an array
+    MakeRest,
+    /// call_spread result, callee, this, args — call with args taken from an array
+    CallSpread,
+    /// new_spread dst, ctor, args — construct with args taken from an array
+    NewSpread,
 }
 
 impl fmt::Display for Opcode {
@@ -344,6 +350,9 @@ impl fmt::Display for Opcode {
             Opcode::Arguments => write!(f, "arguments"),
             Opcode::IterClose => write!(f, "iter_close"),
             Opcode::ToString => write!(f, "to_string"),
+            Opcode::MakeRest => write!(f, "make_rest"),
+            Opcode::CallSpread => write!(f, "call_spread"),
+            Opcode::NewSpread => write!(f, "new_spread"),
         }
     }
 }
