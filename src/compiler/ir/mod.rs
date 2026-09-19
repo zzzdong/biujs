@@ -127,11 +127,14 @@ impl IrUnit {
         }
     }
 
+    /// Declare a fresh function, returning its (unique) id.
+    ///
+    /// Ids are intentionally **not** de-duplicated by signature: two distinct
+    /// function expressions may well share a name and parameter list (e.g. the
+    /// anonymous `(actual, expected, message) => …` helpers in test262's
+    /// `assert.js`). Re-using an id would make the second definition overwrite
+    /// the first one's body.
     pub fn declare_function(&mut self, signature: FuncSignature) -> FunctionId {
-        if let Some(id) = self.functions.iter().position(|f| f.signature == signature) {
-            return FunctionId::new(id as u32);
-        }
-
         let id = FunctionId::new(self.functions.len() as u32);
         self.functions.push(IrFunction::new(id, signature));
         id

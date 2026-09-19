@@ -29,6 +29,101 @@ pub fn register_string_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "toLowerCase", |this, _args| string_to_lower(this));
     set_prototype_method(proto, "trim", |this, _args| string_trim(this));
     set_prototype_method(proto, "split", |this, args| string_split(this, args));
+    set_prototype_method(proto, "startsWith", |this, args| string_starts_with(this, args));
+    set_prototype_method(proto, "endsWith", |this, args| string_ends_with(this, args));
+    set_prototype_method(proto, "repeat", |this, args| string_repeat(this, args));
+    set_prototype_method(proto, "trimStart", |this, _args| {
+        Ok(Value::string(&this.to_js_string().trim_start().to_string()))
+    });
+    set_prototype_method(proto, "trimEnd", |this, _args| {
+        Ok(Value::string(&this.to_js_string().trim_end().to_string()))
+    });
+    set_prototype_method(proto, "padStart", |this, args| {
+        string_pad(this, args, true)
+    });
+    set_prototype_method(proto, "padEnd", |this, args| {
+        string_pad(this, args, false)
+    });
+    set_prototype_method(proto, "lastIndexOf", |this, args| {
+        string_last_index_of(this, args)
+    });
+}
+
+/// `String.fromCharCode(...)`
+pub fn string_from_char_code(args: &[Value]) -> Result<Value, RuntimeError> {
+    let mut out = String::new();
+    for arg in args {
+        let code = arg.to_number() as u32;
+        if let Some(c) = char::from_u32(code & 0xFFFF) {
+            out.push(c);
+        }
+    }
+    Ok(Value::string(&out))
+}
+
+/// Register the `String` constructor's static methods.
+pub fn register_string_statics(string_fn: &Value) {
+    super::set_static_method(string_fn, "fromCharCode", |args| {
+        string_from_char_code(args)
+    });
+}
+
+pub fn string_starts_with(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    Ok(Value::Bool(
+        s.starts_with(&args.first().map(|v| v.to_js_string()).unwrap_or_default()),
+    ))
+}
+
+pub fn string_ends_with(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    Ok(Value::Bool(
+        s.ends_with(&args.first().map(|v| v.to_js_string()).unwrap_or_default()),
+    ))
+}
+
+pub fn string_repeat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    let count = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+    if count < 0.0 || count.is_infinite() {
+        return Err(RuntimeError::RangeError("Invalid count value".to_string()));
+    }
+    let count = count as usize;
+    if s.len().saturating_mul(count) > 1 << 24 {
+        return Err(RuntimeError::RangeError("Invalid string length".to_string()));
+    }
+    Ok(Value::string(&s.repeat(count)))
+}
+
+pub fn string_pad(obj: &Value, args: &[Value], at_start: bool) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    let target = args.first().map(|v| v.to_number()).unwrap_or(0.0) as usize;
+    let fill = args
+        .get(1)
+        .map(|v| v.to_js_string())
+        .filter(|f| !f.is_empty())
+        .unwrap_or_else(|| " ".to_string());
+    let len = s.chars().count();
+    if target <= len || target > 1 << 20 {
+        return Ok(Value::string(&s));
+    }
+    let pad_len = target - len;
+    let fill_chars: Vec<char> = fill.chars().collect();
+    let padding: String = (0..pad_len).map(|i| fill_chars[i % fill_chars.len()]).collect();
+    Ok(Value::string(&if at_start {
+        format!("{padding}{s}")
+    } else {
+        format!("{s}{padding}")
+    }))
+}
+
+pub fn string_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    let needle = args.first().map(|v| v.to_js_string()).unwrap_or_default();
+    match s.rfind(&needle) {
+        Some(idx) => Ok(Value::Number(idx as f64)),
+        None => Ok(Value::Number(-1.0)),
+    }
 }
 
 fn string_value_of(obj: &Value) -> Result<Value, RuntimeError> {

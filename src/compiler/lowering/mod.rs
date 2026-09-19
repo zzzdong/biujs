@@ -17,6 +17,18 @@ impl Variable {
     }
 }
 
+/// State for one open `try` statement, used to model the control-flow edges
+/// that a delayed `break`/`continue` creates through its `finally` block.
+struct SehFrameInfo {
+    /// The `finally` block of this try statement, if it has one.
+    finally_blk: Option<BlockId>,
+    /// Trampoline blocks that will be entered once this frame's `finally` has
+    /// run. Each gets a CFG edge from `finally_blk` so that liveness/SSA see the
+    /// real data flow (the finally block is what produces the values the
+    /// trampoline observes).
+    pending_exits: Vec<BlockId>,
+}
+
 /// Context for break/continue inside loops.
 struct LoopContext {
     break_point: BlockId,
@@ -44,6 +56,19 @@ pub struct JSASTLower<'a> {
     seh_depth: usize,
     /// Arrow function this capture: if Some, contains the variable holding captured `this`
     arrow_this_var: Option<Value>,
+    /// True only for the lowerer of the script's top-level `main` function.
+    ///
+    /// Script-level bindings are also published into the *global environment*
+    /// (`StoreEnv`) so that nested functions — which get their own frame and
+    /// cannot read the caller's registers — can still resolve them via
+    /// `LoadEnv`. This is what makes closures over script scope work.
+    is_script: bool,
+    /// Nesting depth of block/catch scopes; 0 means "directly in script scope".
+    scope_depth: usize,
+    /// One entry per open `try` statement (parallel to `seh_depth`).
+    seh_frames: Vec<SehFrameInfo>,
+    /// Names published into the global environment by this (script) lowerer.
+    global_names: std::collections::HashSet<String>,
 }
 
 impl<'a> JSASTLower<'a> {
@@ -54,6 +79,36 @@ impl<'a> JSASTLower<'a> {
             loop_contexts: Vec::new(),
             seh_depth: 0,
             arrow_this_var: None,
+            is_script: false,
+            scope_depth: 0,
+            seh_frames: Vec::new(),
+            global_names: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Create the lowerer for the script's top level.
+    pub fn new_script(builder: &'a mut dyn InstBuilder, symbols: SymbolTable<Variable>) -> Self {
+        let mut lower = Self::new(builder, symbols);
+        lower.is_script = true;
+        lower
+    }
+
+    /// Whether a binding declared right here becomes a script-level global.
+    fn at_script_scope(&self) -> bool {
+        self.is_script && self.scope_depth == 0
+    }
+
+    /// Publish `name -> value` into the global environment (script scope only).
+    fn define_global(&mut self, name: &str, value: Value) {
+        self.builder.store_external_variable(name.to_string(), value);
+        self.global_names.insert(name.to_string());
+    }
+
+    /// Re-publish a global after it has been reassigned.
+    fn sync_global(&mut self, name: &str, value: Value) {
+        if self.global_names.contains(name) {
+            self.builder
+                .store_external_variable(name.to_string(), value);
         }
     }
 
@@ -74,10 +129,16 @@ impl<'a> JSASTLower<'a> {
         self.builder.switch_to_block(entry);
         self.builder.set_entry(entry);
 
-        // Now assign hoisted functions to symbols (we have a current block)
+        // Now assign hoisted functions (we have a current block)
         for (name, func_val) in hoisted_funcs {
             let dst = self.builder.alloc();
             self.builder.assign(dst, func_val);
+            // Script-level declarations are also published to the global
+            // environment so nested functions (which have their own frame and
+            // cannot read the caller's registers) can resolve them via LoadEnv.
+            if self.at_script_scope() {
+                self.define_global(&name, func_val);
+            }
             self.symbols.insert(name, Variable::new(dst));
         }
 
@@ -134,7 +195,9 @@ impl<'a> JSASTLower<'a> {
             Statement::ReturnStatement(ret) => self.lower_return(ret),
             Statement::IfStatement(if_stmt) => self.lower_if(if_stmt),
             Statement::WhileStatement(while_stmt) => self.lower_while(while_stmt),
+            Statement::DoWhileStatement(do_while) => self.lower_do_while(do_while),
             Statement::ForStatement(for_stmt) => self.lower_for(for_stmt),
+            Statement::SwitchStatement(switch) => self.lower_switch(switch),
             Statement::BlockStatement(block) => self.lower_block_stmt(block),
             Statement::BreakStatement(_) => self.lower_break(),
             Statement::ContinueStatement(_) => self.lower_continue(),
@@ -156,6 +219,9 @@ impl<'a> JSASTLower<'a> {
         if let Some(id) = &class.id {
             let dst = self.builder.alloc();
             self.builder.assign(dst, class_val);
+            if self.at_script_scope() {
+                self.define_global(&id.name.to_string(), class_val);
+            }
             self.symbols.insert(id.name.to_string(), Variable::new(dst));
         }
     }
@@ -214,6 +280,7 @@ impl<'a> JSASTLower<'a> {
                 None,
                 false,
                 &[],
+                false,
             );
 
             if is_constructor {
@@ -267,12 +334,22 @@ impl<'a> JSASTLower<'a> {
             let name = self.binding_pattern_name(&declarator.id);
             let dst = self.builder.alloc();
 
-            if let Some(init) = &declarator.init {
-                let value = self.lower_expression(init);
+            let value = match &declarator.init {
+                Some(init) => Some(self.lower_expression(init)),
+                None => None,
+            };
+
+            if let Some(value) = value {
                 self.builder.assign(dst, value);
+                if self.at_script_scope() {
+                    self.define_global(&name, value);
+                }
+            } else if self.at_script_scope() {
+                // `var x;` — publish the (undefined) binding so nested reads
+                // resolve to undefined instead of throwing ReferenceError.
+                self.define_global(&name, Value::Primitive(Primitive::Undefined));
             }
             // else: dst stays as default (undefined)
-
             self.symbols.insert(name, Variable::new(dst));
         }
     }
@@ -340,6 +417,112 @@ impl<'a> JSASTLower<'a> {
         self.builder.switch_to_block(after_blk);
     }
 
+    /// `do { body } while (test);` — the body always runs at least once.
+    fn lower_do_while(&mut self, do_while: &DoWhileStatement<'_>) {
+        let body_blk = self.create_block("dowhile_body");
+        let cond_blk = self.create_block("dowhile_cond");
+        let after_blk = self.create_block("dowhile_after");
+
+        self.enter_loop_context(after_blk, cond_blk);
+
+        self.builder.jump(body_blk);
+        self.builder.switch_to_block(body_blk);
+        self.lower_statement(&do_while.body);
+        if !self.current_block_is_terminated() {
+            self.builder.jump(cond_blk);
+        }
+
+        self.builder.switch_to_block(cond_blk);
+        let cond = self.lower_expression(&do_while.test);
+        self.builder.br_if(cond, body_blk, after_blk);
+
+        self.leave_loop_context();
+        self.builder.switch_to_block(after_blk);
+    }
+
+    /// `switch (disc) { case a: …; default: …; }`
+    ///
+    /// Case tests are evaluated in source order using strict equality; clause
+    /// bodies fall through to the next clause unless terminated. `break` exits
+    /// the switch, `continue` propagates to the enclosing loop.
+    fn lower_switch(&mut self, switch: &SwitchStatement<'_>) {
+        let disc = self.lower_expression(&switch.discriminant);
+        let after_blk = self.create_block("switch_after");
+
+        let n = switch.cases.len();
+        let mut test_blks: Vec<Option<BlockId>> = Vec::with_capacity(n);
+        let mut body_blks: Vec<BlockId> = Vec::with_capacity(n);
+        let mut default_idx: Option<usize> = None;
+
+        for (i, case) in switch.cases.iter().enumerate() {
+            if case.test.is_some() {
+                test_blks.push(Some(self.create_block(format!("case_test_{i}"))));
+            } else {
+                test_blks.push(None);
+                default_idx = Some(i);
+            }
+            body_blks.push(self.create_block(format!("case_body_{i}")));
+        }
+
+        // `break` leaves the switch; `continue` belongs to the enclosing loop.
+        let continue_point = self
+            .loop_contexts
+            .last()
+            .map(|c| c.continue_point)
+            .unwrap_or(after_blk);
+        self.enter_loop_context(after_blk, continue_point);
+
+        // Entry point of the test chain (or the default clause, or the exit).
+        let tests: Vec<(usize, BlockId)> = test_blks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.map(|b| (i, b)))
+            .collect();
+
+        if let Some((_, first)) = tests.first() {
+            self.builder.jump(*first);
+        } else if let Some(d) = default_idx {
+            self.builder.jump(body_blks[d]);
+        } else {
+            self.builder.jump(after_blk);
+        }
+
+        // Test chain: `disc === test ? body : next-test (or default, or exit)`.
+        for (k, (i, test_blk)) in tests.iter().enumerate() {
+            self.builder.switch_to_block(*test_blk);
+            let case_test = switch.cases[*i].test.as_ref().unwrap();
+            let test_val = self.lower_expression(case_test);
+            let eq = self.builder.binop(Opcode::StrictEqual, disc, test_val);
+            let next = tests
+                .get(k + 1)
+                .map(|(_, b)| *b)
+                .or_else(|| default_idx.map(|d| body_blks[d]))
+                .unwrap_or(after_blk);
+            self.builder.br_if(eq, body_blks[*i], next);
+        }
+
+        // Clause bodies, falling through in source order.
+        for i in 0..n {
+            self.builder.switch_to_block(body_blks[i]);
+            for stmt in &switch.cases[i].consequent {
+                self.lower_statement(stmt);
+                if self.current_block_is_terminated() {
+                    break;
+                }
+            }
+            if !self.current_block_is_terminated() {
+                if i + 1 < n {
+                    self.builder.jump(body_blks[i + 1]);
+                } else {
+                    self.builder.jump(after_blk);
+                }
+            }
+        }
+
+        self.leave_loop_context();
+        self.builder.switch_to_block(after_blk);
+    }
+
     fn lower_for(&mut self, for_stmt: &ForStatement<'_>) {
         // ForStatement in oxc: for (init; test; update) body
         let cond_blk = self.create_block("for_cond");
@@ -394,27 +577,55 @@ impl<'a> JSASTLower<'a> {
 
     fn lower_block_stmt(&mut self, block: &BlockStatement<'_>) {
         self.symbols.enter_scope();
+        self.scope_depth += 1;
         for stmt in &block.body {
             self.lower_statement(stmt);
             if self.current_block_is_terminated() {
                 break;
             }
         }
+        self.scope_depth -= 1;
         self.symbols.leave_scope();
+    }
+
+    /// Emit a jump out of a loop, running any intervening `finally` blocks first.
+    ///
+    /// `DelayedJump` cannot carry block arguments, so it targets a small
+    /// trampoline block which then performs an ordinary `Jump`. That way the
+    /// SSA builder still inserts (and fills) the phi parameters the real target
+    /// block needs — otherwise loop-carried variables would read stale
+    /// registers after the finally block ran.
+    fn lower_loop_exit(&mut self, target: BlockId, label: &str) {
+        let Some(ctx_seh_depth) = self.loop_contexts.last().map(|c| c.seh_depth) else {
+            return;
+        };
+        let seh_depth_to_pop = self.seh_depth.saturating_sub(ctx_seh_depth);
+        if seh_depth_to_pop > 0 {
+            // `DelayedJump` carries no block arguments, so it targets a small
+            // trampoline which then performs an ordinary `Jump`. That way the
+            // SSA builder inserts (and fills) the phi parameters the real target
+            // needs; jumping straight there would leave loop-carried variables
+            // holding stale registers.
+            let trampoline = self.create_block(format!("{label}_trampoline"));
+            // Every `finally` frame being unwound leads here, so register the
+            // trampoline on each of them (see `SehFrameInfo::pending_exits`).
+            let first = self.seh_frames.len().saturating_sub(seh_depth_to_pop);
+            for frame in self.seh_frames.iter_mut().skip(first) {
+                frame.pending_exits.push(trampoline);
+            }
+            self.builder.delayed_jump(trampoline, seh_depth_to_pop);
+            self.builder.switch_to_block(trampoline);
+            self.builder.jump(target);
+        } else {
+            self.builder.jump(target);
+        }
+        self.builder.seal_block(self.builder.current_block());
     }
 
     fn lower_break(&mut self) {
         if let Some(ctx) = self.loop_contexts.last() {
             let break_point = ctx.break_point;
-            // Check if we need to execute finally blocks before breaking
-            let seh_depth_to_pop = self.seh_depth.saturating_sub(ctx.seh_depth);
-            if seh_depth_to_pop > 0 {
-                // Use delayed jump to execute finally blocks first
-                self.builder.delayed_jump(break_point, seh_depth_to_pop);
-            } else {
-                self.builder.jump(break_point);
-            }
-            self.builder.seal_block(self.builder.current_block());
+            self.lower_loop_exit(break_point, "break");
         } else {
             log::warn!("break outside loop - ignoring");
         }
@@ -423,15 +634,7 @@ impl<'a> JSASTLower<'a> {
     fn lower_continue(&mut self) {
         if let Some(ctx) = self.loop_contexts.last() {
             let continue_point = ctx.continue_point;
-            // Check if we need to execute finally blocks before continuing
-            let seh_depth_to_pop = self.seh_depth.saturating_sub(ctx.seh_depth);
-            if seh_depth_to_pop > 0 {
-                // Use delayed jump to execute finally blocks first
-                self.builder.delayed_jump(continue_point, seh_depth_to_pop);
-            } else {
-                self.builder.jump(continue_point);
-            }
-            self.builder.seal_block(self.builder.current_block());
+            self.lower_loop_exit(continue_point, "continue");
         } else {
             log::warn!("continue outside loop - ignoring");
         }
@@ -478,11 +681,21 @@ impl<'a> JSASTLower<'a> {
 
         // Increment SEH depth for try body
         self.seh_depth += 1;
+        self.seh_frames.push(SehFrameInfo {
+            finally_blk: if has_finally { Some(finally_blk) } else { None },
+            pending_exits: Vec::new(),
+        });
 
         self.builder.push_seh(seh_handler, seh_finally);
         self.builder.add_exception_edge(try_body, seh_handler);
         if has_finally {
             self.builder.add_exception_edge(try_body, finally_blk);
+            // A `throw` from inside the catch clause also runs this `finally`
+            // before propagating outwards — model that as a real CFG edge, or
+            // values written in the catch clause look dead to liveness/SSA.
+            if has_catch {
+                self.builder.add_exception_edge(catch_blk, finally_blk);
+            }
         }
         self.builder.jump(try_body);
 
@@ -493,8 +706,23 @@ impl<'a> JSASTLower<'a> {
         }
         // Decrement SEH depth after try body
         self.seh_depth -= 1;
+        // Model the data flow a delayed break/continue creates: the trampoline
+        // is entered once this try's `finally` has finished, so the finally
+        // block is its real predecessor.
+        if let Some(frame) = self.seh_frames.pop() {
+            if let Some(finally_blk) = frame.finally_blk {
+                for target in frame.pending_exits {
+                    self.builder
+                        .control_flow_graph_mut()
+                        .add_edge(finally_blk, target);
+                }
+            }
+        }
         if !self.current_block_is_terminated() {
-            self.builder.switch_to_block(try_body);
+            // Emit into whatever block the body *ended* in. Switching back to
+            // `try_body` would append the normal-exit path after the body's
+            // terminator (dead code) and leave the real tail block unterminated,
+            // so it would silently fall through into the next block.
             self.builder.pop_seh();
             if has_finally {
                 self.builder.jump(finally_blk);
@@ -512,6 +740,7 @@ impl<'a> JSASTLower<'a> {
             let exc_val = self.builder.load_exception();
             if let Some(catch_clause) = &try_stmt.handler {
                 self.symbols.enter_scope();
+                self.scope_depth += 1;
                 let name = self.catch_clause_param_name(catch_clause);
                 let dst = self.builder.alloc();
                 self.builder.assign(dst, exc_val);
@@ -519,6 +748,7 @@ impl<'a> JSASTLower<'a> {
                 if let Some(v) = self.lower_block_like_with_result(&catch_clause.body.body) {
                     self.builder.assign(result_var, v);
                 }
+                self.scope_depth -= 1;
                 self.symbols.leave_scope();
             }
             if !self.current_block_is_terminated() {
@@ -642,6 +872,12 @@ impl<'a> JSASTLower<'a> {
             BinaryOperator::GreaterEqualThan => self.builder.binop(Opcode::GreaterEqual, lhs, rhs),
             BinaryOperator::Instanceof => self.builder.binop(Opcode::InstanceOf, lhs, rhs),
             BinaryOperator::In => self.builder.binop(Opcode::In, lhs, rhs),
+            BinaryOperator::BitwiseAnd => self.builder.binop(Opcode::BitAnd, lhs, rhs),
+            BinaryOperator::BitwiseOR => self.builder.binop(Opcode::BitOr, lhs, rhs),
+            BinaryOperator::BitwiseXOR => self.builder.binop(Opcode::BitXor, lhs, rhs),
+            BinaryOperator::ShiftLeft => self.builder.binop(Opcode::Shl, lhs, rhs),
+            BinaryOperator::ShiftRight => self.builder.binop(Opcode::Shr, lhs, rhs),
+            BinaryOperator::ShiftRightZeroFill => self.builder.binop(Opcode::UShr, lhs, rhs),
             _ => {
                 log::warn!("unimplemented binary operator: {:?}", bin.operator);
                 Value::Primitive(Primitive::Null)
@@ -650,6 +886,15 @@ impl<'a> JSASTLower<'a> {
     }
 
     fn lower_unary(&mut self, unary: &UnaryExpression<'_>) -> Value {
+        // `delete` and `typeof` need the *reference*, not the loaded value, so
+        // the operand is lowered lazily per operator.
+        if let UnaryOperator::Delete = unary.operator {
+            return self.lower_delete(&unary.argument);
+        }
+        if let UnaryOperator::Typeof = unary.operator {
+            return self.lower_typeof(&unary.argument);
+        }
+
         let arg = self.lower_expression(&unary.argument);
 
         match unary.operator {
@@ -666,64 +911,116 @@ impl<'a> JSASTLower<'a> {
             }
             UnaryOperator::Typeof => self.builder.typeof_(arg),
             UnaryOperator::Void => {
-                // void expr: evaluate expr, return undefined
-                self.lower_expression(&unary.argument);
+                // `void expr`: evaluate for side effects, always yield undefined.
+                // `arg` above already emitted the evaluation.
                 Value::Primitive(Primitive::Undefined)
             }
-            UnaryOperator::Delete => {
-                // delete is complex; placeholder
-                log::warn!("delete operator not yet implemented");
-                Value::Primitive(Primitive::Boolean(false))
+            UnaryOperator::Delete => unreachable!("handled above"),
+        }
+    }
+
+    /// `typeof expr`.
+    ///
+    /// An unresolvable identifier yields `"undefined"` instead of raising a
+    /// `ReferenceError` (ES6 12.5.5.1 — IsUnresolvableReference short-circuit).
+    fn lower_typeof(&mut self, expr: &Expression<'_>) -> Value {
+        if let Expression::Identifier(ident) = expr.get_inner_expression() {
+            let name = ident.name.as_str();
+            // Names the compiler cannot resolve might still be globals that are
+            // only installed at run time (`Object`, `SyntaxError`, …), so the
+            // "undefined" fallback has to happen in the VM.
+            if !matches!(name, "undefined" | "NaN" | "Infinity")
+                && self.symbols.lookup(name).is_none()
+                && !self.global_names.contains(name)
+            {
+                return self.builder.typeof_env(name.to_string());
+            }
+        }
+        let arg = self.lower_expression(expr);
+        self.builder.typeof_(arg)
+    }
+
+    /// `delete target` — removes a property and reports whether it existed.
+    fn lower_delete(&mut self, expr: &Expression<'_>) -> Value {
+        match expr.get_inner_expression() {
+            Expression::StaticMemberExpression(member) => {
+                let object = self.lower_expression(&member.object);
+                self.builder
+                    .delete_property(object, member.property.name.as_str())
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.lower_expression(&member.object);
+                let index = self.lower_expression(&member.expression);
+                self.builder.delete_index(object, index)
+            }
+            // `delete someIdentifier` — bindings are not deletable here.
+            _ => {
+                if let Expression::Identifier(_) = expr.get_inner_expression() {
+                    Value::Primitive(Primitive::Boolean(false))
+                } else {
+                    log::warn!("unsupported delete target");
+                    Value::Primitive(Primitive::Boolean(true))
+                }
             }
         }
     }
 
     fn lower_update(&mut self, update: &UpdateExpression<'_>) -> Value {
         let one = Value::Primitive(Primitive::Float(1.0));
+        let op = match update.operator {
+            UpdateOperator::Increment => Opcode::Addx,
+            UpdateOperator::Decrement => Opcode::Subx,
+        };
 
-        // Read current value and compute new value based on argument type
-        let (arg, target_val) = match &update.argument {
+        match &update.argument {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                let var = self.symbols.lookup(ident.name.as_str());
-                let current = var
-                    .map(|v| v.0)
-                    .unwrap_or(Value::Primitive(Primitive::Null));
-                (current, var.map(|v| v.0))
+                match self.symbols.lookup(ident.name.as_str()) {
+                    Some(var) => {
+                        let current = var.0;
+                        let new_val = self.builder.binop(op, current, one);
+                        self.builder.assign(current, new_val);
+                        self.sync_global(&ident.name.to_string(), new_val);
+                        // prefix returns new value, postfix returns old value
+                        if update.prefix { new_val } else { current }
+                    }
+                    None => {
+                        // Undeclared target: treat as a global slot.
+                        let current = self
+                            .builder
+                            .load_external_variable(ident.name.to_string());
+                        let new_val = self.builder.binop(op, current, one);
+                        self.builder
+                            .store_external_variable(ident.name.to_string(), new_val);
+                        if update.prefix { new_val } else { current }
+                    }
+                }
             }
             SimpleAssignmentTarget::StaticMemberExpression(member) => {
                 let object = self.lower_expression(&member.object);
                 let current = self
                     .builder
                     .get_property(object, member.property.name.as_str());
-                (current, None) // complex target, simplified for now
+                let new_val = self.builder.binop(op, current, one);
+                self.builder
+                    .set_property(object, member.property.name.as_str(), new_val);
+                if update.prefix { new_val } else { current }
             }
             SimpleAssignmentTarget::ComputedMemberExpression(member) => {
                 let object = self.lower_expression(&member.object);
                 let index = self.lower_expression(&member.expression);
                 let current = self.builder.index_get(object, index);
-                (current, None)
+                let new_val = self.builder.binop(op, current, one);
+                self.builder.index_set(object, index, new_val);
+                if update.prefix { new_val } else { current }
             }
             _ => {
                 log::warn!(
                     "unsupported update expression target: {:?}",
                     update.argument
                 );
-                (Value::Primitive(Primitive::Null), None)
+                Value::Primitive(Primitive::Null)
             }
-        };
-
-        let new_val = match update.operator {
-            UpdateOperator::Increment => self.builder.binop(Opcode::Addx, arg, one),
-            UpdateOperator::Decrement => self.builder.binop(Opcode::Subx, arg, one),
-        };
-
-        // Assign back to the target
-        if let Some(dst) = target_val {
-            self.builder.assign(dst, new_val);
         }
-
-        // prefix returns new value, postfix returns old value
-        if update.prefix { new_val } else { arg }
     }
 
     fn lower_logical(&mut self, logical: &LogicalExpression<'_>) -> Value {
@@ -779,69 +1076,97 @@ impl<'a> JSASTLower<'a> {
         }
     }
 
-    fn lower_assignment(&mut self, assign: &AssignmentExpression<'_>) -> Value {
-        let value = self.lower_expression(&assign.right);
+    /// Emit `current <op> rhs` for a compound assignment (`+=`, `&=`, …).
+    fn compound_binop(
+        &mut self,
+        op: AssignmentOperator,
+        current: Value,
+        rhs: Value,
+    ) -> Option<Value> {
+        let opcode = match op {
+            AssignmentOperator::Addition => Opcode::Addx,
+            AssignmentOperator::Subtraction => Opcode::Subx,
+            AssignmentOperator::Multiplication => Opcode::Mulx,
+            AssignmentOperator::Division => Opcode::Divx,
+            AssignmentOperator::Remainder => Opcode::Remx,
+            AssignmentOperator::BitwiseAnd => Opcode::BitAnd,
+            AssignmentOperator::BitwiseOR => Opcode::BitOr,
+            AssignmentOperator::BitwiseXOR => Opcode::BitXor,
+            AssignmentOperator::ShiftLeft => Opcode::Shl,
+            AssignmentOperator::ShiftRight => Opcode::Shr,
+            AssignmentOperator::ShiftRightZeroFill => Opcode::UShr,
+            _ => return None,
+        };
+        Some(self.builder.binop(opcode, current, rhs))
+    }
 
+    fn lower_assignment(&mut self, assign: &AssignmentExpression<'_>) -> Value {
         match &assign.left {
             AssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                let target = self.symbols.lookup(ident.name.as_str());
-                match assign.operator {
-                    AssignmentOperator::Assign => {
-                        if let Some(var) = target {
-                            self.builder.assign(var.0, value);
-                        }
+                match self.symbols.lookup(ident.name.as_str()) {
+                    Some(var) => {
+                        let current = var.0;
+                        let rhs = self.lower_expression(&assign.right);
+                        let value = self
+                            .compound_binop(assign.operator, current, rhs)
+                            .unwrap_or(rhs);
+                        self.builder.assign(current, value);
+                        self.sync_global(&ident.name.to_string(), value);
+                        value
                     }
-                    AssignmentOperator::Addition => {
-                        if let Some(var) = target {
-                            let result = self.builder.binop(Opcode::Addx, var.0, value);
-                            self.builder.assign(var.0, result);
-                        }
-                    }
-                    AssignmentOperator::Subtraction => {
-                        if let Some(var) = target {
-                            let result = self.builder.binop(Opcode::Subx, var.0, value);
-                            self.builder.assign(var.0, result);
-                        }
-                    }
-                    AssignmentOperator::Multiplication => {
-                        if let Some(var) = target {
-                            let result = self.builder.binop(Opcode::Mulx, var.0, value);
-                            self.builder.assign(var.0, result);
-                        }
-                    }
-                    AssignmentOperator::Division => {
-                        if let Some(var) = target {
-                            let result = self.builder.binop(Opcode::Divx, var.0, value);
-                            self.builder.assign(var.0, result);
-                        }
-                    }
-                    AssignmentOperator::Remainder => {
-                        if let Some(var) = target {
-                            let result = self.builder.binop(Opcode::Remx, var.0, value);
-                            self.builder.assign(var.0, result);
-                        }
-                    }
-                    _ => {
-                        log::warn!("unimplemented assignment operator: {:?}", assign.operator);
+                    None => {
+                        // Assignment to an undeclared (or environment-backed)
+                        // name: read-modify-write through the global environment.
+                        let rhs = self.lower_expression(&assign.right);
+                        let value = if assign.operator == AssignmentOperator::Assign {
+                            rhs
+                        } else {
+                            let current = self
+                                .builder
+                                .load_external_variable(ident.name.to_string());
+                            self.compound_binop(assign.operator, current, rhs)
+                                .unwrap_or(rhs)
+                        };
+                        self.builder
+                            .store_external_variable(ident.name.to_string(), value);
+                        value
                     }
                 }
-                value
             }
             AssignmentTarget::ComputedMemberExpression(member) => {
+                // Evaluate the reference base first, then the RHS (spec order).
                 let object = self.lower_expression(&member.object);
                 let index = self.lower_expression(&member.expression);
+                let rhs = self.lower_expression(&assign.right);
+                let value = if assign.operator == AssignmentOperator::Assign {
+                    rhs
+                } else {
+                    let current = self.builder.index_get(object, index);
+                    self.compound_binop(assign.operator, current, rhs)
+                        .unwrap_or(rhs)
+                };
                 self.builder.index_set(object, index, value);
                 value
             }
             AssignmentTarget::StaticMemberExpression(member) => {
                 let object = self.lower_expression(&member.object);
+                let rhs = self.lower_expression(&assign.right);
+                let value = if assign.operator == AssignmentOperator::Assign {
+                    rhs
+                } else {
+                    let current = self
+                        .builder
+                        .get_property(object, member.property.name.as_str());
+                    self.compound_binop(assign.operator, current, rhs)
+                        .unwrap_or(rhs)
+                };
                 self.builder
                     .set_property(object, member.property.name.as_str(), value);
                 value
             }
             _ => {
                 log::warn!("unimplemented assignment target: {:?}", assign.left);
-                value
+                self.lower_expression(&assign.right)
             }
         }
     }
@@ -1027,6 +1352,7 @@ impl<'a> JSASTLower<'a> {
                 .iter()
                 .map(|s| String::from(*s))
                 .collect::<Vec<String>>(),
+            true,
         );
 
         // At runtime, capture the current `this` value
@@ -1064,7 +1390,7 @@ impl<'a> JSASTLower<'a> {
             .collect();
 
         if let Some(body) = &func.body {
-            self.lower_function_inner(Some(name), params, body, None, false, &[])
+            self.lower_function_inner(Some(name), params, body, None, false, &[], false)
         } else {
             Value::Primitive(Primitive::Null)
         }
@@ -1124,7 +1450,7 @@ impl<'a> JSASTLower<'a> {
 
         if let Some(body) = &func.body {
             let func_id_val =
-                self.lower_function_inner(Some(name.clone()), params, body, None, false, &[]);
+                self.lower_function_inner(Some(name.clone()), params, body, None, false, &[], false);
             Some((name, func_id_val))
         } else {
             None
@@ -1145,6 +1471,7 @@ impl<'a> JSASTLower<'a> {
         captured_this: Option<Value>,
         auto_return: bool,
         captured_names: &[String],
+        is_arrow: bool,
     ) -> Value {
         // During hoisting, there may be no current block yet
         let curr = self.builder.try_current_block();
@@ -1158,6 +1485,15 @@ impl<'a> JSASTLower<'a> {
         let mut symbols = self.symbols.clone();
         for name in captured_names {
             symbols.remove(name);
+        }
+        // Script-scope bindings live in the global environment. They must NOT be
+        // carried into the nested function's symbol table: the corresponding IR
+        // variable belongs to the *outer* frame's register file, so using it here
+        // would read a foreign (or, after SSA renaming, an arbitrary) value.
+        if !self.global_names.is_empty() {
+            for name in &self.global_names {
+                symbols.remove(name);
+            }
         }
 
         let mut func_builder = FunctionBuilder::new(self.builder.module_mut(), &mut func);
@@ -1176,6 +1512,16 @@ impl<'a> JSASTLower<'a> {
             func_lower
                 .symbols
                 .insert(param.name.to_string(), Variable::new(arg));
+        }
+
+        // Every ordinary function has its own `arguments` binding. It has to be
+        // installed eagerly (not on first use) so that nested arrow functions,
+        // which clone this symbol table, resolve `arguments` lexically.
+        if !is_arrow {
+            let args_val = func_lower.builder.arguments_object();
+            func_lower
+                .symbols
+                .insert("arguments".to_string(), Variable::new(args_val));
         }
 
         // First pass: collect nested function declarations for hoisting

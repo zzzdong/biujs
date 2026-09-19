@@ -11,6 +11,9 @@ pub struct Module {
     pub name: Option<String>,
     pub constants: Vec<Constant>,
     pub symtab: HashMap<FunctionId, usize>,
+    /// Declared name and parameter count of every bytecode function, keyed by
+    /// function id. Function objects expose these as `name` / `length`.
+    pub func_info: HashMap<u32, (String, usize)>,
     pub instructions: Vec<Bytecode>,
     pub debug_instructions: BTreeMap<usize, crate::compiler::ir::Instruction>,
 }
@@ -20,12 +23,14 @@ impl Module {
         name: impl Into<Option<String>>,
         constants: Vec<Constant>,
         symtab: HashMap<FunctionId, usize>,
+        func_info: HashMap<u32, (String, usize)>,
         instructions: Vec<Bytecode>,
     ) -> Self {
         Self {
             name: name.into(),
             constants,
             symtab,
+            func_info,
             instructions,
             debug_instructions: BTreeMap::new(),
         }
@@ -152,6 +157,18 @@ pub enum Opcode {
     Not,
     /// bitnot dst, src (bitwise NOT ~)
     BitNot,
+    /// bitand dst, src1, src2 (bitwise AND &)
+    BitAnd,
+    /// bitor dst, src1, src2 (bitwise OR |)
+    BitOr,
+    /// bitxor dst, src1, src2 (bitwise XOR ^)
+    BitXor,
+    /// shl dst, src1, src2 (left shift <<)
+    Shl,
+    /// shr dst, src1, src2 (sign-propagating right shift >>)
+    Shr,
+    /// ushr dst, src1, src2 (unsigned right shift >>>)
+    UShr,
     /// neg dst, src
     Neg,
     /// addx dst, src1, src2 (object addition)
@@ -186,6 +203,9 @@ pub enum Opcode {
     StrictNotEqual,
     /// typeof dst, src
     TypeOf,
+    /// typeof_env dst, name — `typeof x` for an unresolvable-at-compile-time
+    /// name: yields "undefined" instead of throwing ReferenceError.
+    TypeOfEnv,
     /// instanceof dst, src1, src2
     InstanceOf,
     /// in dst, src1, src2
@@ -208,6 +228,12 @@ pub enum Opcode {
     PropGet,
     /// prop_set obj, prop, value
     PropSet,
+    /// prop_delete dst, obj, prop
+    PropDelete,
+    /// index_delete dst, obj, idx
+    IndexDelete,
+    /// store_env name, value — assign into the global environment
+    StoreEnv,
     /// call_method dst, obj, method
     CallMethod,
     /// try catch_offset, finally_offset (SEH: register handler at offset)
@@ -234,6 +260,8 @@ pub enum Opcode {
     MakeArrowFuncObj,
     /// closure_var name, value — push a captured variable for the next MakeArrowFuncObj
     ClosureVar,
+    /// arguments dst — materialise the current frame's `arguments` object
+    Arguments,
 }
 
 impl fmt::Display for Opcode {
@@ -258,6 +286,12 @@ impl fmt::Display for Opcode {
             Opcode::Mov => write!(f, "mov"),
             Opcode::Not => write!(f, "not"),
             Opcode::BitNot => write!(f, "bitnot"),
+            Opcode::BitAnd => write!(f, "bitand"),
+            Opcode::BitOr => write!(f, "bitor"),
+            Opcode::BitXor => write!(f, "bitxor"),
+            Opcode::Shl => write!(f, "shl"),
+            Opcode::Shr => write!(f, "shr"),
+            Opcode::UShr => write!(f, "ushr"),
             Opcode::Neg => write!(f, "neg"),
             Opcode::Addx => write!(f, "addx"),
             Opcode::Subx => write!(f, "subx"),
@@ -275,6 +309,7 @@ impl fmt::Display for Opcode {
             Opcode::StrictEqual => write!(f, "seq"),
             Opcode::StrictNotEqual => write!(f, "sne"),
             Opcode::TypeOf => write!(f, "typeof"),
+            Opcode::TypeOfEnv => write!(f, "typeof_env"),
             Opcode::InstanceOf => write!(f, "instanceof"),
             Opcode::In => write!(f, "in"),
             Opcode::MakeIter => write!(f, "make_iter"),
@@ -286,6 +321,9 @@ impl fmt::Display for Opcode {
             Opcode::IndexSet => write!(f, "index_set"),
             Opcode::PropGet => write!(f, "prop_get"),
             Opcode::PropSet => write!(f, "prop_set"),
+            Opcode::PropDelete => write!(f, "prop_delete"),
+            Opcode::IndexDelete => write!(f, "index_delete"),
+            Opcode::StoreEnv => write!(f, "store_env"),
             Opcode::CallMethod => write!(f, "call_method"),
             Opcode::Try => write!(f, "try"),
             Opcode::EndTry => write!(f, "end_try"),
@@ -299,6 +337,7 @@ impl fmt::Display for Opcode {
             Opcode::MakeFuncObj => write!(f, "make_func_obj"),
             Opcode::MakeArrowFuncObj => write!(f, "make_arrow_func_obj"),
             Opcode::ClosureVar => write!(f, "closure_var"),
+            Opcode::Arguments => write!(f, "arguments"),
         }
     }
 }
@@ -808,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_module_new() {
-        let module = Module::new(Some("test".to_string()), vec![], HashMap::new(), vec![]);
+        let module = Module::new(Some("test".to_string()), vec![], HashMap::new(), HashMap::new(), vec![]);
         assert_eq!(module.name, Some("test".to_string()));
         assert!(module.constants.is_empty());
         assert!(module.symtab.is_empty());
@@ -820,6 +859,7 @@ mod tests {
         let module = Module::new(
             Some("main".to_string()),
             vec![Constant::from("hello")],
+            HashMap::new(),
             HashMap::new(),
             vec![Bytecode::empty(Opcode::Halt)],
         );

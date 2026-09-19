@@ -62,14 +62,42 @@ impl<'a> SSABuilder<'a> {
         // 3. 确定Phi节点位置
         let phi_placements = self.determine_phi_nodes(&var_info, &dominance_frontier);
 
+        // 3.5 Build the block → phi-variable mapping ONCE, in a deterministic
+        //     order. Parameters and jump arguments must be emitted in exactly
+        //     the same order, and `phi_placements` is a HashMap whose iteration
+        //     order is not stable between the two traversals.
+        let block_phi_vars = Self::build_block_phi_vars(&phi_placements);
+
         // 4. 添加Phi块参数
-        self.add_phi_parameters(&phi_placements);
+        self.add_phi_parameters(&block_phi_vars);
+
+
 
         // 5. 变量重命名，并记录每个块中每个原始变量的最终版本
         let block_var_versions = self.rename_variables(&var_info);
 
         // 6. 处理跳转参数（在重命名之后，使用重命名后的变量）
-        self.handle_jump_args(&phi_placements, &block_var_versions);
+        self.handle_jump_args(&block_phi_vars, &block_var_versions);
+    }
+
+    /// Group phi placements by block, keeping variable ids sorted so the
+    /// resulting parameter/argument order is stable.
+    fn build_block_phi_vars(
+        phi_placements: &HashMap<Variable, Vec<BlockId>>,
+    ) -> BTreeMap<BlockId, Vec<Variable>> {
+        let mut vars: Vec<Variable> = phi_placements.keys().copied().collect();
+        vars.sort_by_key(|var| var.as_usize());
+
+        let mut result: BTreeMap<BlockId, Vec<Variable>> = BTreeMap::new();
+        for var in vars {
+            for block_id in &phi_placements[&var] {
+                let entry = result.entry(*block_id).or_default();
+                if !entry.contains(&var) {
+                    entry.push(var);
+                }
+            }
+        }
+        result
     }
 
     /// 预处理：扫描所有块，为每个Throw指令添加从throw块到对应SEH handler的异常边
@@ -116,16 +144,35 @@ impl<'a> SSABuilder<'a> {
             }
         }
 
-        // 添加异常边（如果尚未添加），同时记录throw→handler映射
+        // 记录所有含 throw / resume_exception 的块，稍后统一推导其 handler。
+        // 不能只依赖线性扫描得到的 seh_scope：块的物理顺序并不等于 SEH 嵌套顺序，
+        // `pop_seh` 可能弹错作用域，导致漏掉真实存在的边（例如 catch → finally）。
+        let mut exception_blocks: HashSet<BlockId> = HashSet::new();
+
+        // 添加异常边（如果尚未添加）
         for (throw_block, handler) in throw_edges {
             let successors = self.cfg.get_successors(throw_block);
             if !successors.contains(&handler) {
                 self.cfg.add_edge(throw_block, handler);
             }
-            self.throw_to_handlers
-                .entry(throw_block)
-                .or_default()
-                .push(handler);
+        }
+
+        for block in self.cfg.blocks() {
+            for inst in block.instructions() {
+                if matches!(
+                    inst,
+                    Instruction::Throw { .. } | Instruction::ResumeException { .. }
+                ) {
+                    exception_blocks.insert(block.id());
+                    break;
+                }
+            }
+        }
+
+        // 一个异常块的 handler 就是它在 CFG 中的所有后继。
+        for block_id in exception_blocks {
+            let successors = self.cfg.get_successors(block_id).clone();
+            self.throw_to_handlers.insert(block_id, successors);
         }
     }
 
@@ -208,8 +255,11 @@ impl<'a> SSABuilder<'a> {
                     })
                     .collect();
 
-                // 如果有多个不同的定义流向这个使用块，就需要phi
-                if preds_with_def.len() > 1 && !visited.contains(&use_block) {
+                // 汇合块需要 phi：只要该块有多个前驱、且其中至少一个定义了该变量，
+                // 从不同前驱到达的版本就可能不同（例如 catch 块给变量赋值后，
+                // 另一条经由 finally 的路径仍携带旧版本）。
+                // 只统计"有定义的前驱"个数会漏掉这种情况。
+                if predecessors.len() > 1 && !preds_with_def.is_empty() && !visited.contains(&use_block) {
                     visited.insert(use_block);
                     phi_placements.entry(*var).or_default().push(use_block);
 
@@ -223,9 +273,9 @@ impl<'a> SSABuilder<'a> {
     }
 
     /// 为需要Phi节点的块添加块参数
-    fn add_phi_parameters(&mut self, phi_placements: &HashMap<Variable, Vec<BlockId>>) {
-        for (var, blocks) in phi_placements {
-            for block_id in blocks {
+    fn add_phi_parameters(&mut self, block_phi_vars: &BTreeMap<BlockId, Vec<Variable>>) {
+        for (block_id, vars) in block_phi_vars {
+            for var in vars {
                 self.cfg.append_block_param(*block_id, *var);
             }
         }
@@ -234,33 +284,27 @@ impl<'a> SSABuilder<'a> {
     /// 处理跳转参数：为跳转到需要Phi参数的块的前驱块添加参数
     fn handle_jump_args(
         &mut self,
-        phi_placements: &HashMap<Variable, Vec<BlockId>>,
+        block_phi_vars: &BTreeMap<BlockId, Vec<Variable>>,
         block_var_versions: &BlockVarVersions,
     ) {
-        // 建立块到其需要的Phi参数的映射
-        let block_phi_vars: HashMap<BlockId, Vec<Variable>> = phi_placements
-            .iter()
-            .map(|(var, blocks)| blocks.iter().map(move |&block_id| (block_id, *var)))
-            .fold(HashMap::new(), |mut acc, iter| {
-                for (block_id, var) in iter {
-                    acc.entry(block_id).or_default().push(var);
-                }
-                acc
-            });
-
         // 为每个需要Phi的块处理其前驱块的跳转指令
-        for (block_id, phi_vars) in &block_phi_vars {
+        for (block_id, sorted_vars) in block_phi_vars {
             let predecessors = self.cfg.get_precedences(*block_id).clone();
-            let sorted_vars = phi_vars.to_vec();
 
             for pred_block_id in predecessors {
-                // 获取前驱块中原始变量的最终版本
-                let arg_values: Vec<Variable> = sorted_vars
+                // 获取前驱块中原始变量的最终版本。
+                // 缺失时必须补 `undefined` 而不是跳过，否则实参个数少于形参个数，
+                // 后续所有实参都会错位。
+                let arg_values: Vec<Value> = sorted_vars
                     .iter()
-                    .filter_map(|phi_var| {
-                        block_var_versions
+                    .map(|phi_var| {
+                        match block_var_versions
                             .get(&pred_block_id)
                             .and_then(|pred_vars| pred_vars.get(phi_var).copied())
+                        {
+                            Some(var) => Value::Variable(var),
+                            None => Value::Primitive(crate::bytecode::Primitive::Undefined),
+                        }
                     })
                     .collect();
 
@@ -275,22 +319,17 @@ impl<'a> SSABuilder<'a> {
         &mut self,
         pred_block_id: BlockId,
         target_block_id: BlockId,
-        arg_values: &[Variable],
+        arg_values: &[Value],
     ) {
         // 预先获取后继信息，避免与后续可变借用冲突
-        let _successors: Vec<BlockId> = self.cfg.get_successors(pred_block_id).clone();
-        // 检查pred_block_id是否是throw块且target_block_id是否是它的异常handler
-        let is_exception_handler = self
-            .throw_to_handlers
-            .get(&pred_block_id)
-            .map(|handlers| handlers.contains(&target_block_id))
-            .unwrap_or(false);
+        let successors: Vec<BlockId> = self.cfg.get_successors(pred_block_id).clone();
+        let is_successor = successors.contains(&target_block_id);
 
         if let Some(pred_block) = self.cfg.get_block_mut(pred_block_id) {
             for inst in pred_block.instructions_mut().iter_mut() {
                 match inst {
                     Instruction::Jump { dst, args } if dst.to_block() == target_block_id => {
-                        args.extend(arg_values.iter().map(|&arg| Value::Variable(arg)));
+                        args.extend(arg_values.iter().copied());
                     }
                     Instruction::BrIf {
                         true_blk,
@@ -302,19 +341,24 @@ impl<'a> SSABuilder<'a> {
                         || false_blk.to_block() == target_block_id =>
                     {
                         if true_blk.to_block() == target_block_id {
-                            true_args.extend(arg_values.iter().map(|&arg| Value::Variable(arg)));
+                            true_args.extend(arg_values.iter().copied());
                         } else {
-                            false_args.extend(arg_values.iter().map(|&arg| Value::Variable(arg)));
+                            false_args.extend(arg_values.iter().copied());
                         }
                     }
                     Instruction::Throw { args, .. } => {
-                        if is_exception_handler {
-                            args.extend(arg_values.iter().map(|&arg| Value::Variable(arg)));
+                        // Every successor of a `throw` is an exception handler
+                        // (catch and/or finally), whether the edge was recorded
+                        // by the CFG scan or added explicitly while lowering.
+                        if is_successor && args.is_empty() {
+                            args.extend(arg_values.iter().copied());
                         }
                     }
                     Instruction::ResumeException { args } => {
-                        if is_exception_handler {
-                            args.extend(arg_values.iter().map(|&arg| Value::Variable(arg)));
+                        // Same reasoning as `throw`: a finally block re-throwing
+                        // propagates to every enclosing handler edge.
+                        if is_successor && args.is_empty() {
+                            args.extend(arg_values.iter().copied());
                         }
                     }
                     _ => {}
@@ -557,6 +601,31 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_use(object, stacks);
                 SSABuilder::rename_use(property, stacks);
             }
+            Instruction::PropertyDelete {
+                dst,
+                object,
+                property,
+            } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                SSABuilder::rename_use(object, stacks);
+                SSABuilder::rename_use(property, stacks);
+            }
+            Instruction::IndexDelete {
+                dst,
+                object,
+                index,
+            } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                SSABuilder::rename_use(object, stacks);
+                SSABuilder::rename_use(index, stacks);
+            }
+            Instruction::StoreEnv { name, value } => {
+                SSABuilder::rename_use(name, stacks);
+                SSABuilder::rename_use(value, stacks);
+            }
+            Instruction::Arguments { dst } => {
+                SSABuilder::rename_definition(dst, new_versions);
+            }
             Instruction::PropertySet {
                 object,
                 property,
@@ -669,6 +738,10 @@ impl<'a> SSABuilder<'a> {
             Instruction::TypeOf { dst, src } => {
                 SSABuilder::rename_definition(dst, new_versions);
                 SSABuilder::rename_use(src, stacks);
+            }
+            Instruction::TypeOfEnv { dst, name } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                SSABuilder::rename_use(name, stacks);
             }
             Instruction::New {
                 dst,

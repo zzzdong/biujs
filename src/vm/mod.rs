@@ -19,7 +19,26 @@ use crate::bytecode::{
     Bytecode, Constant, FunctionId, Module, Opcode, Operand, Primitive, Register,
 };
 
-const STACK_MAX: usize = 0x0FFF;
+/// Size of the pre-allocated value stack. Slots are addressed directly, so the
+/// whole frame area is materialized up front (it used to be a tiny 4 KiB stack,
+/// which deep programs overflowed instantly).
+const STACK_MAX: usize = 1 << 18;
+
+/// Maximum JS call depth. Exceeding it raises `RangeError: Maximum call stack
+/// size exceeded` instead of exhausting host memory.
+const MAX_CALL_DEPTH: usize = 512;
+
+/// Default instruction budget for a `run`. A runaway `while` loop therefore
+/// reports an error instead of spinning forever. `None` disables the budget.
+pub const DEFAULT_STEP_LIMIT: u64 = 20_000_000;
+
+/// Prefix of the synthetic name given to bound-function wrappers.
+const BOUND_PREFIX: &str = "__bound__";
+
+/// Whether an operand denotes a writable storage location.
+fn is_addressable(operand: Operand) -> bool {
+    matches!(operand, Operand::Register(_) | Operand::Stack(_))
+}
 
 /// JavaScript Virtual Machine
 ///
@@ -28,6 +47,34 @@ const STACK_MAX: usize = 0x0FFF;
 pub struct VM {
     state: State,
     builtins: Builtins,
+    /// Function metadata (`name`, parameter count) of the module being run.
+    /// Kept here so `materialize_function` can set `fn.name` / `fn.length`
+    /// without threading the module through every call site.
+    current_module_info: Option<HashMap<u32, (String, usize)>>,
+    /// Memoized `FunctionObject` per bytecode function id.
+    ///
+    /// `Value::Function(id)` is a bare function *reference*; whenever it is used
+    /// as a value (property access, `new`, `instanceof`, …) it must be boxed into
+    /// a real object. Boxing must be idempotent: a function's `prototype` object
+    /// is created once and shared, otherwise `F.prototype.x = 1` would be lost the
+    /// next time `F` is materialized.
+    func_objs: HashMap<u32, Value>,
+    /// Instruction budget for the current run (`None` = unlimited).
+    step_limit: Option<u64>,
+    /// Instructions executed so far in the current run.
+    steps: u64,
+    /// Bound functions created by `Function.prototype.bind`, keyed by a
+    /// synthetic id that is embedded in the wrapper's name.
+    bound_functions: HashMap<u32, BoundFunction>,
+    next_bound_id: u32,
+}
+
+/// Result of `Function.prototype.bind`: a target plus the pre-bound `this` and
+/// leading arguments.
+struct BoundFunction {
+    target: Value,
+    this_arg: Value,
+    bound_args: Vec<Value>,
 }
 
 impl VM {
@@ -35,12 +82,35 @@ impl VM {
         let mut state = State::new();
         let builtins = Builtins::new();
         builtins.register(&mut state.globals);
-        Self { state, builtins }
+        Self {
+            state,
+            builtins,
+            current_module_info: None,
+            func_objs: HashMap::new(),
+            step_limit: Some(DEFAULT_STEP_LIMIT),
+            steps: 0,
+            bound_functions: HashMap::new(),
+            next_bound_id: 0,
+        }
+    }
+
+    /// Builder-style override of the instruction budget.
+    ///
+    /// A budget turns a runaway loop (usually an engine bug) into a
+    /// `RangeError` instead of an unbounded spin.
+    pub fn with_step_limit(mut self, limit: Option<u64>) -> Self {
+        self.step_limit = limit;
+        self
     }
 
     /// Execute a bytecode module and return the result
     pub fn run(&mut self, module: &Module) -> Result<Value, RuntimeError> {
         self.state = State::new();
+        self.func_objs.clear();
+        self.current_module_info = Some(module.func_info.clone());
+        self.bound_functions.clear();
+        self.next_bound_id = 0;
+        self.steps = 0;
         // Re-register builtins into the fresh state
         self.builtins.register(&mut self.state.globals);
 
@@ -53,6 +123,53 @@ impl VM {
             .unwrap_or(Value::Undefined))
     }
 
+    /// Box a bare `Value::Function(id)` into a stable `FunctionObject`.
+    ///
+    /// The mapping is memoized for the lifetime of a `run` so that `F.prototype`
+    /// and any properties hung off the function object remain observable.
+    fn materialize_function(&mut self, id: u32) -> Value {
+        if let Some(v) = self.func_objs.get(&id) {
+            return v.clone();
+        }
+        let name = self
+            .current_module_info
+            .as_ref()
+            .and_then(|info| info.get(&id))
+            .cloned();
+        let (name, arity) = match name {
+            Some((name, arity)) => (name, arity),
+            None => (String::new(), 0),
+        };
+        let obj = crate::vm::object::new_function_object(id, &name);
+        // `fn.name` and `fn.length` are ordinary own properties of a function.
+        if let Value::Object(ref obj_ref) = obj {
+            let mut borrowed = obj_ref.borrow_mut();
+            let _ = borrowed
+                .property_set(PropertyKey::from_str("name"), Value::string(&name));
+            let _ = borrowed.property_set(
+                PropertyKey::from_str("length"),
+                Value::Number(arity as f64),
+            );
+        }
+        // Attach Function.prototype so `f.call`, `f.bind`, … resolve.
+        if let Value::Object(ref obj_ref) = obj {
+            obj_ref
+                .borrow_mut()
+                .set_prototype(Some(Rc::clone(&self.builtins.function_prototype)));
+        }
+        self.func_objs.insert(id, obj.clone());
+        obj
+    }
+
+    /// Coerce a value that is about to be used as an object into a `Value::Object`
+    /// where possible (currently: bare function references).
+    fn as_object_value(&mut self, val: &Value) -> Value {
+        match val {
+            Value::Function(id) => self.materialize_function(*id),
+            other => other.clone(),
+        }
+    }
+
     /// Execute a single bytecode instruction. Returns `Ok(false)` when execution
     /// should stop (Halt, or the program counter is out of bounds), and `Ok(true)`
     /// to continue. This is factored out so that other methods can run a nested
@@ -62,6 +179,14 @@ impl VM {
             Some(i) => i.clone(),
             None => return Ok(false),
         };
+        self.steps += 1;
+        if let Some(limit) = self.step_limit {
+            if self.steps > limit {
+                return Err(RuntimeError::RangeError(
+                    "execution step limit exceeded (possible infinite loop)".to_string(),
+                ));
+            }
+        }
         let Bytecode {
             opcode,
             operands: _,
@@ -99,6 +224,11 @@ impl VM {
                     let return_pc = self.state.popc()?;
                     let saved_seh_depth = self.state.popc()?;
                     let saved_closure_depth = self.state.popc()?;
+                    // Restore the caller's `this` binding and frame arity.
+                    if let Some(saved_this) = self.state.this_stack.pop() {
+                        self.state.this_val = saved_this;
+                    }
+                    self.state.frame_argc.pop();
                     // If this frame was invoked via `new`, apply [[Construct]] return
                     // semantics: a returned object becomes the result, otherwise the
                     // newly created `this` object is used.
@@ -115,11 +245,41 @@ impl VM {
                 }
             }
             _ => {
-                self.run_instruction(&inst, module)?;
+                if let Err(err) = self.run_instruction(&inst, module) {
+                    // Spec-level errors (`TypeError`, `RangeError`, …) and
+                    // uncaught JS throws are ordinary exceptions as far as user
+                    // code is concerned: `try { … } catch (e)` and
+                    // `assert.throws(TypeError, …)` must see them. Route them
+                    // through the structured-exception machinery instead of
+                    // aborting the whole program.
+                    if let Some(exc) = self.as_js_exception(&err) {
+                        self.handle_throw(exc)?;
+                        return Ok(true);
+                    }
+                    return Err(err);
+                }
             }
         }
 
         Ok(true)
+    }
+
+    /// Turn a VM error into the JS value user code would catch.
+    ///
+    /// Returns `None` for errors that are *not* part of the language (internal
+    /// errors, unimplemented features) — those must abort execution.
+    fn as_js_exception(&self, err: &RuntimeError) -> Option<Value> {
+        match err {
+            RuntimeError::TypeError(_)
+            | RuntimeError::RangeError(_)
+            | RuntimeError::ReferenceError(_)
+            | RuntimeError::SyntaxError(_)
+            | RuntimeError::Thrown(_) => {
+                Some(crate::builtins::runtime_error_to_js_error(err, &self.builtins))
+            }
+            // Not part of the language: let it abort execution.
+            _ => None,
+        }
     }
 
     /// ES `OrdinaryToPrimitive` (https://tc39.es/ecma262/#sec-ordinarytoprimitive).
@@ -175,6 +335,40 @@ impl VM {
         ))
     }
 
+    /// Create the wrapper returned by `Function.prototype.bind`.
+    fn make_bound(&mut self, target: Value, this_arg: Value, bound_args: Vec<Value>) -> Value {
+        let id = self.next_bound_id;
+        self.next_bound_id += 1;
+        self.bound_functions.insert(
+            id,
+            BoundFunction {
+                target,
+                this_arg,
+                bound_args,
+            },
+        );
+        Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::NativeFunctionObject::new(&format!("{BOUND_PREFIX}{id}")),
+        )))
+    }
+
+    /// Argument list for `f.call(...)` / `f.apply(...)`, minus the `thisArg`.
+    fn call_or_apply_args(
+        &self,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if method == "call" {
+            return Ok(args.iter().skip(1).cloned().collect());
+        }
+        match args.get(1) {
+            None | Some(Value::Undefined) | Some(Value::Null) => Ok(Vec::new()),
+            Some(list) => self.array_like_elements(list).ok_or_else(|| {
+                RuntimeError::TypeError("CreateListFromArrayLike called on non-object".to_string())
+            }),
+        }
+    }
+
     /// Re-entrantly invoke a callable `callee` with `this` bound and no arguments,
     /// returning its result. This drives a nested execution loop so that user
     /// defined `valueOf` / `toString` methods can be honoured during coercion.
@@ -184,87 +378,191 @@ impl VM {
         this: Value,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        self.invoke(callee, this, &[], module)
+    }
+
+    /// Re-entrant invocation of **any** callable with an explicit `this` and
+    /// argument list.
+    ///
+    /// This is the single entry point built-ins use to call back into JavaScript
+    /// (`Function.prototype.call`, `Array.prototype.map`, …). It:
+    ///
+    /// 1. runs native built-ins directly (no bytecode frame), and
+    /// 2. for bytecode functions pushes a fresh frame, drives a nested execution
+    ///    loop until the callee returns, then restores the caller's context.
+    pub fn invoke(
+        &mut self,
+        callee: &Value,
+        this: Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        // Native built-ins never need a bytecode frame.
+        if let Some(name) = crate::builtins::native_function_name(callee) {
+            return self.call_native_by_name(&name, this, args, module);
+        }
+
+        let (func_id, effective_this, captured_vars) = match callee {
+            Value::Function(id) => (*id, this.clone(), Vec::new()),
+            Value::Object(obj_ref) => {
+                let borrowed = obj_ref.borrow();
+                match borrowed
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::FunctionObject>()
+                {
+                    Some(func_obj) => (
+                        func_obj.func_id,
+                        func_obj.captured_this.clone().unwrap_or(this.clone()),
+                        func_obj.captured_vars.clone(),
+                    ),
+                    None => {
+                        return Err(RuntimeError::TypeError("not a function".to_string()));
+                    }
+                }
+            }
+            Value::Undefined => {
+                return Err(RuntimeError::TypeError(
+                    "undefined is not a function".to_string(),
+                ));
+            }
+            _ => return Err(RuntimeError::TypeError("not a function".to_string())),
+        };
+
         let saved_pc = self.state.pc;
         let saved_rsp = self.state.rsp;
         let saved_rbp = self.state.rbp;
         let saved_closure = self.state.closure_var_stack.len();
         let saved_seh = self.state.seh_stack.len();
+        let saved_this = self.state.this_val.clone();
+        let saved_this_depth = self.state.this_stack.len();
+        let saved_construct = self.state.construct_stack.len();
 
-        // Sentinel return address that is one past the last instruction; when the
-        // callee returns, `Ret` sets `pc` to it and the nested loop stops.
+        // Push the arguments and open the callee's frame at the new stack top,
+        // using the same convention as the `Call`/`CallEx` opcodes (arg0 ends up
+        // at `[rbp-1]`).
+        for arg in args.iter().rev() {
+            self.state.push(arg.clone())?;
+        }
+        self.state.rbp = self.state.rsp;
+
+        // Sentinel return address one past the last instruction: when the callee
+        // returns, `Ret` lands here and the nested loop stops.
         let return_pc = module.instructions.len();
 
-        // Set up the call frame the same way the `Call`/`CallEx` opcodes do.
-        self.state.this_val = this.clone();
-        match callee {
-            Value::Function(id) => match module.symtab.get(&FunctionId::new(*id)) {
-                Some(location) => {
-                    self.state.pushc(self.state.closure_var_stack.len())?;
-                    self.state.pushc(self.state.seh_stack.len())?;
-                    self.state.pushc(return_pc)?;
-                    self.state.construct_stack.push(false);
-                    self.state.jump(*location);
-                }
-                None => {
-                    return Err(RuntimeError::ReferenceError(format!(
-                        "undefined function: {id}"
-                    )));
-                }
-            },
-            Value::Object(obj_ref) => {
-                let (id, captured_this, captured_vars) = {
-                    let borrowed = obj_ref.borrow();
-                    if borrowed.kind() == crate::vm::property::ObjectKind::Function {
-                        if let Some(func_obj) = borrowed
-                            .as_any()
-                            .downcast_ref::<crate::vm::object::FunctionObject>()
-                        {
-                            (
-                                func_obj.func_id,
-                                func_obj.captured_this.clone(),
-                                func_obj.captured_vars.clone(),
-                            )
-                        } else {
-                            return Err(RuntimeError::TypeError("not a function".to_string()));
-                        }
-                    } else {
-                        return Err(RuntimeError::TypeError("not a function".to_string()));
-                    }
-                };
-                self.state.this_val = captured_this.unwrap_or(this);
-                for (name, value) in &captured_vars {
-                    let mut map = std::collections::HashMap::new();
-                    map.insert(name.clone(), value.clone());
-                    self.state.closure_var_stack.push(map);
-                }
-                match module.symtab.get(&FunctionId::new(id)) {
-                    Some(location) => {
-                        self.state.pushc(self.state.closure_var_stack.len())?;
-                        self.state.pushc(self.state.seh_stack.len())?;
-                        self.state.pushc(return_pc)?;
-                        self.state.construct_stack.push(false);
-                        self.state.jump(*location);
-                    }
-                    None => {
-                        return Err(RuntimeError::ReferenceError(format!(
-                            "undefined function: {id}"
-                        )));
-                    }
-                }
-            }
-            _ => return Err(RuntimeError::TypeError("not a function".to_string())),
+        self.state.enter_frame(args.len())?;
+        self.state.this_val = effective_this;
+        for (name, value) in &captured_vars {
+            let mut map = std::collections::HashMap::new();
+            map.insert(name.clone(), value.clone());
+            self.state.closure_var_stack.push(map);
         }
 
-        while self.step(module)? {}
+        match module.symtab.get(&FunctionId::new(func_id)) {
+            Some(location) => {
+                self.state.pushc(self.state.closure_var_stack.len())?;
+                self.state.pushc(self.state.seh_stack.len())?;
+                self.state.pushc(return_pc)?;
+                self.state.construct_stack.push(false);
+                self.state.jump(*location);
+            }
+            None => {
+                return Err(RuntimeError::ReferenceError(format!(
+                    "undefined function: {func_id}"
+                )));
+            }
+        }
+
+        // Drive the nested frame. On error the caller's context is restored
+        // first, so an enclosing `try` still sees the exception: unwinding has
+        // to happen before the error is propagated upwards.
+        let outcome = (|| -> Result<(), RuntimeError> {
+            while self.step(module)? {}
+            Ok(())
+        })();
 
         let rv = self.state.get_register(Register::Rv)?;
+        outcome?;
+
         // Restore the caller's execution context.
         self.state.pc = saved_pc;
         self.state.rsp = saved_rsp;
         self.state.rbp = saved_rbp;
         self.state.closure_var_stack.truncate(saved_closure);
         self.state.seh_stack.truncate(saved_seh);
+        self.state.this_stack.truncate(saved_this_depth);
+        self.state.frame_argc.truncate(saved_this_depth);
+        self.state.this_val = saved_this;
+        self.state.construct_stack.truncate(saved_construct);
         Ok(rv)
+    }
+
+    /// Dispatch a built-in by name, honouring prototype methods.
+    ///
+    /// `set_prototype_method` registers prototype methods under the synthetic
+    /// name `__proto_method__<name>`; those need the receiver as their first
+    /// argument, whereas real natives (`Object.keys`, `isNaN`, …) do not.
+    fn call_native_by_name(
+        &mut self,
+        name: &str,
+        this: Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
+            return crate::builtins::object_prototype_to_string(&this, args);
+        }
+        // `Function.prototype` registers `call` / `apply` / `bind` under their
+        // plain names, so handle them before the static-method lookup.
+        if matches!(name, "call" | "apply") && this.is_callable() {
+            let call_args = self.call_or_apply_args(name, args)?;
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            return self.invoke(&this, this_arg, &call_args, module);
+        }
+        if name == "bind" && this.is_callable() {
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
+            return Ok(self.make_bound(this, this_arg, bound_args));
+        }
+        if let Some(id) = name.strip_prefix(BOUND_PREFIX) {
+            let id: u32 = id
+                .parse()
+                .map_err(|_| RuntimeError::InternalError("malformed bound function".to_string()))?;
+            let Some((target, this_arg, mut all)) = self
+                .bound_functions
+                .get(&id)
+                .map(|b| (b.target.clone(), b.this_arg.clone(), b.bound_args.clone()))
+            else {
+                return Err(RuntimeError::InternalError(
+                    "bound function is no longer available".to_string(),
+                ));
+            };
+            all.extend(args.iter().cloned());
+            return self.invoke(&target, this_arg, &all, module);
+        }
+        if let Some(method) = name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
+            // `f.call` / `f.apply` / `f.bind` are the same operations as the
+            // `CallMethod` opcode path handles; they must work identically when
+            // the method value is fetched first (`Function.prototype.call.bind(…)`).
+            if method == "bind" && this.is_callable() {
+                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
+                return Ok(self.make_bound(this, this_arg, bound_args));
+            }
+            if (method == "call" || method == "apply") && this.is_callable() {
+                let call_args = self.call_or_apply_args(method, args)?;
+                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                return self.invoke(&this, this_arg, &call_args, module);
+            }
+            if let Some(result) = self.try_array_callback_method(&this, method, args, module)? {
+                return Ok(result);
+            }
+            return crate::builtins::call_prototype_method(&this, method, args);
+        }
+        // Static methods are stored under their qualified name ("Array.from").
+        if name.contains('.') {
+            return crate::builtins::call_static_method(name, args);
+        }
+        crate::builtins::call_native(name, args)
     }
 
     fn run_instruction(&mut self, inst: &Bytecode, module: &Module) -> Result<(), RuntimeError> {
@@ -274,8 +572,11 @@ impl VM {
             // ===== Control Flow =====
             Opcode::Call => {
                 let func_id = operands[0].as_immd();
+                // Second operand is the argument count (see `CodeGen::gen_call`).
+                let arg_count = operands.get(1).map(|o| o.as_immd() as usize).unwrap_or(0);
                 match module.symtab.get(&FunctionId::new(func_id as u32)) {
                     Some(location) => {
+                        self.state.enter_frame(arg_count)?;
                         // Strict mode: this = undefined for regular function calls
                         self.state.this_val = Value::Undefined;
                         self.state.pushc(self.state.closure_var_stack.len())?;
@@ -293,101 +594,89 @@ impl VM {
                 }
             }
             Opcode::CallEx => {
-                // Dynamic call: operand may be Symbol or Register/Stack holding a function value
-                match operands[0] {
-                    Operand::Symbol(sym) => match module.symtab.get(&FunctionId::new(sym)) {
-                        Some(location) => {
-                            // Strict mode: this = undefined
-                            self.state.this_val = Value::Undefined;
-                            self.state.pushc(self.state.closure_var_stack.len())?;
-                            self.state.pushc(self.state.seh_stack.len())?;
-                            self.state.pushc(self.state.pc + 1)?;
-                            self.state.jump(*location);
-                            return Ok(());
-                        }
-                        None => {
-                            return Err(RuntimeError::ReferenceError(format!(
-                                "undefined function: sym_{sym}"
-                            )));
-                        }
-                    },
-                    Operand::Register(_) | Operand::Stack(_) => {
-                        let value = self.get_value(operands[0])?;
-                        match value {
-                            Value::Function(id) => {
-                                // Strict mode: this = undefined for regular calls
-                                self.state.this_val = Value::Undefined;
-                                match module.symtab.get(&FunctionId::new(id)) {
-                                    Some(location) => {
-                                        self.state.pushc(self.state.closure_var_stack.len())?;
-                                        self.state.pushc(self.state.seh_stack.len())?;
-                                        self.state.pushc(self.state.pc + 1)?;
-                                        self.state.jump(*location);
-                                        return Ok(());
-                                    }
-                                    None => {
-                                        return Err(RuntimeError::ReferenceError(format!(
-                                            "undefined function: {id}"
-                                        )));
-                                    }
-                                }
+                let arg_count = operands[1].as_immd() as usize;
+                // Operands are read with the *caller's* frame pointer still in
+                // place: a stack-slot operand would otherwise resolve inside the
+                // callee's frame. The frame switch happens once they are read.
+                let callee = self.get_value(operands[0])?;
+                self.state.rbp = self.state.rsp;
+
+                // Native (built-in) function: dispatch by name. This makes every
+                // registered builtin callable without keeping a static whitelist
+                // in sync with the lowering pass.
+                if let Some(name) = crate::builtins::native_function_name(&callee) {
+                    let args = self.collect_call_args(arg_count)?;
+                    let result = self.call_native_by_name(&name, Value::Undefined, &args, module)?;
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
+
+                match callee {
+                    Value::Function(id) => {
+                        self.state.enter_frame(arg_count)?;
+                        // Strict mode: this = undefined for regular calls
+                        self.state.this_val = Value::Undefined;
+                        match module.symtab.get(&FunctionId::new(id)) {
+                            Some(location) => {
+                                self.state.pushc(self.state.closure_var_stack.len())?;
+                                self.state.pushc(self.state.seh_stack.len())?;
+                                self.state.pushc(self.state.pc + 1)?;
+                                self.state.construct_stack.push(false);
+                                self.state.jump(*location);
+                                return Ok(());
                             }
-                            Value::Object(obj_ref) => {
-                                // Check if this is a FunctionObject (from class lowering)
-                                let borrowed = obj_ref.borrow();
-                                if borrowed.kind() == ObjectKind::Function {
-                                    if let Some(func_obj) = borrowed
-                                        .as_any()
-                                        .downcast_ref::<crate::vm::object::FunctionObject>(
-                                    ) {
-                                        let id = func_obj.func_id;
-                                        // Check if this is an arrow function with captured this
-                                        let captured_this = func_obj.captured_this.clone();
-                                        let captured_vars = func_obj.captured_vars.clone();
-                                        drop(borrowed);
-                                        // For arrow functions, use captured this; otherwise undefined
-                                        self.state.this_val =
-                                            captured_this.unwrap_or(Value::Undefined);
-                                        // Push captured variables onto closure_var_stack
-                                        for (name, value) in &captured_vars {
-                                            let mut map = std::collections::HashMap::new();
-                                            map.insert(name.clone(), value.clone());
-                                            self.state.closure_var_stack.push(map);
-                                        }
-                                        match module.symtab.get(&FunctionId::new(id)) {
-                                            Some(location) => {
-                                                self.state
-                                                    .pushc(self.state.closure_var_stack.len())?;
-                                                self.state.pushc(self.state.seh_stack.len())?;
-                                                self.state.pushc(self.state.pc + 1)?;
-                                                self.state.jump(*location);
-                                                return Ok(());
-                                            }
-                                            None => {
-                                                return Err(RuntimeError::ReferenceError(format!(
-                                                    "undefined function: {id}"
-                                                )));
-                                            }
-                                        }
-                                    } else {
-                                        return Err(RuntimeError::TypeError(
-                                            "not a constructor".to_string(),
-                                        ));
-                                    }
-                                } else {
-                                    return Err(RuntimeError::TypeError(
-                                        "not a function".to_string(),
-                                    ));
-                                }
-                            }
-                            _ => {
-                                return Err(RuntimeError::TypeError("not a function".to_string()));
+                            None => {
+                                return Err(RuntimeError::ReferenceError(format!(
+                                    "undefined function: {id}"
+                                )));
                             }
                         }
                     }
-                    _ => {
-                        return Err(RuntimeError::TypeError("invalid call target".to_string()));
+                    Value::Object(obj_ref) => {
+                        // A FunctionObject coming from class/closure lowering.
+                        let borrowed = obj_ref.borrow();
+                        if borrowed.kind() == ObjectKind::Function {
+                            let Some(func_obj) = borrowed
+                                .as_any()
+                                .downcast_ref::<crate::vm::object::FunctionObject>()
+                            else {
+                                return Err(RuntimeError::TypeError(
+                                    "not a constructor".to_string(),
+                                ));
+                            };
+                            let id = func_obj.func_id;
+                            // Arrow functions capture `this`; others use undefined.
+                            let captured_this = func_obj.captured_this.clone();
+                            let captured_vars = func_obj.captured_vars.clone();
+                            drop(borrowed);
+
+                            self.state.enter_frame(arg_count)?;
+                            self.state.this_val = captured_this.unwrap_or(Value::Undefined);
+                            for (name, value) in &captured_vars {
+                                let mut map = std::collections::HashMap::new();
+                                map.insert(name.clone(), value.clone());
+                                self.state.closure_var_stack.push(map);
+                            }
+                            match module.symtab.get(&FunctionId::new(id)) {
+                                Some(location) => {
+                                    self.state.pushc(self.state.closure_var_stack.len())?;
+                                    self.state.pushc(self.state.seh_stack.len())?;
+                                    self.state.pushc(self.state.pc + 1)?;
+                                    self.state.construct_stack.push(false);
+                                    self.state.jump(*location);
+                                    return Ok(());
+                                }
+                                None => {
+                                    return Err(RuntimeError::ReferenceError(format!(
+                                        "undefined function: {id}"
+                                    )));
+                                }
+                            }
+                        }
+                        return Err(RuntimeError::TypeError("not a function".to_string()));
                     }
+                    _ => return Err(RuntimeError::TypeError("not a function".to_string())),
                 }
             }
             Opcode::Jump => {
@@ -607,9 +896,32 @@ impl VM {
             Opcode::BitNot => {
                 // Bitwise NOT: convert to 32-bit signed integer, flip bits
                 let value = self.get_value(operands[1])?;
-                let num = value.to_number() as i32;
+                let num = to_int32(value.to_number());
                 let result = Value::Number((!num) as f64);
                 self.set_value(operands[0], result)?;
+            }
+            Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
+                let lhs = self.get_value(operands[1])?;
+                let rhs = self.get_value(operands[2])?;
+                let a = to_int32(lhs.to_number());
+                let b = to_int32(rhs.to_number());
+                let result = match opcode {
+                    Opcode::BitAnd => a & b,
+                    Opcode::BitOr => a | b,
+                    _ => a ^ b,
+                };
+                self.set_value(operands[0], Value::Number(result as f64))?;
+            }
+            Opcode::Shl | Opcode::Shr | Opcode::UShr => {
+                let lhs = self.get_value(operands[1])?;
+                let rhs = self.get_value(operands[2])?;
+                let shift_count = (to_uint32(rhs.to_number()) & 0x1F) as u32;
+                let result = match opcode {
+                    Opcode::Shl => to_int32(lhs.to_number()).wrapping_shl(shift_count),
+                    Opcode::Shr => to_int32(lhs.to_number()).wrapping_shr(shift_count),
+                    _ => (to_uint32(lhs.to_number()).wrapping_shr(shift_count)) as i32,
+                };
+                self.set_value(operands[0], Value::Number(result as f64))?;
             }
             Opcode::Neg => {
                 let value = self.get_value(operands[1])?;
@@ -697,44 +1009,84 @@ impl VM {
                 let type_str = value.type_of().to_string();
                 self.set_value(operands[0], Value::String(Rc::new(type_str)))?;
             }
+            Opcode::TypeOfEnv => {
+                // `typeof unresolvableName` is "undefined" — never a
+                // ReferenceError. The name is a constant-pool index.
+                let name_index = operands[1].as_immd();
+                let name = match &module.constants[name_index as usize] {
+                    Constant::String(s) => s.as_str().to_string(),
+                };
+                let value = self
+                    .state
+                    .closure_var_stack
+                    .iter()
+                    .rev()
+                    .find_map(|map| map.get(&name).cloned())
+                    .or_else(|| self.state.get_global(&name));
+                let type_str = match value {
+                    Some(v) => v.type_of().to_string(),
+                    None => "undefined".to_string(),
+                };
+                self.set_value(operands[0], Value::String(Rc::new(type_str)))?;
+            }
             Opcode::InstanceOf => {
                 let obj = self.get_value(operands[1])?;
                 let ctor = self.get_value(operands[2])?;
+                // A bare `Value::Function(id)` must be boxed first so its
+                // (single, stable) `prototype` object is reachable.
+                let ctor = self.as_object_value(&ctor);
 
-                let result = match (&obj, &ctor) {
-                    // Get the constructor's prototype property
-                    (_, Value::Object(ctor_ref)) => {
+                let result = match ctor {
+                    Value::Object(ctor_ref) => {
                         let ctor_proto = ctor_ref
                             .borrow()
                             .property_get(&PropertyKey::from("prototype"));
-                        if let Some(desc) = ctor_proto {
-                            let target_proto = desc.value;
-                            // Walk the object's prototype chain
-                            let mut current = match &obj {
-                                Value::Object(obj_ref) => obj_ref.borrow().get_prototype(),
-                                _ => None,
-                            };
-                            let mut found = false;
-                            while let Some(proto_ref) = current {
-                                if Value::Object(Rc::clone(&proto_ref)) == target_proto {
-                                    found = true;
-                                    break;
+                        match ctor_proto {
+                            Some(desc) => {
+                                let target_proto = desc.value;
+                                // Walk the object's prototype chain
+                                let mut current = match &obj {
+                                    Value::Object(obj_ref) => obj_ref.borrow().get_prototype(),
+                                    _ => None,
+                                };
+                                let mut found = false;
+                                while let Some(proto_ref) = current {
+                                    if Value::Object(Rc::clone(&proto_ref)) == target_proto {
+                                        found = true;
+                                        break;
+                                    }
+                                    current = proto_ref.borrow().get_prototype();
                                 }
-                                current = proto_ref.borrow().get_prototype();
+                                found
                             }
-                            found
-                        } else {
-                            false
+                            None => false,
                         }
                     }
-                    _ => false,
+                    _ => {
+                        return Err(RuntimeError::TypeError(format!(
+                            "Right-hand side of 'instanceof' is not callable"
+                        )));
+                    }
                 };
 
                 self.set_value(operands[0], Value::Bool(result))?;
             }
             Opcode::In => {
-                // TODO: implement when objects exist
-                self.set_value(operands[0], Value::Bool(false))?;
+                let key = self.resolve_property_key(operands[1], module)?;
+                let obj = self.get_value(operands[2])?;
+                let obj = self.as_object_value(&obj);
+                let result = match obj {
+                    Value::Object(obj_ref) => crate::vm::prototype::internal_has_property(
+                        obj_ref, &key,
+                    )
+                    .map_err(RuntimeError::TypeError)?,
+                    _ => {
+                        return Err(RuntimeError::TypeError(
+                            "Cannot use 'in' operator on non-object".to_string(),
+                        ));
+                    }
+                };
+                self.set_value(operands[0], Value::Bool(result))?;
             }
 
             // ===== Iteration =====
@@ -783,85 +1135,83 @@ impl VM {
                 let obj_val = Value::Object(Rc::new(RefCell::new(obj)));
                 self.set_value(operands[0], obj_val)?;
             }
-            Opcode::IndexGet => {
+            Opcode::IndexGet | Opcode::PropGet => {
                 let obj = self.get_value(operands[1])?;
                 let key = self.resolve_property_key(operands[2], module)?;
-                let value = match obj {
-                    Value::Object(obj_ref) => {
-                        crate::vm::prototype::internal_get(obj_ref, &key, None)
-                            .map_err(|e| RuntimeError::TypeError(e))?
+                // Boxing a bare function reference has to be written back so that
+                // later uses of the same slot observe the same prototype object.
+                let obj = self.as_object_value(&obj);
+                // Only writable locations can cache the boxed function object;
+                // an inline `Value::Function` operand (e.g. `(function(){}).x`)
+                // is not addressable.
+                if is_addressable(operands[1]) {
+                    if matches!(self.get_value(operands[1])?, Value::Function(_)) {
+                        self.set_value(operands[1], obj.clone())?;
                     }
-                    _ => Value::Undefined,
-                };
+                }
+                let value = self.get_member(&obj, &key, module)?;
                 self.set_value(operands[0], value)?;
             }
-            Opcode::IndexSet => {
+            Opcode::IndexSet | Opcode::PropSet => {
                 let obj = self.get_value(operands[0])?;
                 let key = self.resolve_property_key(operands[1], module)?;
                 let val = self.get_value(operands[2])?;
-                match obj {
-                    Value::Object(obj_ref) => {
-                        crate::vm::prototype::internal_set(obj_ref, key, val)
-                            .map_err(|e| RuntimeError::TypeError(e))?;
-                    }
-                    _ => {
-                        return Err(RuntimeError::TypeError(
-                            "IndexSet on non-object".to_string(),
-                        ));
-                    }
+                let obj = self.as_object_value(&obj);
+                self.set_member(&obj, key, val, module)?;
+                // Persist the boxed function object back into its slot.
+                if is_addressable(operands[0]) {
+                    self.set_value(operands[0], obj)?;
                 }
             }
-            Opcode::PropGet => {
+            Opcode::IndexDelete | Opcode::PropDelete => {
                 let obj = self.get_value(operands[1])?;
                 let key = self.resolve_property_key(operands[2], module)?;
-                let value = match obj {
-                    Value::Object(obj_ref) => {
-                        crate::vm::prototype::internal_get(obj_ref, &key, None)
-                            .map_err(|e| RuntimeError::TypeError(e))?
-                    }
-                    Value::Function(func_id) => {
-                        // Convert Value::Function to FunctionObject and update storage
-                        let func_obj = new_function_object(func_id, "<function>");
-                        self.set_value(operands[1], func_obj.clone())?;
-
-                        // Now get the property from the FunctionObject
-                        if let Value::Object(func_ref) = &func_obj {
-                            crate::vm::prototype::internal_get(func_ref.clone(), &key, None)
-                                .map_err(|e| RuntimeError::TypeError(e))?
-                        } else {
-                            Value::Undefined
-                        }
-                    }
-                    _ => Value::Undefined,
-                };
-                self.set_value(operands[0], value)?;
+                let obj = self.as_object_value(&obj);
+                let removed = self.delete_member(&obj, &key)?;
+                self.set_value(operands[0], Value::Bool(removed))?;
             }
-            Opcode::PropSet => {
-                let obj = self.get_value(operands[0])?;
-                let key = self.resolve_property_key(operands[1], module)?;
-                let val = self.get_value(operands[2])?;
-                match obj {
-                    Value::Object(obj_ref) => {
-                        crate::vm::prototype::internal_set(obj_ref, key, val)
-                            .map_err(|e| RuntimeError::TypeError(e))?;
-                    }
-                    Value::Function(func_id) => {
-                        // Convert Value::Function to FunctionObject so properties can be set
-                        let func_obj = new_function_object(func_id, "<function>");
-                        if let Value::Object(obj_ref) = &func_obj {
-                            crate::vm::prototype::internal_set(Rc::clone(obj_ref), key, val)
-                                .map_err(|e| RuntimeError::TypeError(e))?;
-                            // Update the original location to point to the new FunctionObject
-                            self.set_value(operands[0], func_obj)?;
-                        }
-                    }
-                    _ => {
-                        return Err(RuntimeError::TypeError("PropSet on non-object".to_string()));
-                    }
+            Opcode::Arguments => {
+                // The callee's arguments live just below its frame pointer:
+                // `arg i` sits at `rbp - argc + i` (see `enter_frame`).
+                let argc = self.state.frame_argc.last().copied().unwrap_or(0);
+                let rbp = self.state.rbp;
+                let mut arr = ArrayObject::new();
+                for i in 0..argc {
+                    // `load_arg(i)` reads `[rbp - (i + 1)]`, so `arguments[i]`
+                    // must use exactly the same slot.
+                    let index = rbp as isize - i as isize - 1;
+                    let val = if index >= 0 {
+                        self.state
+                            .data_stack
+                            .get(index as usize)
+                            .cloned()
+                            .unwrap_or(Value::Undefined)
+                    } else {
+                        Value::Undefined
+                    };
+                    arr.push(val);
                 }
+                let obj = Value::Object(Rc::new(RefCell::new(arr)));
+                self.set_value(operands[0], obj)?;
+            }
+            Opcode::StoreEnv => {
+                let name_index = operands[0].as_immd();
+                let name = match &module.constants[name_index as usize] {
+                    Constant::String(s) => s.as_str().to_string(),
+                };
+                let value = self.get_value(operands[1])?;
+                self.state.globals.insert(name, value);
             }
             Opcode::CallMethod => {
-                let obj_val = self.get_value(operands[0])?;
+                let mut obj_val = self.get_value(operands[0])?;
+                // A bare function reference must be boxed before looking up the
+                // method, otherwise `F.method()` silently resolves to undefined.
+                obj_val = self.as_object_value(&obj_val);
+                if is_addressable(operands[0])
+                    && matches!(self.get_value(operands[0])?, Value::Function(_))
+                {
+                    self.set_value(operands[0], obj_val.clone())?;
+                }
                 let arg_count = operands[2].as_immd() as usize;
 
                 let method_name = match operands[1] {
@@ -874,13 +1224,49 @@ impl VM {
                     }
                 };
 
-                // Read arguments from the stack
+                // Operands have been read with the caller's frame pointer; switch
+                // to the callee's frame before collecting the outgoing arguments.
+                self.state.rbp = self.state.rsp;
+
+                // Read the outgoing arguments. These live below the *new* frame
+                // pointer, so they must not go through the "missing argument"
+                // rule (which is about the callee's own parameters).
                 let mut args = Vec::with_capacity(arg_count);
                 for i in 0..arg_count {
-                    let offset = -(i as isize + 1);
-                    if let Ok(arg) = self.state.get_value_from_stack(offset) {
-                        args.push(arg);
-                    }
+                    let index = self.state.rbp - i - 1;
+                    args.push(self.state.raw_stack_value(index));
+                }
+
+                // `f.call(thisArg, …)` / `f.apply(thisArg, argsArray)` — the
+                // only way to invoke a callable with an explicit `this`.
+                // `f.bind(thisArg, ...args)` — returns a wrapper that remembers
+                // the bound `this` and leading arguments.
+                if method_name == "bind" && obj_val.is_callable() {
+                    let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                    let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
+                    let wrapper = self.make_bound(obj_val, this_arg, bound_args);
+                    self.state.set_register(Register::Rv, wrapper)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
+
+                if (method_name == "call" || method_name == "apply") && obj_val.is_callable() {
+                    let call_args = self.call_or_apply_args(&method_name, &args)?;
+                    let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                    let result = self.invoke(&obj_val, this_arg, &call_args, module)?;
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
+
+                // Array callback methods (`map`, `filter`, `reduce`, `sort`, …)
+                // are executed here so they can call the user function.
+                if let Some(result) =
+                    self.try_array_callback_method(&obj_val, &method_name, &args, module)?
+                {
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
                 }
 
                 // First check: is this a static method on a native function (constructor)?
@@ -905,8 +1291,18 @@ impl VM {
                 // Look up user-defined method on the object's prototype chain
                 let method_val = self.lookup_property_on_object(&obj_val, &method_name);
 
+                // A native prototype method (e.g. a method reached through the
+                // prototype chain rather than the fast dispatch above).
+                if let Some(name) = crate::builtins::native_function_name(&method_val) {
+                    let result = self.call_native_by_name(&name, obj_val, &args, module)?;
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
+
                 match method_val {
                     Value::Function(id) => {
+                        self.state.enter_frame(arg_count)?;
                         // User-defined bytecode function - call it with this = obj_val
                         self.state.this_val = obj_val;
                         match module.symtab.get(&FunctionId::new(id)) {
@@ -914,6 +1310,7 @@ impl VM {
                                 self.state.pushc(self.state.closure_var_stack.len())?;
                                 self.state.pushc(self.state.seh_stack.len())?;
                                 self.state.pushc(self.state.pc + 1)?;
+                                self.state.construct_stack.push(false);
                                 self.state.jump(*location);
                                 return Ok(());
                             }
@@ -935,6 +1332,7 @@ impl VM {
                                 let captured_this = func_obj.captured_this.clone();
                                 let captured_vars = func_obj.captured_vars.clone();
                                 drop(borrowed);
+                                self.state.enter_frame(arg_count)?;
                                 // For arrow functions, use captured this; for regular methods, use obj_val
                                 self.state.this_val = captured_this.unwrap_or(obj_val);
                                 // Push captured variables onto closure_var_stack
@@ -948,6 +1346,7 @@ impl VM {
                                         self.state.pushc(self.state.closure_var_stack.len())?;
                                         self.state.pushc(self.state.seh_stack.len())?;
                                         self.state.pushc(self.state.pc + 1)?;
+                                        self.state.construct_stack.push(false);
                                         self.state.jump(*location);
                                         return Ok(());
                                     }
@@ -1031,14 +1430,16 @@ impl VM {
             Opcode::New => {
                 let constructor_val = self.get_value(operands[0])?;
                 let arg_count = operands[1].as_immd() as usize;
+                // Operands are read with the caller's frame pointer; the frame
+                // switch happens afterwards, before the arguments are collected.
+                self.state.rbp = self.state.rsp;
 
                 // 1. Determine the function ID and prototype
                 let (func_id, prototype) = match constructor_val {
                     Value::Function(id) => {
-                        // Value::Function should have been converted to FunctionObject by PropGet
-                        // If we get here, it means the constructor was called directly without accessing its properties
-                        // Create a FunctionObject and use its prototype
-                        let func_obj = new_function_object(id, "<constructor>");
+                        // Box the bare function reference into its (memoized) object
+                        // so `F.prototype` identity is stable across `new` calls.
+                        let func_obj = self.materialize_function(id);
                         if let Value::Object(func_ref) = &func_obj {
                             let proto = func_ref
                                 .borrow()
@@ -1080,9 +1481,8 @@ impl VM {
                             // Get arguments from the stack (args were pushed in reverse order)
                             let mut args = Vec::with_capacity(arg_count);
                             for i in 0..arg_count {
-                                let offset = -(i as isize + 1);
-                                let arg = self.state.get_value_from_stack(offset)?;
-                                args.push(arg);
+                                let index = self.state.rbp - i - 1;
+                                args.push(self.state.raw_stack_value(index));
                             }
                             // Reverse to get original order
                             args.reverse();
@@ -1179,6 +1579,7 @@ impl VM {
                 // 5. Save closure depth, SEH depth and return PC, then jump to constructor
                 match module.symtab.get(&FunctionId::new(func_id)) {
                     Some(location) => {
+                        self.state.enter_frame(arg_count)?;
                         // Reset Rv before invoking the constructor so that a constructor
                         // with no explicit `return` (Rv stays undefined) yields `this`
                         // via the [[Construct]] logic in `Ret`. This also avoids leaking a
@@ -1212,7 +1613,7 @@ impl VM {
                         ));
                     }
                 };
-                let obj_val = crate::vm::object::new_function_object(func_id, "<class>");
+                let obj_val = self.materialize_function(func_id);
                 self.set_value(operands[0], obj_val)?;
             }
             Opcode::MakeArrowFuncObj => {
@@ -1262,14 +1663,16 @@ impl VM {
             Opcode::CallNative => {
                 let callable = self.get_value(operands[0])?;
                 let arg_count = operands[1].as_immd() as usize;
+                // Same ordering rule as `CallEx`: read operands first, then
+                // switch to the frame that holds the outgoing arguments.
+                self.state.rbp = self.state.rsp;
 
                 if let Some(name) = crate::builtins::native_function_name(&callable) {
                     // Arguments are on the stack below the frame: arg0 at [rbp-1], arg1 at [rbp-2], etc.
                     let mut args = Vec::with_capacity(arg_count);
                     for i in 0..arg_count {
-                        let offset = -(i as isize + 1);
-                        let arg = self.state.get_value_from_stack(offset)?;
-                        args.push(arg);
+                        let index = self.state.rbp - i - 1;
+                        args.push(self.state.raw_stack_value(index));
                     }
 
                     match crate::builtins::call_native(&name, &args) {
@@ -1355,10 +1758,11 @@ impl VM {
                             self.state.seh_stack.pop();
                             return self.handle_throw(exc);
                         }
-                    } else if let Some(target_offset) = delayed_jump {
-                        // Delayed jump after finally execution
+                    } else if let Some(target_pc) = delayed_jump {
+                        // Delayed jump after finally execution. `target_pc` is an
+                        // absolute address (see Codegen for DelayedJump).
                         self.state.seh_stack.pop();
-                        self.state.jump_offset(target_offset);
+                        self.state.jump(target_pc.max(0) as usize);
                         return Ok(());
                     } else if delayed_return {
                         // Delayed return after finally execution
@@ -1377,6 +1781,235 @@ impl VM {
 
         self.state.jump_offset(1);
         Ok(())
+    }
+
+    /// Snapshot of an array-like receiver's elements (arrays and strings).
+    fn array_like_elements(&self, val: &Value) -> Option<Vec<Value>> {
+        match val {
+            Value::Object(obj_ref) => {
+                if let Some(arr) = obj_ref.borrow().as_any().downcast_ref::<ArrayObject>() {
+                    return Some(
+                        (0..arr.len())
+                            .map(|i| arr.get(i).cloned().unwrap_or(Value::Undefined))
+                            .collect(),
+                    );
+                }
+                // Generic array-like: `length` plus integer-keyed properties.
+                // `Array.prototype.every.call({length:2, 0:'a', 1:'b'}, …)` and
+                // friends rely on this; it is the spec's ListFromLength path.
+                let borrowed = obj_ref.borrow();
+                let len_desc = borrowed.property_get(&PropertyKey::from_str("length"))?;
+                let len = len_desc.value.to_number();
+                if !len.is_finite() || len < 0.0 {
+                    return None;
+                }
+                let len = len.min((1u64 << 24) as f64) as usize;
+                Some(
+                    (0..len)
+                        .map(|i| {
+                            borrowed
+                                .property_get(&PropertyKey::from_str(&i.to_string()))
+                                .map(|d| d.value)
+                                .unwrap_or(Value::Undefined)
+                        })
+                        .collect(),
+                )
+            }
+            Value::String(s) => Some(s.chars().map(|c| Value::string(&c.to_string())).collect()),
+            _ => None,
+        }
+    }
+
+    /// Run an `Array.prototype` method that has to call back into user code.
+    ///
+    /// Returns `Ok(None)` when `method` is not one of those methods, so callers
+    /// can fall back to the ordinary dispatch chain.
+    fn try_array_callback_method(
+        &mut self,
+        receiver: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        const CALLBACK_METHODS: &[&str] = &[
+            "map",
+            "filter",
+            "forEach",
+            "some",
+            "every",
+            "reduce",
+            "reduceRight",
+            "find",
+            "findIndex",
+            "sort",
+        ];
+        if !CALLBACK_METHODS.contains(&method) {
+            return Ok(None);
+        }
+        let Some(elements) = self.array_like_elements(receiver) else {
+            // Not array-like: behave like "method not found" and let the caller
+            // continue with its normal lookup (which raises a TypeError).
+            return Ok(None);
+        };
+
+        let callback = args.first().cloned().unwrap_or(Value::Undefined);
+        let call = |vm: &mut Self,
+                    cb: &Value,
+                    elem: &Value,
+                    index: usize|
+         -> Result<Value, RuntimeError> {
+            vm.invoke(
+                cb,
+                Value::Undefined,
+                &[
+                    elem.clone(),
+                    Value::Number(index as f64),
+                    receiver.clone(),
+                ],
+                module,
+            )
+        };
+
+        match method {
+            "sort" => {
+                let mut items = elements;
+                if callback.is_callable() {
+                    // Insertion sort: stable and lets the comparator be a
+                    // fallible JS call.
+                    for i in 1..items.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let cmp = self
+                                .invoke(
+                                    &callback,
+                                    Value::Undefined,
+                                    &[items[j - 1].clone(), items[j].clone()],
+                                    module,
+                                )?
+                                .to_number();
+                            if cmp > 0.0 {
+                                items.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                } else if !callback.is_undefined() {
+                    return Err(RuntimeError::TypeError(
+                        "The comparison function must be either a function or undefined"
+                            .to_string(),
+                    ));
+                } else {
+                    items.sort_by(|a, b| a.to_js_string().cmp(&b.to_js_string()));
+                }
+                if let Value::Object(obj_ref) = receiver {
+                    let mut borrowed = obj_ref.borrow_mut();
+                    if let Some(arr) = borrowed.as_any_mut().downcast_mut::<ArrayObject>() {
+                        arr.replace_elements(items);
+                    }
+                }
+                Ok(Some(receiver.clone()))
+            }
+            _ if !callback.is_callable() => Err(RuntimeError::TypeError(format!(
+                "{method} callback is not a function"
+            ))),
+            "forEach" => {
+                for (i, e) in elements.iter().enumerate() {
+                    call(self, &callback, e, i)?;
+                }
+                Ok(Some(Value::Undefined))
+            }
+            "map" => {
+                let mut out = Vec::with_capacity(elements.len());
+                for (i, e) in elements.iter().enumerate() {
+                    out.push(call(self, &callback, e, i)?);
+                }
+                Ok(Some(crate::vm::object::new_array_object_from_vec(out)))
+            }
+            "filter" => {
+                let mut out = Vec::new();
+                for (i, e) in elements.iter().enumerate() {
+                    if call(self, &callback, e, i)?.to_boolean() {
+                        out.push(e.clone());
+                    }
+                }
+                Ok(Some(crate::vm::object::new_array_object_from_vec(out)))
+            }
+            "some" => {
+                for (i, e) in elements.iter().enumerate() {
+                    if call(self, &callback, e, i)?.to_boolean() {
+                        return Ok(Some(Value::Bool(true)));
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "every" => {
+                for (i, e) in elements.iter().enumerate() {
+                    if !call(self, &callback, e, i)?.to_boolean() {
+                        return Ok(Some(Value::Bool(false)));
+                    }
+                }
+                Ok(Some(Value::Bool(true)))
+            }
+            "find" => {
+                for (i, e) in elements.iter().enumerate() {
+                    if call(self, &callback, e, i)?.to_boolean() {
+                        return Ok(Some(e.clone()));
+                    }
+                }
+                Ok(Some(Value::Undefined))
+            }
+            "findIndex" => {
+                for (i, e) in elements.iter().enumerate() {
+                    if call(self, &callback, e, i)?.to_boolean() {
+                        return Ok(Some(Value::Number(i as f64)));
+                    }
+                }
+                Ok(Some(Value::Number(-1.0)))
+            }
+            "reduce" | "reduceRight" => {
+                let indices: Vec<usize> = if method == "reduce" {
+                    (0..elements.len()).collect()
+                } else {
+                    (0..elements.len()).rev().collect()
+                };
+                let (mut acc, start) = match args.get(1) {
+                    Some(init) => (init.clone(), 0usize),
+                    None => {
+                        let Some(&first) = indices.first() else {
+                            return Err(RuntimeError::TypeError(
+                                "Reduce of empty array with no initial value".to_string(),
+                            ));
+                        };
+                        (elements[first].clone(), 1)
+                    }
+                };
+                for &i in indices.iter().skip(start) {
+                    acc = self.invoke(
+                        &callback,
+                        Value::Undefined,
+                        &[acc, elements[i].clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                }
+                Ok(Some(acc))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Read the arguments a caller pushed for a dynamic call.
+    ///
+    /// Arguments live just below the current frame: arg0 at `[rbp-1]`, arg1 at
+    /// `[rbp-2]`, … (they were pushed in reverse order).
+    fn collect_call_args(&self, arg_count: usize) -> Result<Vec<Value>, RuntimeError> {
+        let mut args = Vec::with_capacity(arg_count);
+        for i in 0..arg_count {
+            let index = self.state.rbp - i - 1;
+            args.push(self.state.raw_stack_value(index));
+        }
+        Ok(args)
     }
 
     /// Resolve a property key from an operand.
@@ -1533,6 +2166,159 @@ impl VM {
         }
     }
 
+    /// Resolve the prototype object that backs a primitive's wrapper type.
+    fn primitive_prototype(&self, val: &Value) -> Option<Rc<RefCell<dyn JSObject>>> {
+        match val {
+            Value::String(_) => Some(Rc::clone(&self.builtins.string_prototype)),
+            Value::Number(_) => Some(Rc::clone(&self.builtins.number_prototype)),
+            Value::Bool(_) => Some(Rc::clone(&self.builtins.boolean_prototype)),
+            Value::Symbol(_) => Some(Rc::clone(&self.builtins.symbol_prototype)),
+            _ => None,
+        }
+    }
+
+    /// ES `[[Get]]` over any JS value.
+    ///
+    /// Objects use the prototype chain; primitives get the automatic wrapper
+    /// behaviour (`"abc".length`, `(1).toString`, …); `null`/`undefined` raise
+    /// `TypeError` as the spec requires.
+    fn get_member(
+        &mut self,
+        obj: &Value,
+        key: &PropertyKey,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        match obj {
+            Value::Object(obj_ref) => {
+                // Accessor properties have to invoke their getter, which needs a
+                // re-entrant call — hence the descriptor search here.
+                if let Some((owner, desc)) =
+                    crate::vm::prototype::find_descriptor(Rc::clone(obj_ref), key)
+                        .map_err(RuntimeError::TypeError)?
+                {
+                    if desc.is_accessor_descriptor() {
+                        return match desc.getter {
+                            Some(getter) => self.invoke(&getter, Value::Object(owner), &[], module),
+                            None => Ok(Value::Undefined),
+                        };
+                    }
+                    return Ok(desc.value);
+                }
+                Ok(Value::Undefined)
+            }
+            Value::Function(id) => {
+                let boxed = self.materialize_function(*id);
+                self.get_member(&boxed, key, module)
+            }
+            Value::String(s) => {
+                let name = key.as_str().unwrap_or("");
+                if name == "length" {
+                    return Ok(Value::Number(s.chars().count() as f64));
+                }
+                if let Ok(idx) = name.parse::<usize>() {
+                    return Ok(s
+                        .chars()
+                        .nth(idx)
+                        .map(|c| Value::string(&c.to_string()))
+                        .unwrap_or(Value::Undefined));
+                }
+                self.lookup_on_prototype(&self.primitive_prototype(obj), key)
+            }
+            Value::Number(_) | Value::Bool(_) | Value::Symbol(_) => {
+                self.lookup_on_prototype(&self.primitive_prototype(obj), key)
+            }
+            Value::Undefined => Err(RuntimeError::TypeError(format!(
+                "Cannot read properties of undefined (reading '{}')",
+                key.display()
+            ))),
+            Value::Null => Err(RuntimeError::TypeError(format!(
+                "Cannot read properties of null (reading '{}')",
+                key.display()
+            ))),
+        }
+    }
+
+    fn lookup_on_prototype(
+        &self,
+        proto: &Option<Rc<RefCell<dyn JSObject>>>,
+        key: &PropertyKey,
+    ) -> Result<Value, RuntimeError> {
+        match proto {
+            Some(p) => crate::vm::prototype::internal_get(Rc::clone(p), key, None)
+                .map_err(RuntimeError::TypeError),
+            None => Ok(Value::Undefined),
+        }
+    }
+
+    /// ES `[[Set]]` over any JS value.
+    fn set_member(
+        &mut self,
+        obj: &Value,
+        key: PropertyKey,
+        value: Value,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        match obj {
+            Value::Object(obj_ref) => {
+                // An accessor anywhere on the chain intercepts the assignment
+                // and routes it to the setter (which needs a re-entrant call).
+                if let Some((owner, desc)) =
+                    crate::vm::prototype::find_descriptor(Rc::clone(obj_ref), &key)
+                        .map_err(RuntimeError::TypeError)?
+                {
+                    if desc.is_accessor_descriptor() {
+                        return match desc.setter {
+                            Some(setter) => {
+                                self.invoke(&setter, Value::Object(owner), &[value], module)?;
+                                Ok(())
+                            }
+                            // Setter-less accessor: silently ignored (sloppy mode).
+                            None => Ok(()),
+                        };
+                    }
+                    if !desc.writable {
+                        // Sloppy mode: read-only assignment is a silent no-op.
+                        return Ok(());
+                    }
+                    let mut borrowed = obj_ref.borrow_mut();
+                    borrowed
+                        .property_set(key, value)
+                        .map_err(RuntimeError::TypeError)?;
+                    return Ok(());
+                }
+                let mut borrowed = obj_ref.borrow_mut();
+                borrowed
+                    .property_set(key, value)
+                    .map_err(RuntimeError::TypeError)?;
+                Ok(())
+            }
+            Value::Function(id) => {
+                let boxed = self.materialize_function(*id);
+                self.set_member(&boxed, key, value, module)
+            }
+            // Assigning to a property of a primitive is a silent no-op in
+            // sloppy mode (the wrapper object is discarded). The engine does
+            // not track strict-mode source, so the spec's TypeError case is
+            // not reachable here.
+            _ => Ok(()),
+        }
+    }
+
+    /// ES `[[Delete]]` on an object. Returns whether the property was removed.
+    fn delete_member(&mut self, obj: &Value, key: &PropertyKey) -> Result<bool, RuntimeError> {
+        match obj {
+            Value::Object(obj_ref) => crate::vm::prototype::internal_delete(Rc::clone(obj_ref), key)
+                .map_err(RuntimeError::TypeError),
+            Value::Function(id) => {
+                let boxed = self.materialize_function(*id);
+                self.delete_member(&boxed, key)
+            }
+            _ => Err(RuntimeError::TypeError(
+                "Cannot delete property of a non-object".to_string(),
+            )),
+        }
+    }
+
     /// Look up a property on an object via its prototype chain.
     fn lookup_property_on_object(&self, obj: &Value, prop_name: &str) -> Value {
         match obj {
@@ -1608,6 +2394,13 @@ struct State {
     /// Per-frame flag: true if the current frame was invoked via `new` ([[Construct]]).
     /// Used to decide whether a returned value should be replaced by `this`.
     construct_stack: Vec<bool>,
+    /// Saved `this` binding of the caller frame, restored on `Ret`.
+    /// Keeping `this` per-frame prevents a nested call from clobbering it.
+    this_stack: Vec<Value>,
+    /// Number of arguments passed to each active frame, parallel to
+    /// `this_stack`. This is what `Opcode::Arguments` reads to build the
+    /// `arguments` object: the callee has no other way to learn its arity.
+    frame_argc: Vec<usize>,
     rsp: usize,
     rbp: usize,
     pc: usize,
@@ -1616,7 +2409,7 @@ struct State {
 impl State {
     fn new() -> Self {
         Self {
-            data_stack: vec![Value::Undefined; STACK_MAX],
+            data_stack: Vec::with_capacity(1024),
             ctrl_stack: Vec::with_capacity(256),
             registers: std::array::from_fn(|_| Value::Undefined),
             seh_stack: Vec::new(),
@@ -1624,6 +2417,8 @@ impl State {
             this_val: Value::Undefined,
             closure_var_stack: Vec::new(),
             construct_stack: Vec::new(),
+            this_stack: Vec::new(),
+            frame_argc: Vec::new(),
             rsp: 0,
             rbp: 0,
             pc: 0,
@@ -1670,6 +2465,10 @@ impl State {
         if self.rsp >= STACK_MAX {
             return Err(RuntimeError::RangeError("stack overflow".to_string()));
         }
+        if self.rsp >= self.data_stack.len() {
+            let grow_to = (self.data_stack.len() * 2).max(1024).min(STACK_MAX);
+            self.data_stack.resize(grow_to, Value::Undefined);
+        }
         self.data_stack[self.rsp] = value;
         self.rsp += 1;
         Ok(())
@@ -1694,6 +2493,20 @@ impl State {
             .ok_or_else(|| RuntimeError::RangeError("control stack underflow".to_string()))
     }
 
+    /// Make sure slot `index` is addressable, growing the (lazy) value stack.
+    fn ensure(&mut self, index: usize) -> Result<(), RuntimeError> {
+        if index >= STACK_MAX {
+            return Err(RuntimeError::RangeError(
+                "stack access out of bounds".to_string(),
+            ));
+        }
+        if index >= self.data_stack.len() {
+            let grow_to = (self.data_stack.len() * 2).max(index + 1).min(STACK_MAX);
+            self.data_stack.resize(grow_to, Value::Undefined);
+        }
+        Ok(())
+    }
+
     fn get_value_from_stack(&self, offset: isize) -> Result<Value, RuntimeError> {
         let index = self.rbp as isize + offset;
         if index < 0 || index as usize >= STACK_MAX {
@@ -1701,7 +2514,29 @@ impl State {
                 "stack access out of bounds".to_string(),
             ));
         }
-        Ok(self.data_stack[index as usize].clone())
+        // Negative offsets address the incoming arguments (`arg i` at
+        // `[rbp - (i + 1)]`). Slots below that region belong to parameters that
+        // were *not* passed; they must read as `undefined` instead of stale
+        // values left over from an earlier frame.
+        //
+        // Only the callee reads those slots, so `frame_argc` is the current
+        // frame's arity here. Call sites read their outgoing arguments through
+        // `raw_stack_value`, which bypasses this check.
+        if offset < 0 {
+            let argc = self.frame_argc.last().copied().unwrap_or(0);
+            if (-offset) as usize > argc {
+                return Ok(Value::Undefined);
+            }
+        }
+        Ok(self.raw_stack_value(index as usize))
+    }
+
+    /// Read a data-stack slot without the "missing argument" rule above.
+    fn raw_stack_value(&self, index: usize) -> Value {
+        self.data_stack
+            .get(index)
+            .cloned()
+            .unwrap_or(Value::Undefined)
     }
 
     fn set_value_to_stack(&mut self, offset: isize, value: Value) -> Result<(), RuntimeError> {
@@ -1711,13 +2546,55 @@ impl State {
                 "stack access out of bounds".to_string(),
             ));
         }
+        // Never write below the argument region: those slots belong to the
+        // caller's frame and writing them would corrupt it.
+        if offset < 0 {
+            let argc = self.frame_argc.last().copied().unwrap_or(0);
+            if (-offset) as usize > argc {
+                return Ok(());
+            }
+        }
+        self.ensure(index as usize)?;
         self.data_stack[index as usize] = value;
+        Ok(())
+    }
+
+    /// Enter a JS call frame: save the caller's `this`, record the argument
+    /// count (used by `Opcode::Arguments`) and guard recursion depth.
+    fn enter_frame(&mut self, argc: usize) -> Result<(), RuntimeError> {
+        if self.ctrl_stack.len() / 3 >= MAX_CALL_DEPTH {
+            return Err(RuntimeError::RangeError(
+                "Maximum call stack size exceeded".to_string(),
+            ));
+        }
+        self.this_stack.push(self.this_val.clone());
+        self.frame_argc.push(argc);
         Ok(())
     }
 
     fn get_global(&self, name: &str) -> Option<Value> {
         self.globals.get(name).cloned()
     }
+}
+
+/// ES `ToInt32` (ECMAScript 7.1.6): truncate toward zero, then modulo 2**32.
+pub fn to_int32(n: f64) -> i32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    let truncated = n.trunc();
+    let rem = truncated % 4_294_967_296.0; // 2**32
+    let rem = if rem < 0.0 { rem + 4_294_967_296.0 } else { rem };
+    if rem >= 2_147_483_648.0 {
+        (rem - 4_294_967_296.0) as i32
+    } else {
+        rem as i32
+    }
+}
+
+/// ES `ToUint32` (ECMAScript 7.1.7).
+pub fn to_uint32(n: f64) -> u32 {
+    to_int32(n) as u32
 }
 
 /// SEH (Structured Exception Handling) record for try/catch/finally
@@ -1752,6 +2629,8 @@ pub enum RuntimeError {
     ReferenceError(String),
     /// RangeError from the JS specification
     RangeError(String),
+    /// SyntaxError from the JS specification
+    SyntaxError(String),
     /// An internal VM error (should not happen in correct code)
     InternalError(String),
     /// A JS exception thrown by user code (via `throw`)
@@ -1765,8 +2644,29 @@ impl std::fmt::Display for RuntimeError {
             RuntimeError::TypeError(msg) => write!(f, "TypeError: {msg}"),
             RuntimeError::ReferenceError(msg) => write!(f, "ReferenceError: {msg}"),
             RuntimeError::RangeError(msg) => write!(f, "RangeError: {msg}"),
+            RuntimeError::SyntaxError(msg) => write!(f, "SyntaxError: {msg}"),
             RuntimeError::InternalError(msg) => write!(f, "InternalError: {msg}"),
-            RuntimeError::Thrown(val) => write!(f, "{val}"),
+            RuntimeError::Thrown(val) => {
+                // Error-like objects should render as `Name: message`, not
+                // `[object Object]`, so failures are diagnosable.
+                if let Value::Object(obj_ref) = val {
+                    let get = |prop: &str| -> Option<String> {
+                        obj_ref
+                            .borrow()
+                            .property_get(&PropertyKey::from_str(prop))
+                            .and_then(|d| match d.value {
+                                Value::String(s) => Some(s.to_string()),
+                                _ => None,
+                            })
+                    };
+                    let name = get("name").unwrap_or_else(|| "Error".to_string());
+                    match get("message") {
+                        Some(msg) if !msg.is_empty() => return write!(f, "{name}: {msg}"),
+                        _ => return write!(f, "{name}"),
+                    }
+                }
+                write!(f, "{val}")
+            }
         }
     }
 }
@@ -1896,8 +2796,10 @@ mod tests {
     #[test]
     fn test_state_get_value_from_stack() {
         let mut state = State::new();
-        state.data_stack[0] = Value::Number(42.0);
         state.rbp = 0;
+        // The value stack grows lazily, so an untouched slot reads as undefined.
+        assert_eq!(state.get_value_from_stack(0).unwrap(), Value::Undefined);
+        state.set_value_to_stack(0, Value::Number(42.0)).unwrap();
         let val = state.get_value_from_stack(0).unwrap();
         assert_eq!(val, Value::Number(42.0));
     }
@@ -2052,6 +2954,7 @@ mod tests {
         crate::bytecode::Module::new(
             Some("test".to_string()),
             constants,
+            HashMap::new(),
             HashMap::new(),
             instructions,
         )

@@ -65,7 +65,7 @@ impl Compiler {
         {
             let mut builder = FunctionBuilder::new(&mut unit, &mut main_func);
             let symbols = SymbolTable::new();
-            let mut lower = JSASTLower::new(&mut builder, symbols);
+            let mut lower = JSASTLower::new_script(&mut builder, symbols);
             lower.lower_program(&program);
         }
         // FunctionBuilder dropped, borrows released
@@ -79,6 +79,19 @@ impl Compiler {
         let mut symtab = HashMap::new();
 
         let function_count = unit.functions.len();
+        // Function metadata (declared name + arity) travels with the module so
+        // function objects can expose `name` and `length`.
+        let mut func_info: HashMap<u32, (String, usize)> = HashMap::new();
+        for func in &unit.functions {
+            func_info.insert(
+                func.id.as_usize() as u32,
+                (
+                    func.signature.name.to_string(),
+                    func.signature.params.len(),
+                ),
+            );
+        }
+
         for idx in 0..function_count {
             let func_id = FunctionId::new(idx as u32);
 
@@ -115,6 +128,7 @@ impl Compiler {
             Some("main".to_string()),
             unit.constants,
             symtab,
+            func_info,
             all_codes,
         ))
     }

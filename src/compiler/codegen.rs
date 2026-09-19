@@ -16,6 +16,16 @@ pub struct Codegen {
     inst_index: usize,
     insts: BTreeMap<usize, Instruction>,
     throw_to_handlers: HashMap<BlockId, Vec<BlockId>>,
+    /// Keep every variable in a fixed stack slot instead of a register.
+    ///
+    /// The register allocator decides when a value may be dropped by liveness
+    /// analysis, and that analysis is not yet trustworthy across basic blocks —
+    /// values used after a branch could be silently lost. Addressing variables
+    /// through memory removes the whole failure mode; registers still serve as
+    /// per-instruction temporaries.
+    memory_resident_vars: bool,
+    /// Spill live values to memory at the end of every basic block.
+    flush_blocks: bool,
 }
 
 impl Codegen {
@@ -27,6 +37,8 @@ impl Codegen {
             inst_index: 0,
             insts: BTreeMap::new(),
             throw_to_handlers,
+            memory_resident_vars: std::env::var("BIUJS_MEM_VARS").is_ok(),
+            flush_blocks: std::env::var("BIUJS_FLUSH").is_ok(),
         }
     }
 
@@ -64,7 +76,25 @@ impl Codegen {
             self.block_map
                 .insert(block.id().as_usize() as isize, self.codes.len() as isize);
 
+            // Registers do not survive a block boundary (see `begin_block`).
+            if self.flush_blocks {
+                self.reg_alloc.begin_block();
+            }
+
             for inst in block.instructions() {
+                // Make every value reachable from memory before control leaves
+                // the block, so whichever block runs next can reload it.
+                if self.flush_blocks && inst.is_terminator() {
+                    for (register, stack) in self.reg_alloc.flush_block() {
+                        trace!("block-end spill [rbp+{stack}] <- {register}");
+                        self.codes.push(Bytecode::double(
+                            Opcode::Mov,
+                            Operand::Stack(stack as isize),
+                            register.into(),
+                        ));
+                    }
+                }
+
                 debug!("inst[{}]: {inst:?}", self.inst_index);
                 debug!("register: {}", self.reg_alloc.reg_set);
 
@@ -186,6 +216,42 @@ impl Codegen {
                         self.codes
                             .push(Bytecode::triple(Opcode::PropGet, dst, object, property));
                     }
+                    Instruction::PropertyDelete {
+                        dst,
+                        object,
+                        property,
+                    } => {
+                        let dst = self.gen_operand(dst);
+                        let object = self.gen_operand(object);
+                        let property = self.gen_operand(property);
+                        self.codes.push(Bytecode::triple(
+                            Opcode::PropDelete,
+                            dst,
+                            object,
+                            property,
+                        ));
+                    }
+                    Instruction::IndexDelete {
+                        dst,
+                        object,
+                        index,
+                    } => {
+                        let dst = self.gen_operand(dst);
+                        let object = self.gen_operand(object);
+                        let index = self.gen_operand(index);
+                        self.codes
+                            .push(Bytecode::triple(Opcode::IndexDelete, dst, object, index));
+                    }
+                    Instruction::StoreEnv { name, value } => {
+                        let name = name.to_operand();
+                        let value = self.gen_operand(value);
+                        self.codes
+                            .push(Bytecode::double(Opcode::StoreEnv, name, value));
+                    }
+                    Instruction::Arguments { dst } => {
+                        let dst = self.gen_operand(dst);
+                        self.codes.push(Bytecode::single(Opcode::Arguments, dst));
+                    }
                     Instruction::PropertySet {
                         object,
                         property,
@@ -225,6 +291,11 @@ impl Codegen {
                         let dst = self.gen_operand(dst);
                         let src = self.gen_operand(src);
                         self.codes.push(Bytecode::double(Opcode::TypeOf, dst, src));
+                    }
+                    Instruction::TypeOfEnv { dst, name } => {
+                        let dst = self.gen_operand(dst);
+                        self.codes
+                            .push(Bytecode::double(Opcode::TypeOfEnv, dst, name.to_operand()));
                     }
                     Instruction::New {
                         dst,
@@ -304,9 +375,10 @@ impl Codegen {
                                     Operand::Stack(stack_offset as isize),
                                     arg_op,
                                 ));
+                                self.reg_alloc.mark_stack_written(*param);
                             } else {
                                 // 既不在寄存器也不在栈上，分配一个新寄存器（后备方案）
-                                let param_reg = self.reg_alloc.alloc(*param, self.inst_index).0;
+                                let param_reg = self.alloc_register(*param);
                                 self.codes.push(Bytecode::double(
                                     Opcode::Mov,
                                     param_reg.into(),
@@ -355,8 +427,9 @@ impl Codegen {
                                     Operand::Stack(stack_offset as isize),
                                     arg_op,
                                 ));
+                                self.reg_alloc.mark_stack_written(*param);
                             } else {
-                                let param_reg = self.reg_alloc.alloc(*param, self.inst_index).0;
+                                let param_reg = self.alloc_register(*param);
                                 self.codes.push(Bytecode::double(
                                     Opcode::Mov,
                                     param_reg.into(),
@@ -387,8 +460,9 @@ impl Codegen {
                                     Operand::Stack(stack_offset as isize),
                                     arg_op,
                                 ));
+                                self.reg_alloc.mark_stack_written(*param);
                             } else {
-                                let param_reg = self.reg_alloc.alloc(*param, self.inst_index).0;
+                                let param_reg = self.alloc_register(*param);
                                 self.codes.push(Bytecode::double(
                                     Opcode::Mov,
                                     param_reg.into(),
@@ -490,8 +564,7 @@ impl Codegen {
                                             arg_op,
                                         ));
                                     } else {
-                                        let param_reg =
-                                            self.reg_alloc.alloc(*param, self.inst_index).0;
+                                        let param_reg = self.alloc_register(*param);
                                         self.codes.push(Bytecode::double(
                                             Opcode::Mov,
                                             param_reg.into(),
@@ -541,8 +614,7 @@ impl Codegen {
                                             arg_op,
                                         ));
                                     } else {
-                                        let param_reg =
-                                            self.reg_alloc.alloc(*param, self.inst_index).0;
+                                        let param_reg = self.alloc_register(*param);
                                         self.codes.push(Bytecode::double(
                                             Opcode::Mov,
                                             param_reg.into(),
@@ -561,8 +633,12 @@ impl Codegen {
                         let pos = self.codes.len();
                         patchs.push(Box::new(move |this: &mut Self| {
                             let target = this.codes[pos].operands[0].as_immd() as usize;
-                            let offset = this.block_map[&(target as isize)] - pos as isize;
-                            this.codes[pos].operands[0] = Operand::new_immd(offset);
+                            // The target is consumed later by `ResumeExc`, at the
+                            // end of the finally block, so it must be an absolute
+                            // PC: a pc-relative offset would be applied from the
+                            // wrong instruction.
+                            let absolute = this.block_map[&(target as isize)];
+                            this.codes[pos].operands[0] = Operand::new_immd(absolute);
                         }));
 
                         self.codes.push(Bytecode::double(
@@ -586,7 +662,7 @@ impl Codegen {
 
     fn gen_call(&mut self, func: Value, args: &[Value], result: Value) {
         // 1. Backup used registers
-        let in_use_registers = self.reg_alloc.in_use_registers();
+        let in_use_registers = self.reg_alloc.call_saved_registers();
         for reg in in_use_registers.iter().copied() {
             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
         }
@@ -599,15 +675,14 @@ impl Codegen {
             Opcode::PushC,
             Operand::new_register(Register::Rbp),
         ));
-        self.codes.push(Bytecode::double(
-            Opcode::MovC,
-            Operand::new_register(Register::Rbp),
-            Operand::new_register(Register::Rsp),
-        ));
 
-        // 4. Call the function
-        self.codes
-            .push(Bytecode::single(Opcode::Call, func.to_operand()));
+        // 4. Call the function (the argument count travels along so the callee
+        //    can materialise `arguments`).
+        self.codes.push(Bytecode::double(
+            Opcode::Call,
+            func.to_operand(),
+            Operand::new_immd(args.len() as isize),
+        ));
 
         // 5. Restore stack pointer (reset to current base pointer)
         self.codes.push(Bytecode::double(
@@ -646,7 +721,7 @@ impl Codegen {
         let callable = self.gen_operand(func);
 
         // 1. Backup used registers
-        let in_use_registers = self.reg_alloc.in_use_registers();
+        let in_use_registers = self.reg_alloc.call_saved_registers();
         for reg in in_use_registers.iter().copied() {
             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
         }
@@ -659,14 +734,15 @@ impl Codegen {
             Opcode::PushC,
             Operand::new_register(Register::Rbp),
         ));
-        self.codes.push(Bytecode::double(
-            Opcode::MovC,
-            Operand::new_register(Register::Rbp),
-            Operand::new_register(Register::Rsp),
-        ));
 
-        // 4. Call the function (CallEx)
-        self.codes.push(Bytecode::single(Opcode::CallEx, callable));
+        // 4. Call the function (CallEx). The argument count travels with the
+        //    instruction so the VM can read the pushed arguments when the
+        //    callee turns out to be a native built-in.
+        self.codes.push(Bytecode::double(
+            Opcode::CallEx,
+            callable,
+            Operand::new_immd(args.len() as isize),
+        ));
 
         // 5. Restore stack pointer to current base pointer
         self.codes.push(Bytecode::double(
@@ -712,11 +788,6 @@ impl Codegen {
             Opcode::PushC,
             Operand::new_register(Register::Rbp),
         ));
-        self.codes.push(Bytecode::double(
-            Opcode::MovC,
-            Operand::new_register(Register::Rbp),
-            Operand::new_register(Register::Rsp),
-        ));
 
         // 3. Call the native function
         self.codes.push(Bytecode::double(
@@ -757,7 +828,7 @@ impl Codegen {
         let callable = self.gen_operand(object);
 
         // 1. Backup used registers
-        let in_use_registers = self.reg_alloc.in_use_registers();
+        let in_use_registers = self.reg_alloc.call_saved_registers();
         for reg in in_use_registers.iter().copied() {
             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
         }
@@ -769,11 +840,6 @@ impl Codegen {
         self.codes.push(Bytecode::single(
             Opcode::PushC,
             Operand::new_register(Register::Rbp),
-        ));
-        self.codes.push(Bytecode::double(
-            Opcode::MovC,
-            Operand::new_register(Register::Rbp),
-            Operand::new_register(Register::Rsp),
         ));
 
         let prop = self.gen_operand(property);
@@ -822,7 +888,7 @@ impl Codegen {
         let callable = self.gen_operand(constructor);
 
         // 1. Backup used registers
-        let in_use_registers = self.reg_alloc.in_use_registers();
+        let in_use_registers = self.reg_alloc.call_saved_registers();
         for reg in in_use_registers.iter().copied() {
             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
         }
@@ -834,11 +900,6 @@ impl Codegen {
         self.codes.push(Bytecode::single(
             Opcode::PushC,
             Operand::new_register(Register::Rbp),
-        ));
-        self.codes.push(Bytecode::double(
-            Opcode::MovC,
-            Operand::new_register(Register::Rbp),
-            Operand::new_register(Register::Rsp),
         ));
 
         // 4. Call the constructor with New opcode (passing arg count)
@@ -903,12 +964,52 @@ impl Codegen {
         }
     }
 
+    /// Emit the bookkeeping that comes with a register allocation.
+    ///
+    /// `alloc` may report that a victim was spilled (`Action::Spill`) or that a
+    /// value must be reloaded from its stack slot (`Action::Restore`). Callers
+    /// that only take the register silently drop that work and lose values.
+    fn apply_alloc_action(&mut self, action: Option<Action>) {
+        let Some(action) = action else { return };
+        match action {
+            Action::Spill { register, stack } => {
+                trace!("spilling [rbp+{stack}] <- {register}");
+                self.codes.push(Bytecode::double(
+                    Opcode::Mov,
+                    Operand::Stack(stack as isize),
+                    register.into(),
+                ));
+            }
+            Action::Restore { register, stack } => {
+                trace!("unspilling [rbp+{stack}] -> {register}");
+                self.codes.push(Bytecode::double(
+                    Opcode::Mov,
+                    register.into(),
+                    Operand::Stack(stack as isize),
+                ));
+            }
+        }
+    }
+
+    /// Allocate a register for `value`, emitting any spill/restore code.
+    fn alloc_register(&mut self, value: crate::compiler::ir::instruction::Variable) -> Register {
+        let (register, action) = self.reg_alloc.alloc(value, self.inst_index);
+        self.apply_alloc_action(action);
+        register
+    }
+
     fn gen_operand(&mut self, value: Value) -> Operand {
         match value {
             Value::Primitive(v) => Operand::new_primitive(v),
             Value::Constant(id) => Operand::new_immd(id.as_usize() as isize),
             Value::Function(id) => Operand::new_symbol(id.as_usize() as u32),
             Value::Block(id) => Operand::new_immd(id.as_usize() as isize),
+            Value::Variable(var) if self.memory_resident_vars => {
+                // Memory-resident mode: every variable lives in a fixed stack
+                // slot, so no value can be lost by register reuse.
+                let stack = self.reg_alloc.ensure_stack_slot(var);
+                Operand::Stack(stack as isize)
+            }
             Value::Variable(var) => {
                 let (register, action) = self.reg_alloc.alloc(var, self.inst_index);
                 trace!("allocating {value} -> {register}, action = {action:?}");

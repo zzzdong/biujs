@@ -75,6 +75,31 @@ fn get_property_value(desc: PropertyDescriptor, throw_on_accessor: bool) -> Resu
     }
 }
 
+/// The first descriptor found for `key` along the prototype chain, together
+/// with the object that holds it.
+///
+/// The VM uses this to invoke accessors (which need re-entrant function calls)
+/// instead of the pure-data walk in `internal_get`.
+pub fn find_descriptor(
+    obj: Rc<RefCell<dyn JSObject>>,
+    key: &PropertyKey,
+) -> Result<Option<(Rc<RefCell<dyn JSObject>>, PropertyDescriptor)>, String> {
+    let mut current = Some(obj);
+    let mut depth = 0;
+    while let Some(owner) = current {
+        if depth > MAX_PROTO_DEPTH {
+            return Err("Maximum prototype chain depth exceeded".to_string());
+        }
+        let desc = owner.borrow().property_get(key);
+        if let Some(desc) = desc {
+            return Ok(Some((Rc::clone(&owner), desc)));
+        }
+        current = owner.borrow().get_prototype();
+        depth += 1;
+    }
+    Ok(None)
+}
+
 // ─────────────────────────────────────────────────────────
 // [[Set]] — prototype chain property assignment
 // ─────────────────────────────────────────────────────────

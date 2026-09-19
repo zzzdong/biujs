@@ -6,6 +6,7 @@ use crate::vm::object::JSObject;
 use crate::vm::value::Value;
 
 use super::number_to_string;
+use super::number_to_string_radix;
 use super::set_prototype_method;
 use super::set_static_method;
 
@@ -15,8 +16,8 @@ use super::set_static_method;
 
 pub fn register_number_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "valueOf", |this, _args| number_value_of(this));
-    set_prototype_method(proto, "toString", |this, _args| {
-        number_to_string_proto(this)
+    set_prototype_method(proto, "toString", |this, args| {
+        number_to_string_with_radix(this, args)
     });
     set_prototype_method(proto, "toFixed", |this, args| number_to_fixed(this, args));
     set_prototype_method(proto, "toExponential", |this, args| {
@@ -33,6 +34,28 @@ fn number_value_of(obj: &Value) -> Result<Value, RuntimeError> {
 
 fn number_to_string_proto(obj: &Value) -> Result<Value, RuntimeError> {
     Ok(Value::string(&number_to_string(obj.to_number())))
+}
+
+/// `Number.prototype.toString([radix])`.
+///
+/// `radix` defaults to 10; outside `[2, 36]` a `RangeError` is raised, as the
+/// spec requires (`toString` on a number is the only numeric conversion that
+/// honours a radix).
+pub fn number_to_string_with_radix(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let n = obj.to_number();
+    let radix = match args.first() {
+        None | Some(Value::Undefined) => 10,
+        Some(v) => {
+            let r = v.to_number();
+            if r != 10.0 && (r < 2.0 || r > 36.0 || r.is_nan()) {
+                return Err(RuntimeError::RangeError(
+                    "toString() radix argument must be between 2 and 36".to_string(),
+                ));
+            }
+            r as u32
+        }
+    };
+    Ok(Value::string(&number_to_string_radix(n, radix)))
 }
 
 // ─────────────────────────────────────────────────────────
@@ -55,6 +78,42 @@ pub fn register_number_statics(number_fn: &Value, _proto: &Rc<RefCell<dyn JSObje
     set_static_method(number_fn, "isNaN", |args| number_is_nan(args));
     set_static_method(number_fn, "isFinite", |args| number_is_finite(args));
     set_static_method(number_fn, "isInteger", |args| number_is_integer(args));
+    set_static_method(number_fn, "isSafeInteger", |args| {
+        Ok(Value::Bool(
+            args.first()
+                .map(|v| {
+                    let n = v.to_number();
+                    n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0
+                })
+                .unwrap_or(false),
+        ))
+    });
+    set_static_method(number_fn, "parseInt", |args| {
+        super::global_parse_int(args)
+    });
+    set_static_method(number_fn, "parseFloat", |args| {
+        super::global_parse_float(args)
+    });
+
+    // Numeric constants live as own properties of the constructor.
+    if let Value::Object(obj_ref) = number_fn {
+        let constants: [(&str, f64); 8] = [
+            ("MAX_SAFE_INTEGER", 9007199254740991.0),
+            ("MIN_SAFE_INTEGER", -9007199254740991.0),
+            ("MAX_VALUE", f64::MAX),
+            ("MIN_VALUE", 5e-324),
+            ("EPSILON", f64::EPSILON),
+            ("POSITIVE_INFINITY", f64::INFINITY),
+            ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+            ("NaN", f64::NAN),
+        ];
+        for (name, value) in constants {
+            let _ = obj_ref.borrow_mut().property_set(
+                crate::vm::PropertyKey::from_str(name),
+                Value::Number(value),
+            );
+        }
+    }
 }
 
 pub fn number_is_nan(args: &[Value]) -> Result<Value, RuntimeError> {

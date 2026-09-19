@@ -123,11 +123,16 @@ impl Value {
         matches!(self, Value::String(_))
     }
 
-    /// Whether this value is callable (a user function id or a function object).
+    /// Whether this value is callable (a bytecode function reference, a user
+    /// function object, or a native built-in).
     pub fn is_callable(&self) -> bool {
+        use crate::vm::property::ObjectKind;
         match self {
             Value::Function(_) => true,
-            Value::Object(obj) => obj.borrow().kind() == crate::vm::property::ObjectKind::Function,
+            Value::Object(obj) => matches!(
+                obj.borrow().kind(),
+                ObjectKind::Function | ObjectKind::NativeFunction
+            ),
             _ => false,
         }
     }
@@ -238,12 +243,22 @@ impl Value {
             Value::Object(obj) => {
                 let kind = obj.borrow().kind();
                 if kind == crate::vm::property::ObjectKind::Array {
+                    // Arrays stringify their elements, so a self-referencing or
+                    // deeply nested array would recurse until the *host* stack
+                    // overflows (an abort, not a catchable error). Bound it.
                     if let Some(arr) = obj
                         .borrow()
                         .as_any()
                         .downcast_ref::<crate::vm::object::ArrayObject>()
                     {
-                        arr.join_elements()
+                        if enter_to_string().is_ok() {
+                            let result = arr.join_elements();
+                            leave_to_string();
+                            result
+                        } else {
+                            // Cyclic / pathologically nested: stop expanding.
+                            String::new()
+                        }
                     } else {
                         "[object Array]".to_string()
                     }
@@ -350,6 +365,37 @@ impl Value {
     pub fn is_object_type(&self) -> bool {
         matches!(self, Value::Object(_) | Value::Null)
     }
+}
+
+// ─────────────────────────────────────────────────────────
+// Recursion guard for element-wise stringification
+// ─────────────────────────────────────────────────────────
+
+/// Maximum nesting depth `ToString` will follow through arrays.
+///
+/// `[a]` where `a` contains the array again has no finite expansion; without a
+/// bound it exhausts the native stack (which aborts the process rather than
+/// raising a catchable error).
+const MAX_TO_STRING_DEPTH: usize = 32;
+
+thread_local! {
+    static TO_STRING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns `Err(())` when the depth limit is reached.
+fn enter_to_string() -> Result<(), ()> {
+    TO_STRING_DEPTH.with(|depth| {
+        let current = depth.get();
+        if current >= MAX_TO_STRING_DEPTH {
+            return Err(());
+        }
+        depth.set(current + 1);
+        Ok(())
+    })
+}
+
+fn leave_to_string() {
+    TO_STRING_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
 }
 
 // ─────────────────────────────────────────────────────────

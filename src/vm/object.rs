@@ -10,6 +10,13 @@ use crate::vm::value::Value;
 /// ValueRef — shorthand for a reference-counted mutable JS value
 pub type ValueRef = Rc<RefCell<Value>>;
 
+/// Largest index a dense array element store will materialize.
+///
+/// Arrays are backed by a contiguous `Vec`, so a sparse write such as
+/// `arr[2**32 - 1] = 1` would otherwise try to allocate ~96 GB and abort the
+/// whole process.
+pub const MAX_DENSE_ELEMENTS: usize = 1 << 20;
+
 // ─────────────────────────────────────────────────────────
 // JSObject trait
 // ─────────────────────────────────────────────────────────
@@ -153,6 +160,29 @@ impl OrdinaryObject {
             frozen: false,
             sealed: false,
         }
+    }
+
+    /// Install a property with a full descriptor (`Object.defineProperty`).
+    ///
+    /// Fails when an existing property is non-configurable or the object is
+    /// frozen; otherwise the descriptor replaces whatever was there.
+    pub fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        if self.frozen {
+            return Err("Cannot define property on frozen object".to_string());
+        }
+        if let Some(existing) = self.properties.get(&key) {
+            if !existing.configurable {
+                return Err("Cannot redefine non-configurable property".to_string());
+            }
+        } else if !self.extensible {
+            return Err("Cannot add property to non-extensible object".to_string());
+        }
+        self.properties.insert(key, desc);
+        Ok(true)
     }
 }
 
@@ -359,6 +389,16 @@ impl ArrayObject {
         self.elements.iter().any(|v| v.strict_eq(needle))
     }
 
+    /// In-place `Array.prototype.reverse`.
+    pub fn reverse(&mut self) {
+        self.elements.reverse();
+    }
+
+    /// Replace all elements (used by `Array.prototype.sort`).
+    pub fn replace_elements(&mut self, elements: Vec<Value>) {
+        self.elements = elements;
+    }
+
     pub fn join(&self, separator: &str) -> String {
         self.elements
             .iter()
@@ -372,6 +412,11 @@ impl ArrayObject {
             return Self::new();
         }
         let end = end.min(self.elements.len());
+        // `Array.prototype.slice` allows `end <= start` (e.g. `a.slice(3, 1)`),
+        // which must yield an empty array rather than panicking on a bad range.
+        if end <= start {
+            return Self::new();
+        }
         Self::from_vec(self.elements[start..end].to_vec())
     }
 
@@ -448,17 +493,24 @@ impl JSObject for ArrayObject {
 
         match &key {
             PropertyKey::Str(s) if s.as_str() == "length" => {
-                // Adjust array length
-                if let Value::Number(n) = value {
-                    let new_len = n as usize;
-                    self.elements.resize(new_len, Value::Undefined);
-                    Ok(true)
-                } else {
-                    Err("Invalid length value".to_string())
-                }
+                // Adjust array length (with the usual ArrayLength validation)
+                let n = value.to_number();
+                let new_len = crate::builtins::validate_array_length(n)
+                    .map_err(|_| "Invalid array length".to_string())?;
+                self.elements.resize(new_len, Value::Undefined);
+                Ok(true)
             }
             PropertyKey::Str(s) => {
                 if let Ok(idx) = s.parse::<usize>() {
+                    // Elements are stored densely, so refuse indices that would
+                    // require an enormous (or non-representable) backing store.
+                    // Without this, `arr[4294967295] = x` tries to allocate
+                    // 2**32 slots (≈96 GB) and aborts the process.
+                    if idx >= MAX_DENSE_ELEMENTS {
+                        return Err(format!(
+                            "Array index {idx} is out of the supported range"
+                        ));
+                    }
                     if idx >= self.elements.len() {
                         self.elements.resize(idx + 1, Value::Undefined);
                     }
@@ -759,10 +811,18 @@ pub fn new_arrow_function_object(
 /// Wrapper for built-in native functions (constructors and static methods).
 /// Stored as `Value::Object` in the global environment.
 /// When `CallEx` encounters this, it dispatches to the appropriate Rust handler.
+///
+/// Native functions still carry **own properties**: `Object.prototype`,
+/// `Error.prototype`, `Array.isArray`, … are all ordinary properties hung off
+/// the constructor. They used to be dropped on the floor, which made
+/// `Object.prototype.toString.call(x)` (and most of `assert.js`) throw.
 #[derive(Debug)]
 pub struct NativeFunctionObject {
     pub name: String,
+    /// `[[Prototype]]` of the function object itself.
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    /// Own properties (`prototype`, static methods, …).
+    properties: BTreeMap<PropertyKey, PropertyDescriptor>,
 }
 
 impl NativeFunctionObject {
@@ -770,6 +830,7 @@ impl NativeFunctionObject {
         Self {
             name: name.to_string(),
             prototype: None,
+            properties: BTreeMap::new(),
         }
     }
 
@@ -777,7 +838,26 @@ impl NativeFunctionObject {
         Self {
             name: name.to_string(),
             prototype: Some(proto),
+            properties: BTreeMap::new(),
         }
+    }
+
+    /// Install the standard `length` / `name` own properties.
+    pub fn with_metadata(mut self, length: usize) -> Self {
+        self.properties.insert(
+            PropertyKey::from_str("length"),
+            PropertyDescriptor::writable_data_descriptor(Value::Number(length as f64), false),
+        );
+        let display = self
+            .name
+            .strip_prefix(crate::builtins::PROTO_METHOD_PREFIX)
+            .unwrap_or(&self.name)
+            .to_string();
+        self.properties.insert(
+            PropertyKey::from_str("name"),
+            PropertyDescriptor::writable_data_descriptor(Value::string(&display), false),
+        );
+        self
     }
 }
 
@@ -795,24 +875,45 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        // NativeFunction has no own properties by default
-        None
+        // Built-in functions expose `name` (and `length = 0`, which is close
+        // enough for the arity checks test262 performs on some built-ins).
+        if let PropertyKey::Str(s) = key {
+            if s.as_str() == "name" {
+                return Some(PropertyDescriptor::data_descriptor(Value::string(
+                    &self.name,
+                )));
+            }
+            if s.as_str() == "length" {
+                return Some(PropertyDescriptor::data_descriptor(Value::Number(0.0)));
+            }
+        }
+        self.properties.get(key).cloned()
     }
 
-    fn property_set(&mut self, _key: PropertyKey, _value: Value) -> Result<bool, String> {
-        Ok(false)
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        self.properties
+            .insert(key, PropertyDescriptor::data_descriptor(value));
+        Ok(true)
     }
 
-    fn property_delete(&mut self, _key: &PropertyKey) -> bool {
-        false
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        self.properties.remove(key).is_some()
     }
 
-    fn has_property(&self, _key: &PropertyKey) -> bool {
-        false
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        if let PropertyKey::Str(s) = key {
+            if s.as_str() == "name" || s.as_str() == "length" {
+                return true;
+            }
+        }
+        self.properties.contains_key(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        vec![]
+        let mut keys: Vec<PropertyKey> = self.properties.keys().cloned().collect();
+        keys.push(PropertyKey::from_str("name"));
+        keys.push(PropertyKey::from_str("length"));
+        keys
     }
 
     fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {

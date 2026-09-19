@@ -116,8 +116,16 @@ impl Liveness {
         }
     }
 
+    /// All live intervals in a **deterministic** order.
+    ///
+    /// `intervals` is a `HashMap`, so `values()` yields a different order on
+    /// every process run. Register allocation depends on that order, which made
+    /// code generation (and therefore program behaviour) non-deterministic.
+    /// Sorting by variable id pins it down.
     fn intervals(&self) -> Vec<LiveInterval> {
-        self.intervals.values().cloned().collect()
+        let mut intervals: Vec<LiveInterval> = self.intervals.values().cloned().collect();
+        intervals.sort_by_key(|interval| interval.var.as_usize());
+        intervals
     }
 
     fn set_register(&mut self, var: Variable, reg: Register) {
@@ -389,6 +397,13 @@ impl LiveIntervalAnalyzer {
 pub struct RegAlloc {
     liveness: Liveness,
     pub(super) reg_set: RegisterSet,
+    /// Variables whose stack slot is known to hold their current value.
+    ///
+    /// A spill slot only becomes valid once something writes it. Reloading a
+    /// value from a slot that was never written (which happens for variables
+    /// the linear scan decided to keep on the stack from the start) yields
+    /// `undefined` instead of the real value.
+    written_stacks: HashSet<Variable>,
 }
 
 impl RegAlloc {
@@ -399,7 +414,59 @@ impl RegAlloc {
         Self {
             liveness: Liveness::new(),
             reg_set: RegisterSet::new(registers),
+            written_stacks: HashSet::new(),
         }
+    }
+
+    /// Record that `value`'s stack slot now holds its current value.
+    pub fn mark_stack_written(&mut self, value: Variable) {
+        self.written_stacks.insert(value);
+    }
+
+    /// Start a new basic block.
+    ///
+    /// Register contents cannot be trusted across a block boundary: a block that
+    /// is *generated* later may run earlier at run time (loops, shared merge
+    /// blocks), and it may reuse the same register. Dropping every register
+    /// assignment forces each value to be reloaded from its stack slot, which
+    /// `flush_block` keeps up to date.
+    pub fn begin_block(&mut self) {
+        for reg in self.reg_set.registers.iter_mut() {
+            reg.variable = None;
+            reg.is_fixed = false;
+        }
+    }
+
+    /// Write every value that currently lives in a register to its stack slot,
+    /// then forget the register assignments.
+    ///
+    /// Called before a block terminator so that any successor block can recover
+    /// the values it needs from memory, whichever path was taken to reach it.
+    pub fn flush_block(&mut self) -> Vec<(Register, usize)> {
+        let mut spills = Vec::new();
+        for reg in self.reg_set.registers.iter() {
+            let Some(var) = reg.variable else { continue };
+            let stack = match self.liveness.intervals.get(&var).and_then(|iv| iv.stack) {
+                Some(stack) => stack,
+                None => {
+                    let stack = self.liveness.new_stack_slot();
+                    self.liveness.set_stack(var, stack);
+                    stack
+                }
+            };
+            self.written_stacks.insert(var);
+            spills.push((reg.register, stack));
+        }
+        for reg in self.reg_set.registers.iter_mut() {
+            reg.variable = None;
+            reg.is_fixed = false;
+        }
+        spills
+    }
+
+    /// Whether `value` can be reloaded from its stack slot.
+    fn stack_holds_value(&self, value: &Variable) -> bool {
+        self.written_stacks.contains(value)
     }
 
     pub fn load_arg(&mut self, arg: usize) -> isize {
@@ -415,6 +482,27 @@ impl RegAlloc {
             .collect()
     }
 
+    /// Registers whose contents must survive a call.
+    ///
+    /// `in_use_registers` only reports what the allocator *currently* believes
+    /// is live. Liveness is computed on the CFG, so a value that is used again
+    /// from a different block can be released early; the callee then clobbers
+    /// the register and the caller silently reads `undefined`. Saving every
+    /// register this function ever assigns cannot lose a value, which matters
+    /// far more than the extra pushes around a call.
+    pub fn call_saved_registers(&self) -> Vec<Register> {
+        let mut regs = self.in_use_registers();
+        for interval in self.liveness.intervals.values() {
+            if let Some(reg) = interval.reg {
+                if !regs.contains(&reg) {
+                    regs.push(reg);
+                }
+            }
+        }
+        regs.sort_by_key(|reg| reg.as_usize());
+        regs
+    }
+
     /// 获取变量被分配的寄存器
     pub fn get_register(&self, value: &Variable) -> Option<Register> {
         for reg_entry in &self.reg_set.registers {
@@ -427,6 +515,19 @@ impl RegAlloc {
 
     pub fn stack_size(&self) -> usize {
         self.liveness.stack_size()
+    }
+
+    /// Stable stack slot for `var`, allocating one on first use.
+    ///
+    /// Used by the memory-resident code path, where variables are never kept in
+    /// registers across instructions (see `Codegen::memory_resident_vars`).
+    pub fn ensure_stack_slot(&mut self, var: Variable) -> usize {
+        if let Some(stack) = self.liveness.intervals.get(&var).and_then(|iv| iv.stack) {
+            return stack;
+        }
+        let stack = self.liveness.new_stack_slot();
+        self.liveness.set_stack(var, stack);
+        stack
     }
 
     pub fn spill_all(&mut self) -> Vec<(Register, usize)> {
@@ -461,33 +562,91 @@ impl RegAlloc {
             Some(register) => (register, None),
             None => match preset_reg {
                 Some(register) => {
+                    // Re-taking a pre-assigned register evicts whoever holds it
+                    // now; that value has to be preserved on the stack first.
+                    let spill = self.evict_occupant(register, value, index);
                     self.reg_set.use_register(register, value, true);
-                    (register, None)
+                    // The variable owns a stack slot, so it was spilled at some
+                    // point (as an allocation victim). Whatever the register
+                    // holds now is not necessarily its value, so reload it.
+                    // Without this the caller silently reads a stale value.
+                    if let Some(stack) = stack
+                        && self.stack_holds_value(&value)
+                    {
+                        return (
+                            register,
+                            Some(Action::Restore {
+                                stack,
+                                register,
+                            }),
+                        );
+                    }
+                    (register, spill)
                 }
                 None => {
-                    let (reg, spill) = self.reg_set.must_alloc(value, index, &mut self.liveness);
+                    let (reg, spill, victim) =
+                        self.reg_set.must_alloc(value, index, &mut self.liveness);
 
                     // 如果变量在栈上，并且在当前索引处开始一个新的活跃范围，需要从栈恢复
-                    if let Some(stack) = stack {
-                        if self
+                    if let Some(stack) = stack
+                        && self.stack_holds_value(&value)
+                        && self
                             .liveness
                             .intervals
                             .get(&value)
                             .map(|iv| iv.ranges.iter().any(|r| r.start == index))
                             .unwrap_or(false)
-                        {
-                            let restore = Action::Restore {
-                                stack,
-                                register: reg,
-                            };
-                            return (reg, Some(restore));
-                        }
+                    {
+                        let restore = Action::Restore {
+                            stack,
+                            register: reg,
+                        };
+                        return (reg, Some(restore));
+                    }
+
+                    if spill.is_some()
+                        && let Some(victim) = victim
+                    {
+                        // The victim's value is being written to its stack slot
+                        // by the emitted spill, so it can be reloaded later.
+                        self.written_stacks.insert(victim);
                     }
 
                     (reg, spill)
                 }
             },
         }
+    }
+
+    /// Preserve the value currently in `register` before `value` takes it over.
+    ///
+    /// `use_register` overwrites the occupant without saving it, so any value
+    /// that is still needed later would silently turn into whatever the new
+    /// owner writes. Spilling it (allocating a slot first if the linear scan
+    /// never gave it one) keeps it recoverable.
+    fn evict_occupant(
+        &mut self,
+        register: Register,
+        value: Variable,
+        _index: usize,
+    ) -> Option<Action> {
+        let occupant = self.reg_set.occupant(register)?;
+        if occupant == value {
+            return None;
+        }
+
+        let stack = match self.liveness.intervals.get(&occupant).and_then(|iv| iv.stack) {
+            Some(stack) => stack,
+            None => {
+                let stack = self.liveness.new_stack_slot();
+                self.liveness.set_stack(occupant, stack);
+                stack
+            }
+        };
+
+        self.reg_set.release(occupant);
+        self.written_stacks.insert(occupant);
+        Some(Action::Spill { register, stack })
     }
 
     pub fn release(&mut self, value: Variable, index: usize) -> Option<Action> {
@@ -500,6 +659,8 @@ impl RegAlloc {
             && let Some(register) = self.reg_set.release(value)
         {
             let spill = Action::Spill { register, stack };
+            // The caller emits `Mov [rbp+stack], register`, so the slot is valid.
+            self.written_stacks.insert(value);
             return Some(spill);
         }
 
@@ -629,16 +790,17 @@ impl RegisterSet {
 
     /// Allocate a register for `value`, spilling an existing live variable to the
     /// stack if no register is free (instead of panicking). Returns the chosen
-    /// register and, if a victim was spilled, the matching `Action::Spill`.
+    /// register, the `Action::Spill` for the victim (if any) and the victim
+    /// itself, so callers can track which stack slots hold a live value.
     fn must_alloc(
         &mut self,
         value: Variable,
         index: usize,
         liveness: &mut Liveness,
-    ) -> (Register, Option<Action>) {
+    ) -> (Register, Option<Action>, Option<Variable>) {
         if let Some(reg) = self.registers.iter_mut().find(|reg| reg.variable.is_none()) {
             reg.variable = Some(value);
-            return (reg.register, None);
+            return (reg.register, None, None);
         }
 
         // No free register: evict a victim. Prefer a register whose current
@@ -664,7 +826,7 @@ impl RegisterSet {
                 // Should be unreachable: a register is always occupied here.
                 let reg = self.registers.iter_mut().next().unwrap();
                 reg.variable = Some(value);
-                return (reg.register, None);
+                return (reg.register, None, None);
             }
         };
 
@@ -689,6 +851,7 @@ impl RegisterSet {
                 register: victim_reg,
                 stack: slot,
             }),
+            Some(victim_var),
         )
     }
 
@@ -714,6 +877,14 @@ impl RegisterSet {
                 return;
             }
         }
+    }
+
+    /// The variable currently held by `register`, if any.
+    fn occupant(&self, register: Register) -> Option<Variable> {
+        self.registers
+            .iter()
+            .find(|reg| reg.register == register)
+            .and_then(|reg| reg.variable)
     }
 
     fn find(&self, variable: Variable) -> Option<Register> {

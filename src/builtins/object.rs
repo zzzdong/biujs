@@ -1,5 +1,6 @@
 use crate::RuntimeError;
-use crate::vm::object::{JSObject, OrdinaryObject, new_array_object_from_vec};
+use crate::vm::property::PropertyDescriptor;
+use crate::vm::object::{JSObject, new_array_object_from_vec};
 use crate::vm::property::PropertyKey;
 use crate::vm::value::Value;
 use std::cell::RefCell;
@@ -110,14 +111,32 @@ pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
     };
     let desc = &args[2];
 
-    // For now, just set the value directly (simplified implementation)
+    // Honour the full descriptor (value/writable/enumerable/configurable and
+    // get/set) instead of only copying the value.
     if let Value::Object(desc_obj) = desc {
-        let borrowed = desc_obj.borrow();
-        if let Some(value_desc) = borrowed.property_get(&PropertyKey::from_str("value")) {
-            let mut obj_mut = obj.borrow_mut();
+        let keys = desc_obj.borrow().own_keys();
+        if keys.is_empty() {
+            return Err(RuntimeError::TypeError(
+                "Property description must be an object".to_string(),
+            ));
+        }
+        let desc_val = desc.clone();
+        let mut obj_mut = obj.borrow_mut();
+        let ordinary = obj_mut
+            .as_any_mut()
+            .downcast_mut::<crate::vm::object::OrdinaryObject>();
+        if let Some(ordinary) = ordinary {
+            apply_property_descriptor(ordinary, &key, &desc_val)?;
+        } else {
+            // Non-ordinary object (array/function/…): fall back to the value.
+            let value = desc_obj
+                .borrow()
+                .property_get(&PropertyKey::from_str("value"))
+                .map(|d| d.value)
+                .unwrap_or(Value::Undefined);
             obj_mut
-                .property_set(key, value_desc.value.clone())
-                .map_err(|e| RuntimeError::TypeError(e))?;
+                .property_set(key, value)
+                .map_err(RuntimeError::TypeError)?;
         }
     }
 
@@ -134,7 +153,7 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
         Value::Object(obj_ref) => obj_ref,
         _ => {
             return Err(RuntimeError::TypeError(
-                "Object.getOwnPropertyDescriptor: first argument must be an object".to_string(),
+                format!("Object.getOwnPropertyDescriptor: first argument must be an object (got {:?}, argc={})", args, args.len()),
             ));
         }
     };
@@ -258,7 +277,87 @@ pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
     };
     let mut new_obj = crate::vm::object::OrdinaryObject::new();
     new_obj.set_prototype(proto);
+
+    // Second argument: property descriptors, each applied in order.
+    if let Some(props) = args.get(1) {
+        if !props.is_undefined() && !props.is_null() {
+            let props_ref = match props {
+                Value::Object(o) => Rc::clone(o),
+                _ => {
+                    return Err(RuntimeError::TypeError(
+                        "Object.create: properties must be an object".to_string(),
+                    ));
+                }
+            };
+            let keys = props_ref.borrow().own_keys();
+            for key in keys {
+                let desc = props_ref
+                    .borrow()
+                    .property_get(&key)
+                    .map(|d| d.value)
+                    .unwrap_or(Value::Undefined);
+                apply_property_descriptor(&mut new_obj, &key, &desc)?;
+            }
+        }
+    }
+
     Ok(Value::Object(Rc::new(RefCell::new(new_obj))))
+}
+
+/// Apply a property descriptor object (as consumed by `Object.defineProperty`
+/// and the `properties` argument of `Object.create`).
+///
+/// Only the attributes the descriptor actually mentions are changed; the rest
+/// default to `false` for `configurable`/`enumerable`/`writable`, exactly as
+/// the spec's `ToPropertyDescriptor` requires.
+pub fn apply_property_descriptor(
+    obj: &mut crate::vm::object::OrdinaryObject,
+    key: &PropertyKey,
+    desc: &Value,
+) -> Result<bool, RuntimeError> {
+    let desc_ref = match desc {
+        Value::Object(o) => o,
+        _ => {
+            return Err(RuntimeError::TypeError(
+                "Property description must be an object".to_string(),
+            ));
+        }
+    };
+    let read = |name: &str| -> Option<Value> {
+        desc_ref
+            .borrow()
+            .property_get(&PropertyKey::from_str(name))
+            .map(|d| d.value)
+    };
+
+    let getter = read("get");
+    let setter = read("set");
+    if getter.is_some() || setter.is_some() {
+        let mut descriptor = PropertyDescriptor::accessor_descriptor(getter, setter);
+        if let Some(v) = read("enumerable") {
+            descriptor.enumerable = v.to_boolean();
+        }
+        if let Some(v) = read("configurable") {
+            descriptor.configurable = v.to_boolean();
+        }
+        return obj
+            .define_property(key.clone(), descriptor)
+            .map_err(RuntimeError::TypeError);
+    }
+
+    let value = read("value").unwrap_or(Value::Undefined);
+    let mut descriptor = PropertyDescriptor::data_descriptor(value);
+    if let Some(v) = read("writable") {
+        descriptor.writable = v.to_boolean();
+    }
+    if let Some(v) = read("enumerable") {
+        descriptor.enumerable = v.to_boolean();
+    }
+    if let Some(v) = read("configurable") {
+        descriptor.configurable = v.to_boolean();
+    }
+    obj.define_property(key.clone(), descriptor)
+        .map_err(RuntimeError::TypeError)
 }
 
 pub fn object_has_own(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -306,12 +405,138 @@ pub fn object_is(args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Bool(result))
 }
 
+/// `Object.assign(target, ...sources)` — copies own enumerable properties.
+pub fn object_assign(args: &[Value]) -> Result<Value, RuntimeError> {
+    let Some(target) = args.first() else {
+        return Err(RuntimeError::TypeError(
+            "Object.assign requires at least 1 argument".to_string(),
+        ));
+    };
+    let Value::Object(target_ref) = target else {
+        return Err(RuntimeError::TypeError(
+            "Object.assign: target is not an object".to_string(),
+        ));
+    };
+    for source in args.iter().skip(1) {
+        if let Value::Object(source_ref) = source {
+            let entries: Vec<(PropertyKey, Value)> = {
+                let borrowed = source_ref.borrow();
+                borrowed
+                    .own_keys()
+                    .into_iter()
+                    .filter_map(|k| {
+                        borrowed
+                            .property_get(&k)
+                            .filter(|d| d.enumerable)
+                            .map(|d| (k, d.value))
+                    })
+                    .collect()
+            };
+            for (key, value) in entries {
+                let _ = target_ref.borrow_mut().property_set(key, value);
+            }
+        }
+    }
+    Ok(target.clone())
+}
+
+/// `Object.defineProperties(obj, props)`
+pub fn object_define_properties(args: &[Value]) -> Result<Value, RuntimeError> {
+    let (Some(target), Some(props)) = (args.first(), args.get(1)) else {
+        return Err(RuntimeError::TypeError(
+            "Object.defineProperties requires 2 arguments".to_string(),
+        ));
+    };
+    let Value::Object(target_ref) = target else {
+        return Err(RuntimeError::TypeError(
+            "Object.defineProperties: target is not an object".to_string(),
+        ));
+    };
+    if let Value::Object(props_ref) = props {
+        let descriptors: Vec<(PropertyKey, Value)> = {
+            let borrowed = props_ref.borrow();
+            borrowed
+                .own_keys()
+                .into_iter()
+                .filter_map(|k| borrowed.property_get(&k).map(|d| (k, d.value)))
+                .collect()
+        };
+        for (key, descriptor) in descriptors {
+            object_define_property(&[target.clone(), Value::string(&key.display()), descriptor])?;
+        }
+    }
+    Ok(target.clone())
+}
+
+/// `Object.prototype.toString.call(value)` — the spec's [[Class]] based form.
+pub fn object_prototype_to_string(obj: &Value, _args: &[Value]) -> Result<Value, RuntimeError> {
+    let class = match obj {
+        Value::Object(o) => o.borrow().class_name().to_string(),
+        Value::Undefined => "Undefined".to_string(),
+        Value::Null => "Null".to_string(),
+        Value::Bool(_) => "Boolean".to_string(),
+        Value::Number(_) => "Number".to_string(),
+        Value::String(_) => "String".to_string(),
+        Value::Symbol(_) => "Symbol".to_string(),
+        Value::Function(_) => "Function".to_string(),
+    };
+    Ok(Value::string(&format!("[object {class}]")))
+}
+
+/// `Object.prototype.hasOwnProperty(V)`
+pub fn object_has_own_property(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let key = match args.first() {
+        Some(Value::String(s)) => PropertyKey::from_str(s),
+        Some(other) => PropertyKey::from_str(&other.to_js_string()),
+        None => return Ok(Value::Bool(false)),
+    };
+    match obj {
+        Value::Object(obj_ref) => Ok(Value::Bool(obj_ref.borrow().has_property(&key))),
+        Value::String(s) => Ok(Value::Bool(key.as_str() == Some("length"))),
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
+/// Name of the `Object.prototype.toString` native.
+///
+/// It needs a dedicated name because `Object.prototype.toString.call(x)` must
+/// report the [[Class]] of `x` even when `x` is an Array or Number, whereas the
+/// generic `toString` dispatch delegates to the receiver's own type.
+pub const OBJECT_TO_STRING_NATIVE: &str = "Object.prototype.toString";
+
+/// Populate `Object.prototype` with the methods every object inherits.
+pub fn register_object_prototype(proto: &Rc<RefCell<dyn JSObject>>, object_fn: &Value) {
+    use super::set_prototype_method;
+
+    // Dedicated native so that `.call(receiver)` keeps Array/Number semantics.
+    let _ = proto.borrow_mut().property_set(
+        PropertyKey::from_str("toString"),
+        Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::NativeFunctionObject::new(OBJECT_TO_STRING_NATIVE),
+        ))),
+    );
+    set_prototype_method(proto, "valueOf", |this, _args| Ok(this.clone()));
+    set_prototype_method(proto, "hasOwnProperty", |this, args| {
+        object_has_own_property(this, args)
+    });
+    set_prototype_method(proto, "toLocaleString", |this, args| {
+        object_prototype_to_string(this, args)
+    });
+    let _ = proto
+        .borrow_mut()
+        .property_set(PropertyKey::from_str("constructor"), object_fn.clone());
+}
+
 pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins) {
     set_static_method(object_fn, "keys", |args| object_keys(args));
     set_static_method(object_fn, "values", |args| object_values(args));
     set_static_method(object_fn, "entries", |args| object_entries(args));
+    set_static_method(object_fn, "assign", |args| object_assign(args));
     set_static_method(object_fn, "defineProperty", |args| {
         object_define_property(args)
+    });
+    set_static_method(object_fn, "defineProperties", |args| {
+        object_define_properties(args)
     });
     set_static_method(object_fn, "getOwnPropertyDescriptor", |args| {
         object_get_own_property_descriptor(args)
@@ -328,4 +553,16 @@ pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins) {
     set_static_method(object_fn, "create", |args| object_create(args));
     set_static_method(object_fn, "hasOwn", |args| object_has_own(args));
     set_static_method(object_fn, "is", |args| object_is(args));
+    set_static_method(object_fn, "isExtensible", |args| Ok(Value::Bool(false)));
+    set_static_method(object_fn, "isFrozen", |args| Ok(Value::Bool(false)));
+    set_static_method(object_fn, "isSealed", |args| Ok(Value::Bool(false)));
+    set_static_method(object_fn, "preventExtensions", |args| {
+        Ok(args.first().cloned().unwrap_or(Value::Undefined))
+    });
+    set_static_method(object_fn, "seal", |args| {
+        Ok(args.first().cloned().unwrap_or(Value::Undefined))
+    });
+    set_static_method(object_fn, "freeze", |args| {
+        Ok(args.first().cloned().unwrap_or(Value::Undefined))
+    });
 }

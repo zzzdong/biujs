@@ -27,6 +27,8 @@ mod debug_instanceof2;
 mod debug_propset;
 #[path = "features/functions.rs"]
 mod functions;
+#[path = "features/language_semantics.rs"]
+mod language_semantics;
 #[path = "features/logical_typeof.rs"]
 mod logical_typeof;
 #[path = "features/objects_and_arrays.rs"]

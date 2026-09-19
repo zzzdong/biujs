@@ -256,6 +256,25 @@ pub enum Instruction {
         index: Value,
         value: Value,
     },
+    PropertyDelete {
+        dst: Value,
+        object: Value,
+        property: Value,
+    },
+    IndexDelete {
+        dst: Value,
+        object: Value,
+        index: Value,
+    },
+    /// Materialise the `arguments` object of the enclosing function.
+    Arguments {
+        dst: Value,
+    },
+    /// Write into the global (environment) binding of `name`.
+    StoreEnv {
+        name: Value,
+        value: Value,
+    },
 
     // Collection / Structural Operations
     MakeArray {
@@ -326,6 +345,12 @@ pub enum Instruction {
     TypeOf {
         dst: Value,
         src: Value,
+    },
+    /// `typeof name` for a name that may not be resolvable at compile time.
+    /// Unlike `LoadEnv` it yields `"undefined"` instead of throwing.
+    TypeOfEnv {
+        dst: Value,
+        name: Value,
     },
     New {
         dst: Value,
@@ -479,6 +504,18 @@ impl Instruction {
                 index,
                 value,
             } => (vec![], vec![*object, *index, *value]),
+            Instruction::PropertyDelete {
+                dst,
+                object,
+                property,
+            } => (vec![*dst], vec![*object, *property]),
+            Instruction::IndexDelete {
+                dst,
+                object,
+                index,
+            } => (vec![*dst], vec![*object, *index]),
+            Instruction::Arguments { dst } => (vec![*dst], vec![]),
+            Instruction::StoreEnv { name, value } => (vec![], vec![*name, *value]),
             Instruction::Halt { value } => (vec![], value.iter().cloned().collect()),
             Instruction::PushSeh { .. } => (vec![], vec![]),
             Instruction::PopSeh => (vec![], vec![]),
@@ -491,6 +528,7 @@ impl Instruction {
             Instruction::ResumeException { .. } => (vec![], vec![]),
             Instruction::DelayedJump { .. } => (vec![], vec![]),
             Instruction::TypeOf { dst, src } => (vec![*dst], vec![*src]),
+            Instruction::TypeOfEnv { dst, .. } => (vec![*dst], vec![]),
             Instruction::New {
                 dst,
                 constructor,
@@ -675,6 +713,26 @@ impl std::fmt::Display for Instruction {
             } => {
                 write!(f, "{object}[{index}] = index_set {value}")
             }
+            Instruction::PropertyDelete {
+                dst,
+                object,
+                property,
+            } => {
+                write!(f, "{dst} = prop_delete {object}.{property}")
+            }
+            Instruction::IndexDelete {
+                dst,
+                object,
+                index,
+            } => {
+                write!(f, "{dst} = index_delete {object}[{index}]")
+            }
+            Instruction::StoreEnv { name, value } => {
+                write!(f, "store_env {name}, {value}")
+            }
+            Instruction::Arguments { dst } => {
+                write!(f, "{dst} = arguments")
+            }
             Instruction::Halt { value } => match value {
                 Some(v) => write!(f, "halt {v}"),
                 None => write!(f, "halt"),
@@ -712,6 +770,9 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::TypeOf { dst, src } => {
                 write!(f, "{dst} = typeof {src}")
+            }
+            Instruction::TypeOfEnv { dst, name } => {
+                write!(f, "{dst} = typeof_env {name}")
             }
             Instruction::New {
                 dst,

@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::RuntimeError;
 use crate::vm::object::{JSObject, OrdinaryObject};
-use crate::vm::property::{PropertyDescriptor, PropertyKey};
+use crate::vm::property::PropertyKey;
 use crate::vm::value::Value;
 
 // ─────────────────────────────────────────────────────────
@@ -110,6 +110,11 @@ pub fn runtime_error_to_js_error(
             Some(msg.clone()),
             Rc::clone(&builtins.range_error_prototype),
             "RangeError",
+        ),
+        RuntimeError::SyntaxError(msg) => create_error_object(
+            Some(msg.clone()),
+            Rc::clone(&builtins.error_prototype),
+            "SyntaxError",
         ),
         RuntimeError::InternalError(msg) => create_error_object(
             Some(msg.clone()),

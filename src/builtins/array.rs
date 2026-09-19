@@ -11,7 +11,7 @@ use crate::vm::value::Value;
 // ─────────────────────────────────────────────────────────
 
 pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
-    use super::set_prototype_method;
+    use super::{mark_prototype_method, set_prototype_method};
 
     set_prototype_method(proto, "push", |this, args| array_push(this, args));
     set_prototype_method(proto, "pop", |this, _args| array_pop(this));
@@ -23,22 +23,211 @@ pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "slice", |this, args| array_slice(this, args));
     set_prototype_method(proto, "concat", |this, args| array_concat(this, args));
     set_prototype_method(proto, "splice", |this, args| array_splice(this, args));
+    set_prototype_method(proto, "reverse", |this, _args| array_reverse(this));
+    set_prototype_method(proto, "lastIndexOf", |this, args| array_last_index_of(this, args));
+    set_prototype_method(proto, "fill", |this, args| array_fill(this, args));
+    set_prototype_method(proto, "toString", |this, _args| array_to_string(this));
+
+    // Callback-driven methods: the VM runs the algorithm so it can call the
+    // user-supplied function for each element.
+    for name in [
+        "map",
+        "filter",
+        "forEach",
+        "some",
+        "every",
+        "reduce",
+        "reduceRight",
+        "find",
+        "findIndex",
+        "sort",
+    ] {
+        mark_prototype_method(proto, name);
+    }
+}
+
+/// `Array.from(arrayLike)` — copies array-like values / iterables we support.
+///
+/// A `mapFn` would have to call back into JavaScript, which the builtin layer
+/// cannot do; such calls are handled by the VM before reaching here.
+pub fn array_from(args: &[Value]) -> Result<Value, RuntimeError> {
+    let Some(source) = args.first() else {
+        return Err(RuntimeError::TypeError(
+            "Array.from requires an array-like object".to_string(),
+        ));
+    };
+    let mut out: Vec<Value> = Vec::new();
+    match source {
+        Value::Object(obj_ref) => {
+            let borrowed = obj_ref.borrow();
+            if let Some(arr) = borrowed.as_any().downcast_ref::<ArrayObject>() {
+                for i in 0..arr.len() {
+                    out.push(arr.get(i).cloned().unwrap_or(Value::Undefined));
+                }
+            } else {
+                // Generic array-like: read `length` and then each index.
+                let len = borrowed
+                    .property_get(&PropertyKey::from_str("length"))
+                    .map(|d| d.value.to_number())
+                    .unwrap_or(0.0);
+                let len = len.max(0.0).min((1u32 << 20) as f64) as usize;
+                for i in 0..len {
+                    let key = PropertyKey::from_str(&i.to_string());
+                    out.push(
+                        borrowed
+                            .property_get(&key)
+                            .map(|d| d.value)
+                            .unwrap_or(Value::Undefined),
+                    );
+                }
+            }
+        }
+        Value::String(s) => {
+            out.extend(s.chars().map(|c| Value::string(&c.to_string())));
+        }
+        _ => {
+            return Err(RuntimeError::TypeError(format!(
+                "Array.from: {} is not iterable",
+                source.type_of()
+            )));
+        }
+    }
+    Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
+        out,
+    )))))
+}
+
+/// Register `Array` constructor statics.
+pub fn register_array_statics(array_fn: &Value) {
+    use super::set_static_method;
+
+    set_static_method(array_fn, "isArray", |args| {
+        Ok(Value::Bool(matches!(
+            args.first(),
+            Some(Value::Object(o)) if o.borrow().kind() == crate::vm::ObjectKind::Array
+        )))
+    });
+    set_static_method(array_fn, "of", |args| array_constructor(args));
+    set_static_method(array_fn, "from", |args| array_from(args));
+}
+
+/// `Array.prototype.reverse()`
+pub fn array_reverse(obj: &Value) -> Result<Value, RuntimeError> {
+    if let Value::Object(obj_ref) = obj {
+        let mut arr = obj_ref.borrow_mut();
+        if let Some(array_obj) = arr.as_any_mut().downcast_mut::<ArrayObject>() {
+            array_obj.reverse();
+            return Ok(obj.clone());
+        }
+    }
+    Err(RuntimeError::TypeError("not an array".to_string()))
+}
+
+/// `Array.prototype.lastIndexOf(searchElement[, fromIndex])`
+pub fn array_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Value::Object(obj_ref) = obj {
+        let arr = obj_ref.borrow();
+        if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
+            let needle = args.first().cloned().unwrap_or(Value::Undefined);
+            let len = array_obj.len();
+            if len == 0 {
+                return Ok(Value::Number(-1.0));
+            }
+            // A negative `fromIndex` counts back from the end (undefined = end).
+            let from = match args.get(1) {
+                Some(v) => {
+                    let n = v.to_number();
+                    if n.is_nan() {
+                        0
+                    } else {
+                        n as i64
+                    }
+                }
+                None => len as i64 - 1,
+            };
+            let from = if from < 0 {
+                (len as i64 + from).max(0)
+            } else {
+                from.min(len as i64 - 1)
+            };
+            for i in (0..=from).rev() {
+                if array_obj.get(i as usize).is_some_and(|v| v.strict_eq(&needle)) {
+                    return Ok(Value::Number(i as f64));
+                }
+            }
+            return Ok(Value::Number(-1.0));
+        }
+    }
+    Err(RuntimeError::TypeError("not an array".to_string()))
+}
+
+/// `Array.prototype.fill(value[, start[, end]])`
+pub fn array_fill(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Value::Object(obj_ref) = obj {
+        let mut arr = obj_ref.borrow_mut();
+        if let Some(array_obj) = arr.as_any_mut().downcast_mut::<ArrayObject>() {
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let len = array_obj.len();
+            let resolve = |arg: Option<&Value>, default: usize| -> usize {
+                match arg {
+                    Some(v) => {
+                        let n = v.to_number();
+                        if n < 0.0 {
+                            ((len as f64) + n).max(0.0) as usize
+                        } else {
+                            (n as usize).min(len)
+                        }
+                    }
+                    None => default,
+                }
+            };
+            let start = resolve(args.get(1), 0);
+            let end = resolve(args.get(2), len);
+            for i in start..end {
+                if let Some(slot) = array_obj.get_mut(i) {
+                    *slot = value.clone();
+                }
+            }
+            return Ok(obj.clone());
+        }
+    }
+    Err(RuntimeError::TypeError("not an array".to_string()))
+}
+
+/// `Array.prototype.toString()`
+pub fn array_to_string(obj: &Value) -> Result<Value, RuntimeError> {
+    if let Value::Object(obj_ref) = obj {
+        let arr = obj_ref.borrow();
+        if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
+            return Ok(Value::string(&array_obj.join_elements()));
+        }
+    }
+    Ok(Value::string("[object Object]"))
 }
 
 // ─────────────────────────────────────────────────────────
 // Array constructor
 // ─────────────────────────────────────────────────────────
 
+/// Largest length `Array(len)` will actually materialize. Anything above this
+/// raises `RangeError` instead of trying to allocate gigabytes up front.
+const MAX_MATERIALIZED_LEN: usize = 1 << 20;
+
 pub fn array_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
     if args.len() == 1 {
         if let Value::Number(n) = args[0] {
-            let len = n as usize;
-            if (n - len as f64).abs() > f64::EPSILON
-                || n.is_nan()
-                || n.is_infinite()
-                || n.is_sign_negative()
-            {
+            // ES `Array(len)`: `intLen = ToUint32(len)` and `len` must equal it.
+            // This rejects NaN, ±Infinity, negatives, non-integers and anything
+            // >= 2**32 (previously `new Array(2**32)` tried to allocate 96 GB).
+            let int_len = to_uint32(n);
+            if n != int_len as f64 {
                 return Err(RuntimeError::RangeError("Invalid array length".to_string()));
+            }
+            let len = int_len as usize;
+            if len > MAX_MATERIALIZED_LEN {
+                return Err(RuntimeError::RangeError(
+                    "Invalid array length".to_string(),
+                ));
             }
             let mut arr = ArrayObject::with_capacity(len);
             for _ in 0..len {
@@ -52,6 +241,28 @@ pub fn array_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
         arr.push(arg.clone());
     }
     Ok(Value::Object(Rc::new(RefCell::new(arr))))
+}
+
+/// Validate an array `length` assignment, returning the materialized length or
+/// `Err` when the spec requires a `RangeError`.
+pub fn validate_array_length(n: f64) -> Result<usize, RuntimeError> {
+    let int_len = to_uint32(n) as usize;
+    if n != int_len as f64 || int_len > MAX_MATERIALIZED_LEN {
+        return Err(RuntimeError::RangeError(
+            "Invalid array length".to_string(),
+        ));
+    }
+    Ok(int_len)
+}
+
+/// ES `ToUint32` (modulo 2**32, saturating NaN to 0).
+fn to_uint32(n: f64) -> u32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    let truncated = n.trunc();
+    let rem = truncated % 4_294_967_296.0; // 2**32
+    (rem as i64 % 4_294_967_296i64) as u32
 }
 
 // ─────────────────────────────────────────────────────────

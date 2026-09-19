@@ -239,14 +239,6 @@ impl SemanticAnalyzer {
             Expression::CallExpression(call) => {
                 self.visit_expression(&call.callee);
             }
-            // MemberExpression variants are handled through the inherit_variants! macro
-            // They include StaticMemberExpression and ComputedMemberExpression
-            _ => {
-                // For other expression types, we don't need to recurse for const checking
-            }
-            Expression::ArrayExpression(_) => {
-                // Simplified: skip array elements for now
-            }
             Expression::ObjectExpression(obj) => {
                 for prop in &obj.properties {
                     if let ObjectPropertyKind::ObjectProperty(prop) = prop {
@@ -254,6 +246,7 @@ impl SemanticAnalyzer {
                     }
                 }
             }
+            // Member expressions and arrays need no recursion for const checks.
             _ => {}
         }
     }

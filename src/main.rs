@@ -7,16 +7,43 @@ fn main() {
 
     let args = std::env::args().collect::<Vec<_>>();
     if args.len() > 1 {
-        eprintln!("Usage: biujs [script_file]");
+        if args[1] == "-h" || args[1] == "--help" {
+            eprintln!("Usage: biujs [script_file]");
+            return;
+        }
 
-        // Load script file
+        // Run a script file. Errors are reported and turned into a non-zero
+        // exit status instead of panicking.
         let script_file = &args[1];
-        let content = std::fs::read_to_string(script_file).unwrap();
+        let content = match std::fs::read_to_string(script_file) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!("biujs: cannot read {script_file}: {err}");
+                std::process::exit(2);
+            }
+        };
+
         let mut compiler = Compiler::new();
-        let module = compiler.compile(&content).unwrap();
+        let module = match compiler.compile(&content) {
+            Ok(module) => module,
+            Err(err) => {
+                eprintln!("Compile error: {err}");
+                std::process::exit(1);
+            }
+        };
+
+        if std::env::var("BIUJS_DUMP").is_ok() {
+            eprintln!("{module}");
+        }
+
         let mut vm = VM::new();
-        let result = vm.run(&module).unwrap();
-        println!("{}", result);
+        match vm.run(&module) {
+            Ok(result) => println!("{result}"),
+            Err(err) => {
+                eprintln!("Runtime error: {err}");
+                std::process::exit(1);
+            }
+        }
 
         return;
     }

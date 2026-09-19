@@ -278,9 +278,50 @@ pub trait InstBuilder {
         });
     }
 
+    fn delete_property(&mut self, object: Value, property: &str) -> Value {
+        let dst = self.alloc();
+        let property = self.make_constant(property.into());
+        self.emit(Instruction::PropertyDelete {
+            dst,
+            object,
+            property,
+        });
+        dst
+    }
+
+    fn delete_index(&mut self, object: Value, index: Value) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::IndexDelete {
+            dst,
+            object,
+            index,
+        });
+        dst
+    }
+
+    /// Bind `dst` to the current function's `arguments` object.
+    fn arguments_object(&mut self) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::Arguments { dst });
+        dst
+    }
+
+    fn store_external_variable(&mut self, name: String, value: Value) {
+        let name = self.make_constant(name.into());
+        self.emit(Instruction::StoreEnv { name, value });
+    }
+
     fn typeof_(&mut self, src: Value) -> Value {
         let dst = self.alloc();
         self.emit(Instruction::TypeOf { dst, src });
+        dst
+    }
+
+    /// `typeof name` where `name` may be unresolvable (yields "undefined").
+    fn typeof_env(&mut self, name: String) -> Value {
+        let dst = self.alloc();
+        let name = self.make_constant(name.into());
+        self.emit(Instruction::TypeOfEnv { dst, name });
         dst
     }
 

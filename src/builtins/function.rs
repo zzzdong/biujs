@@ -14,29 +14,7 @@ pub fn function_constructor(_args: &[Value]) -> Result<Value, RuntimeError> {
     ))
 }
 
-/// Function.prototype.call(thisArg, ...args)
-pub fn function_prototype_call(args: &[Value]) -> Result<Value, RuntimeError> {
-    // call needs at least 1 arg (thisArg) and a `this` context that is the function
-    Err(RuntimeError::TypeError(
-        "Function.prototype.call is not yet fully supported".to_string(),
-    ))
-}
-
-/// Function.prototype.apply(thisArg, argsArray)
-pub fn function_prototype_apply(args: &[Value]) -> Result<Value, RuntimeError> {
-    Err(RuntimeError::TypeError(
-        "Function.prototype.apply is not yet fully supported".to_string(),
-    ))
-}
-
-/// Function.prototype.bind(thisArg, ...args)
-pub fn function_prototype_bind(args: &[Value]) -> Result<Value, RuntimeError> {
-    Err(RuntimeError::TypeError(
-        "Function.prototype.bind is not yet fully supported".to_string(),
-    ))
-}
-
-/// Function.prototype.toString()
+/// `Function.prototype.toString()`
 pub fn function_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> {
     let name = match obj {
         Value::Function(_) => "anonymous".to_string(),
