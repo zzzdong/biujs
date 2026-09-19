@@ -237,26 +237,48 @@ impl<'a> JSASTLower<'a> {
             .map(|id| id.name.to_string())
             .unwrap_or_else(|| "<class>".to_string());
 
-        // 1. Separate constructor and method definitions
+        // 1. Separate constructor / instance methods / statics / accessors
         // Collect info as owned strings to avoid borrow issues
         let mut constructor_idx: Option<usize> = None;
         let mut method_infos: Vec<(String, &Function)> = Vec::new();
+        let mut static_infos: Vec<(String, &Function)> = Vec::new();
+        let mut accessor_infos: Vec<(String, bool, &Function)> = Vec::new();
 
         for element in &class.body.body {
             if let oxc_ast::ast::ClassElement::MethodDefinition(method_def) = element {
+                let is_get = method_def.kind == oxc_ast::ast::MethodDefinitionKind::Get;
+                let is_set = method_def.kind == oxc_ast::ast::MethodDefinitionKind::Set;
                 if method_def.kind == oxc_ast::ast::MethodDefinitionKind::Constructor {
                     constructor_idx = Some(method_infos.len());
                     method_infos.push((String::new(), &method_def.value));
-                } else if !method_def.r#static {
-                    if let Some(name) = self.class_method_name_str(method_def) {
+                } else if let Some(name) = self.class_method_name_str(method_def) {
+                    if method_def.r#static {
+                        static_infos.push((name, &method_def.value));
+                    } else if is_get || is_set {
+                        accessor_infos.push((name, is_get, &method_def.value));
+                    } else {
                         method_infos.push((name, &method_def.value));
                     }
                 }
             }
         }
 
-        // 2. Create prototype object
-        let proto = self.builder.make_object();
+        // 2. Create the prototype object.
+        //
+        // With `extends P`, the prototype must inherit from `P.prototype`;
+        // without it, a fresh object is enough.
+        let mut super_ctor: Option<Value> = None;
+        let proto = match &class.super_class {
+            Some(super_expr) => {
+                let parent = self.lower_expression(super_expr);
+                super_ctor = Some(parent);
+                let parent_proto = self.builder.get_property(parent, "prototype");
+                let object_fn = self.builder.load_external_variable("Object".to_string());
+                self.builder
+                    .call_property(object_fn, "create", vec![parent_proto])
+            }
+            None => self.builder.make_object(),
+        };
 
         // 3. Process each method - create function and add to prototype or use as constructor
         let mut constructor_id = None;
@@ -308,8 +330,96 @@ impl<'a> JSASTLower<'a> {
         // 5. Create a FunctionObject wrapping the constructor
         let func_obj = self.builder.make_func_obj(constructor_id);
 
-        // 6. Set .prototype on the constructor FunctionObject
+        // 6. Set .prototype on the constructor FunctionObject, and the
+        //    back-reference `prototype.constructor` that code relies on.
         self.builder.set_property(func_obj, "prototype", proto);
+        self.builder.set_property(proto, "constructor", func_obj);
+
+        // 6b. Inheritance wiring. The parent constructor is published as
+        //     `__super__` on the child constructor: methods are compiled as
+        //     separate functions and cannot reference the enclosing frame's
+        //     registers, so `super(...)` resolves the parent at run time from
+        //     `Object.getPrototypeOf(this).constructor.__super__`.
+        if let Some(parent) = super_ctor {
+            self.builder.set_property(func_obj, "__super__", parent);
+            // Static inheritance: `Object.setPrototypeOf(child, parent)`.
+            let object_fn = self.builder.load_external_variable("Object".to_string());
+            self.builder
+                .call_property(object_fn, "setPrototypeOf", vec![func_obj, parent]);
+        }
+
+        // 7. Static methods live directly on the constructor.
+        for (method_name, method_func) in static_infos.iter() {
+            let func_val = self.lower_function_inner(
+                Some(format!("{}.{method_name}", class_name)),
+                &method_func.params.items,
+                method_func.body.as_ref().unwrap(),
+                None,
+                false,
+                &[],
+                false,
+            );
+            self.builder.set_property(func_obj, method_name, func_val);
+        }
+
+        // 8. Accessors (`get x()` / `set x(v)`) are installed with
+        //    `Object.defineProperty` so they keep accessor semantics. A getter
+        //    and a setter for the same name must land in ONE descriptor —
+        //    defining them separately would make the second overwrite the first.
+        let mut accessors: Vec<(String, Option<Value>, Option<Value>)> = Vec::new();
+        for (name, is_get, accessor_func) in accessor_infos.iter() {
+            let func_val = self.lower_function_inner(
+                Some(format!(
+                    "{}.{name}{}",
+                    class_name,
+                    if *is_get { " (getter)" } else { " (setter)" }
+                )),
+                &accessor_func.params.items,
+                accessor_func.body.as_ref().unwrap(),
+                None,
+                false,
+                &[],
+                false,
+            );
+            if let Some(entry) = accessors.iter_mut().find(|(n, _, _)| n == name) {
+                if *is_get {
+                    entry.1 = Some(func_val);
+                } else {
+                    entry.2 = Some(func_val);
+                }
+            } else if *is_get {
+                accessors.push((name.clone(), Some(func_val), None));
+            } else {
+                accessors.push((name.clone(), None, Some(func_val)));
+            }
+        }
+
+        for (name, getter, setter) in accessors {
+            let desc = self.builder.make_object();
+            if let Some(getter) = getter {
+                self.builder.set_property(desc, "get", getter);
+            }
+            if let Some(setter) = setter {
+                self.builder.set_property(desc, "set", setter);
+            }
+            self.builder.set_property(
+                desc,
+                "configurable",
+                Value::Primitive(Primitive::Boolean(true)),
+            );
+            // Class accessors are enumerable: false, like class methods.
+            self.builder.set_property(
+                desc,
+                "enumerable",
+                Value::Primitive(Primitive::Boolean(true)),
+            );
+            let object_fn = self.builder.load_external_variable("Object".to_string());
+            let name_const = self.builder.load_constant(crate::bytecode::Constant::String(
+                std::sync::Arc::new(name.into()),
+            ));
+            self.builder
+                .call_property(object_fn, "defineProperty", vec![proto, name_const, desc]);
+        }
 
         func_obj
     }
@@ -1345,26 +1455,115 @@ impl<'a> JSASTLower<'a> {
         }
     }
 
+    // --------------------------- spread ---------------------------
+
+    /// Does this argument list contain a `...` element?
+    fn has_spread_arguments(args: &[Argument<'_>]) -> bool {
+        args.iter()
+            .any(|arg| matches!(arg, Argument::SpreadElement(_)))
+    }
+
+    /// Build the array of call arguments for `f(...)` / `new F(...)`,
+    /// appending the elements of every `...src` argument.
+    fn lower_spread_arguments(&mut self, args: &[Argument<'_>]) -> Value {
+        let argv = self.builder.make_array();
+        for arg in args {
+            match arg {
+                Argument::SpreadElement(spread) => {
+                    let src = self.lower_expression(&spread.argument);
+                    self.emit_iterate_push(argv, src);
+                }
+                _ => {
+                    let value = self.lower_argument_expr(arg);
+                    self.builder.array_push(argv, value);
+                }
+            }
+        }
+        argv
+    }
+
+    /// `array.push(...src)` — one VM instruction instead of a lowered loop.
+    fn emit_iterate_push(&mut self, array: Value, src: Value) {
+        self.builder.array_push_spread(array, src);
+    }
+
     fn lower_call(&mut self, call: &CallExpression<'_>) -> Value {
+        // `super(...)` — call the parent constructor with the current `this`.
+        if matches!(&call.callee, Expression::Super(_)) {
+            let this = self.builder.load_this();
+            let super_ctor = self.lower_super_ctor();
+            // `this` is passed to `call_spread` separately, so it must not
+            // appear in the argument array as well.
+            let argv = self.builder.make_array();
+            for arg in &call.arguments {
+                match arg {
+                    Argument::SpreadElement(spread) => {
+                        let src = self.lower_expression(&spread.argument);
+                        self.emit_iterate_push(argv, src);
+                    }
+                    _ => {
+                        let value = self.lower_argument_expr(arg);
+                        self.builder.array_push(argv, value);
+                    }
+                }
+            }
+            return self.builder.call_spread(super_ctor, this, argv);
+        }
+
+        let has_spread = Self::has_spread_arguments(&call.arguments);
         let args: Vec<Value> = call
             .arguments
             .iter()
             .map(|arg| match arg {
-                Argument::SpreadElement(_) => {
-                    log::warn!("spread arguments not yet supported");
-                    Value::Primitive(Primitive::Null)
-                }
-                _ => {
-                    // oxc Argument enum variants need matching
-                    // For now, try to extract the expression
-                    self.lower_argument_expr(arg)
-                }
+                // A spread element is folded into the argv array above; the
+                // per-argument slot stays a placeholder in that case.
+                Argument::SpreadElement(_) => Value::Primitive(Primitive::Null),
+                _ => self.lower_argument_expr(arg),
             })
             .collect();
+
+        // `...` in the argument list: build an argv array and let the VM do the
+        // call with an explicit `this`.
+        if has_spread {
+            let argv = self.lower_spread_arguments(&call.arguments);
+            let (callee, this) = match &call.callee {
+                Expression::StaticMemberExpression(static_member) => {
+                    let object = self.lower_expression(&static_member.object);
+                    let prop_name = static_member.property.name.as_str();
+                    let method = self.builder.get_property(object, prop_name);
+                    (method, object)
+                }
+                Expression::ComputedMemberExpression(computed_member) => {
+                    let object = self.lower_expression(&computed_member.object);
+                    let prop = self.lower_expression(&computed_member.expression);
+                    let method = self.builder.index_get(object, prop);
+                    (method, object)
+                }
+                _ => {
+                    let callee = self.lower_expression(&call.callee);
+                    (callee, Value::Primitive(Primitive::Undefined))
+                }
+            };
+            return self.builder.call_spread(callee, this, argv);
+        }
 
         // Check if callee is a member expression (method call)
         match &call.callee {
             Expression::StaticMemberExpression(static_member) => {
+                // `super.m(...)`: the parent method must run with the current
+                // `this`, which plain property access cannot provide, so route
+                // it through `Function.prototype.call`.
+                if matches!(&static_member.object, Expression::Super(_)) {
+                    let this = self.builder.load_this();
+                    let super_proto = self.lower_super_proto();
+                    let method = self
+                        .builder
+                        .get_property(super_proto, static_member.property.name.as_str());
+                    let mut call_args: Vec<Value> = Vec::with_capacity(args.len() + 1);
+                    call_args.push(this);
+                    call_args.extend(args.iter().copied());
+                    return self.builder.call_property(method, "call", call_args);
+                }
                 let object = self.lower_expression(&static_member.object);
                 let prop_name = static_member.property.name.as_str();
                 return self.builder.call_property(object, prop_name, args);
@@ -1393,6 +1592,10 @@ impl<'a> JSASTLower<'a> {
 
     fn lower_new(&mut self, new: &NewExpression<'_>) -> Value {
         let constructor = self.lower_expression(&new.callee);
+        if Self::has_spread_arguments(&new.arguments) {
+            let argv = self.lower_spread_arguments(&new.arguments);
+            return self.builder.new_spread(constructor, argv);
+        }
         let args: Vec<Value> = new
             .arguments
             .iter()
@@ -1404,12 +1607,25 @@ impl<'a> JSASTLower<'a> {
 
     fn lower_member_expr(&mut self, expr: &Expression<'_>) -> Value {
         match expr {
+            Expression::Super(_) => self.lower_super_proto(),
             Expression::StaticMemberExpression(static_member) => {
+                // `super.name` — read it from the parent's prototype.
+                if matches!(&static_member.object, Expression::Super(_)) {
+                    let super_proto = self.lower_super_proto();
+                    return self
+                        .builder
+                        .get_property(super_proto, static_member.property.name.as_str());
+                }
                 let object = self.lower_expression(&static_member.object);
                 self.builder
                     .get_property(object, static_member.property.name.as_str())
             }
             Expression::ComputedMemberExpression(computed) => {
+                if matches!(&computed.object, Expression::Super(_)) {
+                    let super_proto = self.lower_super_proto();
+                    let index = self.lower_expression(&computed.expression);
+                    return self.builder.index_get(super_proto, index);
+                }
                 let object = self.lower_expression(&computed.object);
                 let index = self.lower_expression(&computed.expression);
                 self.builder.index_get(object, index)
@@ -1423,6 +1639,34 @@ impl<'a> JSASTLower<'a> {
                 Value::Primitive(Primitive::Null)
             }
         }
+    }
+
+    // --------------------------- `super` ---------------------------
+
+    /// The home object of the running method: `Object.getPrototypeOf(this)`.
+    ///
+    /// For an instance of `C` this is `C.prototype`, which is where class
+    /// methods live and whose `constructor` back-reference points at `C`.
+    fn lower_home_object(&mut self) -> Value {
+        let this = self.builder.load_this();
+        let object_fn = self.builder.load_external_variable("Object".to_string());
+        self.builder
+            .call_property(object_fn, "getPrototypeOf", vec![this])
+    }
+
+    /// The prototype `super` reads from: `Object.getPrototypeOf(home)`.
+    fn lower_super_proto(&mut self) -> Value {
+        let home = self.lower_home_object();
+        let object_fn = self.builder.load_external_variable("Object".to_string());
+        self.builder
+            .call_property(object_fn, "getPrototypeOf", vec![home])
+    }
+
+    /// The parent constructor, published as `__super__` on the child.
+    fn lower_super_ctor(&mut self) -> Value {
+        let home = self.lower_home_object();
+        let ctor = self.builder.get_property(home, "constructor");
+        self.builder.get_property(ctor, "__super__")
     }
 
     fn lower_conditional(&mut self, cond: &ConditionalExpression<'_>) -> Value {
@@ -1452,8 +1696,9 @@ impl<'a> JSASTLower<'a> {
         let array = self.builder.make_array();
         for element in &arr.elements {
             match element {
-                ArrayExpressionElement::SpreadElement(_) => {
-                    log::warn!("spread in array not yet supported");
+                ArrayExpressionElement::SpreadElement(spread) => {
+                    let src = self.lower_expression(&spread.argument);
+                    self.emit_iterate_push(array, src);
                 }
                 ArrayExpressionElement::Elision(_) => {
                     // holes in array → push undefined

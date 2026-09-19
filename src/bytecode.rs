@@ -218,6 +218,8 @@ pub enum Opcode {
     MakeArray,
     /// array_push dst, src
     ArrayPush,
+    /// array_push_spread dst, src — append every element of `src` to `array`
+    ArrayPushSpread,
     /// make_object dst
     MakeObject,
     /// index_get dst, obj, idx
@@ -326,6 +328,7 @@ impl fmt::Display for Opcode {
             Opcode::IterNext => write!(f, "iter_next"),
             Opcode::MakeArray => write!(f, "make_array"),
             Opcode::ArrayPush => write!(f, "array_push"),
+            Opcode::ArrayPushSpread => write!(f, "array_push_spread"),
             Opcode::MakeObject => write!(f, "make_object"),
             Opcode::IndexGet => write!(f, "index_get"),
             Opcode::IndexSet => write!(f, "index_set"),

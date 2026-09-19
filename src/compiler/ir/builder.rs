@@ -300,6 +300,12 @@ pub trait InstBuilder {
         array
     }
 
+    /// Append every element of `src` to `array` (`[...src]`).
+    fn array_push_spread(&mut self, array: Value, src: Value) -> Value {
+        self.emit(Instruction::ArrayPushSpread { array, src });
+        array
+    }
+
     fn make_object(&mut self) -> Value {
         let object = self.alloc();
         self.emit(Instruction::MakeObject { dst: object });

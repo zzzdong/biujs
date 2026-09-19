@@ -136,7 +136,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "Set",
     "SharedArrayBuffer",
     "String.prototype.replaceAll",
-    "super",
     "symbol-description",
     "tail-call-optimization",
     "Temporal",

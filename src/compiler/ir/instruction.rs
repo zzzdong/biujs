@@ -284,6 +284,15 @@ pub enum Instruction {
         array: Value,
         value: Value,
     },
+    /// Append every element of `src` to `array` (`[...src]`).
+    ///
+    /// Doing this in a single instruction keeps the loop inside the VM: a
+    /// lowered JS loop would need several basic blocks, and values that live
+    /// across a block boundary are not reliably preserved.
+    ArrayPushSpread {
+        array: Value,
+        src: Value,
+    },
     MakeObject {
         dst: Value,
     },
@@ -539,6 +548,7 @@ impl Instruction {
             } => (vec![*dst], vec![*constructor, *args]),
             Instruction::MakeArray { dst } => (vec![*dst], vec![]),
             Instruction::ArrayPush { array, value } => (vec![], vec![*array, *value]),
+            Instruction::ArrayPushSpread { array, src } => (vec![], vec![*array, *src]),
             Instruction::MakeObject { dst } => (vec![*dst], vec![]),
             Instruction::IndexGet { dst, object, index } => (vec![*dst], vec![*object, *index]),
             Instruction::IndexSet {
@@ -765,6 +775,9 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::ArrayPush { array, value } => {
                 write!(f, "array_push {array}, {value}")
+            }
+            Instruction::ArrayPushSpread { array, src } => {
+                write!(f, "array_push_spread {array}, {src}")
             }
             Instruction::MakeObject { dst } => {
                 write!(f, "{dst} = make_object")

@@ -173,6 +173,15 @@ impl Codegen {
                         let dst = self.gen_operand(dst);
                         self.codes.push(Bytecode::single(Opcode::MakeArray, dst));
                     }
+                    Instruction::ArrayPushSpread { array, src } => {
+                        let array = self.gen_operand(array);
+                        let src = self.gen_operand(src);
+                        self.codes.push(Bytecode::double(
+                            Opcode::ArrayPushSpread,
+                            array,
+                            src,
+                        ));
+                    }
                     Instruction::ArrayPush { array, value } => {
                         let array = self.gen_operand(array);
                         let value = self.gen_operand(value);
@@ -300,8 +309,18 @@ impl Codegen {
                         let callee = self.gen_operand(callee);
                         let this = self.gen_operand(this);
                         let args = self.gen_operand(args);
+                        // The callee runs in a nested frame and freely reuses
+                        // registers, so live values must be saved across it —
+                        // same contract as `gen_call`.
+                        let in_use_registers = self.reg_alloc.call_saved_registers();
+                        for reg in in_use_registers.iter().copied() {
+                            self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
+                        }
                         self.codes
                             .push(Bytecode::triple(Opcode::CallSpread, callee, this, args));
+                        for reg in in_use_registers.iter().rev().copied() {
+                            self.codes.push(Bytecode::single(Opcode::Pop, reg.into()));
+                        }
                         // The result travels in Rv (same as CallMethod).
                         let result = self.gen_operand(result);
                         self.codes.push(Bytecode::double(
@@ -318,8 +337,15 @@ impl Codegen {
                         let dst = self.gen_operand(dst);
                         let ctor = self.gen_operand(constructor);
                         let args = self.gen_operand(args);
+                        let in_use_registers = self.reg_alloc.call_saved_registers();
+                        for reg in in_use_registers.iter().copied() {
+                            self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
+                        }
                         self.codes
                             .push(Bytecode::triple(Opcode::NewSpread, dst, ctor, args));
+                        for reg in in_use_registers.iter().rev().copied() {
+                            self.codes.push(Bytecode::single(Opcode::Pop, reg.into()));
+                        }
                     }
                     Instruction::IterateNext {
                         iter,
@@ -391,6 +417,16 @@ impl Codegen {
                                 Opcode::Mov,
                                 Operand::new_register(Register::Rv),
                                 ret,
+                            ));
+                        } else {
+                            // A value-less `return` (or falling off the end of a
+                            // function) yields `undefined`. Rv still holds the
+                            // result of the last call otherwise, which would make
+                            // a constructor "return" that leftover object.
+                            self.codes.push(Bytecode::double(
+                                Opcode::Mov,
+                                Operand::new_register(Register::Rv),
+                                Operand::new_primitive(crate::bytecode::Primitive::Undefined),
                             ));
                         }
 

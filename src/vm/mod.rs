@@ -232,6 +232,11 @@ impl VM {
                     let return_pc = self.state.popc()?;
                     let saved_seh_depth = self.state.popc()?;
                     let saved_closure_depth = self.state.popc()?;
+                    // The frame's own `this`, needed for [[Construct]] below.
+                    // It has to be captured *before* the caller's binding is
+                    // restored, otherwise a constructor would return the
+                    // caller's `this` instead of the object it just built.
+                    let frame_this = self.state.this_val.clone();
                     // Restore the caller's `this` binding and frame arity.
                     if let Some(saved_this) = self.state.this_stack.pop() {
                         self.state.this_val = saved_this;
@@ -243,8 +248,7 @@ impl VM {
                     if let Some(true) = self.state.construct_stack.pop() {
                         let rv = self.state.get_register(Register::Rv)?;
                         if !rv.is_object() {
-                            self.state
-                                .set_register(Register::Rv, self.state.this_val.clone())?;
+                            self.state.set_register(Register::Rv, frame_this)?;
                         }
                     }
                     self.state.closure_var_stack.truncate(saved_closure_depth);
@@ -1209,6 +1213,33 @@ impl VM {
                 arr.set_prototype(Some(Rc::clone(&self.builtins.array_prototype)));
                 let arr_val = Value::Object(Rc::new(RefCell::new(arr)));
                 self.set_value(operands[0], arr_val)?;
+            }
+            Opcode::ArrayPushSpread => {
+                // `[...src]` / `f(...src)`: append every element of `src`.
+                // The loop runs here rather than in lowered bytecode so that no
+                // value has to stay live across a basic-block boundary.
+                let array_val = self.get_value(operands[0])?;
+                let src = self.get_value(operands[1])?;
+                let items = self.array_like_elements(&src).ok_or_else(|| {
+                    RuntimeError::TypeError(format!("{} is not iterable", src.type_of()))
+                })?;
+                match array_val {
+                    Value::Object(obj_ref) => {
+                        let mut obj = obj_ref.borrow_mut();
+                        let Some(arr) = obj.as_any_mut().downcast_mut::<ArrayObject>() else {
+                            return Err(RuntimeError::TypeError(
+                                "ArrayPushSpread on non-array object".to_string(),
+                            ));
+                        };
+                        for item in items {
+                            arr.push(item);
+                        }
+                        Ok(())
+                    }
+                    _ => Err(RuntimeError::TypeError(
+                        "ArrayPushSpread on non-object".to_string(),
+                    )),
+                }?;
             }
             Opcode::ArrayPush => {
                 let array_val = self.get_value(operands[0])?;
@@ -2343,8 +2374,13 @@ impl VM {
                         .map_err(RuntimeError::TypeError)?
                 {
                     if desc.is_accessor_descriptor() {
+                        // `this` is the *receiver* (the object the property was
+                        // read from), not the object that happens to hold the
+                        // descriptor — class accessors live on the prototype.
+                        let receiver = Value::Object(Rc::clone(obj_ref));
+                        let _ = owner;
                         return match desc.getter {
-                            Some(getter) => self.invoke(&getter, Value::Object(owner), &[], module),
+                            Some(getter) => self.invoke(&getter, receiver, &[], module),
                             None => Ok(Value::Undefined),
                         };
                     }
@@ -2413,9 +2449,12 @@ impl VM {
                         .map_err(RuntimeError::TypeError)?
                 {
                     if desc.is_accessor_descriptor() {
+                        // Same receiver rule as `get_member` above.
+                        let receiver = Value::Object(Rc::clone(obj_ref));
+                        let _ = owner;
                         return match desc.setter {
                             Some(setter) => {
-                                self.invoke(&setter, Value::Object(owner), &[value], module)?;
+                                self.invoke(&setter, receiver, &[value], module)?;
                                 Ok(())
                             }
                             // Setter-less accessor: silently ignored (sloppy mode).

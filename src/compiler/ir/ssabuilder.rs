@@ -726,6 +726,10 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_use(array, stacks);
                 SSABuilder::rename_use(value, stacks);
             }
+            Instruction::ArrayPushSpread { array, src } => {
+                SSABuilder::rename_use(array, stacks);
+                SSABuilder::rename_use(src, stacks);
+            }
             Instruction::MakeObject { dst } => {
                 SSABuilder::rename_definition(dst, new_versions);
             }
