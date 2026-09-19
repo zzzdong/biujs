@@ -381,6 +381,27 @@ impl VM {
         }
     }
 
+    /// Reject a class constructor that is being called without `new`.
+    fn check_class_ctor(&self, callee: &Value) -> Result<(), RuntimeError> {
+        if let Value::Object(obj_ref) = callee {
+            let borrowed = obj_ref.borrow();
+            if borrowed
+                .as_any()
+                .downcast_ref::<crate::vm::object::FunctionObject>()
+                .is_some()
+                && borrowed
+                    .property_get(&PropertyKey::from_str(crate::builtins::CLASS_CTOR_FLAG))
+                    .map(|d| d.value.to_boolean())
+                    .unwrap_or(false)
+            {
+                return Err(RuntimeError::TypeError(
+                    "Class constructor cannot be invoked without 'new'".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Re-entrantly invoke a callable `callee` with `this` bound and no arguments,
     /// returning its result. This drives a nested execution loop so that user
     /// defined `valueOf` / `toString` methods can be honoured during coercion.
@@ -555,6 +576,7 @@ impl VM {
         // `Function.prototype` registers `call` / `apply` / `bind` under their
         // plain names, so handle them before the static-method lookup.
         if matches!(name, "call" | "apply") && this.is_callable() {
+            self.check_class_ctor(&this)?;
             let call_args = self.call_or_apply_args(name, args)?;
             let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
             return self.invoke(&this, this_arg, &call_args, module);
@@ -590,6 +612,8 @@ impl VM {
                 return Ok(self.make_bound(this, this_arg, bound_args));
             }
             if (method == "call" || method == "apply") && this.is_callable() {
+                // `C.call(...)` must fail for a class constructor, same as `C()`.
+                self.check_class_ctor(&this)?;
                 let call_args = self.call_or_apply_args(method, args)?;
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 return self.invoke(&this, this_arg, &call_args, module);
@@ -675,6 +699,8 @@ impl VM {
                         }
                     }
                     Value::Object(obj_ref) => {
+                        // A class constructor cannot be called without `new`.
+                        self.check_class_ctor(&Value::Object(Rc::clone(&obj_ref)))?;
                         // A FunctionObject coming from class/closure lowering.
                         let borrowed = obj_ref.borrow();
                         if borrowed.kind() == ObjectKind::Function {

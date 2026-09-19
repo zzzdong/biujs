@@ -812,6 +812,9 @@ where
 ///
 /// The VM strips it and dispatches to `call_prototype_method`, passing the
 /// receiver as the first argument.
+/// Property used to mark a class constructor (calling it without `new` throws).
+pub const CLASS_CTOR_FLAG: &str = "__isClassCtor__";
+
 pub const PROTO_METHOD_PREFIX: &str = "__proto_method__";
 
 /// Register a prototype method that the VM implements itself.

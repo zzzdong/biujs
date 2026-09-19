@@ -350,6 +350,12 @@ impl<'a> JSASTLower<'a> {
         //    back-reference `prototype.constructor` that code relies on.
         self.builder.set_property(func_obj, "prototype", proto);
         self.builder.set_property(proto, "constructor", func_obj);
+        // Marks a class constructor: calling one without `new` is a TypeError.
+        self.builder.set_property(
+            func_obj,
+            crate::builtins::CLASS_CTOR_FLAG,
+            Value::Primitive(Primitive::Boolean(true)),
+        );
 
         // 6b. Inheritance wiring. The parent constructor is published as
         //     `__super__` on the child constructor: methods are compiled as
