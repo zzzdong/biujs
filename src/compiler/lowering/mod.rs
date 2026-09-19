@@ -197,6 +197,8 @@ impl<'a> JSASTLower<'a> {
             Statement::WhileStatement(while_stmt) => self.lower_while(while_stmt),
             Statement::DoWhileStatement(do_while) => self.lower_do_while(do_while),
             Statement::ForStatement(for_stmt) => self.lower_for(for_stmt),
+            Statement::ForOfStatement(for_of) => self.lower_for_of(for_of),
+            Statement::ForInStatement(for_in) => self.lower_for_in(for_in),
             Statement::SwitchStatement(switch) => self.lower_switch(switch),
             Statement::BlockStatement(block) => self.lower_block_stmt(block),
             Statement::BreakStatement(_) => self.lower_break(),
@@ -260,12 +262,6 @@ impl<'a> JSASTLower<'a> {
         let mut constructor_id = None;
 
         for (idx, (method_name, method_func)) in method_infos.iter().enumerate() {
-            let params: Vec<FuncParam> = method_func
-                .params
-                .items
-                .iter()
-                .map(|p| FuncParam::new(self.binding_pattern_name(&p.pattern)))
-                .collect();
 
             let is_constructor = Some(idx) == constructor_idx;
 
@@ -275,7 +271,7 @@ impl<'a> JSASTLower<'a> {
                 } else {
                     format!("{}.{}", class_name, method_name)
                 }),
-                params,
+                &method_func.params.items,
                 method_func.body.as_ref().unwrap(),
                 None,
                 false,
@@ -415,6 +411,128 @@ impl<'a> JSASTLower<'a> {
 
         self.leave_loop_context();
         self.builder.switch_to_block(after_blk);
+    }
+
+    /// `for (lhs of rhs) body` — iterate `rhs` via the iterator protocol.
+    ///
+    /// CFG (see docs/m1-syntax-plan.md §3.2):
+    /// ```text
+    /// iter_blk: it = MakeIterator(rhs)          ← rhs evaluated once
+    /// cond:     (item, has_next) = IterateNext(it)
+    /// body:     bind lhs = item; body; → cond   ← continue target
+    /// close:    IteratorClose(it) → after       ← break target
+    /// ```
+    fn lower_for_of(&mut self, for_of: &ForOfStatement<'_>) {
+        if for_of.r#await {
+            log::warn!("for-await not supported; treating as for-of");
+        }
+
+        let src = self.lower_expression(&for_of.right);
+        let it = self.builder.make_iterator(src);
+
+        let cond_blk = self.create_block("forof_cond");
+        let body_blk = self.create_block("forof_body");
+        let close_blk = self.create_block("forof_close");
+        let after_blk = self.create_block("forof_after");
+
+        // break must pass through IteratorClose; continue goes to cond.
+        self.enter_loop_context(close_blk, cond_blk);
+
+        self.builder.jump(cond_blk);
+        self.builder.switch_to_block(cond_blk);
+        let (item, has_next) = self.builder.iterate_next(it);
+        self.builder.br_if(has_next, body_blk, close_blk);
+
+        self.builder.switch_to_block(body_blk);
+        self.bind_for_of_left(&for_of.left, item);
+        self.lower_statement(&for_of.body);
+        if !self.current_block_is_terminated() {
+            self.builder.jump(cond_blk);
+        }
+
+        self.leave_loop_context();
+        self.builder.switch_to_block(close_blk);
+        self.builder.iterator_close(it);
+        self.builder.jump(after_blk);
+        self.builder.switch_to_block(after_blk);
+    }
+
+    /// `for (lhs in rhs) body` — desugared to for-of over `Object.keys(rhs)`.
+    fn lower_for_in(&mut self, for_in: &ForInStatement<'_>) {
+        let obj = self.lower_expression(&for_in.right);
+        let object_fn = self.builder.load_external_variable("Object".to_string());
+        let keys = self
+            .builder
+            .call_property(object_fn, "keys", vec![obj]);
+
+        // Reuse the for-of CFG with the key array as the source.
+        let it = self.builder.make_iterator(keys);
+
+        let cond_blk = self.create_block("forin_cond");
+        let body_blk = self.create_block("forin_body");
+        let close_blk = self.create_block("forin_close");
+        let after_blk = self.create_block("forin_after");
+
+        self.enter_loop_context(close_blk, cond_blk);
+
+        self.builder.jump(cond_blk);
+        self.builder.switch_to_block(cond_blk);
+        let (item, has_next) = self.builder.iterate_next(it);
+        self.builder.br_if(has_next, body_blk, close_blk);
+
+        self.builder.switch_to_block(body_blk);
+        self.bind_for_of_left(&for_in.left, item);
+        self.lower_statement(&for_in.body);
+        if !self.current_block_is_terminated() {
+            self.builder.jump(cond_blk);
+        }
+
+        self.leave_loop_context();
+        self.builder.switch_to_block(close_blk);
+        self.builder.iterator_close(it);
+        self.builder.jump(after_blk);
+        self.builder.switch_to_block(after_blk);
+    }
+
+    /// Bind the `left` of a for-of/for-in head to `item`.
+    fn bind_for_of_left(&mut self, left: &ForStatementLeft<'_>, item: Value) {
+        match left {
+            ForStatementLeft::VariableDeclaration(decl) => {
+                for declarator in &decl.declarations {
+                    // Destructuring patterns land here in T7; for now bind the
+                    // simple identifier.
+                    let name = self.binding_pattern_name(&declarator.id);
+                    let dst = self.builder.alloc();
+                    self.builder.assign(dst, item);
+                    self.symbols.insert(name, Variable::new(dst));
+                }
+            }
+            ForStatementLeft::AssignmentTargetIdentifier(ident) => {
+                match self.symbols.lookup(ident.name.as_str()) {
+                    Some(var) => {
+                        self.builder.assign(var.0, item);
+                        self.sync_global(ident.name.as_str(), item);
+                    }
+                    None => {
+                        self.builder
+                            .store_external_variable(ident.name.to_string(), item);
+                    }
+                }
+            }
+            ForStatementLeft::ComputedMemberExpression(member) => {
+                let object = self.lower_expression(&member.object);
+                let index = self.lower_expression(&member.expression);
+                self.builder.index_set(object, index, item);
+            }
+            ForStatementLeft::StaticMemberExpression(member) => {
+                let object = self.lower_expression(&member.object);
+                self.builder
+                    .set_property(object, member.property.name.as_str(), item);
+            }
+            _ => {
+                log::warn!("unimplemented for-of/for-in assignment target");
+            }
+        }
     }
 
     /// `do { body } while (test);` — the body always runs at least once.
@@ -1350,20 +1468,18 @@ impl<'a> JSASTLower<'a> {
 
     fn lower_arrow_function(&mut self, arrow: &ArrowFunctionExpression<'_>) -> Value {
         let name = "<arrow>".to_string();
-        let params: Vec<FuncParam> = arrow
-            .params
-            .items
-            .iter()
-            .map(|p| FuncParam::new(self.binding_pattern_name(&p.pattern)))
-            .collect();
 
         // Arrow functions with expression body need automatic return
         let is_expression_body = arrow.expression;
 
         // Determine which outer variables need to be captured.
         // We collect all referenced identifiers and subtract those declared inside the arrow body.
-        let param_names: std::collections::HashSet<String> =
-            params.iter().map(|p| p.name.to_string()).collect();
+        let param_names: std::collections::HashSet<String> = arrow
+            .params
+            .items
+            .iter()
+            .map(|p| self.binding_pattern_name(&p.pattern))
+            .collect();
         let mut referenced = std::collections::HashSet::new();
         let mut declared = std::collections::HashSet::new();
         // Parameters are considered "declared" locally
@@ -1380,7 +1496,7 @@ impl<'a> JSASTLower<'a> {
         // Lower the arrow function body
         let func_val = self.lower_function_inner(
             Some(name),
-            params,
+            &arrow.params.items,
             &arrow.body,
             None,
             is_expression_body,
@@ -1418,15 +1534,8 @@ impl<'a> JSASTLower<'a> {
             .map(|id| id.name.to_string())
             .unwrap_or_else(|| "<anonymous>".to_string());
 
-        let params: Vec<FuncParam> = func
-            .params
-            .items
-            .iter()
-            .map(|p| FuncParam::new(self.binding_pattern_name(&p.pattern)))
-            .collect();
-
         if let Some(body) = &func.body {
-            self.lower_function_inner(Some(name), params, body, None, false, &[], false)
+            self.lower_function_inner(Some(name), &func.params.items, body, None, false, &[], false)
         } else {
             Value::Primitive(Primitive::Null)
         }
@@ -1441,30 +1550,33 @@ impl<'a> JSASTLower<'a> {
     }
 
     fn lower_template_literal(&mut self, tpl: &TemplateLiteral<'_>) -> Value {
-        // Simplified: just concatenate string parts
-        // For template literals with expressions, this is more complex
-        let mut parts: Vec<Value> = Vec::new();
-        for quasi in &tpl.quasis {
-            let raw = quasi.value.raw.as_str();
-            if !raw.is_empty() {
-                parts.push(self.builder.load_constant(raw.into()));
+        // Interleave cooked quasis with ToString'd expressions:
+        //   `a${x}b` → "a" ++ ToString(x) ++ "b"
+        // ToString (not Addx) is required: with plain Addx, two leading
+        // numbers would add arithmetically instead of concatenating.
+        let mut result: Option<Value> = None;
+
+        for (i, quasi) in tpl.quasis.iter().enumerate() {
+            let cooked = quasi.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
+            if !cooked.is_empty() {
+                let part = self.builder.load_constant(cooked.into());
+                result = Some(match result {
+                    None => part,
+                    Some(prev) => self.builder.binop(Opcode::Addx, prev, part),
+                });
+            }
+
+            if let Some(expr) = tpl.expressions.get(i) {
+                let value = self.lower_expression(expr);
+                let part = self.builder.to_string(value);
+                result = Some(match result {
+                    None => part,
+                    Some(prev) => self.builder.binop(Opcode::Addx, prev, part),
+                });
             }
         }
 
-        if parts.is_empty() {
-            return Value::Primitive(Primitive::Null);
-        }
-
-        if parts.len() == 1 {
-            return parts[0];
-        }
-
-        // Concatenate all parts using Addx
-        let mut result = parts[0];
-        for part in &parts[1..] {
-            result = self.builder.binop(Opcode::Addx, result, *part);
-        }
-        result
+        result.unwrap_or(Value::Primitive(Primitive::Undefined))
     }
 
     // ──────────────────────── Function Lowering ────────────────────────
@@ -1477,16 +1589,16 @@ impl<'a> JSASTLower<'a> {
             .map(|id| id.name.to_string())
             .unwrap_or_else(|| "<anonymous>".to_string());
 
-        let params: Vec<FuncParam> = func
-            .params
-            .items
-            .iter()
-            .map(|p| FuncParam::new(self.binding_pattern_name(&p.pattern)))
-            .collect();
-
         if let Some(body) = &func.body {
-            let func_id_val =
-                self.lower_function_inner(Some(name.clone()), params, body, None, false, &[], false);
+            let func_id_val = self.lower_function_inner(
+                Some(name.clone()),
+                &func.params.items,
+                body,
+                None,
+                false,
+                &[],
+                false,
+            );
             Some((name, func_id_val))
         } else {
             None
@@ -1502,7 +1614,7 @@ impl<'a> JSASTLower<'a> {
     fn lower_function_inner(
         &mut self,
         name: Option<String>,
-        params: Vec<FuncParam>,
+        params: &[FormalParameter<'_>],
         body: &FunctionBody<'_>,
         captured_this: Option<Value>,
         auto_return: bool,
@@ -1512,7 +1624,11 @@ impl<'a> JSASTLower<'a> {
         // During hoisting, there may be no current block yet
         let curr = self.builder.try_current_block();
 
-        let func_sig = FuncSignature::new(name.clone(), params.clone());
+        let sig_params: Vec<FuncParam> = params
+            .iter()
+            .map(|p| FuncParam::new(self.binding_pattern_name(&p.pattern)))
+            .collect();
+        let func_sig = FuncSignature::new(name.clone(), sig_params);
         let func_id = self.builder.module_mut().declare_function(func_sig.clone());
 
         let mut func = IrFunction::new(func_id, func_sig);
@@ -1542,12 +1658,34 @@ impl<'a> JSASTLower<'a> {
         func_lower.builder.set_entry(entry);
         func_lower.builder.switch_to_block(entry);
 
-        // Load arguments
+        // Load arguments and bind parameters. A parameter with an initializer
+        // (default value) gets an `undefined` check: the initializer runs only
+        // when the argument was not passed (or was passed as `undefined`).
+        // Initializers may reference earlier parameters, so bindings happen in
+        // declaration order before each initializer is lowered.
         for (idx, param) in params.iter().enumerate() {
             let arg = func_lower.builder.load_arg(idx);
+            let param_name = func_lower.binding_pattern_name(&param.pattern);
             func_lower
                 .symbols
-                .insert(param.name.to_string(), Variable::new(arg));
+                .insert(param_name, Variable::new(arg));
+
+            if let Some(init) = &param.initializer {
+                let undefined = Value::Primitive(Primitive::Undefined);
+                let is_undef = func_lower
+                    .builder
+                    .binop(Opcode::StrictEqual, arg, undefined);
+                let default_blk = func_lower.create_block("param_default");
+                let merge_blk = func_lower.create_block("param_merge");
+                func_lower.builder.br_if(is_undef, default_blk, merge_blk);
+
+                func_lower.builder.switch_to_block(default_blk);
+                let default_val = func_lower.lower_expression(init);
+                func_lower.builder.assign(arg, default_val);
+                func_lower.builder.jump(merge_blk);
+
+                func_lower.builder.switch_to_block(merge_blk);
+            }
         }
 
         // Every ordinary function has its own `arguments` binding. It has to be

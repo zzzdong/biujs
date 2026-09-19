@@ -236,6 +236,18 @@ pub trait InstBuilder {
         result
     }
 
+    /// ES ToString conversion (objects via ToPrimitive with a "string" hint).
+    fn to_string(&mut self, src: Value) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::ToString { dst, src });
+        dst
+    }
+
+    /// Signal early exit to a protocol iterator (`IteratorClose`).
+    fn iterator_close(&mut self, iter: Value) {
+        self.emit(Instruction::IteratorClose { iter });
+    }
+
     fn iterate_next(&mut self, iter: Value) -> (Value, Value) {
         let next = self.alloc();
         let has_next = self.alloc();

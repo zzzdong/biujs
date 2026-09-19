@@ -274,6 +274,15 @@ impl Codegen {
                         self.codes
                             .push(Bytecode::double(Opcode::MakeIter, dst, src));
                     }
+                    Instruction::IteratorClose { iter } => {
+                        let iter = self.gen_operand(iter);
+                        self.codes.push(Bytecode::single(Opcode::IterClose, iter));
+                    }
+                    Instruction::ToString { dst, src } => {
+                        let dst = self.gen_operand(dst);
+                        let src = self.gen_operand(src);
+                        self.codes.push(Bytecode::double(Opcode::ToString, dst, src));
+                    }
                     Instruction::IterateNext {
                         iter,
                         item,

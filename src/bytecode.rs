@@ -262,6 +262,10 @@ pub enum Opcode {
     ClosureVar,
     /// arguments dst — materialise the current frame's `arguments` object
     Arguments,
+    /// iter_close iter — signal early exit to a protocol iterator
+    IterClose,
+    /// to_string dst, src — ES ToString (objects via ToPrimitive("string"))
+    ToString,
 }
 
 impl fmt::Display for Opcode {
@@ -338,6 +342,8 @@ impl fmt::Display for Opcode {
             Opcode::MakeArrowFuncObj => write!(f, "make_arrow_func_obj"),
             Opcode::ClosureVar => write!(f, "closure_var"),
             Opcode::Arguments => write!(f, "arguments"),
+            Opcode::IterClose => write!(f, "iter_close"),
+            Opcode::ToString => write!(f, "to_string"),
         }
     }
 }

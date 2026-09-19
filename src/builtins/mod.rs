@@ -234,6 +234,19 @@ impl Builtins {
         // Setup Error.prototype methods
         error::setup_error_prototype(&self.error_prototype, self);
 
+        // Register `Symbol.iterator` on the natively iterable prototypes.
+        // The factory is dispatched by name in `call_native_by_name`, which
+        // builds an internal iterator over `this`.
+        let iterator_fn = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+            crate::vm::iterator::ITERATOR_NATIVE_NAME,
+        ))));
+        for proto in [&self.array_prototype, &self.string_prototype] {
+            let _ = proto.borrow_mut().property_set(
+                crate::vm::iterator::iterator_symbol_key(),
+                iterator_fn.clone(),
+            );
+        }
+
         let bool_fn_val = Value::Object(Rc::new(RefCell::new(
             NativeFunctionObject::with_prototype("Boolean", Rc::clone(&self.boolean_prototype)),
         )));
@@ -271,6 +284,32 @@ impl Builtins {
         symbol::register_symbol_statics(&symbol_fn_val, &self.symbol_prototype);
         symbol::register_symbol_prototype(&self.symbol_prototype);
         Self::link_constructor_prototype(&symbol_fn_val, &self.symbol_prototype);
+
+        // Well-known symbols (ES6 §19.4.2): `Symbol.iterator` is required by
+        // the iteration protocol; the others are registered so property
+        // lookups on user code don't break.
+        // The *properties of the Symbol constructor* are string-keyed
+        // (`Symbol.iterator` reads the "iterator" property); their VALUES are
+        // the well-known symbol values used as property keys elsewhere.
+        let well_known: [(&str, u64, &str); 6] = [
+            ("iterator", crate::vm::iterator::ITERATOR_SYMBOL_ID, "Symbol.iterator"),
+            ("asyncIterator", 0xFFFF_FFFF_FFFF_0001, "Symbol.asyncIterator"),
+            ("hasInstance", 0xFFFF_FFFF_FFFF_0002, "Symbol.hasInstance"),
+            ("isConcatSpreadable", 0xFFFF_FFFF_FFFF_0003, "Symbol.isConcatSpreadable"),
+            ("toPrimitive", 0xFFFF_FFFF_FFFF_0004, "Symbol.toPrimitive"),
+            ("toStringTag", 0xFFFF_FFFF_FFFF_0005, "Symbol.toStringTag"),
+        ];
+        if let Value::Object(symbol_obj) = &symbol_fn_val {
+            for (name, id, description) in well_known {
+                let _ = symbol_obj.borrow_mut().property_set(
+                    PropertyKey::from_str(name),
+                    Value::Symbol(Rc::new(crate::vm::value::SymbolData::new(
+                        Some(description.to_string()),
+                        id,
+                    ))),
+                );
+            }
+        }
         globals.insert("Symbol".to_string(), symbol_fn_val);
 
         // `Math` — a plain namespace object of numeric helpers.

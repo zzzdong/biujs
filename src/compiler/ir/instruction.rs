@@ -298,6 +298,16 @@ pub enum Instruction {
         has_next: Value,
         iter: Value,
     },
+    /// Signal early exit (break) to a protocol iterator: calls
+    /// `iterator.return()` if present. No-op for native iterators.
+    IteratorClose {
+        iter: Value,
+    },
+    /// ES ToString: primitives directly; objects via ToPrimitive("string").
+    ToString {
+        dst: Value,
+        src: Value,
+    },
 
     // Control Flow Instructions
     Return {
@@ -495,6 +505,8 @@ impl Instruction {
                 item,
                 has_next,
             } => (vec![*item, *has_next], vec![*iter]),
+            Instruction::IteratorClose { iter } => (vec![], vec![*iter]),
+            Instruction::ToString { dst, src } => (vec![*dst], vec![*src]),
             Instruction::MakeArray { dst } => (vec![*dst], vec![]),
             Instruction::ArrayPush { array, value } => (vec![], vec![*array, *value]),
             Instruction::MakeObject { dst } => (vec![*dst], vec![]),
@@ -686,6 +698,12 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::MakeIterator { src, dst } => {
                 write!(f, "{dst} = make_iterator {src}")
+            }
+            Instruction::IteratorClose { iter } => {
+                write!(f, "iterator_close {iter}")
+            }
+            Instruction::ToString { dst, src } => {
+                write!(f, "{dst} = to_string {src}")
             }
             Instruction::IterateNext {
                 iter,

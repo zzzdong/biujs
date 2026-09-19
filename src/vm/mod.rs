@@ -1,3 +1,4 @@
+pub mod iterator;
 pub mod object;
 pub mod property;
 pub mod prototype;
@@ -15,6 +16,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::Builtins;
+use crate::vm::iterator::iterator_symbol_key;
 use crate::bytecode::{
     Bytecode, Constant, FunctionId, Module, Opcode, Operand, Primitive, Register,
 };
@@ -47,6 +49,10 @@ fn is_addressable(operand: Operand) -> bool {
 pub struct VM {
     state: State,
     builtins: Builtins,
+    /// Live iterators created by `MakeIterator`, keyed by registry id. The
+    /// user-facing `next()`/`return()` natives look iterators up here.
+    iterator_registry: HashMap<u64, Value>,
+    next_iterator_id: u64,
     /// Function metadata (`name`, parameter count) of the module being run.
     /// Kept here so `materialize_function` can set `fn.name` / `fn.length`
     /// without threading the module through every call site.
@@ -85,6 +91,8 @@ impl VM {
         Self {
             state,
             builtins,
+            iterator_registry: HashMap::new(),
+            next_iterator_id: 0,
             current_module_info: None,
             func_objs: HashMap::new(),
             step_limit: Some(DEFAULT_STEP_LIMIT),
@@ -510,6 +518,35 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
             return crate::builtins::object_prototype_to_string(&this, args);
+        }
+        // `Symbol.iterator` factory: returns an internal iterator over `this`.
+        if name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
+            return self.make_iterator(this, module);
+        }
+        // Per-iterator `next()` / `return()` methods.
+        if let Some(id) = name.strip_prefix(crate::vm::iterator::ITERATOR_NEXT_PREFIX) {
+            let id: u64 = id
+                .parse()
+                .map_err(|_| RuntimeError::InternalError("malformed iterator id".to_string()))?;
+            let iter_val = self
+                .iterator_registry
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| RuntimeError::TypeError("iterator is no longer alive".to_string()))?;
+            let (item, done) = self.iterator_next(iter_val, module)?;
+            let mut result = crate::vm::object::OrdinaryObject::new();
+            let _ = result.property_set(PropertyKey::from_str("value"), item);
+            let _ = result.property_set(PropertyKey::from_str("done"), Value::Bool(done));
+            return Ok(Value::Object(Rc::new(RefCell::new(result))));
+        }
+        if let Some(id) = name.strip_prefix(crate::vm::iterator::ITERATOR_RETURN_PREFIX) {
+            let id: u64 = id
+                .parse()
+                .map_err(|_| RuntimeError::InternalError("malformed iterator id".to_string()))?;
+            if let Some(iter_val) = self.iterator_registry.get(&id).cloned() {
+                self.iterator_close(iter_val, module)?;
+            }
+            return Ok(Value::Undefined);
         }
         // `Function.prototype` registers `call` / `apply` / `bind` under their
         // plain names, so handle them before the static-method lookup.
@@ -1091,15 +1128,28 @@ impl VM {
 
             // ===== Iteration =====
             Opcode::MakeIter => {
-                // TODO: implement proper iteration
                 let src = self.get_value(operands[1])?;
-                self.set_value(operands[0], src)?;
+                let iter_val = self.make_iterator(src, module)?;
+                self.set_value(operands[0], iter_val)?;
             }
             Opcode::IterNext => {
-                // TODO: implement proper iteration
-                // For now, just signal end
-                self.set_value(operands[0], Value::Undefined)?;
-                self.set_value(operands[1], Value::Bool(false))?;
+                // Operand order comes from codegen: (item, has_next, src).
+                let iter_val = self.get_value(operands[2])?;
+                let (item, done) = self.iterator_next(iter_val, module)?;
+                self.set_value(operands[0], item)?;
+                self.set_value(operands[1], Value::Bool(!done))?;
+            }
+            Opcode::IterClose => {
+                let iter_val = self.get_value(operands[0])?;
+                self.iterator_close(iter_val, module)?;
+            }
+            Opcode::ToString => {
+                let src = self.get_value(operands[1])?;
+                let s = match self.to_primitive(&src, "string", module) {
+                    Ok(v) => v.to_js_string(),
+                    Err(_) => src.to_js_string(),
+                };
+                self.set_value(operands[0], Value::string(&s))?;
             }
 
             // ===== Object/Array Operations =====
@@ -1224,8 +1274,26 @@ impl VM {
                     }
                 };
 
+                // Symbol-keyed method call (`obj[Symbol.iterator]()`): the key
+                // must be resolved through the property map by symbol identity;
+                // stringifying it (the default path below) would never match.
+                // The key value is read with the caller's frame pointer; the
+                // dispatch itself happens after the frame switch below.
+                let symbol_key = if matches!(operands[1], Operand::Immd(_)) {
+                    None
+                } else {
+                    match self.get_value(operands[1])? {
+                        Value::Symbol(sym) => Some(PropertyKey::Symbol(sym.id)),
+                        _ => None,
+                    }
+                };
+
                 // Operands have been read with the caller's frame pointer; switch
                 // to the callee's frame before collecting the outgoing arguments.
+                // The switch must happen on EVERY path through here (including
+                // the symbol-keyed early return below): the epilogue emitted by
+                // codegen (`movc rsp, rbp; popc rbp`) expects rbp to be the new
+                // frame base.
                 self.state.rbp = self.state.rsp;
 
                 // Read the outgoing arguments. These live below the *new* frame
@@ -1235,6 +1303,33 @@ impl VM {
                 for i in 0..arg_count {
                     let index = self.state.rbp - i - 1;
                     args.push(self.state.raw_stack_value(index));
+                }
+
+                if let Some(key) = symbol_key {
+                    let method_val = match &obj_val {
+                        Value::Object(obj_ref) => {
+                            match crate::vm::prototype::find_descriptor(
+                                Rc::clone(obj_ref),
+                                &key,
+                            )
+                            .map_err(RuntimeError::TypeError)?
+                            {
+                                Some((_owner, desc)) => desc.value,
+                                None => Value::Undefined,
+                            }
+                        }
+                        _ => Value::Undefined,
+                    };
+                    if !method_val.is_callable() {
+                        return Err(RuntimeError::TypeError(
+                            "not a function".to_string(),
+                        ));
+                    }
+                    let result =
+                        self.invoke(&method_val, obj_val.clone(), &args, module)?;
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
                 }
 
                 // `f.call(thisArg, …)` / `f.apply(thisArg, argsArray)` — the
@@ -2342,6 +2437,156 @@ impl VM {
     ///
     /// Looks up the method through the prototype chain and executes
     /// known methods (toString, valueOf, etc.) directly.
+    /// `GetIterator` (ES6 §7.4.1): produce the internal iterator for `src`.
+    ///
+    /// Fast path for arrays/strings/`arguments`; otherwise call
+    /// `src[Symbol.iterator]()`.
+    fn make_iterator(&mut self, src: Value, module: &Module) -> Result<Value, RuntimeError> {
+        use crate::vm::iterator::NativeIteratorState;
+        if std::env::var("BIUJS_TRACE_ITER").is_ok() {
+            eprintln!("[make_iter] src_type={}", src.type_of());
+        }
+
+        let state = match &src {
+            Value::Object(obj_ref) => {
+                let is_array = obj_ref.borrow().kind() == ObjectKind::Array;
+                if is_array {
+                    let items = self.array_like_elements(&src).unwrap_or_default();
+                    Some(NativeIteratorState::Array { items, idx: 0 })
+                } else {
+                    None
+                }
+            }
+            Value::String(s) => Some(NativeIteratorState::String {
+                chars: s.chars().map(|c| Value::string(&c.to_string())).collect(),
+                idx: 0,
+            }),
+            _ => None,
+        };
+
+        let state = match state {
+            Some(state) => state,
+            None => {
+                // Slow path: `src[Symbol.iterator]()`.
+                let factory = self.get_member(&src, &iterator_symbol_key(), module)?;
+                if !factory.is_callable() {
+                    return Err(RuntimeError::TypeError(format!(
+                        "{} is not iterable",
+                        src.type_of()
+                    )));
+                }
+                let iterator = self.invoke(&factory, src.clone(), &[], module)?;
+                crate::vm::iterator::NativeIteratorState::Js { iterator }
+            }
+        };
+
+        let id = self.next_iterator_id;
+        self.next_iterator_id += 1;
+        let iter_val = Value::Object(Rc::new(RefCell::new(
+            crate::vm::iterator::NativeIteratorObject::new(id, state),
+        )));
+        self.iterator_registry.insert(id, iter_val.clone());
+        Ok(iter_val)
+    }
+
+    /// One step of `IterateNext`: returns `(value, done)`.
+    fn iterator_next(
+        &mut self,
+        iter_val: Value,
+        module: &Module,
+    ) -> Result<(Value, bool), RuntimeError> {
+        use crate::vm::iterator::{native_next, NativeIteratorState};
+
+        let iter_obj = match &iter_val {
+            Value::Object(obj_ref) => Rc::clone(obj_ref),
+            _ => {
+                return Err(RuntimeError::TypeError(
+                    "IteratorNext on non-iterator".to_string(),
+                ));
+            }
+        };
+
+        let is_js_iterator = {
+            let borrowed = iter_obj.borrow();
+            let Some(it) = borrowed.as_any().downcast_ref::<crate::vm::iterator::NativeIteratorObject>() else {
+                return Err(RuntimeError::TypeError(
+                    "IteratorNext on non-iterator".to_string(),
+                ));
+            };
+            matches!(&*it.state().borrow(), NativeIteratorState::Js { .. })
+        };
+
+        if is_js_iterator {
+            // Slow path: `it.next()`, then read { value, done }.
+            let iterator = {
+                let borrowed = iter_obj.borrow();
+                let it = borrowed
+                    .as_any()
+                    .downcast_ref::<crate::vm::iterator::NativeIteratorObject>()
+                    .unwrap();
+                match &*it.state().borrow() {
+                    NativeIteratorState::Js { iterator } => iterator.clone(),
+                    _ => unreachable!(),
+                }
+            };
+            let next = self.get_member(&iterator, &PropertyKey::from_str("next"), module)?;
+            let result = self.invoke(&next, iterator.clone(), &[], module)?;
+            let done = match self.get_member(&result, &PropertyKey::from_str("done"), module)? {
+                Value::Undefined => false,
+                v => v.to_boolean(),
+            };
+            if done {
+                return Ok((Value::Undefined, true));
+            }
+            let item = self.get_member(&result, &PropertyKey::from_str("value"), module)?;
+            Ok((item, false))
+        } else {
+            let mut borrowed = iter_obj.borrow_mut();
+            let it = borrowed
+                .as_any_mut()
+                .downcast_mut::<crate::vm::iterator::NativeIteratorObject>()
+                .unwrap();
+            match native_next(&mut *it.state().borrow_mut()) {
+                Some(item) => Ok((item, false)),
+                None => Ok((Value::Undefined, true)),
+            }
+        }
+    }
+
+    /// `IteratorClose` (ES6 §7.4.6): give the iterator a chance to clean up.
+    ///
+    /// Only meaningful on the slow path (calls `iterator.return()`); native
+    /// iterators are stateless no-ops. Errors from `return()` are swallowed,
+    /// as the spec requires for abrupt completions that already have a reason.
+    fn iterator_close(&mut self, iter_val: Value, module: &Module) -> Result<(), RuntimeError> {
+        use crate::vm::iterator::NativeIteratorState;
+
+        let Value::Object(iter_obj) = &iter_val else {
+            return Ok(());
+        };
+        let iterator = {
+            let borrowed = iter_obj.borrow();
+            let Some(it) = borrowed.as_any().downcast_ref::<crate::vm::iterator::NativeIteratorObject>() else {
+                return Ok(());
+            };
+            match &*it.state().borrow() {
+                NativeIteratorState::Js { iterator } => Some(iterator.clone()),
+                _ => None,
+            }
+        };
+        let Some(iterator) = iterator else {
+            return Ok(());
+        };
+        let return_fn = self
+            .get_member(&iterator, &PropertyKey::from_str("return"), module)
+            .unwrap_or(Value::Undefined);
+        if return_fn.is_callable() {
+            // Swallow errors from `return()` — the original completion wins.
+            let _ = self.invoke(&return_fn, iterator, &[], module);
+        }
+        Ok(())
+    }
+
     fn call_builtin_method(
         &self,
         obj: &Value,

@@ -626,6 +626,13 @@ impl<'a> SSABuilder<'a> {
             Instruction::Arguments { dst } => {
                 SSABuilder::rename_definition(dst, new_versions);
             }
+            Instruction::IteratorClose { iter } => {
+                SSABuilder::rename_use(iter, stacks);
+            }
+            Instruction::ToString { dst, src } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                SSABuilder::rename_use(src, stacks);
+            }
             Instruction::PropertySet {
                 object,
                 property,
