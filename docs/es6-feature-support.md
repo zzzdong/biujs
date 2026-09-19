@@ -1,8 +1,10 @@
 # ES6 Feature Support Status
 
-> **Last updated**: 2026-05-26  
-> **Engine version**: 0.1.0  
-> **Total tests**: 479 (188 unit + 225 feature + 66 test262)
+> **Last updated**: 2026-09-20
+> **Engine version**: 0.1.0
+> **Total tests**: 188 unit + 17 feature files + test262 10240 executed (3901 passing)
+>
+> Roadmap: see `docs/es6-conformance-plan.md` (M2 residual → M6).
 
 ## Project Goal
 
@@ -12,19 +14,16 @@
 - ✅ **Strict mode only** - All code runs in strict mode by default
 - ❌ **No `eval()`** - Not supported (incompatible with static compilation)
 - ❌ **No `with` statement** - Not supported (incompatible with static compilation)
-- ❌ **No `arguments` object** - Not supported (use named params or future rest params)
-- ❌ **No `var`** - Not supported (use `let`/`const`, incompatible with static frame model)
+- ✅ **`arguments` object** - Supported (materialized per frame from the argument count)
+- ✅ **`var`** - Supported (function-scoped binding alongside `let`/`const`)
 
 ### Design Philosophy
 This engine uses a **static compilation model** with register-based VM:
 - Static frame indexing replaces dynamic scope chain lookups
-- Register allocation benefits from predictable `let`/`const` scoping
 - Closure capture uses **create-time value snapshot** semantics — captured variables (including Objects via `Rc` sharing) are copied at closure creation, not referenced via a scope chain. This is a deliberate simplification compatible with the static model.
 - Features incompatible with this architecture are excluded:
   - `eval()` - dynamic code evaluation breaks static analysis
   - `with` - dynamic property lookup breaks static binding
-  - `var` - function scoping and hoisting complicates register allocation
-  - `arguments` - aliasing behavior conflicts with static frame layout
 
 ---
 
@@ -257,8 +256,33 @@ This engine uses a **static compilation model** with register-based VM:
 | Feature | Status | Since | Notes |
 |---------|--------|-------|-------|
 | `class` syntax | ✅ | recent | Class declarations and expressions |
-| `constructor` | ✅ | recent | Default and custom constructors |
+| `constructor` | ✅ | recent | Default and custom constructors; `new` is required (plain call throws TypeError) |
 | Methods | ✅ | recent | Instance methods on prototype |
+| Static methods | ✅ | M2 | Defined on the constructor |
+| Static fields (`static x = 1`) | ✅ | M2 | Evaluated once when the class is built |
+| Instance fields (`x = 1`) | ✅ | M2 | Initialized at the start of the constructor |
+| Getters / setters | ✅ | M2 | One merged `Object.defineProperty` descriptor per name |
+| `prototype.constructor` back-reference | ✅ | M2 | |
+| `extends` | ✅ | M2 | Prototype created with `Object.create(parent.prototype)`; static inheritance via `setPrototypeOf` |
+| `super()` | ✅ | M2 | Parent constructor resolved at run time from the receiver |
+| `super.method()` / `super.prop` | ⚠️ | M2 | Bound through `Function.prototype.call`; property read uses the parent prototype |
+| `new.target` | ❌ | — | Planned (M2 residual) |
+| Computed method names | ❌ | — | Planned (M2 residual, via `Object.defineProperty`) |
+| Private fields / methods (`#x`) | ❌ | — | Out of scope (ES2022) |
+| Static blocks | ❌ | — | Out of scope (ES2022) |
+
+### ES6 Syntax Delivered Elsewhere
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `for...of` / `for...in` | ✅ | Dual-path iterator protocol |
+| Iterators (`Symbol.iterator`) | ⚠️ | Fast path for arrays/strings; user iterators via protocol; `return()`/`throw()` incomplete |
+| Destructuring (array/object/params/assignment targets) | ✅ | Defaults, elision, rest, nesting |
+| Spread (call / `new` / array / object literal) | ✅ | `ArrayPushSpread` runs the loop in the VM |
+| Rest parameters | ✅ | `MakeRest` |
+| Default parameters | ✅ | Can reference earlier parameters |
+| Template literal interpolation | ✅ | Tagged templates: basic form only (no frozen `raw`) |
+| Generators (`function*`) | ❌ | Planned (M4) |
 
 ---
 
@@ -397,45 +421,41 @@ These features are intentionally **not supported** as they are incompatible with
 |---------|--------|
 | `eval()` | Dynamic code evaluation breaks static analysis |
 | `with` statement | Dynamic property lookup breaks static binding |
-| `var` | Function scoping and hoisting complicates register allocation |
-| `arguments` object | Aliasing behavior conflicts with static frame layout |
 | `arguments.callee` | Deprecated in strict mode |
 | `Function.prototype.caller` | Deprecated in strict mode |
 | Octal literals (`0777`) | Deprecated in strict mode (use `0o777`) |
 | Duplicate parameter names | Syntax error in strict mode |
 | `this` boxing in primitive functions | Not applicable in strict mode |
-| Regular expression literals | Out of scope |
-| Binary/Octal/Hex literals | Out of scope |
-| Exponentiation operator (`**`) | Out of scope |
-| Default parameters | Out of scope |
-| Rest parameters (`...args`) | Out of scope |
-| Spread operator (`...`) | Out of scope |
-| `for...in` / `for...of` | Out of scope |
-| `do...while` | Out of scope |
-| `switch` / `case` | Out of scope |
-| Labeled statements | Out of scope |
-| Generator functions (`function*`) | Out of scope |
-| Async functions (`async`/`await`) | Out of scope |
-| Class `extends` / `super` | Out of scope |
-| Class static methods | Out of scope |
-| Class getters/setters | Out of scope |
-| ES modules (`import`/`export`) | Out of scope |
-| CommonJS (`require`/`module.exports`) | Out of scope |
-| `Math`, `Date`, `JSON`, `RegExp` | Out of scope |
-| `Map`, `Set`, `WeakMap`, `WeakSet` | Out of scope |
-| `Promise`, `Proxy`, `Reflect` | Out of scope |
-| `console`, `globalThis` | Out of scope |
-| Most Array.prototype methods | Out of scope |
-| Most Object static methods | Out of scope |
+| Regular expression literals | No regexp engine (independent sub-project) |
+| Async functions (`async`/`await`), async iteration | Not ES6 |
+| Class private fields/methods (`#x`), static blocks | Not ES6 (ES2022) |
+| `BigInt`, optional chaining, nullish coalescing | Not ES6 |
+| `Temporal`, `Intl`, `Atomics`, `SharedArrayBuffer` | Not ES6 and/or host dependent |
+| ES modules (`import`/`export`) | Static-linking only possible; not committed in the current plan |
+| CommonJS (`require`/`module.exports`) | Not part of the language |
+
+### Planned But Not Yet Delivered
+
+These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.md`:
+
+| Feature | Milestone |
+|---------|-----------|
+| Computed property names, `new.target`, `**` | M2 residual |
+| Well-known symbols (`toStringTag`, `toPrimitive`, `hasInstance`, `species`) | M2 residual |
+| Built-ins: Object / Array / String / Number / Math / Function / Error completeness | M3 |
+| `JSON`, `Date` | M3 |
+| Generators (`function*`) and full iterator close semantics | M4 |
+| `Map`, `Set`, `WeakMap`, `WeakSet`, `Promise` | M5 |
+| `Proxy`, `Reflect` | M5 |
+| `TypedArray` / `ArrayBuffer` / `DataView` | M6 |
 
 ### Test Counts
 
 | Test Suite | Count |
 |------------|-------|
 | Unit tests (value, vm, etc.) | 188 |
-| Feature integration tests | 225 |
-| test262 conformance tests | 66 |
-| **Total** | **479** |
+| Feature integration test files | 17 |
+| test262 executed / passing | 10240 / 3901 |
 
 ---
 
@@ -469,3 +489,7 @@ These features are intentionally **not supported** as they are incompatible with
 | 2026-05-26 | ✅ 18 new test262 test suites (72 total tests) |
 | 2026-05-26 | ✅ Arrow function closure variable capture with `ClosureVar` runtime stack |
 | 2026-05-26 | ✅ 5 closure capture feature tests with value assertions |
+| 2026-09-20 | ✅ M1: iterator protocol, for-of/for-in, template interpolation, default/rest params, spread (call/new/array/object), destructuring incl. assignment targets |
+| 2026-09-20 | ✅ M2: class static members/fields, accessors, `extends`/`super`, `prototype.constructor`, class constructors require `new` |
+| 2026-09-20 | 🐛 Implicit return now clears Rv (constructors returned a leftover object); accessors use the receiver as `this` |
+| 2026-09-20 | 📈 test262 2444 → 3901 passing (10240 executed) |
