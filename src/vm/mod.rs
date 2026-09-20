@@ -586,6 +586,96 @@ impl VM {
         Ok(rv)
     }
 
+    /// ES `ToPropertyDescriptor` (7.3.3).
+    ///
+    /// The six descriptor fields are read through `[[Get]]`, so an accessor
+    /// field runs with the descriptor object as `this`; the result is a plain
+    /// object holding only the fields that were present. `get`/`set` must be
+    /// callable or undefined.
+    fn to_property_descriptor(
+        &mut self,
+        value: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        if !matches!(value, Value::Object(_) | Value::Function(_)) {
+            return Err(RuntimeError::TypeError(
+                "Property description must be an object".to_string(),
+            ));
+        }
+        let desc = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::OrdinaryObject::new(),
+        )));
+        for name in ["enumerable", "configurable", "value", "writable", "get", "set"] {
+            let key = PropertyKey::from_str(name);
+            let present = match value {
+                Value::Object(obj) => {
+                    crate::vm::prototype::internal_has_property(Rc::clone(obj), &key)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !present {
+                continue;
+            }
+            let raw = self.get_member(value, &key, module)?;
+            let converted = match name {
+                "get" | "set" => {
+                    if !raw.is_undefined() && !raw.is_callable() {
+                        return Err(RuntimeError::TypeError(
+                            "Getter or setter is not callable".to_string(),
+                        ));
+                    }
+                    raw
+                }
+                "value" => raw,
+                _ => Value::Bool(raw.to_boolean()),
+            };
+            if let Value::Object(desc_ref) = &desc {
+                let _ = desc_ref.borrow_mut().property_set(key, converted);
+            }
+        }
+        Ok(desc)
+    }
+
+    /// `ToPropertyDescriptor` for every own enumerable key of `props`
+    /// (`Object.defineProperties` / the `Object.create` properties argument).
+    fn to_property_descriptors(
+        &mut self,
+        props: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let Value::Object(props_ref) = props else {
+            return Err(RuntimeError::TypeError(
+                "Properties must be an object".to_string(),
+            ));
+        };
+        // Own enumerable keys first, then a real [[Get]] for each value: the
+        // properties object may itself hold accessors (ES 19.1.2.3.1 step 3).
+        let keys: Vec<PropertyKey> = {
+            let borrowed = props_ref.borrow();
+            borrowed
+                .own_keys()
+                .into_iter()
+                .filter(|k| {
+                    borrowed
+                        .property_get(k)
+                        .is_some_and(|d| d.enumerable)
+                })
+                .collect()
+        };
+        let out = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::OrdinaryObject::new(),
+        )));
+        for key in keys {
+            let value = self.get_member(props, &key, module)?;
+            let converted = self.to_property_descriptor(&value, module)?;
+            if let Value::Object(out_ref) = &out {
+                let _ = out_ref.borrow_mut().property_set(key, converted);
+            }
+        }
+        Ok(out)
+    }
+
     /// ES 19.1.3.6 `Object.prototype.toString`.
     ///
     /// A string-valued `Symbol.toStringTag` takes precedence over the built-in
@@ -717,6 +807,29 @@ impl VM {
         }
         // Static methods are stored under their qualified name ("Array.from").
         if name.contains('.') {
+            // The descriptor arguments are read through [[Get]] first, which
+            // only the VM can do (their fields may be accessors).
+            if name == "Object.defineProperty" && args.len() >= 3 {
+                let descriptor = self.to_property_descriptor(&args[2], module)?;
+                return crate::builtins::call_static_method(
+                    name,
+                    &[args[0].clone(), args[1].clone(), descriptor],
+                );
+            }
+            if name == "Object.defineProperties" && args.len() >= 2 {
+                let props = self.to_property_descriptors(&args[1], module)?;
+                return crate::builtins::call_static_method(
+                    name,
+                    &[args[0].clone(), props],
+                );
+            }
+            if name == "Object.create" && args.len() >= 2 && !args[1].is_undefined() {
+                let props = self.to_property_descriptors(&args[1], module)?;
+                return crate::builtins::call_static_method(
+                    name,
+                    &[args[0].clone(), props],
+                );
+            }
             return crate::builtins::call_static_method(name, args);
         }
         crate::builtins::call_native(name, args)

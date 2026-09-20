@@ -605,10 +605,16 @@ impl JSObject for ArrayObject {
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         match key {
             PropertyKey::Str(s) if s.as_str() == "length" => {
-                Some(PropertyDescriptor::writable_data_descriptor(
-                    Value::Number(self.elements.len() as f64),
-                    false,
-                ))
+                // Array `length`: writable, non-enumerable, non-configurable
+                // (ES 10.4.2.1), so `Object.keys([1, 2])` is just the indices.
+                Some(PropertyDescriptor {
+                    value: Value::Number(self.elements.len() as f64),
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                    getter: None,
+                    setter: None,
+                })
             }
             PropertyKey::Str(s) => {
                 // Try parsing index
@@ -1114,12 +1120,26 @@ impl JSObject for NativeFunctionObject {
         // enough for the arity checks test262 performs on some built-ins).
         if let PropertyKey::Str(s) = key {
             if s.as_str() == "name" {
-                return Some(PropertyDescriptor::data_descriptor(Value::string(
-                    &self.name,
-                )));
+                // Function `name` / `length`: non-writable, non-enumerable,
+                // configurable (ES 10.2.9 / 10.2.10).
+                return Some(PropertyDescriptor {
+                    value: Value::string(&self.name),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: None,
+                    setter: None,
+                });
             }
             if s.as_str() == "length" {
-                return Some(PropertyDescriptor::data_descriptor(Value::Number(0.0)));
+                return Some(PropertyDescriptor {
+                    value: Value::Number(0.0),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: None,
+                    setter: None,
+                });
             }
         }
         self.properties.get(key).cloned()

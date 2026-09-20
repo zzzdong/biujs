@@ -499,6 +499,8 @@ pub fn call_prototype_method(
         "toString" => dispatch_to_string(obj),
         "valueOf" => dispatch_value_of(obj),
         "hasOwnProperty" => object::object_has_own_property(obj, args),
+        "isPrototypeOf" => object::object_is_prototype_of(obj, args),
+        "propertyIsEnumerable" => object::object_property_is_enumerable(obj, args),
         // Number prototype
         "toFixed" => number::number_to_fixed(obj, args),
         "toExponential" => number::number_to_exponential(obj, args),

@@ -37,6 +37,8 @@ mod language_semantics;
 mod logical_typeof;
 #[path = "features/new_target.rs"]
 mod new_target;
+#[path = "features/object_builtins.rs"]
+mod object_builtins;
 #[path = "features/objects_and_arrays.rs"]
 mod objects_and_arrays;
 #[path = "features/stack_overflow.rs"]

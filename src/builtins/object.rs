@@ -19,33 +19,66 @@ pub fn object_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
+/// Own enumerable string keys of a value, applying `ToObject` first.
+///
+/// Shared by `Object.keys` / `values` / `entries`: a string primitive exposes
+/// its index keys, other primitives have none, and null/undefined throw.
+fn to_object_string_keys(value: &Value) -> Result<Vec<PropertyKey>, RuntimeError> {
+    match value {
+        Value::Object(obj_ref) => Ok(obj_ref
+            .borrow()
+            .own_keys()
+            .into_iter()
+            .filter(|k| k.as_str().is_some())
+            .filter(|k| {
+                obj_ref
+                    .borrow()
+                    .property_get(k)
+                    .is_some_and(|d| d.enumerable)
+            })
+            .collect()),
+        Value::String(s) => Ok((0..s.chars().count())
+            .map(|i| PropertyKey::from_str(&i.to_string()))
+            .collect()),
+        Value::Number(_) | Value::Bool(_) | Value::Symbol(_) => Ok(Vec::new()),
+        Value::Undefined | Value::Null => Err(RuntimeError::TypeError(
+            "Cannot convert undefined or null to object".to_string(),
+        )),
+        Value::Function(_) => Ok(Vec::new()),
+    }
+}
+
+/// Read `key` from a value for `Object.values` / `Object.entries`, honouring
+/// string index access on primitives.
+fn to_object_get(value: &Value, key: &PropertyKey) -> Value {
+    match value {
+        Value::Object(obj_ref) => obj_ref
+            .borrow()
+            .property_get(key)
+            .map(|d| d.value)
+            .unwrap_or(Value::Undefined),
+        Value::String(s) => key
+            .as_str()
+            .and_then(|k| k.parse::<usize>().ok())
+            .and_then(|i| s.chars().nth(i))
+            .map(|c| Value::string(&c.to_string()))
+            .unwrap_or(Value::Undefined),
+        _ => Value::Undefined,
+    }
+}
+
 pub fn object_keys(args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
             "Object.keys requires at least 1 argument".to_string(),
         ));
     }
-    match &args[0] {
-        Value::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            // EnumerableOwnPropertyNames: own *string* keys that are enumerable.
-            let str_keys: Vec<Value> = borrowed
-                .own_keys()
-                .into_iter()
-                .filter(|k| k.as_str().is_some())
-                .filter(|k| {
-                    borrowed
-                        .property_get(k)
-                        .is_some_and(|desc| desc.enumerable)
-                })
-                .map(|k| Value::string(&k.display()))
-                .collect();
-            Ok(new_array_object_from_vec(str_keys))
-        }
-        _ => Err(RuntimeError::TypeError(
-            "Object.keys: argument is not an object".to_string(),
-        )),
-    }
+    let keys = to_object_string_keys(&args[0])?;
+    let str_keys: Vec<Value> = keys
+        .iter()
+        .filter_map(|k| k.as_str().map(Value::string))
+        .collect();
+    Ok(new_array_object_from_vec(str_keys))
 }
 
 pub fn object_values(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -54,23 +87,9 @@ pub fn object_values(args: &[Value]) -> Result<Value, RuntimeError> {
             "Object.values requires at least 1 argument".to_string(),
         ));
     }
-    match &args[0] {
-        Value::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            let values: Vec<Value> = borrowed
-                .own_keys()
-                .into_iter()
-                .filter(|k| k.as_str().is_some())
-                .filter_map(|k| borrowed.property_get(&k))
-                .filter(|desc| desc.enumerable)
-                .map(|desc| desc.value)
-                .collect();
-            Ok(new_array_object_from_vec(values))
-        }
-        _ => Err(RuntimeError::TypeError(
-            "Object.values: argument is not an object".to_string(),
-        )),
-    }
+    let keys = to_object_string_keys(&args[0])?;
+    let values: Vec<Value> = keys.iter().map(|k| to_object_get(&args[0], k)).collect();
+    Ok(new_array_object_from_vec(values))
 }
 
 pub fn object_entries(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -79,23 +98,17 @@ pub fn object_entries(args: &[Value]) -> Result<Value, RuntimeError> {
             "Object.entries requires at least 1 argument".to_string(),
         ));
     }
-    match &args[0] {
-        Value::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            let entries: Vec<Value> = borrowed
-                .own_keys()
-                .into_iter()
-                .filter(|k| k.as_str().is_some())
-                .filter_map(|k| {
-                    borrowed.property_get(&k).filter(|d| d.enumerable).map(|desc| {
-                        new_array_object_from_vec(vec![Value::string(&k.display()), desc.value])
-                    })
-                })
-                .collect();
-            Ok(new_array_object_from_vec(entries))
-        }
-        _ => Ok(new_array_object_from_vec(vec![])),
-    }
+    let keys = to_object_string_keys(&args[0])?;
+    let entries: Vec<Value> = keys
+        .iter()
+        .map(|k| {
+            new_array_object_from_vec(vec![
+                Value::string(&k.display()),
+                to_object_get(&args[0], k),
+            ])
+        })
+        .collect();
+    Ok(new_array_object_from_vec(entries))
 }
 
 pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -122,14 +135,9 @@ pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
     let desc = &args[2];
 
     // Honour the full descriptor (value/writable/enumerable/configurable and
-    // get/set) instead of only copying the value.
-    if let Value::Object(desc_obj) = desc {
-        let keys = desc_obj.borrow().own_keys();
-        if keys.is_empty() {
-            return Err(RuntimeError::TypeError(
-                "Property description must be an object".to_string(),
-            ));
-        }
+    // get/set) instead of only copying the value. An *empty* descriptor is
+    // valid: it creates the property with every attribute `false`.
+    if let Value::Object(_) = desc {
         let desc_val = desc.clone();
         // Every object kind keeps its own property table, so the descriptor
         // survives on arrays, functions and prototype objects too — a class
@@ -137,6 +145,10 @@ pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
         // through exactly this path.
         let mut obj_mut = obj.borrow_mut();
         apply_property_descriptor(&mut *obj_mut, &key, &desc_val)?;
+    } else {
+        return Err(RuntimeError::TypeError(
+            "Property description must be an object".to_string(),
+        ));
     }
 
     Ok(Value::Object(Rc::clone(obj)))
@@ -317,8 +329,9 @@ pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
     new_obj.set_prototype(proto);
 
     // Second argument: property descriptors, each applied in order.
+    // `undefined` means "none"; anything else must be an object (ES 19.1.2.2).
     if let Some(props) = args.get(1) {
-        if !props.is_undefined() && !props.is_null() {
+        if !props.is_undefined() {
             let props_ref = match props {
                 Value::Object(o) => Rc::clone(o),
                 _ => {
@@ -525,18 +538,29 @@ pub fn object_define_properties(args: &[Value]) -> Result<Value, RuntimeError> {
             "Object.defineProperties: target is not an object".to_string(),
         ));
     };
-    if let Value::Object(props_ref) = props {
-        let descriptors: Vec<(PropertyKey, Value)> = {
-            let borrowed = props_ref.borrow();
-            borrowed
-                .own_keys()
-                .into_iter()
-                .filter_map(|k| borrowed.property_get(&k).map(|d| (k, d.value)))
-                .collect()
+    // `Properties` must be an object (ES 19.1.2.3 step 2); null/undefined and
+    // primitives are a TypeError.
+    let Value::Object(props_ref) = props else {
+        return Err(RuntimeError::TypeError(
+            "Object.defineProperties: properties must be an object".to_string(),
+        ));
+    };
+    // Every descriptor is converted *before* any property is defined, so a bad
+    // descriptor leaves the target untouched.
+    let descriptors: Vec<(PropertyKey, Value)> = {
+        let borrowed = props_ref.borrow();
+        borrowed
+            .own_keys()
+            .into_iter()
+            .filter_map(|k| borrowed.property_get(&k).map(|d| (k, d.value)))
+            .collect()
+    };
+    for (key, descriptor) in descriptors {
+        let key_value = match &key {
+            PropertyKey::Str(s) => Value::string(s),
+            PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(*id),
         };
-        for (key, descriptor) in descriptors {
-            object_define_property(&[target.clone(), Value::string(&key.display()), descriptor])?;
-        }
+        object_define_property(&[target.clone(), key_value, descriptor])?;
     }
     Ok(target.clone())
 }
@@ -560,12 +584,73 @@ pub fn object_prototype_to_string(obj: &Value, _args: &[Value]) -> Result<Value,
 pub fn object_has_own_property(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let key = match args.first() {
         Some(Value::String(s)) => PropertyKey::from_str(s),
+        Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),
         Some(other) => PropertyKey::from_str(&other.to_js_string()),
         None => return Ok(Value::Bool(false)),
     };
     match obj {
         Value::Object(obj_ref) => Ok(Value::Bool(obj_ref.borrow().has_property(&key))),
-        Value::String(s) => Ok(Value::Bool(key.as_str() == Some("length"))),
+        Value::String(s) => {
+            // String wrappers expose an own `length` and their index keys.
+            let own = match key.as_str() {
+                Some("length") => true,
+                Some(k) => k
+                    .parse::<usize>()
+                    .ok()
+                    .is_some_and(|i| i < s.chars().count()),
+                None => false,
+            };
+            Ok(Value::Bool(own))
+        }
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
+/// `Object.prototype.isPrototypeOf(V)` — is `this` anywhere on `V`'s
+/// prototype chain?
+pub fn object_is_prototype_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let Value::Object(target) = obj else {
+        // ES: ToObject(this) then walk V's chain; a primitive receiver has no
+        // object identity, so the answer is false for object arguments and a
+        // TypeError for primitives (handled by the caller's ToObject).
+        return Ok(Value::Bool(false));
+    };
+    let Some(Value::Object(candidate)) = args.first() else {
+        return Ok(Value::Bool(false));
+    };
+    let mut current = candidate.borrow().get_prototype();
+    let mut depth = 0;
+    while let Some(proto) = current {
+        if depth > 1000 {
+            break;
+        }
+        if Rc::ptr_eq(&proto, target) {
+            return Ok(Value::Bool(true));
+        }
+        current = proto.borrow().get_prototype();
+        depth += 1;
+    }
+    Ok(Value::Bool(false))
+}
+
+/// `Object.prototype.propertyIsEnumerable(V)`.
+pub fn object_property_is_enumerable(
+    obj: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let key = match args.first() {
+        Some(Value::String(s)) => PropertyKey::from_str(s),
+        Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),
+        Some(other) => PropertyKey::from_str(&other.to_js_string()),
+        None => return Ok(Value::Bool(false)),
+    };
+    match obj {
+        Value::Object(obj_ref) => Ok(Value::Bool(
+            obj_ref
+                .borrow()
+                .property_get(&key)
+                .is_some_and(|d| d.enumerable),
+        )),
         _ => Ok(Value::Bool(false)),
     }
 }
@@ -591,6 +676,12 @@ pub fn register_object_prototype(proto: &Rc<RefCell<dyn JSObject>>, object_fn: &
     set_prototype_method(proto, "valueOf", |this, _args| Ok(this.clone()));
     set_prototype_method(proto, "hasOwnProperty", |this, args| {
         object_has_own_property(this, args)
+    });
+    set_prototype_method(proto, "isPrototypeOf", |this, args| {
+        object_is_prototype_of(this, args)
+    });
+    set_prototype_method(proto, "propertyIsEnumerable", |this, args| {
+        object_property_is_enumerable(this, args)
     });
     set_prototype_method(proto, "toLocaleString", |this, args| {
         object_prototype_to_string(this, args)
