@@ -228,6 +228,13 @@ impl JSObject for OrdinaryObject {
         if self.frozen || self.sealed {
             return false;
         }
+        // ES6 [[Delete]]: an own property whose [[Configurable]] is false cannot
+        // be removed — the request reports failure instead.
+        if let Some(desc) = self.properties.get(key) {
+            if !desc.configurable {
+                return false;
+            }
+        }
         self.properties.remove(key).is_some()
     }
 

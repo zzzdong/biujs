@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use log::{debug, trace};
 
-use super::ir::{BlockId, ControlFlowGraph, Instruction, Value};
+use super::ir::{BlockId, ControlFlowGraph, Instruction, Value, Variable};
 use crate::bytecode::{Bytecode, Opcode, Operand, Register};
 
 use super::regalloc::{Action, RegAlloc};
@@ -16,16 +16,18 @@ pub struct Codegen {
     inst_index: usize,
     insts: BTreeMap<usize, Instruction>,
     throw_to_handlers: HashMap<BlockId, Vec<BlockId>>,
-    /// Keep every variable in a fixed stack slot instead of a register.
-    ///
-    /// The register allocator decides when a value may be dropped by liveness
-    /// analysis, and that analysis is not yet trustworthy across basic blocks —
-    /// values used after a branch could be silently lost. Addressing variables
-    /// through memory removes the whole failure mode; registers still serve as
+    /// Keep every variable in a fixed stack slot, using registers only as
     /// per-instruction temporaries.
+    ///
+    /// Default. A single-pass, layout-ordered code generator cannot know which
+    /// predecessor ran, so a value that this pass believes is in a register may
+    /// never have been written on the path that is actually taken. Addressing
+    /// variables through memory removes that entire class of bug. It is also
+    /// faster in practice: no registers have to be saved around a call.
+    /// `BIUJS_REG_VARS` opts into the register path (see `begin_block` /
+    /// `spill_live_out`), which keeps values in registers inside a block and
+    /// only routes them through memory at block boundaries.
     memory_resident_vars: bool,
-    /// Spill live values to memory at the end of every basic block.
-    flush_blocks: bool,
 }
 
 impl Codegen {
@@ -37,8 +39,8 @@ impl Codegen {
             inst_index: 0,
             insts: BTreeMap::new(),
             throw_to_handlers,
-            memory_resident_vars: std::env::var("BIUJS_MEM_VARS").is_ok(),
-            flush_blocks: std::env::var("BIUJS_FLUSH").is_ok(),
+            // Memory-resident by default; opt into the register path explicitly.
+            memory_resident_vars: std::env::var("BIUJS_REG_VARS").is_err(),
         }
     }
 
@@ -53,6 +55,20 @@ impl Codegen {
         }
         log::debug!("=== end IR ===");
         let block_layout = cfg.loop_root_reverse_postorder_layout2();
+
+        // A value can escape to an exception handler from the middle of a block,
+        // which the per-terminator hand-off of the register path cannot cover.
+        // Functions with a handler therefore always keep variables in memory,
+        // so any handler can reload them whichever instruction threw.
+        let uses_exception_handlers = cfg.blocks().iter().any(|block| {
+            block
+                .instructions()
+                .iter()
+                .any(|inst| matches!(inst, Instruction::PushSeh { .. }))
+        });
+        if uses_exception_handlers {
+            self.memory_resident_vars = true;
+        }
 
         self.reg_alloc.arrange(&cfg, &block_layout);
 
@@ -76,16 +92,15 @@ impl Codegen {
             self.block_map
                 .insert(block.id().as_usize() as isize, self.codes.len() as isize);
 
-            // Registers do not survive a block boundary (see `begin_block`).
-            if self.flush_blocks {
-                self.reg_alloc.begin_block();
-            }
+            // No register state survives a block boundary; each block reloads
+            // what it needs from memory (see `RegAlloc::begin_block`).
+            self.reg_alloc.begin_block();
 
             for inst in block.instructions() {
-                // Make every value reachable from memory before control leaves
-                // the block, so whichever block runs next can reload it.
-                if self.flush_blocks && inst.is_terminator() {
-                    for (register, stack) in self.reg_alloc.flush_block() {
+                // Hand the values a successor still needs over through memory
+                // before control leaves the block.
+                if inst.is_terminator() {
+                    for (register, stack) in self.reg_alloc.spill_live_out(block.id()) {
                         trace!("block-end spill [rbp+{stack}] <- {register}");
                         self.codes.push(Bytecode::double(
                             Opcode::Mov,
@@ -312,7 +327,7 @@ impl Codegen {
                         // The callee runs in a nested frame and freely reuses
                         // registers, so live values must be saved across it —
                         // same contract as `gen_call`.
-                        let in_use_registers = self.reg_alloc.call_saved_registers();
+                        let in_use_registers = self.call_saved_registers();
                         for reg in in_use_registers.iter().copied() {
                             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
                         }
@@ -337,7 +352,7 @@ impl Codegen {
                         let dst = self.gen_operand(dst);
                         let ctor = self.gen_operand(constructor);
                         let args = self.gen_operand(args);
-                        let in_use_registers = self.reg_alloc.call_saved_registers();
+                        let in_use_registers = self.call_saved_registers();
                         for reg in in_use_registers.iter().copied() {
                             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
                         }
@@ -433,42 +448,14 @@ impl Codegen {
                         self.codes.push(Bytecode::empty(Opcode::Ret));
                     }
                     Instruction::Jump { dst, args } => {
-                        // 为每个跳转参数生成mov指令
-                        for (param, arg) in cfg
+                        // Hand each block parameter over through its stack slot
+                        // (see `store_jump_args` for why it must not travel in a
+                        // register only).
+                        let params = cfg
                             .get_block(dst.to_block())
                             .map(|b| b.params())
-                            .unwrap_or_default()
-                            .iter()
-                            .zip(args.iter())
-                        {
-                            let arg_op = self.gen_operand(*arg);
-                            // 检查形参是否已分配寄存器
-                            if let Some(param_reg) = self.reg_alloc.get_register(param) {
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    param_reg.into(),
-                                    arg_op,
-                                ));
-                            } else if let Some(stack_offset) =
-                                self.reg_alloc.get_stack_offset(param)
-                            {
-                                // 形参在栈上，存储到栈位置
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    Operand::Stack(stack_offset as isize),
-                                    arg_op,
-                                ));
-                                self.reg_alloc.mark_stack_written(*param);
-                            } else {
-                                // 既不在寄存器也不在栈上，分配一个新寄存器（后备方案）
-                                let param_reg = self.alloc_register(*param);
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    param_reg.into(),
-                                    arg_op,
-                                ));
-                            }
-                        }
+                            .unwrap_or_default();
+                        self.store_jump_args(params, &args);
 
                         let dst = self.gen_operand(dst);
 
@@ -488,71 +475,18 @@ impl Codegen {
                         true_args,
                         false_args,
                     } => {
-                        // 为true分支参数生成mov指令
-                        let true_block_id = true_blk.to_block();
+                        // Hand both branches' parameters over through memory.
                         let true_params = cfg
-                            .get_block(true_block_id)
+                            .get_block(true_blk.to_block())
                             .map(|b| b.params())
                             .unwrap_or_default();
-                        for (param, arg) in true_params.iter().zip(true_args.iter()) {
-                            let arg_op = self.gen_operand(*arg);
-                            if let Some(param_reg) = self.reg_alloc.get_register(param) {
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    param_reg.into(),
-                                    arg_op,
-                                ));
-                            } else if let Some(stack_offset) =
-                                self.reg_alloc.get_stack_offset(param)
-                            {
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    Operand::Stack(stack_offset as isize),
-                                    arg_op,
-                                ));
-                                self.reg_alloc.mark_stack_written(*param);
-                            } else {
-                                let param_reg = self.alloc_register(*param);
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    param_reg.into(),
-                                    arg_op,
-                                ));
-                            }
-                        }
+                        self.store_jump_args(true_params, &true_args);
 
-                        // 为false分支参数生成mov指令
-                        let false_block_id = false_blk.to_block();
                         let false_params = cfg
-                            .get_block(false_block_id)
+                            .get_block(false_blk.to_block())
                             .map(|b| b.params())
                             .unwrap_or_default();
-                        for (param, arg) in false_params.iter().zip(false_args.iter()) {
-                            let arg_op = self.gen_operand(*arg);
-                            if let Some(param_reg) = self.reg_alloc.get_register(param) {
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    param_reg.into(),
-                                    arg_op,
-                                ));
-                            } else if let Some(stack_offset) =
-                                self.reg_alloc.get_stack_offset(param)
-                            {
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    Operand::Stack(stack_offset as isize),
-                                    arg_op,
-                                ));
-                                self.reg_alloc.mark_stack_written(*param);
-                            } else {
-                                let param_reg = self.alloc_register(*param);
-                                self.codes.push(Bytecode::double(
-                                    Opcode::Mov,
-                                    param_reg.into(),
-                                    arg_op,
-                                ));
-                            }
-                        }
+                        self.store_jump_args(false_params, &false_args);
 
                         let condition = self.gen_operand(condition);
                         let true_blk = self.gen_operand(true_blk);
@@ -630,31 +564,7 @@ impl Codegen {
                                     continue;
                                 }
                                 // 这个后继块是catch handler，传递phi参数
-                                for (param, arg) in params.iter().zip(args.iter()) {
-                                    let arg_op = self.gen_operand(*arg);
-                                    if let Some(param_reg) = self.reg_alloc.get_register(param) {
-                                        self.codes.push(Bytecode::double(
-                                            Opcode::Mov,
-                                            param_reg.into(),
-                                            arg_op,
-                                        ));
-                                    } else if let Some(stack_offset) =
-                                        self.reg_alloc.get_stack_offset(param)
-                                    {
-                                        self.codes.push(Bytecode::double(
-                                            Opcode::Mov,
-                                            Operand::Stack(stack_offset as isize),
-                                            arg_op,
-                                        ));
-                                    } else {
-                                        let param_reg = self.alloc_register(*param);
-                                        self.codes.push(Bytecode::double(
-                                            Opcode::Mov,
-                                            param_reg.into(),
-                                            arg_op,
-                                        ));
-                                    }
-                                }
+                                self.store_jump_args(params, &args);
                             }
                         }
                         let val = self.gen_operand(value);
@@ -680,31 +590,7 @@ impl Codegen {
                                 if params.is_empty() {
                                     continue;
                                 }
-                                for (param, arg) in params.iter().zip(args.iter()) {
-                                    let arg_op = self.gen_operand(*arg);
-                                    if let Some(param_reg) = self.reg_alloc.get_register(param) {
-                                        self.codes.push(Bytecode::double(
-                                            Opcode::Mov,
-                                            param_reg.into(),
-                                            arg_op,
-                                        ));
-                                    } else if let Some(stack_offset) =
-                                        self.reg_alloc.get_stack_offset(param)
-                                    {
-                                        self.codes.push(Bytecode::double(
-                                            Opcode::Mov,
-                                            Operand::Stack(stack_offset as isize),
-                                            arg_op,
-                                        ));
-                                    } else {
-                                        let param_reg = self.alloc_register(*param);
-                                        self.codes.push(Bytecode::double(
-                                            Opcode::Mov,
-                                            param_reg.into(),
-                                            arg_op,
-                                        ));
-                                    }
-                                }
+                                self.store_jump_args(params, &args);
                             }
                         }
                         self.codes.push(Bytecode::empty(Opcode::ResumeExc));
@@ -745,7 +631,7 @@ impl Codegen {
 
     fn gen_call(&mut self, func: Value, args: &[Value], result: Value) {
         // 1. Backup used registers
-        let in_use_registers = self.reg_alloc.call_saved_registers();
+        let in_use_registers = self.call_saved_registers();
         for reg in in_use_registers.iter().copied() {
             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
         }
@@ -804,7 +690,7 @@ impl Codegen {
         let callable = self.gen_operand(func);
 
         // 1. Backup used registers
-        let in_use_registers = self.reg_alloc.call_saved_registers();
+        let in_use_registers = self.call_saved_registers();
         for reg in in_use_registers.iter().copied() {
             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
         }
@@ -911,7 +797,7 @@ impl Codegen {
         let callable = self.gen_operand(object);
 
         // 1. Backup used registers
-        let in_use_registers = self.reg_alloc.call_saved_registers();
+        let in_use_registers = self.call_saved_registers();
         for reg in in_use_registers.iter().copied() {
             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
         }
@@ -971,7 +857,7 @@ impl Codegen {
         let callable = self.gen_operand(constructor);
 
         // 1. Backup used registers
-        let in_use_registers = self.reg_alloc.call_saved_registers();
+        let in_use_registers = self.call_saved_registers();
         for reg in in_use_registers.iter().copied() {
             self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
         }
@@ -1025,6 +911,45 @@ impl Codegen {
         ));
     }
 
+    /// Registers that have to survive a nested call.
+    ///
+    /// With variables resident in memory nothing is held in a register across a
+    /// call, so the callee cannot clobber a value the caller still needs.
+    fn call_saved_registers(&self) -> Vec<Register> {
+        if self.memory_resident_vars {
+            Vec::new()
+        } else {
+            self.reg_alloc.call_saved_registers()
+        }
+    }
+
+    /// Hand a block's parameters over at a jump.
+    ///
+    /// A block parameter is not produced by an instruction inside its own block:
+    /// it is written by every predecessor's terminator. The value therefore
+    /// always travels through the parameter's dedicated stack slot, and the
+    /// block entry reloads it from there. Delivering only through a register is
+    /// unsound here: the predecessor and the target can be generated in either
+    /// order, so a register hand-off written by one edge is invisible (or stale)
+    /// when the block itself is generated — which is how a loop header ended up
+    /// reading a stale stack slot while the back edge updated only the register,
+    /// leaving the loop counter frozen.
+    fn store_jump_args(&mut self, params: &[Variable], args: &[Value]) {
+        for (param, arg) in params.iter().zip(args.iter()) {
+            let arg_op = self.gen_operand(*arg);
+            let stack = self.reg_alloc.ensure_stack_slot(*param);
+            self.codes.push(Bytecode::double(
+                Opcode::Mov,
+                Operand::Stack(stack as isize),
+                arg_op,
+            ));
+            // The slot now holds the incoming value; any register copy is stale,
+            // so the block entry must reload from memory.
+            self.reg_alloc.mark_stack_written(*param);
+            self.reg_alloc.forget_register(param);
+        }
+    }
+
     fn store_args(&mut self, args: &[Value], index: usize) {
         for arg in args.iter().rev() {
             let op = self.gen_operand(*arg);
@@ -1049,36 +974,33 @@ impl Codegen {
 
     /// Emit the bookkeeping that comes with a register allocation.
     ///
-    /// `alloc` may report that a victim was spilled (`Action::Spill`) or that a
-    /// value must be reloaded from its stack slot (`Action::Restore`). Callers
-    /// that only take the register silently drop that work and lose values.
-    fn apply_alloc_action(&mut self, action: Option<Action>) {
-        let Some(action) = action else { return };
-        match action {
-            Action::Spill { register, stack } => {
-                trace!("spilling [rbp+{stack}] <- {register}");
-                self.codes.push(Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Stack(stack as isize),
-                    register.into(),
-                ));
-            }
-            Action::Restore { register, stack } => {
-                trace!("unspilling [rbp+{stack}] -> {register}");
-                self.codes.push(Bytecode::double(
-                    Opcode::Mov,
-                    register.into(),
-                    Operand::Stack(stack as isize),
-                ));
+    /// `alloc` may report that a victim was spilled (`Action::Spill`) and/or
+    /// that the value itself must be reloaded from its stack slot
+    /// (`Action::Restore`). The actions are emitted in the order given: a spill
+    /// must reach memory before the register is overwritten by a restore.
+    /// Callers that only take the register silently drop that work and lose
+    /// values.
+    fn apply_alloc_actions(&mut self, actions: Vec<Action>) {
+        for action in actions {
+            match action {
+                Action::Spill { register, stack } => {
+                    trace!("spilling [rbp+{stack}] <- {register}");
+                    self.codes.push(Bytecode::double(
+                        Opcode::Mov,
+                        Operand::Stack(stack as isize),
+                        register.into(),
+                    ));
+                }
+                Action::Restore { register, stack } => {
+                    trace!("unspilling [rbp+{stack}] -> {register}");
+                    self.codes.push(Bytecode::double(
+                        Opcode::Mov,
+                        register.into(),
+                        Operand::Stack(stack as isize),
+                    ));
+                }
             }
         }
-    }
-
-    /// Allocate a register for `value`, emitting any spill/restore code.
-    fn alloc_register(&mut self, value: crate::compiler::ir::instruction::Variable) -> Register {
-        let (register, action) = self.reg_alloc.alloc(value, self.inst_index);
-        self.apply_alloc_action(action);
-        register
     }
 
     fn gen_operand(&mut self, value: Value) -> Operand {
@@ -1094,32 +1016,9 @@ impl Codegen {
                 Operand::Stack(stack as isize)
             }
             Value::Variable(var) => {
-                let (register, action) = self.reg_alloc.alloc(var, self.inst_index);
-                trace!("allocating {value} -> {register}, action = {action:?}");
-
-                if let Some(action) = action {
-                    match action {
-                        Action::Restore { stack, register } => {
-                            trace!("unspilling({value}) [rbp+{stack}] -> {register}");
-                            self.codes.push(Bytecode::double(
-                                Opcode::Mov,
-                                register.into(),
-                                Operand::Stack(stack as isize),
-                            ));
-                        }
-                        Action::Spill { register, stack } => {
-                            // A victim variable was evicted from `register`; preserve
-                            // its value on the stack before the register is reused.
-                            trace!("spilling [rbp+{stack}] <- {register}");
-                            self.codes.push(Bytecode::double(
-                                Opcode::Mov,
-                                Operand::Stack(stack as isize),
-                                register.into(),
-                            ));
-                        }
-                    }
-                }
-
+                let (register, actions) = self.reg_alloc.alloc(var, self.inst_index);
+                trace!("allocating {value} -> {register}, actions = {actions:?}");
+                self.apply_alloc_actions(actions);
                 Operand::new_register(register)
             }
         }

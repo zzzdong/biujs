@@ -7,7 +7,7 @@ use std::fmt;
 
 pub use builder::{FunctionBuilder, InstBuilder, IrBuilder};
 pub use cfg::{Block, ControlFlowGraph};
-pub use instruction::{BlockId, Instruction, Name, Value};
+pub use instruction::{BlockId, Instruction, Name, Value, Variable};
 pub use ssabuilder::SSABuilder;
 
 use crate::bytecode::{Constant, ConstantId, FunctionId};

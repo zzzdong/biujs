@@ -219,8 +219,14 @@ impl<'a> SSABuilder<'a> {
             // 获取所有定义点所在的块
             let def_blocks: HashSet<BlockId> = info.defs.iter().map(|(block, _)| *block).collect();
 
-            // 计算支配边界闭包
+            // 计算支配边界闭包。
+            //
+            // `def_blocks` 是 `HashSet`，直接迭代会让 worklist（以及最终
+            // `phi_placements[var]` 的 push 顺序）随进程的哈希种子变化，进而让
+            // 块参数的顺序、乃至同一份源码生成的字节码在不同运行间不同。先排序固定
+            // 下来。
             let mut worklist: Vec<BlockId> = def_blocks.iter().cloned().collect();
+            worklist.sort_unstable();
             let mut visited = HashSet::new();
 
             while let Some(block) = worklist.pop() {
@@ -236,8 +242,10 @@ impl<'a> SSABuilder<'a> {
             }
 
             // **新增：特别处理汇合块**
-            // 获取变量的所有使用点
-            let use_blocks: HashSet<BlockId> = info.uses.iter().map(|(block, _)| *block).collect();
+            // 获取变量的所有使用点。排序以保持确定性（见上）。
+            let mut use_blocks: Vec<BlockId> = info.uses.iter().map(|(block, _)| *block).collect();
+            use_blocks.sort_unstable();
+            use_blocks.dedup();
 
             // 检查是否有多个定义流向同一个使用块
             for &use_block in &use_blocks {
@@ -267,6 +275,13 @@ impl<'a> SSABuilder<'a> {
                     worklist.push(use_block);
                 }
             }
+        }
+
+        // Canonicalise the per-variable block lists so the resulting block
+        // parameter order does not depend on hash iteration order.
+        for blocks in phi_placements.values_mut() {
+            blocks.sort_unstable();
+            blocks.dedup();
         }
 
         phi_placements

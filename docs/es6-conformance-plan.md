@@ -2,7 +2,7 @@
 
 > **日期**：2026-09-20
 > **目标来源**：`README.md:3-4` —— *"A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6** features but without `eval` or eval-like features or `with` statement."*
-> **基线**：test262 **3901 / 10240**（38.10% 通过，6339 失败，14432 跳过）；单元测试 188；feature 集成 17 个文件；runner 启用 89 个套件
+> **基线**：test262 **3908 / 10240**（38.16% 通过，6332 失败，14432 跳过）；单元测试 190；feature 集成 17 个文件；runner 启用 89 个套件
 > **上一阶段**：M1（迭代器 / for-of / 解构 / 展开 / 模板 / 默认参数）与 M2（class：静态成员、访问器、extends/super、public 字段）已交付
 
 ---
@@ -57,10 +57,10 @@
 | 指标 | 数值 |
 |------|------|
 | test262 已执行 | 10240 |
-| 通过 | **3901**（38.10%） |
-| 失败 | 6339 |
+| 通过 | **3908**（38.16%） |
+| 失败 | 6332 |
 | 跳过（特性表 + 未启用套件） | 14432 |
-| 单元测试 | 188（全绿） |
+| 单元测试 | 190（全绿） |
 | feature 集成测试 | 17 个文件 |
 
 > **KPI 约定**：解锁特性会让分母变大、通过率下降，因此**主指标是通过的绝对数 + 目标套件通过率**，通过率仅作参考。
@@ -71,17 +71,40 @@
 - **M1**：双路径迭代协议、`for-of`/`for-in`、模板插值、默认参数、剩余参数、展开（调用/`new`/数组/对象）、数组与对象解构（含赋值目标、默认值、rest、嵌套）
 - **M2**：class 静态成员、`prototype.constructor` 反向链接、getter/setter（合并单一描述符）、`extends` + `super()`/`super.m()`、public 实例/静态字段、类构造器必须 `new` 调用
 - **通用修复**：隐式返回清空 `Rv`（构造函数原会返回原型对象）、访问器以接收者作 `this`、构造函数返回自身 `this`、调用点寄存器保存、规范错误可被 JS `try/catch` 捕获
+- **寄存器分配跨块活跃性**（2026-09-20 修复，见 §2.4）：重写存活分析 + 值跨块经内存交接；顺带修复非可配置属性可被 `delete` 删除、以及 phi 参数顺序随哈希种子变化导致的编译不确定
 
 ### 2.3 已知技术债（计划内需正视，不掩埋）
 
 | 债务 | 影响 | 当前处置 |
 |------|------|----------|
-| **寄存器分配的跨块活跃性不可靠** | 跨基本块存活的值可能被覆盖 | 已规避：展开改用原生 `ArrayPushSpread` 指令（循环收进 VM）；`BIUJS_FLUSH=1` 的块刷新方案实测净收益为负，暂不启用。彻底修复需重写 liveness |
 | Rc/RefCell 无环回收 | 循环引用泄漏 | 暂接受 |
 | 闭包值快照语义 | 与规范"引用同一绑定"不同（for-let 按轮捕获等） | 架构决定，相关用例允许失败 |
 | 迭代器 `return()`/`throw()`（IteratorClose 异常路径） | break/异常提前退出时未 close | 正常结束路径已 close；异常路径待 M4 |
 | 无正则引擎 | 1879 个 RegExp 测试 | 明确不在范围 |
 | 慢：内置方法多经 `invoke` 派发 | 全量 ~数分钟 | 建性能护栏 |
+
+### 2.4 跨块活跃性修复（2026-09-20）
+
+原债务描述为"寄存器分配的跨块活跃性不可靠"，实际是四个独立缺陷叠加，逐个修复：
+
+| # | 缺陷 | 修复 |
+|---|------|------|
+| 1 | 存活区间**有空洞**：只按定义/使用点打点，`live_out` 仅做部分延伸，跨块"live-through"的索引不被覆盖；`must_alloc` 据此把仍是活值的变量选为牺牲者 | 按块做**后向存活扫描**（以 `live_out` 为种子），把变量在其真正活跃的每个指令索引上都记录进区间；`ranges` 精确、无洞 |
+| 2 | `alloc` **吞掉 spill 动作**：需要 `Restore` 时直接 `return`，把 `evict_occupant`/`must_alloc` 的 `Action::Spill` 丢弃——被驱逐的值被标记"已写栈"却没有真正写栈，之后重载得到陈旧值 | `alloc` 返回**按顺序执行的动作列表**（先 `Spill` 后 `Restore`），调用方全部发射 |
+| 3 | **编译期寄存器状态跨块不可信**：代码生成按布局顺序线性推进，块入口的 `reg_set` 可能来自"运行时未必执行过"的兄弟块；`find()` 命中假值而跳过重载 | 块边界**只经内存交接**：块入口清空 `reg_set`，终止符处把 `live_out` 中仍在寄存器的值写回栈槽（`begin_block` / `spill_live_out`） |
+| 4 | **块参数（phi）交接不一致**：一条边写寄存器、另一条边写栈槽，块入口却从陈旧的栈槽重载（循环计数因此不更新） | `store_jump_args` 统一经**参数专属栈槽**交接：每条边写槽、块入口重载；栈槽一经分配永不变更（`must_alloc` 改为复用已有槽） |
+
+配套决定：**变量默认内存驻留**（每个变量固定栈槽，寄存器仅作指令级暂存）。
+单遍、按布局顺序生成的代码无法实现"跨块寄存器状态"的可信推理；改成内存驻留后该类缺陷整体消失。实测更快（调用点无需保存 16 个寄存器），故不再作为 workaround，而是默认行为；
+`BIUJS_REG_VARS=1` 可切回"块内寄存器 + 边界落栈"路径（仍需 `begin_block`/`spill_live_out`）；含 `try` 的函数强制内存驻留，
+因为异常可在块中途逃逸到 handler，终止符处的落栈覆盖不到。
+
+顺带修复：
+- `delete` 忽略 `[[Configurable]]`，不可配置属性可被删除（`OrdinaryObject::property_delete`）；修好后 `built-ins/Object` 由 1026 → 1029。
+- phi 参数顺序受 `HashSet` 迭代顺序影响，同一份源码在不同进程生成的字节码不同（`SSABuilder::determine_phi_nodes`）；排序后编译确定化。
+- `ResumeException` 未把 `args` 计为使用（`defined_and_used`）。
+
+回归护栏：`tests/features/control_flow.rs` 新增"循环 × 多活跃值/循环携带值/循环内展开/嵌套循环"四条；`regalloc.rs` 新增区间覆盖与 `alloc` 双动作两条单元测试。
 
 ---
 
@@ -91,10 +114,10 @@
 
 | 套件 | 失败数 | 主要缺口 |
 |------|--------|----------|
-| `built-ins/Object` | 2035 | ES6 静态方法（`assign`/`getOwnPropertySymbols`/`is` 细节）、属性描述符语义、原型方法 |
+| `built-ins/Object` | 2032 | ES6 静态方法（`assign`/`getOwnPropertySymbols`/`is` 细节）、属性描述符语义、原型方法 |
 | `built-ins/Array` | 1975 | `from`/`of`/`fill`/`find`/`findIndex`/`copyWithin`/`entries`/`keys`/`values`、泛型调用、类数组路径 |
 | `built-ins/String` | 686 | ES6 增补（`repeat`/`startsWith`/`endsWith`/`codePointAt`/`normalize`/`raw`）、迭代器 |
-| `built-ins/Function` | 246 | `name`/`length` 语义、`hasInstance`、`toString` |
+| `built-ins/Function` | 245 | `name`/`length` 语义、`hasInstance`、`toString` |
 | `built-ins/Number` | 175 | ES6 常量与 `isInteger`/`isSafeInteger`/`parseFloat` |
 | `language/statements/class` | 155 | 计算属性名、`new.target`、字段初始化次序、描述符可枚举性细节 |
 | `built-ins/Math` | 134 | ES6 数值方法（`hypot`/`sign`/`clz32`/`imul`/`log2`/`cbrt`…） |
@@ -198,7 +221,7 @@
 | `var` / `arguments` | 已实现并可用（订正旧文档）；`arguments` 由每帧 `frame_argc` 物化 |
 | 闭包捕获 | 保持**创建时值快照**（`dyn-capture.md`）；for-let 按轮捕获等规范细节允许失败 |
 | 动态派发 | 内置方法经 `invoke` 统一入口；新增内置只需注册，无需同步白名单 |
-| 跨块活跃性 | 未彻底修复前，新增"循环 + 多块"的降级优先考虑**原生指令**（`ArrayPushSpread` 模式）而非展开为多块 JS |
+| 跨块活跃性 | **已修复**（§2.4）：变量默认内存驻留，跨块值经栈槽交接，"生成顺序 ≠ 运行顺序"不再影响正确性。新增"循环 + 多块"降级不再需要回避；但仍建议优先原生指令——块越少，边界交接越少 |
 
 ---
 
@@ -209,7 +232,7 @@
 3. **失败原因聚合**：每里程碑开始/结束各跑一次
    `TEST262_SUITES=... TEST262_FAILURES=300 ... | grep FAIL | sed ... | sort | uniq -c | sort -rn`，用于排下一轮优先级。
 4. **性能护栏**：记录全量耗时基线；劣化 > 2× 需定位（热点：慢路径迭代的 `invoke`、内置方法派发）。
-5. **单元测试**：188 个保持全绿；新增运行时机制（生成器帧、微任务）需补单元测试。
+5. **单元测试**：190 个保持全绿；新增运行时机制（生成器帧、微任务）需补单元测试。
 
 ---
 
@@ -222,7 +245,7 @@
 | 解锁大特性后通过率下滑 | 指标误读 | 以通过绝对数为主指标，报告同时给出分母 |
 | Proxy 需要完整内部方法 | 成本高、收益不确定 | 排 M5 末位，允许低通过率 |
 | JSON/Date 涉及时区与浮点格式 | 长尾失败 | 先做无 reviver/UTC 子集，明确记录偏差 |
-| 跨块活跃性缺陷在新多块降级中复发 | 隐蔽错误值 | 优先用原生指令；新增多块降级必须有对照冒烟 |
+| 跨块活跃性缺陷在新多块降级中复发 | 隐蔽错误值 | 已修复（§2.4）；护栏：`features` 四条多活跃值循环断言 + `regalloc` 两条单元测试 |
 
 ---
 

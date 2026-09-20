@@ -79,23 +79,6 @@ impl LiveInterval {
         });
     }
 
-    pub fn update_end(&mut self, index: usize) {
-        self.end = self.end.max(index);
-        // 更新最后一个范围的结束位置
-        if let Some(last) = self.ranges.last_mut()
-            && index > last.end
-        {
-            last.end = index;
-        }
-    }
-
-    pub fn merge(&mut self, other: &LiveInterval) {
-        self.start = self.start.min(other.start);
-        self.end = self.end.max(other.end);
-
-        self.ranges.extend(other.ranges.clone());
-    }
-
     /// Whether `index` falls within one of this interval's live ranges.
     pub fn covers(&self, index: usize) -> bool {
         self.ranges
@@ -107,13 +90,23 @@ impl LiveInterval {
 #[derive(Debug, Clone)]
 pub struct Liveness {
     intervals: HashMap<Variable, LiveInterval>,
+    /// `live_out` set of every block: values a successor still needs after the
+    /// block's terminator. Used to spill exactly those values to memory at a
+    /// block boundary.
+    live_out: HashMap<BlockId, HashSet<Variable>>,
 }
 
 impl Liveness {
     fn new() -> Self {
         Liveness {
             intervals: HashMap::new(),
+            live_out: HashMap::new(),
         }
+    }
+
+    /// Values a successor still needs once `block` has finished.
+    fn live_out_of(&self, block: BlockId) -> Option<&HashSet<Variable>> {
+        self.live_out.get(&block)
     }
 
     /// All live intervals in a **deterministic** order.
@@ -126,6 +119,14 @@ impl Liveness {
         let mut intervals: Vec<LiveInterval> = self.intervals.values().cloned().collect();
         intervals.sort_by_key(|interval| interval.var.as_usize());
         intervals
+    }
+
+    /// Mark `var` as live at `index`, creating its interval on first sight.
+    fn record(&mut self, var: Variable, index: usize) {
+        self.intervals
+            .entry(var)
+            .or_insert_with(|| LiveInterval::new(var))
+            .active(index);
     }
 
     fn set_register(&mut self, var: Variable, reg: Register) {
@@ -163,113 +164,150 @@ pub struct LiveIntervalAnalyzer {}
 
 impl LiveIntervalAnalyzer {
     pub fn scan(cfg: &ControlFlowGraph, block_layout: &BlockLayout) -> Liveness {
-        // 1. 遍历一次控制流图，生成基本存活区间
-        let mut liveness = Self::build_basic_intervals(cfg, block_layout);
-
-        // 第二遍：计算live_in和live_out集合
+        // Compute per-block live_in/live_out over the whole CFG (including the
+        // exception edges), then turn them into per-variable live intervals.
         let (_live_in_sets, live_out_sets) = Self::compute_liveness_sets(cfg, block_layout);
-
-        // 第三遍：更新变量存活周期
-        Self::update_intervals(cfg, block_layout, &live_out_sets, &mut liveness);
-
-        liveness
+        Self::build_intervals(cfg, block_layout, &live_out_sets)
     }
 
-    /// 第一遍：扫描所有指令，建立基本的LiveInterval
-    fn build_basic_intervals(cfg: &ControlFlowGraph, block_layout: &BlockLayout) -> Liveness {
+    /// Build one live interval per variable.
+    ///
+    /// An interval must cover **every** instruction index at which the value is
+    /// needed, no matter which basic block that instruction lives in. The
+    /// previous implementation approximated this with a forward scan plus a
+    /// partial "extend for live-out" pass, which left holes across block
+    /// boundaries: a value still needed by a successor could look dead, so the
+    /// allocator was free to hand its register to another value and silently
+    /// overwrite it.
+    ///
+    /// Instead we run a proper backward liveness scan over each block, seeded
+    /// with its `live_out` set, and record the value at exactly the indices
+    /// where it is live. The resulting ranges are precise inside a block and
+    /// complete across blocks.
+    fn build_intervals(
+        cfg: &ControlFlowGraph,
+        block_layout: &BlockLayout,
+        live_out_sets: &HashMap<BlockId, HashSet<Variable>>,
+    ) -> Liveness {
         let mut liveness = Liveness::new();
-        let mut index = 0;
+        liveness.live_out = live_out_sets.clone();
+        let mut index = 0usize;
 
         for block in block_layout.iter(cfg) {
             let block_start = index;
-            // 处理块参数（Phi参数）：它们在块开始时就是活跃的
+            let len = block.instructions().len();
+            let block_out: HashSet<Variable> = live_out_sets
+                .get(&block.id())
+                .cloned()
+                .unwrap_or_default();
+
+            // Values live on exit seed the backward walk: they must stay live up
+            // to the terminator, whichever successor runs next.
+            let mut live = block_out.clone();
+
+            // Block parameters are defined at the block entry by the
+            // predecessors' jump arguments, so they are live from the start.
             for param in block.params() {
-                liveness
-                    .intervals
-                    .entry(*param)
-                    .or_insert(LiveInterval::new(*param))
-                    .active(block_start);
+                live.insert(*param);
             }
 
-            for inst in block.instructions().iter() {
-                match inst {
-                    Instruction::Jump { dst, args } => {
-                        let params = cfg
-                            .get_block(dst.to_block())
-                            .expect("no such block")
-                            .params();
-                        for (_arg, param) in args.iter().zip(params.iter()) {
-                            liveness
-                                .intervals
-                                .entry(*param)
-                                .or_insert(LiveInterval::new(*param))
-                                .active(index);
-                        }
-                    }
-                    Instruction::BrIf {
-                        condition: _,
-                        true_blk,
-                        false_blk,
-                        true_args,
-                        false_args,
-                    } => {
-                        let true_params = cfg
-                            .get_block(true_blk.to_block())
-                            .expect("no such block")
-                            .params();
-                        for (_arg, param) in true_args.iter().zip(true_params.iter()) {
-                            liveness
-                                .intervals
-                                .entry(*param)
-                                .or_insert(LiveInterval::new(*param))
-                                .active(index);
-                        }
+            // `live_at[i]` = variables live *before* instruction `i` runs, plus
+            // the variables `i` defines (a definition needs a register too).
+            let mut live_at: Vec<HashSet<Variable>> = vec![HashSet::new(); len];
 
-                        let false_params = cfg
-                            .get_block(false_blk.to_block())
-                            .expect("no such block")
-                            .params();
-                        for (_arg, param) in false_args.iter().zip(false_params.iter()) {
-                            liveness
-                                .intervals
-                                .entry(*param)
-                                .or_insert(LiveInterval::new(*param))
-                                .active(index);
-                        }
-                    }
-                    _ => {}
+            for (local, inst) in block.instructions().iter().enumerate().rev() {
+                let (defined, used) = inst.defined_and_used_vars();
+
+                // Destination parameters of a jump are live at the jump itself:
+                // codegen emits `mov param_reg, arg` there, so `param_reg` must
+                // not be shared with a value still needed at that point.
+                for param in Self::consumed_params(cfg, block.id(), inst) {
+                    live.insert(param);
                 }
 
-                Self::process_instruction(&mut liveness, index, inst);
+                for var in &defined {
+                    live.remove(var);
+                }
+                for var in &used {
+                    live.insert(*var);
+                }
 
-                index += 1;
+                let mut at = live.clone();
+                at.extend(defined.iter().copied());
+                live_at[local] = at;
             }
+
+            for (local, vars) in live_at.iter().enumerate() {
+                let at = block_start + local;
+                for var in vars {
+                    liveness.record(*var, at);
+                }
+            }
+
+            for param in block.params() {
+                liveness.record(*param, block_start);
+            }
+
+            // Live-out values have to survive the whole block even if no
+            // instruction mentions them (e.g. an empty block).
+            let block_last = block_start + len.saturating_sub(1);
+            for var in &block_out {
+                liveness.record(*var, block_last);
+            }
+
+            index += len;
         }
 
         liveness
     }
 
-    /// 处理指令中的变量，更新LiveInterval
-    fn process_instruction(liveness: &mut Liveness, index: usize, inst: &Instruction) {
-        let (defined, used) = inst.defined_and_used_vars();
-
-        // 处理使用的变量（在定义之前处理使用）
-        for var in used {
-            liveness
-                .intervals
-                .entry(var)
-                .or_insert(LiveInterval::new(var))
-                .active(index);
+    /// Block parameters that the given jump instruction writes.
+    ///
+    /// These are the values handed over across the edge; they must be live at
+    /// the jump so their destination register is reserved at that point.
+    fn consumed_params(
+        cfg: &ControlFlowGraph,
+        block_id: BlockId,
+        inst: &Instruction,
+    ) -> Vec<Variable> {
+        fn params_of(cfg: &ControlFlowGraph, block_id: BlockId) -> Vec<Variable> {
+            cfg.get_block(block_id)
+                .map(|block| block.params().to_vec())
+                .unwrap_or_default()
         }
 
-        // 处理定义的变量
-        for var in defined {
-            liveness
-                .intervals
-                .entry(var)
-                .or_insert(LiveInterval::new(var))
-                .active(index);
+        let mut params = Vec::new();
+        match inst {
+            Instruction::Jump { dst, .. } => {
+                if let Some(target) = dst.as_block() {
+                    params.extend(params_of(cfg, target));
+                }
+            }
+            Instruction::BrIf {
+                true_blk,
+                false_blk,
+                ..
+            } => {
+                if let Some(target) = true_blk.as_block() {
+                    params.extend(params_of(cfg, target));
+                }
+                if let Some(target) = false_blk.as_block() {
+                    params.extend(params_of(cfg, target));
+                }
+            }
+            Instruction::DelayedJump { target, .. } => {
+                params.extend(params_of(cfg, *target));
+            }
+            // Exception edges carry the handler's parameters.
+            Instruction::Throw { .. } | Instruction::ResumeException { .. } => {
+                for &successor in cfg.get_successors(block_id) {
+                    params.extend(params_of(cfg, successor));
+                }
+            }
+            _ => {}
         }
+
+        params
     }
 
     /// 第二遍：计算每个块的live_in和live_out集合
@@ -362,79 +400,6 @@ impl LiveIntervalAnalyzer {
         live_out
     }
 
-    /// 第三遍：更新变量的存活周期
-    fn update_intervals(
-        cfg: &ControlFlowGraph,
-        block_layout: &BlockLayout,
-        live_out_sets: &HashMap<BlockId, HashSet<Variable>>,
-        liveness: &mut Liveness,
-    ) {
-        // 计算每个块的起始和结束索引
-        let mut block_starts = Vec::new();
-        let mut current_index = 0;
-
-        for block in block_layout.iter(cfg) {
-            block_starts.push(current_index);
-            current_index += block.instructions().len();
-        }
-
-        // 遍历所有块，更新变量的存活周期
-        for (block_id, block) in block_layout.iter(cfg).enumerate() {
-            let block_start = block_starts[block_id];
-            let block_end = block_start + block.instructions().len();
-
-            // 本块内被使用的变量集合（含跳转实参），提前算好避免平方复杂度
-            let mut used_here: HashSet<Variable> = HashSet::new();
-            for inst in block.instructions() {
-                let (_, used) = inst.defined_and_used_vars();
-                used_here.extend(used);
-            }
-
-            // live_out 中的变量在块尾仍然存活：把它们的区间延伸到块的末尾。
-            // 对于"本块定义、后继块使用"的变量，这是其寄存器不被复用的关键。
-            if let Some(live_out) = live_out_sets.get(&block.id()) {
-                for &var in live_out {
-                    if let Some(interval) = liveness.intervals.get_mut(&var) {
-                        interval.update_end(block_end);
-                    }
-                }
-            }
-
-            // live-through 变量（live-out 但本块没有出现）同样必须被认为覆盖
-            // 本块 —— 它的值在块内一直保存在寄存器里，区间上不能留下"空洞"，
-            // 否则分组会认为别的变量可以复用同一个寄存器。
-            if let Some(live_out) = live_out_sets.get(&block.id()) {
-                let mut to_extend: Vec<Variable> = Vec::new();
-                for &var in live_out {
-                    if used_here.contains(&var) {
-                        continue;
-                    }
-                    let covers_block = liveness
-                        .intervals
-                        .get(&var)
-                        .map(|iv| {
-                            iv.ranges
-                                .iter()
-                                .any(|r| r.start <= block_start && r.end >= block_end.saturating_sub(1))
-                        })
-                        .unwrap_or(false);
-                    if !covers_block {
-                        to_extend.push(var);
-                    }
-                }
-                for var in to_extend {
-                    if let Some(interval) = liveness.intervals.get_mut(&var) {
-                        interval.ranges.push(LiveRange {
-                            start: block_start,
-                            end: block_end.saturating_sub(1),
-                        });
-                        // 保持区间按起点有序：`update_end` 依赖最后一个区间
-                        interval.ranges.sort_by_key(|r| r.start);
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -469,11 +434,13 @@ impl RegAlloc {
 
     /// Start a new basic block.
     ///
-    /// Register contents cannot be trusted across a block boundary: a block that
-    /// is *generated* later may run earlier at run time (loops, shared merge
-    /// blocks), and it may reuse the same register. Dropping every register
-    /// assignment forces each value to be reloaded from its stack slot, which
-    /// `flush_block` keeps up to date.
+    /// Register contents cannot be trusted across a block boundary. Code
+    /// generation walks the blocks in layout order, but at run time any
+    /// predecessor may run, and a value that this pass believes sits in a
+    /// register may never have been written on the path that was actually taken
+    /// (or may have been written by a sibling block that never executed).
+    /// Dropping every register assignment makes each block re-establish the
+    /// values it needs from memory — `spill_live_out` keeps that memory current.
     pub fn begin_block(&mut self) {
         for reg in self.reg_set.registers.iter_mut() {
             reg.variable = None;
@@ -481,15 +448,28 @@ impl RegAlloc {
         }
     }
 
-    /// Write every value that currently lives in a register to its stack slot,
-    /// then forget the register assignments.
+    /// Write the values a successor still needs (`live_out`) to their stack
+    /// slots, so the next block can reload them.
     ///
-    /// Called before a block terminator so that any successor block can recover
-    /// the values it needs from memory, whichever path was taken to reach it.
-    pub fn flush_block(&mut self) -> Vec<(Register, usize)> {
+    /// Called before a block terminator. Only values that are actually live
+    /// across the boundary are written; values that die inside the block are
+    /// left alone. This is the memory side of the block-boundary hand-off that
+    /// `begin_block` reloads from.
+    pub fn spill_live_out(&mut self, block: BlockId) -> Vec<(Register, usize)> {
+        let Some(live_out) = self.liveness.live_out_of(block).cloned() else {
+            return Vec::new();
+        };
+
+        let holders: Vec<(Register, Variable)> = self
+            .reg_set
+            .registers
+            .iter()
+            .filter_map(|reg| reg.variable.map(|var| (reg.register, var)))
+            .filter(|(_, var)| live_out.contains(var))
+            .collect();
+
         let mut spills = Vec::new();
-        for reg in self.reg_set.registers.iter() {
-            let Some(var) = reg.variable else { continue };
+        for (register, var) in holders {
             let stack = match self.liveness.intervals.get(&var).and_then(|iv| iv.stack) {
                 Some(stack) => stack,
                 None => {
@@ -499,11 +479,7 @@ impl RegAlloc {
                 }
             };
             self.written_stacks.insert(var);
-            spills.push((reg.register, stack));
-        }
-        for reg in self.reg_set.registers.iter_mut() {
-            reg.variable = None;
-            reg.is_fixed = false;
+            spills.push((register, stack));
         }
         spills
     }
@@ -557,6 +533,16 @@ impl RegAlloc {
         None
     }
 
+    /// Forget that `value` lives in a register.
+    ///
+    /// Used when a value is handed over through memory (a block parameter at a
+    /// jump): the register no longer holds the current value, so the reading
+    /// block must reload it from its stack slot instead of trusting whatever the
+    /// register happens to contain.
+    pub fn forget_register(&mut self, value: &Variable) {
+        self.reg_set.release(*value);
+    }
+
     pub fn stack_size(&self) -> usize {
         self.liveness.stack_size()
     }
@@ -574,18 +560,6 @@ impl RegAlloc {
         stack
     }
 
-    pub fn spill_all(&mut self) -> Vec<(Register, usize)> {
-        let mut spills = Vec::new();
-        for reg_entry in &self.reg_set.registers {
-            if let Some(var) = &reg_entry.variable {
-                if let Some(stack) = self.get_stack_offset(var) {
-                    spills.push((reg_entry.register, stack));
-                }
-            }
-        }
-        spills
-    }
-
     /// 获取变量被分配的栈偏移量，如果变量不在栈上则返回None
     pub fn get_stack_offset(&self, value: &Variable) -> Option<usize> {
         self.liveness
@@ -594,7 +568,16 @@ impl RegAlloc {
             .and_then(|interval| interval.stack)
     }
 
-    pub fn alloc(&mut self, value: Variable, index: usize) -> (Register, Option<Action>) {
+    /// Make `value` available in a register at `index`.
+    ///
+    /// Returns the register plus the memory bookkeeping the caller has to emit,
+    /// **in order**. Up to two actions can be required: first the spill of the
+    /// value evicted from the register, then the reload of `value` itself from
+    /// its stack slot. The original code returned a single action and dropped
+    /// the evicted value's spill whenever a reload was also needed — the victim
+    /// was marked as "spilled" without the store ever being emitted, so a value
+    /// that was still live got reloaded as whatever stale content the slot held.
+    pub fn alloc(&mut self, value: Variable, index: usize) -> (Register, Vec<Action>) {
         // Extract the fields we need so the borrow of `self.liveness` is released
         // before we potentially mutate it via `must_alloc`.
         let (preset_reg, stack) = {
@@ -602,64 +585,49 @@ impl RegAlloc {
             (interval.reg, interval.stack)
         };
 
-        match self.reg_set.find(value) {
-            Some(register) => (register, None),
-            None => match preset_reg {
-                Some(register) => {
-                    // Re-taking a pre-assigned register evicts whoever holds it
-                    // now; that value has to be preserved on the stack first.
-                    let spill = self.evict_occupant(register, value, index);
-                    self.reg_set.use_register(register, value, true);
-                    // The variable owns a stack slot, so it was spilled at some
-                    // point (as an allocation victim). Whatever the register
-                    // holds now is not necessarily its value, so reload it.
-                    // Without this the caller silently reads a stale value.
-                    if let Some(stack) = stack
-                        && self.stack_holds_value(&value)
-                    {
-                        return (
-                            register,
-                            Some(Action::Restore {
-                                stack,
-                                register,
-                            }),
-                        );
-                    }
-                    (register, spill)
+        if let Some(register) = self.reg_set.find(value) {
+            return (register, Vec::new());
+        }
+
+        let mut actions = Vec::new();
+
+        let register = match preset_reg {
+            Some(register) => {
+                // Re-taking a pre-assigned register evicts whoever holds it
+                // now; that value has to be preserved on the stack first.
+                if let Some((occupant, spill)) = self.evict_occupant(register, value, index) {
+                    self.written_stacks.insert(occupant);
+                    actions.push(spill);
                 }
-                None => {
-                    let (reg, spill, victim) =
-                        self.reg_set.must_alloc(value, index, &mut self.liveness);
-
-                    // 如果变量在栈上，并且在当前索引处开始一个新的活跃范围，需要从栈恢复
-                    if let Some(stack) = stack
-                        && self.stack_holds_value(&value)
-                        && self
-                            .liveness
-                            .intervals
-                            .get(&value)
-                            .map(|iv| iv.ranges.iter().any(|r| r.start == index))
-                            .unwrap_or(false)
-                    {
-                        let restore = Action::Restore {
-                            stack,
-                            register: reg,
-                        };
-                        return (reg, Some(restore));
-                    }
-
-                    if spill.is_some()
-                        && let Some(victim) = victim
-                    {
-                        // The victim's value is being written to its stack slot
-                        // by the emitted spill, so it can be reloaded later.
+                self.reg_set.use_register(register, value, true);
+                register
+            }
+            None => {
+                let (register, spill, victim) =
+                    self.reg_set.must_alloc(value, index, &mut self.liveness);
+                if let Some(spill) = spill {
+                    if let Some(victim) = victim {
+                        // The victim's value is written to its stack slot by the
+                        // spill below, so it can be reloaded later.
                         self.written_stacks.insert(victim);
                     }
-
-                    (reg, spill)
+                    actions.push(spill);
                 }
-            },
+                register
+            }
+        };
+
+        // The value owns a stack slot, so it was spilled at some point (as an
+        // allocation victim) and the register does not necessarily hold it.
+        // Reload it from memory. The spill above (if any) is emitted first, so
+        // the evicted value is safe before this register is overwritten.
+        if let Some(stack) = stack
+            && self.stack_holds_value(&value)
+        {
+            actions.push(Action::Restore { stack, register });
         }
+
+        (register, actions)
     }
 
     /// Preserve the value currently in `register` before `value` takes it over.
@@ -668,12 +636,15 @@ impl RegAlloc {
     /// that is still needed later would silently turn into whatever the new
     /// owner writes. Spilling it (allocating a slot first if the linear scan
     /// never gave it one) keeps it recoverable.
+    ///
+    /// The caller is responsible for emitting the returned spill and only then
+    /// recording the occupant's slot as valid.
     fn evict_occupant(
         &mut self,
         register: Register,
         value: Variable,
         _index: usize,
-    ) -> Option<Action> {
+    ) -> Option<(Variable, Action)> {
         let occupant = self.reg_set.occupant(register)?;
         if occupant == value {
             return None;
@@ -689,8 +660,7 @@ impl RegAlloc {
         };
 
         self.reg_set.release(occupant);
-        self.written_stacks.insert(occupant);
-        Some(Action::Spill { register, stack })
+        Some((occupant, Action::Spill { register, stack }))
     }
 
     pub fn release(&mut self, value: Variable, index: usize) -> Option<Action> {
@@ -754,55 +724,48 @@ impl RegAlloc {
                     self.liveness.set_register(interval.var, *reg);
                 }
             }
-            return;
-        }
+        } else {
+            // 2.2 保留3个临时寄存器，其他的进行优先级分配
+            let (_temp_regs, fixed_regs) = registers.split_at(3);
 
-        // 2.2 保留3个临时寄存器，其他的进行优先级分配
-        let (_temp_regs, fixed_regs) = registers.split_at(3);
+            // 排序
+            groups.sort_by(|a, b| {
+                let a_len: usize = a.iter().map(|interval| interval.ranges.len()).sum();
+                let b_len: usize = b.iter().map(|interval| interval.ranges.len()).sum();
+                b_len.cmp(&a_len)
+            });
 
-        // 排序
-        groups.sort_by(|a, b| {
-            let a_len: usize = a.iter().map(|interval| interval.ranges.len()).sum();
-            let b_len: usize = b.iter().map(|interval| interval.ranges.len()).sum();
-            b_len.cmp(&a_len)
-        });
+            for (i, group) in groups.iter().enumerate() {
+                trace!("Group[{i}]: {group:?}");
+            }
 
-        for (i, group) in groups.iter().enumerate() {
-            trace!("Group[{i}]: {group:?}");
-        }
+            // 2.2.1 分配固定寄存器
+            let (fixed_group, temp_group) = groups.split_at(fixed_regs.len());
+            for (group, reg) in fixed_group.iter().zip(fixed_regs) {
+                for interval in group {
+                    self.liveness.set_register(interval.var, *reg);
+                }
+            }
 
-        // 2.2.1 分配固定寄存器
-        let (fixed_group, temp_group) = groups.split_at(fixed_regs.len());
-        for (group, reg) in fixed_group.iter().zip(fixed_regs) {
-            for interval in group {
-                self.liveness.set_register(interval.var, *reg);
+            // 2.2.2 分配临时寄存器，只分配栈上空间，不分配寄存器
+            for (i, group) in temp_group.iter().enumerate() {
+                for interval in group {
+                    self.liveness.set_stack(interval.var, i);
+                }
             }
         }
 
-        // 2.2.2 分配临时寄存器，只分配栈上空间，不分配寄存器
-        for (i, group) in temp_group.iter().enumerate() {
-            for interval in group {
-                self.liveness.set_stack(interval.var, i);
-            }
-        }
-
-        // 验证所有块参数都有分配（寄存器或栈）
+        // 3. Block parameters cross a block boundary instead of being produced
+        //    by an instruction inside the block: every predecessor hands the
+        //    value over, and the block entry consumes it. Give each parameter a
+        //    dedicated stack slot and treat the slot as written — the hand-off
+        //    always goes through memory (`Codegen::store_jump_args`), so the
+        //    entry can always reload it, no matter which predecessor ran or in
+        //    which order the blocks are generated.
         for block in block_layout.iter(cfg) {
             for param in block.params() {
-                let interval = self.liveness.intervals.get(param);
-                match interval {
-                    Some(interval) => {
-                        if interval.reg.is_none() && interval.stack.is_none() {
-                            trace!(
-                                "Warning: phi parameter {:?} has no register or stack allocation",
-                                param
-                            );
-                        }
-                    }
-                    None => {
-                        trace!("Warning: phi parameter {:?} has no live interval", param);
-                    }
-                }
+                self.ensure_stack_slot(*param);
+                self.mark_stack_written(*param);
             }
         }
     }
@@ -874,8 +837,18 @@ impl RegisterSet {
             }
         };
 
-        let slot = liveness.new_stack_slot();
-        liveness.set_stack(victim_var, slot);
+        // A spilled value must keep *one* stack slot for its whole life: block
+        // parameters are written through that slot by every predecessor and
+        // reloaded by the block entry, so re-slotting a victim here would make
+        // one edge write a different location than the one that is read.
+        let slot = match liveness.intervals.get(&victim_var).and_then(|iv| iv.stack) {
+            Some(slot) => slot,
+            None => {
+                let slot = liveness.new_stack_slot();
+                liveness.set_stack(victim_var, slot);
+                slot
+            }
+        };
         let victim_reg = self
             .registers
             .iter()
@@ -973,4 +946,118 @@ impl RegisterHold {
 pub enum Action {
     Restore { stack: usize, register: Register },
     Spill { register: Register, stack: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::ir::Value;
+
+    fn var(v: Variable) -> Value {
+        Value::Variable(v)
+    }
+
+    /// A value produced in one block and consumed in a later block must have
+    /// every index in between covered by its live interval. The old analysis
+    /// built intervals from def/use points only and left the live-through
+    /// indices uncovered, so the allocator could treat such a value as dead and
+    /// reuse its register.
+    #[test]
+    fn cross_block_interval_covers_every_live_index() {
+        let mut cfg = ControlFlowGraph::new();
+        let b0 = cfg.create_block("b0");
+        let b1 = cfg.create_block("b1");
+        let b2 = cfg.create_block("b2");
+        cfg.set_entry(b0);
+
+        let v0 = cfg.create_variable().to_variable();
+        let v1 = cfg.create_variable().to_variable();
+
+        // b0: v0 is produced, then control flows on (indices 0, 1).
+        cfg.switch_to_block(b0);
+        cfg.emit(Instruction::MakeArray { dst: var(v0) });
+        cfg.emit(Instruction::Jump {
+            dst: Value::Block(b1),
+            args: vec![],
+        });
+
+        // b1: v0 is live through this block but never mentioned (index 2).
+        cfg.switch_to_block(b1);
+        cfg.emit(Instruction::Jump {
+            dst: Value::Block(b2),
+            args: vec![],
+        });
+
+        // b2: v0 is finally consumed (indices 3, 4).
+        cfg.switch_to_block(b2);
+        cfg.emit(Instruction::Move {
+            dst: var(v1),
+            src: var(v0),
+        });
+        cfg.emit(Instruction::Return {
+            value: Some(var(v1)),
+        });
+
+        let layout = cfg.loop_root_reverse_postorder_layout2();
+        let liveness = LiveIntervalAnalyzer::scan(&cfg, &layout);
+        let interval = liveness
+            .intervals
+            .get(&v0)
+            .expect("v0 should have a live interval");
+
+        // v0 is defined at 0 and used at 3, so it is live at 0, 1, 2 and 3.
+        for index in 0..4 {
+            assert!(
+                interval.covers(index),
+                "index {index} is live but not covered: {interval:?}"
+            );
+        }
+    }
+
+    /// `alloc` must report *both* pieces of memory bookkeeping when it evicts an
+    /// occupant and reloads the requested value: emitting only the reload would
+    /// drop the evicted value (it was still marked as spilled, so the next
+    /// reload would read stale memory).
+    #[test]
+    fn alloc_reports_spill_and_reload_together() {
+        let registers = [Register::R0, Register::R1, Register::R2, Register::R3];
+        let mut alloc = RegAlloc::new(&registers);
+
+        let evicted = Variable::new(0);
+        let value = Variable::new(1);
+
+        // `evicted` currently sits in R0 and its slot holds its value.
+        alloc.liveness.record(evicted, 0);
+        alloc.liveness.set_register(evicted, Register::R0);
+        alloc.liveness.set_stack(evicted, 0);
+        alloc.mark_stack_written(evicted);
+        alloc.reg_set.use_register(Register::R0, evicted, false);
+
+        // `value` shares R0 (their ranges do not overlap) and is spilled to 1.
+        alloc.liveness.record(value, 5);
+        alloc.liveness.set_register(value, Register::R0);
+        alloc.liveness.set_stack(value, 1);
+        alloc.mark_stack_written(value);
+
+        let (register, actions) = alloc.alloc(value, 5);
+        assert_eq!(register, Register::R0);
+        assert_eq!(
+            actions.len(),
+            2,
+            "the eviction and the reload are both required: {actions:?}"
+        );
+
+        match &actions[0] {
+            Action::Spill { register, stack } => {
+                assert_eq!((*register, *stack), (Register::R0, 0));
+            }
+            other => panic!("expected the evicted value to be spilled first: {other:?}"),
+        }
+        match &actions[1] {
+            Action::Restore { register, stack } => {
+                assert_eq!((*register, *stack), (Register::R0, 1));
+            }
+            other => panic!("expected the value to be reloaded second: {other:?}"),
+        }
+    }
 }

@@ -444,3 +444,117 @@ fn return_in_try_catch_finally_no_throw() {
     "#;
     assert_eq!(eval_number(js), 3.0);
 }
+
+// ============================================================
+// Values that stay live across basic-block boundaries
+// ============================================================
+
+#[test]
+fn loop_keeps_many_live_values_across_blocks() {
+    // More simultaneously-live values than there are registers. Every one of
+    // them has to survive the loop back edge; when the allocator handed a
+    // register to a value that was still live in another block, the sum came
+    // out as 0 (or a bogus value) instead of 544.
+    let js = r#"
+        function test() {
+            let v1 = 1;
+            let v2 = 2;
+            let v3 = 3;
+            let v4 = 4;
+            let v5 = 5;
+            let v6 = 6;
+            let v7 = 7;
+            let v8 = 8;
+            let v9 = 9;
+            let v10 = 10;
+            let v11 = 11;
+            let v12 = 12;
+            let v13 = 13;
+            let v14 = 14;
+            let v15 = 15;
+            let v16 = 16;
+            let total = 0;
+            for (let i = 0; i < 4; i = i + 1) {
+                total = total + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8
+                    + v9 + v10 + v11 + v12 + v13 + v14 + v15 + v16;
+            }
+            return total;
+        }
+        test()
+    "#;
+    assert_eq!(eval_number(js), 544.0);
+}
+
+#[test]
+fn loop_keeps_many_loop_carried_values() {
+    // The carried values are redefined at the end of each iteration, so the
+    // new value has to reach the next iteration through the back edge.
+    let js = r#"
+        function test() {
+            let a = 1;
+            let b = 2;
+            let c = 3;
+            let d = 4;
+            let e = 5;
+            let f = 6;
+            let g = 7;
+            let h = 8;
+            let sum = 0;
+            for (let i = 0; i < 3; i = i + 1) {
+                sum = sum + (a + b + c + d + e + f + g + h) * (i + 1);
+                a = a + 1;
+                b = b + 1;
+                c = c + 1;
+                d = d + 1;
+                e = e + 1;
+                f = f + 1;
+                g = g + 1;
+                h = h + 1;
+            }
+            return sum;
+        }
+        test()
+    "#;
+    assert_eq!(eval_number(js), 280.0);
+}
+
+#[test]
+fn spread_inside_loop_keeps_values_across_blocks() {
+    // `[...a, ...b, i]` builds several values per iteration; the accumulator
+    // and the loop counter must survive every block boundary in the body.
+    let js = r#"
+        function test() {
+            let out = 0;
+            for (let i = 0; i < 3; i = i + 1) {
+                let a = [1, 2, 3];
+                let b = [4, 5];
+                let all = [...a, ...b, i];
+                out = out + all[0] + all[1] + all[2] + all[3] + all[4] + all[5];
+            }
+            return out;
+        }
+        test()
+    "#;
+    assert_eq!(eval_number(js), 48.0);
+}
+
+#[test]
+fn nested_loops_keep_outer_values_alive() {
+    let js = r#"
+        function test() {
+            let base = 10;
+            let step = 3;
+            let total = 0;
+            for (let i = 0; i < 3; i = i + 1) {
+                for (let j = 0; j < 3; j = j + 1) {
+                    total = total + base + step * j;
+                }
+                base = base + 1;
+            }
+            return total;
+        }
+        test()
+    "#;
+    // inner sums: (10+0)+(10+3)+(10+6)=39, 42, 45  -> 126
+    assert_eq!(eval_number(js), 126.0);
+}

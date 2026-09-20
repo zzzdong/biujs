@@ -286,9 +286,11 @@ pub enum Instruction {
     },
     /// Append every element of `src` to `array` (`[...src]`).
     ///
-    /// Doing this in a single instruction keeps the loop inside the VM: a
-    /// lowered JS loop would need several basic blocks, and values that live
-    /// across a block boundary are not reliably preserved.
+    /// Doing this in one instruction keeps the loop inside the VM. A lowered JS
+    /// loop is now *correct* — values live across a block boundary are handed
+    /// over through memory (see `codegen::Codegen::store_jump_args`) — but a
+    /// single opcode is still cheaper: fewer basic blocks, fewer phi parameters
+    /// and fewer block-boundary reloads.
     ArrayPushSpread {
         array: Value,
         src: Value,
@@ -577,7 +579,10 @@ impl Instruction {
                 (vec![], used)
             }
             Instruction::LoadException { dst } => (vec![*dst], vec![]),
-            Instruction::ResumeException { .. } => (vec![], vec![]),
+            // `resume_exception` hands its arguments over to the outer handler's
+            // phi parameters, exactly like `throw` does; codegen reads those
+            // values when emitting the moves, so they must count as uses.
+            Instruction::ResumeException { args } => (vec![], args.iter().cloned().collect()),
             Instruction::DelayedJump { .. } => (vec![], vec![]),
             Instruction::TypeOf { dst, src } => (vec![*dst], vec![*src]),
             Instruction::TypeOfEnv { dst, .. } => (vec![*dst], vec![]),
