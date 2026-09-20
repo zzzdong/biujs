@@ -1,10 +1,10 @@
 # ES6 Feature Support Status
 
-> **Last updated**: 2026-09-20
+> **Last updated**: 2026-09-21
 > **Engine version**: 0.1.0
-> **Total tests**: 188 unit + 17 feature files + test262 10240 executed (3901 passing)
+> **Total tests**: 190 unit + 22 feature files + test262 10365 executed / **4611 passing** (44.5%; was 3908 at M2 end) — per-suite table in `docs/es6-conformance-plan.md` §2.1b
 >
-> Roadmap: see `docs/es6-conformance-plan.md` (M2 residual → M6).
+> Roadmap: see `docs/es6-conformance-plan.md` (M2' done → M3 in progress).
 
 ## Project Goal
 
@@ -296,13 +296,13 @@ This engine uses a **static compilation model** with register-based VM:
 
 | Object | Status | Notes |
 |--------|--------|-------|
-| `Object` | ✅ | recent | Static: keys, values, entries, defineProperty, getOwnPropertyDescriptor, getOwnPropertyNames, getPrototypeOf, setPrototypeOf, create, hasOwn, is |
-| `Array` | ✅ | recent | Constructor + prototype: push, pop, shift, unshift, indexOf, includes, join, slice, concat, splice |
+| `Object` | ✅ | recent | Static: keys, values, entries, assign, defineProperty, defineProperties, getOwnPropertyDescriptor(s), getOwnPropertyNames, getOwnPropertySymbols, getPrototypeOf, setPrototypeOf, create, hasOwn, is, isExtensible/isFrozen/isSealed, preventExtensions/seal/freeze; prototype: toString, valueOf, hasOwnProperty, isPrototypeOf, propertyIsEnumerable, toLocaleString |
+| `Array` | ✅ | recent | Constructor + prototype: push, pop, shift, unshift, indexOf, lastIndexOf, includes, join, slice, concat, splice, reverse, fill, toString; `length` attributes; non-index own properties |
 | `Function` | ✅ | recent | Constructor and prototype methods (no dynamic code evaluation) |
 | `Boolean` | ✅ | recent | Constructor + prototype: valueOf, toString |
 | `Number` | ✅ | recent | Constructor + static (isFinite, isInteger, isNaN) + prototype (valueOf, toString, toFixed, toExponential, toPrecision) |
-| `String` | ✅ | recent | Constructor + prototype: charAt, charCodeAt, concat, includes, indexOf, slice, substring, toUpperCase, toLowerCase, trim, split |
-| `Symbol` | ⚠️ | M1 | Type exists, `Symbol()` not constructable |
+| `String` | ✅ | recent | Constructor + prototype: charAt, charCodeAt, concat, includes, indexOf, slice, substring, toUpperCase, toLowerCase, trim, split, startsWith, endsWith, repeat |
+| `Symbol` | ⚠️ | M1/M2' | `Symbol()` non-constructable; well-known symbols defined with spec attributes; `description` getter, `toString`/`valueOf`, `Symbol.for`/`keyFor`; `Object.getOwnPropertySymbols` works |
 | `Error` | ✅ | recent | All error types implemented (Error, TypeError, ReferenceError, RangeError, URIError, EvalError) |
 
 ### Utility
@@ -458,8 +458,8 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 | Test Suite | Count |
 |------------|-------|
 | Unit tests (value, vm, etc.) | 190 |
-| Feature integration test files | 19 |
-| test262 executed / passing | measured per milestone (report absolute count) |
+| Feature integration test files | 22 |
+| test262 executed / passing | 10365 / 4611 (44.5%) |
 
 ---
 

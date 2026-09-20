@@ -1,6 +1,6 @@
 # ES6 一致性计划（M2 收尾 → M6）
 
-> **日期**：2026-09-20
+> **日期**：2026-09-20（初版）；2026-09-21 更新 —— M2' 完成、M3-B1 首批交付（见 §2.1b/§2.2b）
 > **目标来源**：`README.md:3-4` —— *"A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6** features but without `eval` or eval-like features or `with` statement."*
 > **基线**：test262 **3908 / 10240**（38.16% 通过，6332 失败，14432 跳过）；单元测试 190；feature 集成 17 个文件；runner 启用 89 个套件
 > **上一阶段**：M1（迭代器 / for-of / 解构 / 展开 / 模板 / 默认参数）与 M2（class：静态成员、访问器、extends/super、public 字段）已交付
@@ -57,7 +57,7 @@
 | 指标 | 数值 |
 |------|------|
 | test262 已执行 | 10240 |
-| 通过 | **3908**（38.16%） |
+| 通过 | **3908**（38.16%，M2 结束时） |
 | 失败 | 6332 |
 | 跳过（特性表 + 未启用套件） | 14432 |
 | 单元测试 | 190（全绿） |
@@ -65,13 +65,66 @@
 
 > **KPI 约定**：解锁特性会让分母变大、通过率下降，因此**主指标是通过的绝对数 + 目标套件通过率**，通过率仅作参考。
 
-### 2.2 已交付（M0 → M2）
+### 2.1b M2' + M3-B1 进展（本次工作，逐套件实测）
+
+M2' 三项语法收尾（S1 计算属性名、S2 `new.target`、S4 `**`、S5 `??`）与 S3 well-known symbols 接入已提交，随后完成 M3-B1（`Object`）第一批。
+定向套件通过数（同一命令、同一机器）：
+
+| 套件 | M2 结束 | 本次工作后 |
+|------|---------|-----------|
+| `language/statements/class` | 33 | **42** |
+| `language/expressions/object` | 33 | 35 |
+| `language/expressions/assignment` | 13 | 14 |
+| `built-ins/Object` | 1029 | **1465** |
+| `built-ins/Array` | 786 | **884** |
+| `built-ins/String` | 319 | **346** |
+| `built-ins/Symbol` | 9 | **17** |
+| `language/expressions/addition` | 29 | 30 |
+| `language/expressions/new.target`（新启用） | 跳过 | 8 / 9 |
+| `language/computed-property-names`（新启用） | 跳过 | 29 / 46 |
+| `language/expressions/exponentiation`（新启用） | 跳过 | 27 / 30 |
+| `language/expressions/coalesce`（新启用） | 跳过 | 16 / 18 |
+
+M2' 验收：三项从跳过表移除（`exponentiation`、`nullish-coalescing` 标签删除，套件启用），`computed-property-names` 与 `exponentiation` 目标套件通过率 ≥ 50%（56% / 90%）。
+
+**全量复测（2026-09-21，本次工作后）**：
+
+| 指标 | M2 结束 | 本次工作后 |
+|------|---------|-----------|
+| test262 已执行 | 10240 | 10365 |
+| 通过 | 3908 | **4611**（+703） |
+| 失败 | 6332 | 5754 |
+| 通过率（已执行） | 38.16% | **44.49%** |
+| 单元测试 | 190 | 190（全绿） |
+| feature 集成测试 | 17 个文件 | 22 个文件（308 条断言，5 条既有 `return_in_try_finally` 失败） |
+
+### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
 - **M1**：双路径迭代协议、`for-of`/`for-in`、模板插值、默认参数、剩余参数、展开（调用/`new`/数组/对象）、数组与对象解构（含赋值目标、默认值、rest、嵌套）
 - **M2**：class 静态成员、`prototype.constructor` 反向链接、getter/setter（合并单一描述符）、`extends` + `super()`/`super.m()`、public 实例/静态字段、类构造器必须 `new` 调用
+- **M2'**：
+  - S1 计算属性名（对象字面量/类成员/访问器/静态，键按源序求值，符号键保留）
+  - S2 `new.target`（帧级 `new.target` 栈；`New` 写入构造器，普通调用为 `undefined`，箭头创建时捕获，`super()` 透传）
+  - S3 well-known symbols 接入（`Symbol.toPrimitive`→ToPrimitive、`Symbol.toStringTag`→`Object.prototype.toString`、`Symbol.hasInstance`→`instanceof`；`Symbol.species` 等已注册）
+  - S4 `**`/`**=`、S5 `??`（真短路）
+  - 属性语义：`OrdinaryOwnPropertyKeys` 顺序、`Object.defineProperty` 部分描述符合并、`Object.keys/values/entries` 可枚举过滤、`define_property` 下沉到 `JSObject` trait（数组/函数/原型对象同样保留完整描述符）
+  - `super` 修正：`[[HomeObject]]` 在类定义时记录到成员函数，经 `LoadCurrentFunction` 读回；修复多级继承链中 `super.m()`/`super()` 自我递归（原会栈溢出）与箭头内 `super`
+  - 新增 `Opcode::LoadNewTarget` / `LoadCurrentFunction` / `CallSuperSpread`；`strict_eq` 视裸函数引用与装箱 `FunctionObject` 为同一引用
 - **通用修复**：隐式返回清空 `Rv`（构造函数原会返回原型对象）、访问器以接收者作 `this`、构造函数返回自身 `this`、调用点寄存器保存、规范错误可被 JS `try/catch` 捕获
 - **寄存器分配跨块活跃性**（2026-09-20 修复，见 §2.4）：重写存活分析 + 值跨块经内存交接；顺带修复非可配置属性可被 `delete` 删除、以及 phi 参数顺序随哈希种子变化导致的编译不确定
+
+### 2.2b M3-B1（`Object`）第一批
+
+- `Object.prototype.isPrototypeOf` / `propertyIsEnumerable`（原缺失）
+- `ToPropertyDescriptor` 移入 VM：描述符字段经 `[[Get]]`（访问器字段以描述符对象为 `this`），`get`/`set` 必须可调用；空描述符合法（全 `false`）
+- `Object.defineProperties` / `Object.create` 的 properties 参数类型校验与逐项读取
+- `Object.keys`/`values`/`entries` 支持原始值（ToObject：字符串给出索引键）
+- `Object.getOwnPropertySymbols` 与符号键的 descriptor/define 路径
+- 属性特性修正：数组 `length`（可写/不可枚举/不可配置）、内置函数 `name`/`length`（不可写/不可枚举/可配置）
+- `Symbol()` 不可 `new`；`Symbol.prototype.description` 为真 getter（原始值接收者的访问器现在会被调用）
+
+**未完成（下一轮）**：`Object.assign`（24 失败）、`Object(values)` 装箱包装对象（~40 失败）、`defineProperties`/`create` 剩余长尾（属性特性校验、`length`/`name` 元数据）、`JSON`/`Date`（B6）。
 
 ### 2.3 已知技术债（计划内需正视，不掩埋）
 
@@ -81,7 +134,9 @@
 | 闭包值快照语义 | 与规范"引用同一绑定"不同（for-let 按轮捕获等） | 架构决定，相关用例允许失败 |
 | 迭代器 `return()`/`throw()`（IteratorClose 异常路径） | break/异常提前退出时未 close | 正常结束路径已 close；异常路径待 M4 |
 | 无正则引擎 | 1879 个 RegExp 测试 | 明确不在范围 |
-| 慢：内置方法多经 `invoke` 派发 | 全量 ~数分钟 | 建性能护栏 |
+| 顶层 `this` 为 `undefined` | 依赖全局对象作 `this` 的 sloppy 用例 | 与"strict only"目标一致，允许失败 |
+| Tagged template 未实现（tag 不调用） | `tag\`\`` 用例 | 计划 M2' 补：strings 数组 + tag 调用 |
+| 慢：内置方法多经 `invoke` 派发 | 全量 ~数分钟（高负载机器上更久） | 建性能护栏 |
 
 ### 2.4 跨块活跃性修复（2026-09-20）
 
@@ -152,23 +207,25 @@
 
 ## 4. 里程碑计划
 
-### M2'：语法收尾（小、快、解锁面广）
+### M2'：语法收尾（小、快、解锁面广）—— ✅ 已完成
 
-| 任务 | 内容 | 验收 |
-|------|------|------|
-| S1 计算属性名 | 类/对象字面量的 `{[expr]: v}`、`class { [expr](){} }`（走 `Object.defineProperty`） | `computed-property-names` 解锁且不回退 |
-| S2 `new.target` | 新增 IR/操作码，由 `New` 写入当前帧；普通调用为 `undefined` | 61 个 `new.target` 用例 |
-| S3 well-known symbols 补齐 | `Symbol.toStringTag` / `Symbol.toPrimitive` / `Symbol.hasInstance` / `Symbol.species` / `Symbol.isConcatSpreadable`，并接入 `Object.prototype.toString`、`ToPrimitive`、`instanceof` | Object/String/Array 相关失败下降 |
-| S4 `**` 与 `**=` | 新增二元指令或复用 `Math.pow` 语义 | 102 个 `exponentiation` 用例 |
-| S5 顺带项 | `u180e`、`String.prototype.replaceAll`、`??` 与逻辑赋值的正确性复核 | 无回退 |
+| 任务 | 内容 | 验收 | 状态 |
+|------|------|------|------|
+| S1 计算属性名 | 类/对象字面量的 `{[expr]: v}`、`class { [expr](){} }`（走 `Object.defineProperty`） | `computed-property-names` 解锁且不回退 | ✅ 29/46 通过 |
+| S2 `new.target` | 新增 IR/操作码，由 `New` 写入当前帧；普通调用为 `undefined` | 61 个 `new.target` 用例 | ✅（帧栈 + 箭头捕获 + `super()` 透传） |
+| S3 well-known symbols 补齐 | `Symbol.toStringTag` / `Symbol.toPrimitive` / `Symbol.hasInstance` / `Symbol.species` / `Symbol.isConcatSpreadable`，并接入 `Object.prototype.toString`、`ToPrimitive`、`instanceof` | Object/String/Array 相关失败下降 | ✅ 前三者已接入；`species` 仅注册（物种构造路径未接，记录偏差） |
+| S4 `**` 与 `**=` | 新增二元指令或复用 `Math.pow` 语义 | 102 个 `exponentiation` 用例 | ✅ 27/30 通过 |
+| S5 顺带项 | `u180e`、`String.prototype.replaceAll`、`??` 与逻辑赋值的正确性复核 | 无回退 | ⚠️ `??` 已修正；`u180e`/`replaceAll` 仍在跳过表 |
 
-**完成标准**：全量通过数不低于 3901；`computed-property-names`/`new.target`/`exponentiation` 三项从跳过表移除后目标套件通过率 ≥ 50%。
+**完成标准**：全量通过数不低于 3901；`computed-property-names`/`new.target`/`exponentiation` 三项从跳过表移除后目标套件通过率 ≥ 50%。→ 达标（56% / 89% / 90%）。
+
+**M2' 额外交付（计划外但必要）**：`super` 的 `[[HomeObject]]` 记录机制，修复多级继承链中 `super.m()`/`super()` 的无限递归（原为栈溢出）与箭头内 `super`；`define_property` 下沉到 `JSObject` trait，数组获得非索引属性表。
 
 ### M3：内置对象补齐（主战场）
 
 | 任务 | 内容 | 目标 |
 |------|------|------|
-| B1 `Object` | `assign`、`getOwnPropertySymbols`、`is`/`isExtensible` 族、描述符语义（`writable/enumerable/configurable` 与 `[[DefineOwnProperty]]` 完整规则） | Object 失败 2035 → 目标减半 |
+| B1 `Object` | `assign`、`getOwnPropertySymbols`、`is`/`isExtensible` 族、描述符语义（`writable/enumerable/configurable` 与 `[[DefineOwnProperty]]` 完整规则） | Object 失败 2035 → 目标减半；**首批已交付**：失败 2032 → 1596（通过 1029 → 1465） |
 | B2 `Array` | `from`/`of`/`fill`/`find`/`findIndex`/`copyWithin`/`entries`/`keys`/`values`/`reduceRight`/`sort` 语义、泛型（类数组）路径、稀疏与长度处理 | Array 失败 1975 → 目标减半 |
 | B3 `String` | `repeat`/`startsWith`/`endsWith`/`codePointAt`/`codePointAt` 代理对/`normalize`/`at`、`String.raw`、`String` 迭代器与 `[Symbol.iterator]` | String 失败 686 → 目标减半 |
 | B4 `Number` / `Math` | ES6 常量（`EPSILON`/`MAX_SAFE_INTEGER`…）与 `isInteger`/`isSafeInteger`/`parseFloat`；Math 的 `hypot`/`sign`/`clz32`/`imul`/`log2`/`log10`/`cbrt`/`trunc`/`fround` | Math/Number 失败显著下降 |
