@@ -36,6 +36,14 @@ pub enum Value {
     Function(u32),
 }
 
+/// Bytecode function id behind a boxed `FunctionObject`, if it is one.
+fn function_object_id(obj: &Rc<RefCell<dyn JSObject>>) -> Option<u32> {
+    obj.borrow()
+        .as_any()
+        .downcast_ref::<crate::vm::object::FunctionObject>()
+        .map(|f| f.func_id)
+}
+
 // Manual PartialEq — dyn JSObject is not PartialEq, so Object variant compares by pointer
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
@@ -310,12 +318,26 @@ impl Value {
             (Value::Symbol(a), Value::Symbol(b)) => a.id == b.id,
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             (Value::Function(a), Value::Function(b)) => a == b,
+            // A bare function reference and its boxed `FunctionObject` denote
+            // the same function: `new F()` stores the boxed object (as
+            // `new.target`), while reading `F` yields the bare reference, and
+            // `new.target === F` must still hold.
+            (Value::Function(a), Value::Object(b)) | (Value::Object(b), Value::Function(a)) => {
+                function_object_id(b) == Some(*a)
+            }
             _ => false,
         }
     }
 
     /// JS abstract equality (==)
     pub fn abstract_eq(&self, other: &Value) -> bool {
+        // The bare/boxed function pair is the same reference, not an
+        // object-to-primitive conversion.
+        if let (Value::Function(_), Value::Object(_)) | (Value::Object(_), Value::Function(_)) =
+            (self, other)
+        {
+            return self.strict_eq(other);
+        }
         match (self, other) {
             // Same type: use strict equality
             (Value::Undefined, Value::Undefined) => true,

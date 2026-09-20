@@ -13,6 +13,8 @@ mod arrow_functions;
 mod arrow_functions_return;
 #[path = "features/builtins.rs"]
 mod builtins_tests;
+#[path = "features/class_super.rs"]
+mod class_super;
 #[path = "features/complex.rs"]
 mod complex;
 #[path = "features/const_var_test.rs"]
@@ -25,12 +27,16 @@ mod debug_instanceof;
 mod debug_instanceof2;
 #[path = "features/debug_propset.rs"]
 mod debug_propset;
+#[path = "features/es6_syntax.rs"]
+mod es6_syntax;
 #[path = "features/functions.rs"]
 mod functions;
 #[path = "features/language_semantics.rs"]
 mod language_semantics;
 #[path = "features/logical_typeof.rs"]
 mod logical_typeof;
+#[path = "features/new_target.rs"]
+mod new_target;
 #[path = "features/objects_and_arrays.rs"]
 mod objects_and_arrays;
 #[path = "features/stack_overflow.rs"]

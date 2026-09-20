@@ -41,6 +41,19 @@ pub trait JSObject: fmt::Debug + Any {
     /// Set a property value, creating or updating as needed
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String>;
 
+    /// Install a property with a full descriptor (`Object.defineProperty`).
+    ///
+    /// Every object kind keeps its own properties in a `PropertyTable`, so the
+    /// descriptor attributes (`writable`/`enumerable`/`configurable`, getter,
+    /// setter) survive on functions, arrays and prototype objects too — a class
+    /// constructor is a `FunctionObject`, and `static get x()` is defined
+    /// through this path.
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String>;
+
     /// Delete a property, returns true if the property was successfully deleted
     fn property_delete(&mut self, key: &PropertyKey) -> bool;
 
@@ -114,13 +127,117 @@ pub trait JSObject: fmt::Debug + Any {
 }
 
 // ─────────────────────────────────────────────────────────
+// PropertyTable — own properties with a spec-ordered key list
+// ─────────────────────────────────────────────────────────
+
+/// `Some(i)` when `key` is a canonical array index (ES `ArrayIndex`).
+///
+/// The index is an integer string in `0 ..= 2^32 - 2` that round-trips through
+/// its numeric value, so `"0"`/`"42"` qualify while `"01"`, `"-0"`, `"1.0"` and
+/// `"4294967295"` do not.
+fn array_index_of(key: &str) -> Option<u32> {
+    if key.is_empty() || key.len() > 10 {
+        return None;
+    }
+    let index: u32 = key.parse().ok()?;
+    if index == u32::MAX {
+        return None;
+    }
+    // `parse` accepts forms such as `+7` or `007`; only the canonical spelling
+    // counts as an array index.
+    (index.to_string() == key).then_some(index)
+}
+
+/// Own properties of an object, in creation order.
+///
+/// Property *order* is observable (`Object.getOwnPropertyNames`, `for-in`,
+/// `Object.keys`, …). ES `OrdinaryOwnPropertyKeys` defines it as: array indices
+/// ascending, then the remaining string keys in creation order, then symbol keys
+/// in creation order. A bare `BTreeMap` cannot express that, so the map (fast
+/// lookup) is paired with a creation-order list.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PropertyTable {
+    values: BTreeMap<PropertyKey, PropertyDescriptor>,
+    creation_order: Vec<PropertyKey>,
+}
+
+impl PropertyTable {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl FromIterator<(PropertyKey, PropertyDescriptor)> for PropertyTable {
+    fn from_iter<I: IntoIterator<Item = (PropertyKey, PropertyDescriptor)>>(iter: I) -> Self {
+        let mut table = PropertyTable::new();
+        for (key, desc) in iter {
+            table.insert(key, desc);
+        }
+        table
+    }
+}
+
+impl PropertyTable {
+
+    pub(crate) fn get(&self, key: &PropertyKey) -> Option<&PropertyDescriptor> {
+        self.values.get(key)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &PropertyKey) -> Option<&mut PropertyDescriptor> {
+        self.values.get_mut(key)
+    }
+
+    pub(crate) fn contains_key(&self, key: &PropertyKey) -> bool {
+        self.values.contains_key(key)
+    }
+
+    /// Insert or replace a property, remembering a first-time key's position.
+    pub(crate) fn insert(&mut self, key: PropertyKey, desc: PropertyDescriptor) {
+        if self.values.insert(key.clone(), desc).is_none() {
+            self.creation_order.push(key);
+        }
+    }
+
+    pub(crate) fn remove(&mut self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        let removed = self.values.remove(key);
+        if removed.is_some() {
+            self.creation_order.retain(|existing| existing != key);
+        }
+        removed
+    }
+
+    /// Keys in `OrdinaryOwnPropertyKeys` order.
+    pub(crate) fn keys(&self) -> Vec<PropertyKey> {
+        let mut indices: Vec<(u32, PropertyKey)> = Vec::new();
+        let mut strings: Vec<PropertyKey> = Vec::new();
+        let mut symbols: Vec<PropertyKey> = Vec::new();
+
+        for key in &self.creation_order {
+            match key {
+                PropertyKey::Str(s) => match array_index_of(s.as_str()) {
+                    Some(index) => indices.push((index, key.clone())),
+                    None => strings.push(key.clone()),
+                },
+                PropertyKey::Symbol(_) => symbols.push(key.clone()),
+            }
+        }
+
+        indices.sort_by_key(|(index, _)| *index);
+        let mut ordered: Vec<PropertyKey> = indices.into_iter().map(|(_, key)| key).collect();
+        ordered.extend(strings);
+        ordered.extend(symbols);
+        ordered
+    }
+}
+
+// ─────────────────────────────────────────────────────────
 // OrdinaryObject — standard JS object
 // ─────────────────────────────────────────────────────────
 
 /// Standard JS object with named properties, prototype chain, and extensibility.
 #[derive(Debug, Clone)]
 pub struct OrdinaryObject {
-    properties: BTreeMap<PropertyKey, PropertyDescriptor>,
+    properties: PropertyTable,
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
     extensible: bool,
     frozen: bool,
@@ -130,7 +247,7 @@ pub struct OrdinaryObject {
 impl OrdinaryObject {
     pub fn new() -> Self {
         Self {
-            properties: BTreeMap::new(),
+            properties: PropertyTable::new(),
             prototype: None,
             extensible: true,
             frozen: false,
@@ -140,7 +257,7 @@ impl OrdinaryObject {
 
     pub fn with_prototype(proto: Rc<RefCell<dyn JSObject>>) -> Self {
         Self {
-            properties: BTreeMap::new(),
+            properties: PropertyTable::new(),
             prototype: Some(proto),
             extensible: true,
             frozen: false,
@@ -224,6 +341,14 @@ impl JSObject for OrdinaryObject {
         }
     }
 
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        OrdinaryObject::define_property(self, key, desc)
+    }
+
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
         if self.frozen || self.sealed {
             return false;
@@ -243,7 +368,7 @@ impl JSObject for OrdinaryObject {
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys().cloned().collect()
+        self.properties.keys()
     }
 
     fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
@@ -305,6 +430,9 @@ impl Default for OrdinaryObject {
 #[derive(Debug, Clone)]
 pub struct ArrayObject {
     elements: Vec<Value>,
+    /// Non-index own properties (`length` aside): `arr.x = 1`, methods hung
+    /// off an instance, symbol keys. Elements stay in the dense `Vec`.
+    properties: PropertyTable,
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
     extensible: bool,
     frozen: bool,
@@ -315,6 +443,7 @@ impl ArrayObject {
     pub fn new() -> Self {
         Self {
             elements: Vec::new(),
+            properties: PropertyTable::new(),
             prototype: None,
             extensible: true,
             frozen: false,
@@ -325,6 +454,7 @@ impl ArrayObject {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             elements: Vec::with_capacity(cap),
+            properties: PropertyTable::new(),
             prototype: None,
             extensible: true,
             frozen: false,
@@ -335,6 +465,7 @@ impl ArrayObject {
     pub fn from_vec(vec: Vec<Value>) -> Self {
         Self {
             elements: vec,
+            properties: PropertyTable::new(),
             prototype: None,
             extensible: true,
             frozen: false,
@@ -486,10 +617,10 @@ impl JSObject for ArrayObject {
                         .get(idx)
                         .map(|v| PropertyDescriptor::data_descriptor(v.clone()))
                 } else {
-                    None
+                    self.properties.get(key).cloned()
                 }
             }
-            _ => None,
+            _ => self.properties.get(key).cloned(),
         }
     }
 
@@ -523,11 +654,87 @@ impl JSObject for ArrayObject {
                     }
                     self.elements[idx] = value;
                     Ok(true)
+                } else if let Some(existing) = self.properties.get(&key) {
+                    if !existing.writable {
+                        return Err("Cannot assign to read-only property".to_string());
+                    }
+                    self.properties
+                        .insert(key, PropertyDescriptor::data_descriptor(value));
+                    Ok(true)
+                } else if !self.extensible {
+                    Err("Cannot add property to non-extensible array".to_string())
                 } else {
-                    Err(format!("Cannot set non-index property on array: {s}"))
+                    self.properties
+                        .insert(key, PropertyDescriptor::data_descriptor(value));
+                    Ok(true)
                 }
             }
-            _ => Err("Cannot set symbol property on array".to_string()),
+            _ => {
+                if let Some(existing) = self.properties.get(&key) {
+                    if !existing.writable {
+                        return Err("Cannot assign to read-only property".to_string());
+                    }
+                } else if !self.extensible {
+                    return Err("Cannot add property to non-extensible array".to_string());
+                }
+                self.properties
+                    .insert(key, PropertyDescriptor::data_descriptor(value));
+                Ok(true)
+            }
+        }
+    }
+
+    /// `Object.defineProperty` on an array: index keys keep writing elements
+    /// (the dense store is the element representation), everything else lands
+    /// in the property table with its full descriptor.
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        if self.frozen {
+            return Err("Cannot define property on frozen array".to_string());
+        }
+        match &key {
+            PropertyKey::Str(s) if s.as_str() == "length" => {
+                if desc.is_accessor_descriptor() {
+                    return Err("Cannot redefine property: length".to_string());
+                }
+                let n = desc.value.to_number();
+                let new_len = crate::builtins::validate_array_length(n)
+                    .map_err(|_| "Invalid array length".to_string())?;
+                self.elements.resize(new_len, Value::Undefined);
+                Ok(true)
+            }
+            PropertyKey::Str(s) => {
+                if let Ok(idx) = s.parse::<usize>() {
+                    if desc.is_accessor_descriptor() {
+                        return Err("Cannot define accessor on array element".to_string());
+                    }
+                    if idx >= MAX_DENSE_ELEMENTS {
+                        return Err(format!(
+                            "Array index {idx} is out of the supported range"
+                        ));
+                    }
+                    if idx >= self.elements.len() {
+                        self.elements.resize(idx + 1, Value::Undefined);
+                    }
+                    self.elements[idx] = desc.value;
+                    Ok(true)
+                } else if !self.extensible && !self.properties.contains_key(&key) {
+                    Err("Cannot add property to non-extensible array".to_string())
+                } else {
+                    self.properties.insert(key, desc);
+                    Ok(true)
+                }
+            }
+            _ => {
+                if !self.extensible && !self.properties.contains_key(&key) {
+                    return Err("Cannot add property to non-extensible array".to_string());
+                }
+                self.properties.insert(key, desc);
+                Ok(true)
+            }
         }
     }
 
@@ -543,7 +750,7 @@ impl JSObject for ArrayObject {
                 }
             }
         }
-        false
+        self.properties.remove(key).is_some()
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
@@ -552,8 +759,9 @@ impl JSObject for ArrayObject {
             PropertyKey::Str(s) => s
                 .parse::<usize>()
                 .ok()
-                .map_or(false, |i| i < self.elements.len()),
-            _ => false,
+                .map_or(false, |i| i < self.elements.len())
+                || self.properties.contains_key(key),
+            _ => self.properties.contains_key(key),
         }
     }
 
@@ -565,6 +773,7 @@ impl JSObject for ArrayObject {
             .map(|(i, _)| Self::index_key(i))
             .collect();
         keys.push(PropertyKey::from_str("length"));
+        keys.extend(self.properties.keys());
         keys
     }
 
@@ -664,10 +873,14 @@ pub fn new_array_object_from_vec(vec: Vec<Value>) -> Value {
 pub struct FunctionObject {
     pub func_id: u32,
     pub name: String,
-    properties: BTreeMap<PropertyKey, PropertyDescriptor>,
+    properties: PropertyTable,
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
     /// For arrow functions: captured `this` value
     pub captured_this: Option<Value>,
+    /// For arrow functions: the enclosing frame's `new.target` at creation
+    /// time. Arrows have no `[[Construct]]`, so `new.target` inside an arrow
+    /// must resolve to the constructor that created the enclosing frame.
+    pub captured_new_target: Option<Value>,
     /// Captured outer variables as (name, value) pairs
     pub captured_vars: Vec<(String, Value)>,
 }
@@ -677,9 +890,10 @@ impl FunctionObject {
         Self {
             func_id,
             name: name.to_string(),
-            properties: BTreeMap::new(),
+            properties: PropertyTable::new(),
             prototype: None,
             captured_this: None,
+            captured_new_target: None,
             captured_vars: Vec::new(),
         }
     }
@@ -694,9 +908,10 @@ impl FunctionObject {
         Self {
             func_id,
             name: name.to_string(),
-            properties: BTreeMap::new(),
+            properties: PropertyTable::new(),
             prototype: None,
             captured_this: Some(captured_this),
+            captured_new_target: None,
             captured_vars,
         }
     }
@@ -725,6 +940,17 @@ impl JSObject for FunctionObject {
         Ok(true)
     }
 
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        // Class members are defined through this path (`static get x()`), so
+        // the descriptor attributes have to survive on function objects.
+        self.properties.insert(key, desc);
+        Ok(true)
+    }
+
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
         self.properties.remove(key).is_some()
     }
@@ -734,7 +960,7 @@ impl JSObject for FunctionObject {
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys().cloned().collect()
+        self.properties.keys()
     }
 
     fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
@@ -797,20 +1023,22 @@ pub fn new_function_object(func_id: u32, name: &str) -> Value {
     Value::Object(obj_ref)
 }
 
-/// Create a `Value::Object` wrapping an Arrow FunctionObject with captured `this` and vars
+/// Create a `Value::Object` wrapping an Arrow FunctionObject with captured `this`, the enclosing
+/// frame's `new.target`, and captured vars.
 pub fn new_arrow_function_object(
     func_id: u32,
     name: &str,
     captured_this: Value,
+    captured_new_target: Value,
     captured_vars: Vec<(String, Value)>,
 ) -> Value {
-    let func_obj = FunctionObject::new_arrow(func_id, name, captured_this, captured_vars);
+    let mut func_obj = FunctionObject::new_arrow(func_id, name, captured_this, captured_vars);
+    func_obj.captured_new_target = Some(captured_new_target);
     let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
 
     // Arrow functions don't have a prototype property
     Value::Object(obj_ref)
 }
-
 // ─────────────────────────────────────────────────────────
 // NativeFunctionObject — built-in function wrapper
 // ─────────────────────────────────────────────────────────
@@ -829,7 +1057,7 @@ pub struct NativeFunctionObject {
     /// `[[Prototype]]` of the function object itself.
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
     /// Own properties (`prototype`, static methods, …).
-    properties: BTreeMap<PropertyKey, PropertyDescriptor>,
+    properties: PropertyTable,
 }
 
 impl NativeFunctionObject {
@@ -837,7 +1065,7 @@ impl NativeFunctionObject {
         Self {
             name: name.to_string(),
             prototype: None,
-            properties: BTreeMap::new(),
+            properties: PropertyTable::new(),
         }
     }
 
@@ -845,7 +1073,7 @@ impl NativeFunctionObject {
         Self {
             name: name.to_string(),
             prototype: Some(proto),
-            properties: BTreeMap::new(),
+            properties: PropertyTable::new(),
         }
     }
 
@@ -903,6 +1131,15 @@ impl JSObject for NativeFunctionObject {
         Ok(true)
     }
 
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        self.properties.insert(key, desc);
+        Ok(true)
+    }
+
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
         self.properties.remove(key).is_some()
     }
@@ -917,7 +1154,7 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        let mut keys: Vec<PropertyKey> = self.properties.keys().cloned().collect();
+        let mut keys: Vec<PropertyKey> = self.properties.keys();
         keys.push(PropertyKey::from_str("name"));
         keys.push(PropertyKey::from_str("length"));
         keys

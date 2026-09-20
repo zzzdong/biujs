@@ -181,6 +181,8 @@ pub enum Opcode {
     Divx,
     /// remx dst, src1, src2 (object remainder)
     Remx,
+    /// pow dst, src1, src2 (exponentiation `**`)
+    Pow,
     /// and dst, src1, src2
     And,
     /// or dst, src1, src2
@@ -256,6 +258,12 @@ pub enum Opcode {
     New,
     /// load_this dst
     LoadThis,
+    /// load_new_target dst — `new.target` of the current frame (undefined for a
+    /// plain call)
+    LoadNewTarget,
+    /// load_current_function dst — the function object whose body is running
+    /// (used by `super` to find the [[HomeObject]] recorded at class definition)
+    LoadCurrentFunction,
     /// make_func_obj dst, func_id
     MakeFuncObj,
     /// make_arrow_func_obj dst, func_id, captured_this
@@ -272,6 +280,9 @@ pub enum Opcode {
     MakeRest,
     /// call_spread result, callee, this, args — call with args taken from an array
     CallSpread,
+    /// call_super_spread callee, this, args — `super(...)`: like CallSpread but
+    /// the callee frame inherits the caller's `new.target`
+    CallSuperSpread,
     /// new_spread dst, ctor, args — construct with args taken from an array
     NewSpread,
 }
@@ -310,6 +321,7 @@ impl fmt::Display for Opcode {
             Opcode::Mulx => write!(f, "mulx"),
             Opcode::Divx => write!(f, "divx"),
             Opcode::Remx => write!(f, "remx"),
+            Opcode::Pow => write!(f, "pow"),
             Opcode::And => write!(f, "and"),
             Opcode::Or => write!(f, "or"),
             Opcode::Less => write!(f, "lt"),
@@ -347,6 +359,8 @@ impl fmt::Display for Opcode {
             Opcode::CreateClosure => write!(f, "create_closure"),
             Opcode::New => write!(f, "new"),
             Opcode::LoadThis => write!(f, "load_this"),
+            Opcode::LoadNewTarget => write!(f, "load_new_target"),
+            Opcode::LoadCurrentFunction => write!(f, "load_current_function"),
             Opcode::MakeFuncObj => write!(f, "make_func_obj"),
             Opcode::MakeArrowFuncObj => write!(f, "make_arrow_func_obj"),
             Opcode::ClosureVar => write!(f, "closure_var"),
@@ -355,6 +369,7 @@ impl fmt::Display for Opcode {
             Opcode::ToString => write!(f, "to_string"),
             Opcode::MakeRest => write!(f, "make_rest"),
             Opcode::CallSpread => write!(f, "call_spread"),
+            Opcode::CallSuperSpread => write!(f, "call_super_spread"),
             Opcode::NewSpread => write!(f, "new_spread"),
         }
     }

@@ -241,6 +241,9 @@ impl VM {
                     if let Some(saved_this) = self.state.this_stack.pop() {
                         self.state.this_val = saved_this;
                     }
+                    if let Some(saved_function) = self.state.function_stack.pop() {
+                        self.state.function_val = saved_function;
+                    }
                     self.state.frame_argc.pop();
                     // If this frame was invoked via `new`, apply [[Construct]] return
                     // semantics: a returned object becomes the result, otherwise the
@@ -251,6 +254,7 @@ impl VM {
                             self.state.set_register(Register::Rv, frame_this)?;
                         }
                     }
+                    self.state.new_target_stack.pop();
                     self.state.closure_var_stack.truncate(saved_closure_depth);
                     self.state.seh_stack.truncate(saved_seh_depth);
                     self.state.jump(return_pc);
@@ -430,13 +434,30 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        self.invoke_with_new_target(callee, this, args, None, module)
+    }
+
+    /// [`Self::invoke`], with an explicit `new.target` for the callee frame.
+    ///
+    /// `super(...)` is the only caller that needs this: ES `SuperCall` performs
+    /// `Construct(func, args, newTarget)` with the *current* frame's
+    /// `new.target`, so a grandchild class sees `new.target === Child` in every
+    /// constructor up the chain.
+    pub fn invoke_with_new_target(
+        &mut self,
+        callee: &Value,
+        this: Value,
+        args: &[Value],
+        new_target_override: Option<Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
         // Native built-ins never need a bytecode frame.
         if let Some(name) = crate::builtins::native_function_name(callee) {
             return self.call_native_by_name(&name, this, args, module);
         }
 
-        let (func_id, effective_this, captured_vars) = match callee {
-            Value::Function(id) => (*id, this.clone(), Vec::new()),
+        let (func_id, effective_this, captured_this_new_target, captured_vars) = match callee {
+            Value::Function(id) => (*id, this.clone(), None, Vec::new()),
             Value::Object(obj_ref) => {
                 let borrowed = obj_ref.borrow();
                 match borrowed
@@ -446,6 +467,7 @@ impl VM {
                     Some(func_obj) => (
                         func_obj.func_id,
                         func_obj.captured_this.clone().unwrap_or(this.clone()),
+                        func_obj.captured_new_target.clone(),
                         func_obj.captured_vars.clone(),
                     ),
                     None => {
@@ -469,6 +491,8 @@ impl VM {
         let saved_this = self.state.this_val.clone();
         let saved_this_depth = self.state.this_stack.len();
         let saved_construct = self.state.construct_stack.len();
+        let saved_new_target = self.state.new_target_stack.len();
+        let saved_function = self.state.function_val.clone();
 
         // Push the arguments and open the callee's frame at the new stack top,
         // using the same convention as the `Call`/`CallEx` opcodes (arg0 ends up
@@ -484,6 +508,10 @@ impl VM {
 
         self.state.enter_frame(args.len())?;
         self.state.this_val = effective_this;
+        self.state.function_val = match callee {
+            Value::Function(id) => self.materialize_function(*id),
+            other => other.clone(),
+        };
         for (name, value) in &captured_vars {
             let mut map = std::collections::HashMap::new();
             map.insert(name.clone(), value.clone());
@@ -496,6 +524,11 @@ impl VM {
                 self.state.pushc(self.state.seh_stack.len())?;
                 self.state.pushc(return_pc)?;
                 self.state.construct_stack.push(false);
+                self.state.new_target_stack.push(
+                    new_target_override
+                        .or(captured_this_new_target)
+                        .unwrap_or(Value::Undefined),
+                );
                 self.state.jump(*location);
             }
             None => {
@@ -525,7 +558,9 @@ impl VM {
         self.state.this_stack.truncate(saved_this_depth);
         self.state.frame_argc.truncate(saved_this_depth);
         self.state.this_val = saved_this;
+        self.state.function_val = saved_function;
         self.state.construct_stack.truncate(saved_construct);
+        self.state.new_target_stack.truncate(saved_new_target);
         Ok(rv)
     }
 
@@ -644,10 +679,12 @@ impl VM {
                         self.state.enter_frame(arg_count)?;
                         // Strict mode: this = undefined for regular function calls
                         self.state.this_val = Value::Undefined;
+                        self.state.function_val = self.materialize_function(func_id as u32);
                         self.state.pushc(self.state.closure_var_stack.len())?;
                         self.state.pushc(self.state.seh_stack.len())?;
                         self.state.pushc(self.state.pc + 1)?;
                         self.state.construct_stack.push(false);
+                        self.state.new_target_stack.push(Value::Undefined);
                         self.state.jump(*location);
                         return Ok(());
                     }
@@ -682,12 +719,14 @@ impl VM {
                         self.state.enter_frame(arg_count)?;
                         // Strict mode: this = undefined for regular calls
                         self.state.this_val = Value::Undefined;
+                        self.state.function_val = self.materialize_function(id);
                         match module.symtab.get(&FunctionId::new(id)) {
                             Some(location) => {
                                 self.state.pushc(self.state.closure_var_stack.len())?;
                                 self.state.pushc(self.state.seh_stack.len())?;
                                 self.state.pushc(self.state.pc + 1)?;
                                 self.state.construct_stack.push(false);
+                                self.state.new_target_stack.push(Value::Undefined);
                                 self.state.jump(*location);
                                 return Ok(());
                             }
@@ -715,11 +754,14 @@ impl VM {
                             let id = func_obj.func_id;
                             // Arrow functions capture `this`; others use undefined.
                             let captured_this = func_obj.captured_this.clone();
+                            // Arrows also inherit the enclosing `new.target`.
+                            let captured_new_target = func_obj.captured_new_target.clone();
                             let captured_vars = func_obj.captured_vars.clone();
                             drop(borrowed);
 
                             self.state.enter_frame(arg_count)?;
                             self.state.this_val = captured_this.unwrap_or(Value::Undefined);
+                            self.state.function_val = Value::Object(Rc::clone(&obj_ref));
                             for (name, value) in &captured_vars {
                                 let mut map = std::collections::HashMap::new();
                                 map.insert(name.clone(), value.clone());
@@ -731,6 +773,9 @@ impl VM {
                                     self.state.pushc(self.state.seh_stack.len())?;
                                     self.state.pushc(self.state.pc + 1)?;
                                     self.state.construct_stack.push(false);
+                                    self.state
+                                        .new_target_stack
+                                        .push(captured_new_target.unwrap_or(Value::Undefined));
                                     self.state.jump(*location);
                                     return Ok(());
                                 }
@@ -951,6 +996,17 @@ impl VM {
                 let lhs = self.get_value(operands[1])?;
                 let rhs = self.get_value(operands[2])?;
                 let value = lhs % rhs;
+                self.set_value(operands[0], value)?;
+            }
+            Opcode::Pow => {
+                // ES `ExponentiationExpression`: ToNumeric on both operands,
+                // then `**`. Like the other arithmetic opcodes this does not
+                // model the BigInt case (the engine has no BigInt).
+                let lhs = self.get_value(operands[1])?;
+                let rhs = self.get_value(operands[2])?;
+                let lprim = self.to_primitive(&lhs, "number", module)?;
+                let rprim = self.to_primitive(&rhs, "number", module)?;
+                let value = Value::Number(lprim.to_number().powf(rprim.to_number()));
                 self.set_value(operands[0], value)?;
             }
 
@@ -1208,6 +1264,29 @@ impl VM {
                         )
                     })?;
                 let result = self.invoke(&callee, this, &args, module)?;
+                self.state.set_register(Register::Rv, result)?;
+            }
+            Opcode::CallSuperSpread => {
+                // `super(...)`: same shape as CallSpread, but the parent
+                // constructor inherits this frame's `new.target`.
+                let callee = self.get_value(operands[0])?;
+                let this = self.get_value(operands[1])?;
+                let args_val = self.get_value(operands[2])?;
+                let args = self
+                    .array_like_elements(&args_val)
+                    .ok_or_else(|| {
+                        RuntimeError::TypeError(
+                            "CallSuperSpread: arguments must be array-like".to_string(),
+                        )
+                    })?;
+                let new_target = self
+                    .state
+                    .new_target_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or(Value::Undefined);
+                let result =
+                    self.invoke_with_new_target(&callee, this, &args, Some(new_target), module)?;
                 self.state.set_register(Register::Rv, result)?;
             }
             Opcode::NewSpread => {
@@ -1508,12 +1587,14 @@ impl VM {
                         self.state.enter_frame(arg_count)?;
                         // User-defined bytecode function - call it with this = obj_val
                         self.state.this_val = obj_val;
+                        self.state.function_val = self.materialize_function(id);
                         match module.symtab.get(&FunctionId::new(id)) {
                             Some(location) => {
                                 self.state.pushc(self.state.closure_var_stack.len())?;
                                 self.state.pushc(self.state.seh_stack.len())?;
                                 self.state.pushc(self.state.pc + 1)?;
                                 self.state.construct_stack.push(false);
+                                self.state.new_target_stack.push(Value::Undefined);
                                 self.state.jump(*location);
                                 return Ok(());
                             }
@@ -1533,11 +1614,13 @@ impl VM {
                                 let id = func_obj.func_id;
                                 // Check if this is an arrow function with captured this
                                 let captured_this = func_obj.captured_this.clone();
+                                let captured_new_target = func_obj.captured_new_target.clone();
                                 let captured_vars = func_obj.captured_vars.clone();
                                 drop(borrowed);
                                 self.state.enter_frame(arg_count)?;
                                 // For arrow functions, use captured this; for regular methods, use obj_val
                                 self.state.this_val = captured_this.unwrap_or(obj_val);
+                                self.state.function_val = Value::Object(Rc::clone(&obj_ref));
                                 // Push captured variables onto closure_var_stack
                                 for (name, value) in &captured_vars {
                                     let mut map = std::collections::HashMap::new();
@@ -1550,6 +1633,9 @@ impl VM {
                                         self.state.pushc(self.state.seh_stack.len())?;
                                         self.state.pushc(self.state.pc + 1)?;
                                         self.state.construct_stack.push(false);
+                                        self.state
+                                            .new_target_stack
+                                            .push(captured_new_target.unwrap_or(Value::Undefined));
                                         self.state.jump(*location);
                                         return Ok(());
                                     }
@@ -1636,6 +1722,14 @@ impl VM {
                 // Operands are read with the caller's frame pointer; the frame
                 // switch happens afterwards, before the arguments are collected.
                 self.state.rbp = self.state.rsp;
+
+                // `new.target` inside the constructor is this constructor. A bare
+                // `Value::Function` is boxed first so the identity is the same
+                // object the callee would see through `F`.
+                let new_target_value = match &constructor_val {
+                    Value::Function(id) => self.materialize_function(*id),
+                    other => other.clone(),
+                };
 
                 // 1. Determine the function ID and prototype
                 let (func_id, prototype) = match constructor_val {
@@ -1778,6 +1872,8 @@ impl VM {
 
                 // 4. Set this_val to the new object
                 self.state.this_val = new_obj_val;
+                // The running function inside the constructor is the constructor.
+                self.state.function_val = new_target_value.clone();
 
                 // 5. Save closure depth, SEH depth and return PC, then jump to constructor
                 match module.symtab.get(&FunctionId::new(func_id)) {
@@ -1792,6 +1888,7 @@ impl VM {
                         self.state.pushc(self.state.seh_stack.len())?;
                         self.state.pushc(self.state.pc + 1)?;
                         self.state.construct_stack.push(true);
+                        self.state.new_target_stack.push(new_target_value);
                         self.state.jump(*location);
                         return Ok(());
                     }
@@ -1804,6 +1901,22 @@ impl VM {
             }
             Opcode::LoadThis => {
                 let value = self.state.this_val.clone();
+                self.set_value(operands[0], value)?;
+            }
+            Opcode::LoadNewTarget => {
+                // `new.target` is per frame: the constructor for a `[[Construct]]`
+                // frame, otherwise undefined (an arrow frame carries the value
+                // captured when the arrow object was created).
+                let value = self
+                    .state
+                    .new_target_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or(Value::Undefined);
+                self.set_value(operands[0], value)?;
+            }
+            Opcode::LoadCurrentFunction => {
+                let value = self.state.function_val.clone();
                 self.set_value(operands[0], value)?;
             }
             Opcode::MakeFuncObj => {
@@ -1844,12 +1957,47 @@ impl VM {
                         captured_vars.push((k, v));
                     }
                 }
+                // An arrow has no `[[Construct]]`: it inherits `new.target` from
+                // the frame that created it, so capture that value here (the
+                // same create-time snapshot rule used for `this`).
+                let captured_new_target = self
+                    .state
+                    .new_target_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or(Value::Undefined);
                 let obj_val = crate::vm::object::new_arrow_function_object(
                     func_id,
                     "<arrow>",
                     captured_this,
+                    captured_new_target,
                     captured_vars,
                 );
+                // Arrows inherit `super` (and the home object) from the enclosing
+                // method: copy the `super`-related properties recorded on the
+                // running function so `super()` / `super.x` work inside an arrow
+                // nested in a constructor or method (ES 14.2.16).
+                let inherited_super: Vec<(PropertyKey, crate::vm::PropertyDescriptor)> =
+                    match &self.state.function_val {
+                        Value::Object(func_ref) => {
+                            let borrowed = func_ref.borrow();
+                            ["__super__", "__superProto__"]
+                                .iter()
+                                .filter_map(|name| {
+                                    let key = PropertyKey::from_str(name);
+                                    borrowed
+                                        .property_get(&key)
+                                        .map(|desc| (key, desc))
+                                })
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                if let Value::Object(arrow_ref) = &obj_val {
+                    for (key, desc) in inherited_super {
+                        let _ = arrow_ref.borrow_mut().define_property(key, desc);
+                    }
+                }
                 self.set_value(operands[0], obj_val)?;
             }
             Opcode::ClosureVar => {
@@ -2220,7 +2368,7 @@ impl VM {
     /// If the operand is an immediate, it's a constant pool index (static property name).
     /// Otherwise, it's a runtime value (dynamic property name).
     fn resolve_property_key(
-        &self,
+        &mut self,
         operand: Operand,
         module: &Module,
     ) -> Result<PropertyKey, RuntimeError> {
@@ -2230,7 +2378,19 @@ impl VM {
             },
             _ => {
                 let prop_val = self.get_value(operand)?;
-                Ok(crate::vm::prototype::value_to_property_key(&prop_val))
+                match &prop_val {
+                    Value::Symbol(sym) => return Ok(PropertyKey::Symbol(sym.id)),
+                    Value::String(s) => return Ok(PropertyKey::from_str(s.as_str())),
+                    _ => {}
+                }
+                // ES `ToPropertyKey` = ToPrimitive(string) then ToString, so a
+                // key object's `toString` runs (its side effects are observed
+                // by test262) before the key is used.
+                let primitive = self.to_primitive(&prop_val, "string", module)?;
+                Ok(match &primitive {
+                    Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
+                    other => PropertyKey::from_str(&other.to_js_string()),
+                })
             }
         }
     }
@@ -2742,6 +2902,8 @@ impl VM {
         let saved_this = self.state.this_val.clone();
         let saved_this_depth = self.state.this_stack.len();
         let saved_construct = self.state.construct_stack.len();
+        let saved_new_target = self.state.new_target_stack.len();
+        let saved_function = self.state.function_val.clone();
 
         for arg in args.iter().rev() {
             self.state.push(arg.clone())?;
@@ -2757,6 +2919,13 @@ impl VM {
             self.state.closure_var_stack.push(map);
         }
 
+        // `new.target` of a `[[Construct]]` frame is the constructor itself.
+        let new_target_value = match callee {
+            Value::Function(id) => self.materialize_function(*id),
+            other => other.clone(),
+        };
+        self.state.function_val = new_target_value.clone();
+
         match module.symtab.get(&FunctionId::new(func_id)) {
             Some(location) => {
                 self.state.set_register(Register::Rv, Value::Undefined)?;
@@ -2764,6 +2933,7 @@ impl VM {
                 self.state.pushc(self.state.seh_stack.len())?;
                 self.state.pushc(return_pc)?;
                 self.state.construct_stack.push(true);
+                self.state.new_target_stack.push(new_target_value);
                 self.state.jump(*location);
             }
             None => {
@@ -2789,7 +2959,9 @@ impl VM {
         self.state.this_stack.truncate(saved_this_depth);
         self.state.frame_argc.truncate(saved_this_depth);
         self.state.this_val = saved_this;
+        self.state.function_val = saved_function;
         self.state.construct_stack.truncate(saved_construct);
+        self.state.new_target_stack.truncate(saved_new_target);
         Ok(rv)
     }
 
@@ -2933,6 +3105,15 @@ struct State {
     /// Per-frame flag: true if the current frame was invoked via `new` ([[Construct]]).
     /// Used to decide whether a returned value should be replaced by `this`.
     construct_stack: Vec<bool>,
+    /// Per-frame `new.target`: the constructor when the frame was entered
+    /// through `new`, `undefined` otherwise. A frame entered for an arrow
+    /// function inherits the value captured when the arrow was created.
+    new_target_stack: Vec<Value>,
+    /// The function object whose body is currently executing. `super` reads the
+    /// home object recorded on it at class-definition time.
+    function_val: Value,
+    /// Saved `function_val` of the caller frames, parallel to `this_stack`.
+    function_stack: Vec<Value>,
     /// Saved `this` binding of the caller frame, restored on `Ret`.
     /// Keeping `this` per-frame prevents a nested call from clobbering it.
     this_stack: Vec<Value>,
@@ -2956,6 +3137,9 @@ impl State {
             this_val: Value::Undefined,
             closure_var_stack: Vec::new(),
             construct_stack: Vec::new(),
+            new_target_stack: Vec::new(),
+            function_val: Value::Undefined,
+            function_stack: Vec::new(),
             this_stack: Vec::new(),
             frame_argc: Vec::new(),
             rsp: 0,
@@ -3107,6 +3291,7 @@ impl State {
             ));
         }
         self.this_stack.push(self.this_val.clone());
+        self.function_stack.push(self.function_val.clone());
         self.frame_argc.push(argc);
         Ok(())
     }

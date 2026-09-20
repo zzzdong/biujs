@@ -47,6 +47,24 @@ impl LoopContext {
     }
 }
 
+/// The name of an object-literal property or class member.
+///
+/// Non-computed literals stay static strings (cheaper, and the property order
+/// is unchanged); a computed key such as `[expr]` becomes a runtime value that
+/// `ToPropertyKey` converts when the member is defined.
+enum MemberKey {
+    Static(String),
+    Dynamic(Value),
+}
+
+/// Debug name for a class member function (`C.m`, `C.[computed]`).
+fn member_display_name(class_name: &str, key: &MemberKey) -> String {
+    match key {
+        MemberKey::Static(name) => format!("{class_name}.{name}"),
+        MemberKey::Dynamic(_) => format!("{class_name}.[computed]"),
+    }
+}
+
 /// Lowers oxc AST nodes into IR instructions.
 pub struct JSASTLower<'a> {
     builder: &'a mut dyn InstBuilder,
@@ -237,40 +255,79 @@ impl<'a> JSASTLower<'a> {
             .map(|id| id.name.to_string())
             .unwrap_or_else(|| "<class>".to_string());
 
-        // 1. Separate constructor / instance methods / statics / accessors
-        // Collect info as owned strings to avoid borrow issues
-        let mut constructor_idx: Option<usize> = None;
-        let mut method_infos: Vec<(String, &Function)> = Vec::new();
-        let mut static_infos: Vec<(String, &Function)> = Vec::new();
-        let mut accessor_infos: Vec<(String, bool, &Function)> = Vec::new();
+        /// One member of a class body.
+        enum Member<'a> {
+            Constructor(&'a Function<'a>),
+            Method {
+                key: MemberKey,
+                func: &'a Function<'a>,
+            },
+            Accessor {
+                key: MemberKey,
+                is_get: bool,
+                func: &'a Function<'a>,
+            },
+            StaticMethod {
+                key: MemberKey,
+                func: &'a Function<'a>,
+            },
+            StaticAccessor {
+                key: MemberKey,
+                is_get: bool,
+                func: &'a Function<'a>,
+            },
+            StaticField {
+                key: MemberKey,
+                field: &'a PropertyDefinition<'a>,
+            },
+        }
 
+        // 1. Walk the body in source order. Computed keys are evaluated right
+        //    here — once, in order — exactly as ClassDefinitionEvaluation does.
+        let mut members: Vec<Member<'_>> = Vec::new();
         let mut instance_fields: Vec<&PropertyDefinition<'_>> = Vec::new();
-        let mut static_fields: Vec<&PropertyDefinition<'_>> = Vec::new();
 
         for element in &class.body.body {
-            if let oxc_ast::ast::ClassElement::PropertyDefinition(property_def) = element {
-                if property_def.r#static {
-                    static_fields.push(property_def);
-                } else {
-                    instance_fields.push(property_def);
-                }
-                continue;
-            }
-            if let oxc_ast::ast::ClassElement::MethodDefinition(method_def) = element {
-                let is_get = method_def.kind == oxc_ast::ast::MethodDefinitionKind::Get;
-                let is_set = method_def.kind == oxc_ast::ast::MethodDefinitionKind::Set;
-                if method_def.kind == oxc_ast::ast::MethodDefinitionKind::Constructor {
-                    constructor_idx = Some(method_infos.len());
-                    method_infos.push((String::new(), &method_def.value));
-                } else if let Some(name) = self.class_method_name_str(method_def) {
-                    if method_def.r#static {
-                        static_infos.push((name, &method_def.value));
-                    } else if is_get || is_set {
-                        accessor_infos.push((name, is_get, &method_def.value));
+            match element {
+                ClassElement::PropertyDefinition(property_def) => {
+                    if property_def.r#static {
+                        let key =
+                            self.lower_member_key(&property_def.key, property_def.computed);
+                        members.push(Member::StaticField {
+                            key,
+                            field: property_def,
+                        });
                     } else {
-                        method_infos.push((name, &method_def.value));
+                        // Instance fields are installed by the constructor, which
+                        // evaluates their keys itself.
+                        instance_fields.push(property_def);
                     }
                 }
+                ClassElement::MethodDefinition(method_def) => {
+                    if method_def.kind == MethodDefinitionKind::Constructor {
+                        members.push(Member::Constructor(method_def.value.as_ref()));
+                        continue;
+                    }
+                    let is_accessor = matches!(
+                        method_def.kind,
+                        MethodDefinitionKind::Get | MethodDefinitionKind::Set
+                    );
+                    let is_get = method_def.kind == MethodDefinitionKind::Get;
+                    let key = self.lower_member_key(&method_def.key, method_def.computed);
+                    let func = method_def.value.as_ref();
+                    members.push(if method_def.r#static {
+                        if is_accessor {
+                            Member::StaticAccessor { key, is_get, func }
+                        } else {
+                            Member::StaticMethod { key, func }
+                        }
+                    } else if is_accessor {
+                        Member::Accessor { key, is_get, func }
+                    } else {
+                        Member::Method { key, func }
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -291,42 +348,30 @@ impl<'a> JSASTLower<'a> {
             None => self.builder.make_object(),
         };
 
-        // 3. Process each method - create function and add to prototype or use as constructor
+        // 3. Build the constructor function (only a non-computed `constructor`
+        //    member counts as one; `['constructor']() {}` is an ordinary
+        //    prototype method).
         let mut constructor_id = None;
-
-        for (idx, (method_name, method_func)) in method_infos.iter().enumerate() {
-
-            let is_constructor = Some(idx) == constructor_idx;
-
-            let func_val = self.lower_function_inner(
-                Some(if is_constructor {
-                    format!("{}_{}", class_name, "constructor")
-                } else {
-                    format!("{}.{}", class_name, method_name)
-                }),
-                &method_func.params.items,
-                method_func.body.as_ref().unwrap(),
-                None,
-                false,
-                &[],
-                false,
-                if is_constructor {
-                    &instance_fields
-                } else {
-                    &[]
-                },
-            );
-
-            if is_constructor {
-                constructor_id = Some(func_val);
-            } else {
-                self.builder.set_property(proto, method_name, func_val);
+        for member in &members {
+            if let Member::Constructor(func) = member {
+                // `C.name` is the class name (ES 14.5.14 ClassDefinitionEvaluation
+                // sets the constructor's name to the binding identifier).
+                constructor_id = Some(self.lower_function_inner(
+                    Some(class_name.clone()),
+                    &func.params.items,
+                    func.body.as_ref().unwrap(),
+                    None,
+                    false,
+                    &[],
+                    false,
+                    &instance_fields,
+                ));
             }
         }
 
         // 4. If no constructor, create a default one
         let constructor_id = constructor_id.unwrap_or_else(|| {
-            let func_sig = FuncSignature::new(format!("{}_{}", class_name, "constructor"), vec![]);
+            let func_sig = FuncSignature::new(class_name.clone(), vec![]);
             let func_id = self.builder.module_mut().declare_function(func_sig.clone());
             let mut func = IrFunction::new(func_id, func_sig);
             let symbols = self.symbols.clone();
@@ -343,130 +388,197 @@ impl<'a> JSASTLower<'a> {
             Value::Function(func_id)
         });
 
-        // 5. Create a FunctionObject wrapping the constructor
+        // 5. Wrap the constructor in a FunctionObject and run MakeConstructor.
+        //    `prototype` (and the `constructor` back-reference it installs on
+        //    the prototype) exist *before* the body members, which is why a
+        //    computed `['constructor']` member can overwrite the back-reference
+        //    and why `prototype` comes first in property order.
         let func_obj = self.builder.make_func_obj(constructor_id);
+        let proto_desc = self.data_descriptor(proto, true, false, false);
+        self.define_property_named(func_obj, "prototype", proto_desc);
+        let ctor_desc = self.data_descriptor(func_obj, true, false, true);
+        self.define_property_named(proto, "constructor", ctor_desc);
 
-        // 6. Set .prototype on the constructor FunctionObject, and the
-        //    back-reference `prototype.constructor` that code relies on.
-        self.builder.set_property(func_obj, "prototype", proto);
-        self.builder.set_property(proto, "constructor", func_obj);
         // Marks a class constructor: calling one without `new` is a TypeError.
-        self.builder.set_property(
-            func_obj,
-            crate::builtins::CLASS_CTOR_FLAG,
+        let flag_desc = self.data_descriptor(
             Value::Primitive(Primitive::Boolean(true)),
+            false,
+            false,
+            false,
         );
+        self.define_property_named(func_obj, crate::builtins::CLASS_CTOR_FLAG, flag_desc);
 
-        // 6b. Inheritance wiring. The parent constructor is published as
+        // 5b. Inheritance wiring. The parent constructor is published as
         //     `__super__` on the child constructor: methods are compiled as
         //     separate functions and cannot reference the enclosing frame's
         //     registers, so `super(...)` resolves the parent at run time from
         //     `Object.getPrototypeOf(this).constructor.__super__`.
         if let Some(parent) = super_ctor {
-            self.builder.set_property(func_obj, "__super__", parent);
+            let super_desc = self.data_descriptor(parent, true, false, true);
+            self.define_property_named(func_obj, "__super__", super_desc);
             // Static inheritance: `Object.setPrototypeOf(child, parent)`.
             let object_fn = self.builder.load_external_variable("Object".to_string());
             self.builder
                 .call_property(object_fn, "setPrototypeOf", vec![func_obj, parent]);
         }
 
-        // 6c. Static fields (`static x = 1`) are evaluated once, here.
-        for field in static_fields {
-            let value = match &field.value {
-                Some(init) => self.lower_expression(init),
-                None => Value::Primitive(Primitive::Undefined),
-            };
-            let name = self.property_key_to_string(&field.key);
-            self.builder.set_property(func_obj, name.as_str(), value);
-        }
+        // 5c. `[[HomeObject]]` wiring for `super.prop` / `super.m()`:
+        //     instance members look on `getPrototypeOf(C.prototype)`, static
+        //     members on `getPrototypeOf(C)`. Both are fixed here, at class
+        //     definition time.
+        let instance_super_proto = self.get_prototype_of(proto);
+        let static_super_proto = self.get_prototype_of(func_obj);
+        let func_obj = self.attach_super_proto(func_obj, instance_super_proto.clone());
 
-        // 7. Static methods live directly on the constructor.
-        for (method_name, method_func) in static_infos.iter() {
-            let func_val = self.lower_function_inner(
-                Some(format!("{}.{method_name}", class_name)),
-                &method_func.params.items,
-                method_func.body.as_ref().unwrap(),
-                None,
-                false,
-                &[],
-                false,
-                &[],
-            );
-            self.builder.set_property(func_obj, method_name, func_val);
-        }
-
-        // 8. Accessors (`get x()` / `set x(v)`) are installed with
-        //    `Object.defineProperty` so they keep accessor semantics. A getter
-        //    and a setter for the same name must land in ONE descriptor —
-        //    defining them separately would make the second overwrite the first.
-        let mut accessors: Vec<(String, Option<Value>, Option<Value>)> = Vec::new();
-        for (name, is_get, accessor_func) in accessor_infos.iter() {
-            let func_val = self.lower_function_inner(
-                Some(format!(
-                    "{}.{name}{}",
-                    class_name,
-                    if *is_get { " (getter)" } else { " (setter)" }
-                )),
-                &accessor_func.params.items,
-                accessor_func.body.as_ref().unwrap(),
-                None,
-                false,
-                &[],
-                false,
-                &[],
-            );
-            if let Some(entry) = accessors.iter_mut().find(|(n, _, _)| n == name) {
-                if *is_get {
-                    entry.1 = Some(func_val);
-                } else {
-                    entry.2 = Some(func_val);
+        // 6. Install the body members in source order: prototype members on the
+        //    prototype object, static members on the constructor itself.
+        for member in &members {
+            match member {
+                Member::Constructor(_) => {}
+                Member::Method { key, func } => {
+                    let name = member_display_name(&class_name, key);
+                    let func_val = self.lower_function_inner(
+                        Some(name),
+                        &func.params.items,
+                        func.body.as_ref().unwrap(),
+                        None,
+                        false,
+                        &[],
+                        false,
+                        &[],
+                    );
+                    let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
+                    let desc = self.method_descriptor(func_val);
+                    self.define_member(proto, key, desc);
                 }
-            } else if *is_get {
-                accessors.push((name.clone(), Some(func_val), None));
-            } else {
-                accessors.push((name.clone(), None, Some(func_val)));
+                Member::StaticMethod { key, func } => {
+                    let name = member_display_name(&class_name, key);
+                    let func_val = self.lower_function_inner(
+                        Some(name),
+                        &func.params.items,
+                        func.body.as_ref().unwrap(),
+                        None,
+                        false,
+                        &[],
+                        false,
+                        &[],
+                    );
+                    let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
+                    let desc = self.method_descriptor(func_val);
+                    self.define_member(func_obj, key, desc);
+                }
+                Member::Accessor { key, is_get, func } => {
+                    let name = member_display_name(&class_name, key);
+                    let func_val = self.lower_function_inner(
+                        Some(name),
+                        &func.params.items,
+                        func.body.as_ref().unwrap(),
+                        None,
+                        false,
+                        &[],
+                        false,
+                        &[],
+                    );
+                    let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
+                    let (getter, setter) = if *is_get {
+                        (Some(func_val), None)
+                    } else {
+                        (None, Some(func_val))
+                    };
+                    let desc = self.accessor_descriptor(getter, setter, false);
+                    self.define_member(proto, key, desc);
+                }
+                Member::StaticAccessor { key, is_get, func } => {
+                    let name = member_display_name(&class_name, key);
+                    let func_val = self.lower_function_inner(
+                        Some(name),
+                        &func.params.items,
+                        func.body.as_ref().unwrap(),
+                        None,
+                        false,
+                        &[],
+                        false,
+                        &[],
+                    );
+                    let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
+                    let (getter, setter) = if *is_get {
+                        (Some(func_val), None)
+                    } else {
+                        (None, Some(func_val))
+                    };
+                    let desc = self.accessor_descriptor(getter, setter, false);
+                    self.define_member(func_obj, key, desc);
+                }
+                // Static fields are ordinary data properties, evaluated once.
+                Member::StaticField { key, field } => {
+                    let value = match &field.value {
+                        Some(init) => self.lower_expression(init),
+                        None => Value::Primitive(Primitive::Undefined),
+                    };
+                    self.set_member(func_obj, key, value);
+                }
             }
-        }
-
-        for (name, getter, setter) in accessors {
-            let desc = self.builder.make_object();
-            if let Some(getter) = getter {
-                self.builder.set_property(desc, "get", getter);
-            }
-            if let Some(setter) = setter {
-                self.builder.set_property(desc, "set", setter);
-            }
-            self.builder.set_property(
-                desc,
-                "configurable",
-                Value::Primitive(Primitive::Boolean(true)),
-            );
-            // Class accessors are enumerable: false, like class methods.
-            self.builder.set_property(
-                desc,
-                "enumerable",
-                Value::Primitive(Primitive::Boolean(true)),
-            );
-            let object_fn = self.builder.load_external_variable("Object".to_string());
-            let name_const = self.builder.load_constant(crate::bytecode::Constant::String(
-                std::sync::Arc::new(name.into()),
-            ));
-            self.builder
-                .call_property(object_fn, "defineProperty", vec![proto, name_const, desc]);
         }
 
         func_obj
     }
 
-    fn class_method_name_str(&self, method: &MethodDefinition<'_>) -> Option<String> {
-        match &method.key {
-            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
-            oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
-            _ => {
-                log::warn!("computed method name not supported in class");
-                None
-            }
-        }
+    /// `[[Value]]` descriptor with explicit attributes.
+    fn data_descriptor(
+        &mut self,
+        value: Value,
+        writable: bool,
+        enumerable: bool,
+        configurable: bool,
+    ) -> Value {
+        let desc = self.builder.make_object();
+        self.builder.set_property(desc, "value", value);
+        self.builder.set_property(
+            desc,
+            "writable",
+            Value::Primitive(Primitive::Boolean(writable)),
+        );
+        self.builder.set_property(
+            desc,
+            "enumerable",
+            Value::Primitive(Primitive::Boolean(enumerable)),
+        );
+        self.builder.set_property(
+            desc,
+            "configurable",
+            Value::Primitive(Primitive::Boolean(configurable)),
+        );
+        desc
+    }
+
+    /// `Object.defineProperty(target, name, desc)` for a static name.
+    fn define_property_named(&mut self, target: Value, name: &str, desc: Value) {
+        let key = MemberKey::Static(name.to_string());
+        self.define_member(target, &key, desc);
+    }
+
+    /// Record the prototype of a member's `[[HomeObject]]` on its function.
+    ///
+    /// `super.x` looks the property up on `getPrototypeOf(homeObject)`, and the
+    /// home object is fixed when the class (or object literal) is defined. The
+    /// value travels on the function object so that `super` stays correct at any
+    /// inheritance depth — and so arrow functions can inherit it at creation
+    /// time instead of re-deriving it from the receiver.
+    fn attach_super_proto(&mut self, func_val: Value, super_proto: Value) -> Value {
+        let boxed = match func_val {
+            Value::Function(_) => self.builder.make_func_obj(func_val),
+            other => other,
+        };
+        let desc = self.data_descriptor(super_proto, true, false, true);
+        self.define_property_named(boxed, "__superProto__", desc);
+        boxed
+    }
+
+    /// `Object.getPrototypeOf(value)` as an IR value.
+    fn get_prototype_of(&mut self, value: Value) -> Value {
+        let object_fn = self.builder.load_external_variable("Object".to_string());
+        self.builder
+            .call_property(object_fn, "getPrototypeOf", vec![value])
     }
 
     fn lower_variable_declaration(&mut self, decl: &VariableDeclaration<'_>) {
@@ -1082,6 +1194,23 @@ impl<'a> JSASTLower<'a> {
                 }
             }
             Expression::ClassExpression(class) => self.lower_class(class),
+            Expression::MetaProperty(meta) => {
+                // `new.target` (ES 14.2.3) reads the current frame's constructor
+                // slot: the constructor for a `[[Construct]]` frame, otherwise
+                // `undefined`. Inside an arrow it is the value captured when the
+                // arrow object was created.
+                if meta.meta.name == "new" && meta.property.name == "target" {
+                    self.builder.load_new_target()
+                } else {
+                    // `import.meta` requires a module loader (out of scope).
+                    log::warn!(
+                        "unsupported meta property: {}.{}",
+                        meta.meta.name,
+                        meta.property.name
+                    );
+                    Value::Primitive(Primitive::Undefined)
+                }
+            }
             _ => {
                 log::warn!("unimplemented expression: {:?}", expr);
                 Value::Primitive(Primitive::Null)
@@ -1135,6 +1264,7 @@ impl<'a> JSASTLower<'a> {
             BinaryOperator::Multiplication => self.builder.binop(Opcode::Mulx, lhs, rhs),
             BinaryOperator::Division => self.builder.binop(Opcode::Divx, lhs, rhs),
             BinaryOperator::Remainder => self.builder.binop(Opcode::Remx, lhs, rhs),
+            BinaryOperator::Exponential => self.builder.binop(Opcode::Pow, lhs, rhs),
             BinaryOperator::Equality => self.builder.binop(Opcode::Equal, lhs, rhs),
             BinaryOperator::Inequality => self.builder.binop(Opcode::NotEqual, lhs, rhs),
             BinaryOperator::StrictEquality => self.builder.binop(Opcode::StrictEqual, lhs, rhs),
@@ -1355,10 +1485,31 @@ impl<'a> JSASTLower<'a> {
                 result
             }
             LogicalOperator::Coalesce => {
-                // ??: if lhs is null/undefined, evaluate rhs
-                // For now, simplified
-                log::warn!("?? operator not fully implemented");
-                lhs
+                // `??` short-circuits on null/undefined: the rhs is evaluated
+                // only when the lhs is nullish, and the lhs is returned as-is
+                // otherwise (so `0 ?? x` is `0`, unlike `0 || x`).
+                let result = self.builder.alloc();
+                let rhs_blk = self.create_block("coalesce_rhs");
+                let merge_blk = self.create_block("coalesce_merge");
+
+                // Loose equality with null is true for exactly null and
+                // undefined, which is the trigger condition for `??`.
+                let is_nullish = self.builder.binop(
+                    Opcode::Equal,
+                    lhs.clone(),
+                    Value::Primitive(Primitive::Null),
+                );
+
+                self.builder.assign(result, lhs);
+                self.builder.br_if(is_nullish, rhs_blk, merge_blk);
+
+                self.builder.switch_to_block(rhs_blk);
+                let rhs = self.lower_expression(&logical.right);
+                self.builder.assign(result, rhs);
+                self.builder.jump(merge_blk);
+
+                self.builder.switch_to_block(merge_blk);
+                result
             }
         }
     }
@@ -1376,6 +1527,7 @@ impl<'a> JSASTLower<'a> {
             AssignmentOperator::Multiplication => Opcode::Mulx,
             AssignmentOperator::Division => Opcode::Divx,
             AssignmentOperator::Remainder => Opcode::Remx,
+            AssignmentOperator::Exponential => Opcode::Pow,
             AssignmentOperator::BitwiseAnd => Opcode::BitAnd,
             AssignmentOperator::BitwiseOR => Opcode::BitOr,
             AssignmentOperator::BitwiseXOR => Opcode::BitXor,
@@ -1541,7 +1693,7 @@ impl<'a> JSASTLower<'a> {
                     }
                 }
             }
-            return self.builder.call_spread(super_ctor, this, argv);
+            return self.builder.call_super(super_ctor, this, argv);
         }
 
         let has_spread = Self::has_spread_arguments(&call.arguments);
@@ -1677,30 +1829,28 @@ impl<'a> JSASTLower<'a> {
 
     // --------------------------- `super` ---------------------------
 
-    /// The home object of the running method: `Object.getPrototypeOf(this)`.
+    /// The prototype `super` reads from, as recorded on the running function
+    /// when its class (or object literal) was defined.
     ///
-    /// For an instance of `C` this is `C.prototype`, which is where class
-    /// methods live and whose `constructor` back-reference points at `C`.
-    fn lower_home_object(&mut self) -> Value {
-        let this = self.builder.load_this();
-        let object_fn = self.builder.load_external_variable("Object".to_string());
-        self.builder
-            .call_property(object_fn, "getPrototypeOf", vec![this])
-    }
-
-    /// The prototype `super` reads from: `Object.getPrototypeOf(home)`.
+    /// Deriving it from `this` instead would break in the middle of an
+    /// inheritance chain: `this` belongs to the most-derived class, so an
+    /// intermediate `super.m()` would resolve back to itself.
     fn lower_super_proto(&mut self) -> Value {
-        let home = self.lower_home_object();
-        let object_fn = self.builder.load_external_variable("Object".to_string());
-        self.builder
-            .call_property(object_fn, "getPrototypeOf", vec![home])
+        let current = self.builder.load_current_function();
+        self.builder.get_property(current, "__superProto__")
     }
 
-    /// The parent constructor, published as `__super__` on the child.
+    /// The parent constructor of the *running* constructor.
+    ///
+    /// The parent is recorded as `__super__` on each class constructor when the
+    /// class is defined. Reading it back from the running function (rather than
+    /// deriving it from `this`) is what makes `super()` work in the middle of an
+    /// inheritance chain: `this` always belongs to the most-derived class, so a
+    /// receiver-based lookup would resolve every intermediate `super()` to the
+    /// same parent and recurse forever.
     fn lower_super_ctor(&mut self) -> Value {
-        let home = self.lower_home_object();
-        let ctor = self.builder.get_property(home, "constructor");
-        self.builder.get_property(ctor, "__super__")
+        let current = self.builder.load_current_function();
+        self.builder.get_property(current, "__super__")
     }
 
     fn lower_conditional(&mut self, cond: &ConditionalExpression<'_>) -> Value {
@@ -1748,14 +1898,148 @@ impl<'a> JSASTLower<'a> {
         array
     }
 
+    /// Lower a property key written in source (`{[k]: v}`, `class { [k]() {} }`).
+    ///
+    /// A non-computed literal stays a static string, so the common case keeps
+    /// the cheap constant path; everything else (including a computed key whose
+    /// expression happens to be a literal) is evaluated here, in source order.
+    fn lower_member_key(&mut self, key: &PropertyKey<'_>, computed: bool) -> MemberKey {
+        if computed {
+            return MemberKey::Dynamic(self.lower_property_key_expression(key));
+        }
+        match key {
+            PropertyKey::StaticIdentifier(id) => MemberKey::Static(id.name.to_string()),
+            PropertyKey::StringLiteral(lit) => MemberKey::Static(lit.value.to_string()),
+            PropertyKey::NumericLiteral(lit) => {
+                MemberKey::Static(crate::builtins::number_to_string(lit.value))
+            }
+            _ => MemberKey::Dynamic(self.lower_property_key_expression(key)),
+        }
+    }
+
+    /// `target[key] = value`, or `target.name = value` for a static key.
+    fn set_member(&mut self, target: Value, key: &MemberKey, value: Value) {
+        match key {
+            MemberKey::Static(name) => self.builder.set_property(target, name, value),
+            MemberKey::Dynamic(key_value) => {
+                self.builder.set_property_dynamic(target, key_value.clone(), value)
+            }
+        }
+    }
+
+    /// `Object.defineProperty(target, key, descriptor)` with a key that may only
+    /// be known at run time.
+    fn define_member(&mut self, target: Value, key: &MemberKey, desc: Value) {
+        let key_value = match key {
+            MemberKey::Static(name) => self.builder.load_constant(
+                crate::bytecode::Constant::String(std::sync::Arc::new(name.clone().into())),
+            ),
+            MemberKey::Dynamic(value) => value.clone(),
+        };
+        let object_fn = self.builder.load_external_variable("Object".to_string());
+        self.builder.call_property(
+            object_fn,
+            "defineProperty",
+            vec![target, key_value, desc],
+        );
+    }
+
+    /// `Object.defineProperty` descriptor for a method-like member.
+    ///
+    /// Matches `CreateMethodProperty`: writable and configurable, and
+    /// **non-enumerable** — that is what keeps `Object.keys(C.prototype)` empty.
+    fn method_descriptor(&mut self, value: Value) -> Value {
+        let desc = self.builder.make_object();
+        self.builder.set_property(desc, "value", value);
+        self.builder
+            .set_property(desc, "writable", Value::Primitive(Primitive::Boolean(true)));
+        self.builder.set_property(
+            desc,
+            "enumerable",
+            Value::Primitive(Primitive::Boolean(false)),
+        );
+        self.builder.set_property(
+            desc,
+            "configurable",
+            Value::Primitive(Primitive::Boolean(true)),
+        );
+        desc
+    }
+
+    /// `Object.defineProperty` descriptor for an accessor member.
+    ///
+    /// Only the halves that exist are mentioned, so `[[DefineOwnProperty]]`
+    /// merges a `get`/`set` pair that was declared as two separate members.
+    fn accessor_descriptor(
+        &mut self,
+        getter: Option<Value>,
+        setter: Option<Value>,
+        enumerable: bool,
+    ) -> Value {
+        let desc = self.builder.make_object();
+        if let Some(getter) = getter {
+            self.builder.set_property(desc, "get", getter);
+        }
+        if let Some(setter) = setter {
+            self.builder.set_property(desc, "set", setter);
+        }
+        self.builder.set_property(
+            desc,
+            "enumerable",
+            Value::Primitive(Primitive::Boolean(enumerable)),
+        );
+        self.builder.set_property(
+            desc,
+            "configurable",
+            Value::Primitive(Primitive::Boolean(true)),
+        );
+        desc
+    }
+
     fn lower_object(&mut self, obj: &ObjectExpression<'_>) -> Value {
         let object = self.builder.make_object();
         for prop in &obj.properties {
             match prop {
                 ObjectPropertyKind::ObjectProperty(p) => {
-                    let key = self.property_key_to_string(&p.key);
-                    let value = self.lower_expression(&p.value);
-                    self.builder.set_property(object, &key, value);
+                    // Per ES 12.2.6.8 the key is evaluated before the value.
+                    let key = self.lower_member_key(&p.key, p.computed);
+                    // A method's [[HomeObject]] is the literal itself, so `super.x`
+                    // must read from `getPrototypeOf(object)`.
+                    let home = p.method.then(|| self.get_prototype_of(object));
+                    match p.kind {
+                        PropertyKind::Get => {
+                            let getter = self.lower_expression(&p.value);
+                            let getter = match &home {
+                                Some(super_proto) => {
+                                    self.attach_super_proto(getter, super_proto.clone())
+                                }
+                                None => getter,
+                            };
+                            let desc = self.accessor_descriptor(Some(getter), None, true);
+                            self.define_member(object, &key, desc);
+                        }
+                        PropertyKind::Set => {
+                            let setter = self.lower_expression(&p.value);
+                            let setter = match &home {
+                                Some(super_proto) => {
+                                    self.attach_super_proto(setter, super_proto.clone())
+                                }
+                                None => setter,
+                            };
+                            let desc = self.accessor_descriptor(None, Some(setter), true);
+                            self.define_member(object, &key, desc);
+                        }
+                        PropertyKind::Init => {
+                            let value = self.lower_expression(&p.value);
+                            let value = match &home {
+                                Some(super_proto) => {
+                                    self.attach_super_proto(value, super_proto.clone())
+                                }
+                                None => value,
+                            };
+                            self.set_member(object, &key, value);
+                        }
+                    }
                 }
                 ObjectPropertyKind::SpreadProperty(spread) => {
                     let src = self.lower_expression(&spread.argument);
@@ -2340,13 +2624,18 @@ impl<'a> JSASTLower<'a> {
             ),
             PropertyKey::NumericLiteral(lit) => self.lower_numeric_literal(lit),
             PropertyKey::TemplateLiteral(tpl) => self.lower_template_literal(tpl),
-            _ => {
-                log::warn!("unsupported computed property key");
-                self.builder
-                    .load_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
-                        "".into(),
-                    )))
-            }
+            // A computed key is an arbitrary expression (`[f()]`, `[a + b]`,
+            // `[obj]`, …): lower it like any other expression.
+            _ => match key.as_expression() {
+                Some(expr) => self.lower_expression(expr),
+                None => {
+                    log::warn!("unsupported computed property key");
+                    self.builder
+                        .load_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
+                            "".into(),
+                        )))
+                }
+            },
         }
     }
 

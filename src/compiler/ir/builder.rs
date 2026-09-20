@@ -134,6 +134,16 @@ pub trait InstBuilder {
         });
     }
 
+    /// `object[property] = value` where the property name is only known at run
+    /// time (a computed key).
+    fn set_property_dynamic(&mut self, object: Value, property: Value, value: Value) {
+        self.emit(Instruction::PropertySet {
+            object,
+            property,
+            value,
+        });
+    }
+
     fn call_property(&mut self, object: Value, property: &str, args: Vec<Value>) -> Value {
         let dst = self.alloc();
 
@@ -248,9 +258,21 @@ pub trait InstBuilder {
         result
     }
 
+    /// `super(...args)`: like `call_spread`, but the callee frame inherits the
+    /// caller's `new.target` (ES `SuperCall`).
+    fn call_super(&mut self, callee: Value, this: Value, args: Value) -> Value {
+        let result = self.alloc();
+        self.emit(Instruction::CallSuper {
+            result,
+            callee,
+            this,
+            args,
+        });
+        result
+    }
+
     /// `new ctor(...args)` with a dynamic argument list.
-    fn new_spread(&mut self, constructor: Value, args: Value) -> Value {
-        let dst = self.alloc();
+    fn new_spread(&mut self, constructor: Value, args: Value) -> Value {        let dst = self.alloc();
         self.emit(Instruction::NewSpread {
             dst,
             constructor,
@@ -386,6 +408,21 @@ pub trait InstBuilder {
     fn load_this(&mut self) -> Value {
         let dst = self.alloc();
         self.emit(Instruction::LoadThis { dst });
+        dst
+    }
+
+    /// Bind `dst` to the current frame's `new.target` (`undefined` unless the
+    /// frame was entered through `new`).
+    fn load_new_target(&mut self) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::LoadNewTarget { dst });
+        dst
+    }
+
+    /// Bind `dst` to the function object currently executing.
+    fn load_current_function(&mut self) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::LoadCurrentFunction { dst });
         dst
     }
 

@@ -9,11 +9,11 @@ mod string;
 mod symbol;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::RuntimeError;
-use crate::vm::object::JSObject;
+use crate::vm::object::{JSObject, PropertyTable};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
@@ -718,14 +718,14 @@ fn new_proto(
 
 #[derive(Debug)]
 struct ProtoObject {
-    properties: BTreeMap<PropertyKey, PropertyDescriptor>,
+    properties: PropertyTable,
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
 }
 
 impl ProtoObject {
     fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
         Self {
-            properties: BTreeMap::new(),
+            properties: PropertyTable::new(),
             prototype,
         }
     }
@@ -749,6 +749,14 @@ impl JSObject for ProtoObject {
             .insert(key, PropertyDescriptor::data_descriptor(value));
         Ok(true)
     }
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        self.properties.insert(key, desc);
+        Ok(true)
+    }
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
         self.properties.remove(key).is_some()
     }
@@ -756,7 +764,7 @@ impl JSObject for ProtoObject {
         self.properties.contains_key(key)
     }
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys().cloned().collect()
+        self.properties.keys()
     }
     fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
         self.prototype.clone()

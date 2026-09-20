@@ -111,6 +111,14 @@ impl JSObject for NativeIteratorObject {
         Err("Cannot add properties to an iterator".to_string())
     }
 
+    fn define_property(
+        &mut self,
+        _key: PropertyKey,
+        _desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        Err("Cannot add properties to an iterator".to_string())
+    }
+
     fn property_delete(&mut self, _key: &PropertyKey) -> bool {
         false
     }

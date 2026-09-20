@@ -344,12 +344,42 @@ impl Codegen {
                             Operand::new_register(Register::Rv),
                         ));
                     }
+                    Instruction::CallSuper {
+                        result,
+                        callee,
+                        this,
+                        args,
+                    } => {
+                        let callee = self.gen_operand(callee);
+                        let this = self.gen_operand(this);
+                        let args = self.gen_operand(args);
+                        // Same register contract as `CallSpread`: the callee runs
+                        // in a nested frame and reuses registers.
+                        let in_use_registers = self.call_saved_registers();
+                        for reg in in_use_registers.iter().copied() {
+                            self.codes.push(Bytecode::single(Opcode::Push, reg.into()));
+                        }
+                        self.codes.push(Bytecode::triple(
+                            Opcode::CallSuperSpread,
+                            callee,
+                            this,
+                            args,
+                        ));
+                        for reg in in_use_registers.iter().rev().copied() {
+                            self.codes.push(Bytecode::single(Opcode::Pop, reg.into()));
+                        }
+                        let result = self.gen_operand(result);
+                        self.codes.push(Bytecode::double(
+                            Opcode::Mov,
+                            result,
+                            Operand::new_register(Register::Rv),
+                        ));
+                    }
                     Instruction::NewSpread {
                         dst,
                         constructor,
                         args,
-                    } => {
-                        let dst = self.gen_operand(dst);
+                    } => {                        let dst = self.gen_operand(dst);
                         let ctor = self.gen_operand(constructor);
                         let args = self.gen_operand(args);
                         let in_use_registers = self.call_saved_registers();
@@ -395,6 +425,16 @@ impl Codegen {
                     Instruction::LoadThis { dst } => {
                         let dst = self.gen_operand(dst);
                         self.codes.push(Bytecode::single(Opcode::LoadThis, dst));
+                    }
+                    Instruction::LoadNewTarget { dst } => {
+                        let dst = self.gen_operand(dst);
+                        self.codes
+                            .push(Bytecode::single(Opcode::LoadNewTarget, dst));
+                    }
+                    Instruction::LoadCurrentFunction { dst } => {
+                        let dst = self.gen_operand(dst);
+                        self.codes
+                            .push(Bytecode::single(Opcode::LoadCurrentFunction, dst));
                     }
                     Instruction::MakeFuncObj { dst, func_id } => {
                         let dst = self.gen_operand(dst);

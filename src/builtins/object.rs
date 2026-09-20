@@ -28,8 +28,18 @@ pub fn object_keys(args: &[Value]) -> Result<Value, RuntimeError> {
     match &args[0] {
         Value::Object(obj_ref) => {
             let borrowed = obj_ref.borrow();
-            let keys = borrowed.own_keys();
-            let str_keys: Vec<Value> = keys.iter().map(|k| Value::string(&k.display())).collect();
+            // EnumerableOwnPropertyNames: own *string* keys that are enumerable.
+            let str_keys: Vec<Value> = borrowed
+                .own_keys()
+                .into_iter()
+                .filter(|k| k.as_str().is_some())
+                .filter(|k| {
+                    borrowed
+                        .property_get(k)
+                        .is_some_and(|desc| desc.enumerable)
+                })
+                .map(|k| Value::string(&k.display()))
+                .collect();
             Ok(new_array_object_from_vec(str_keys))
         }
         _ => Err(RuntimeError::TypeError(
@@ -47,13 +57,14 @@ pub fn object_values(args: &[Value]) -> Result<Value, RuntimeError> {
     match &args[0] {
         Value::Object(obj_ref) => {
             let borrowed = obj_ref.borrow();
-            let keys = borrowed.own_keys();
-            let mut values = Vec::new();
-            for key in &keys {
-                if let Some(desc) = borrowed.property_get(key) {
-                    values.push(desc.value);
-                }
-            }
+            let values: Vec<Value> = borrowed
+                .own_keys()
+                .into_iter()
+                .filter(|k| k.as_str().is_some())
+                .filter_map(|k| borrowed.property_get(&k))
+                .filter(|desc| desc.enumerable)
+                .map(|desc| desc.value)
+                .collect();
             Ok(new_array_object_from_vec(values))
         }
         _ => Err(RuntimeError::TypeError(
@@ -71,13 +82,13 @@ pub fn object_entries(args: &[Value]) -> Result<Value, RuntimeError> {
     match &args[0] {
         Value::Object(obj_ref) => {
             let borrowed = obj_ref.borrow();
-            let keys = borrowed.own_keys();
-            let entries: Vec<Value> = keys
-                .iter()
+            let entries: Vec<Value> = borrowed
+                .own_keys()
+                .into_iter()
+                .filter(|k| k.as_str().is_some())
                 .filter_map(|k| {
-                    borrowed.property_get(k).map(|desc| {
-                        let key_str = k.display();
-                        new_array_object_from_vec(vec![Value::string(&key_str), desc.value])
+                    borrowed.property_get(&k).filter(|d| d.enumerable).map(|desc| {
+                        new_array_object_from_vec(vec![Value::string(&k.display()), desc.value])
                     })
                 })
                 .collect();
@@ -101,13 +112,12 @@ pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
             ));
         }
     };
+    // `ToPropertyKey`: strings pass through, symbols stay symbols, anything
+    // else is stringified. Computed class members routinely use symbols.
     let key = match &args[1] {
         Value::String(s) => PropertyKey::from_str(s),
-        _ => {
-            return Err(RuntimeError::TypeError(
-                "Object.defineProperty: property key must be a string".to_string(),
-            ));
-        }
+        Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
+        other => PropertyKey::from_str(&other.to_js_string()),
     };
     let desc = &args[2];
 
@@ -121,23 +131,12 @@ pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
             ));
         }
         let desc_val = desc.clone();
+        // Every object kind keeps its own property table, so the descriptor
+        // survives on arrays, functions and prototype objects too — a class
+        // constructor is a `FunctionObject`, and `static get x()` is defined
+        // through exactly this path.
         let mut obj_mut = obj.borrow_mut();
-        let ordinary = obj_mut
-            .as_any_mut()
-            .downcast_mut::<crate::vm::object::OrdinaryObject>();
-        if let Some(ordinary) = ordinary {
-            apply_property_descriptor(ordinary, &key, &desc_val)?;
-        } else {
-            // Non-ordinary object (array/function/…): fall back to the value.
-            let value = desc_obj
-                .borrow()
-                .property_get(&PropertyKey::from_str("value"))
-                .map(|d| d.value)
-                .unwrap_or(Value::Undefined);
-            obj_mut
-                .property_set(key, value)
-                .map_err(RuntimeError::TypeError)?;
-        }
+        apply_property_descriptor(&mut *obj_mut, &key, &desc_val)?;
     }
 
     Ok(Value::Object(Rc::clone(obj)))
@@ -322,13 +321,14 @@ pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 /// Apply a property descriptor object (as consumed by `Object.defineProperty`
-/// and the `properties` argument of `Object.create`).
+/// and the `properties` argument of `Object.create`) to any object kind.
 ///
-/// Only the attributes the descriptor actually mentions are changed; the rest
-/// default to `false` for `configurable`/`enumerable`/`writable`, exactly as
-/// the spec's `ToPropertyDescriptor` requires.
+/// Only the attributes the descriptor actually mentions are changed; the
+/// others keep the value the existing property already has, and default to
+/// `false` for a brand-new property — the ES `[[DefineOwnProperty]]` rule for
+/// a partial descriptor.
 pub fn apply_property_descriptor(
-    obj: &mut crate::vm::object::OrdinaryObject,
+    obj: &mut dyn JSObject,
     key: &PropertyKey,
     desc: &Value,
 ) -> Result<bool, RuntimeError> {
@@ -347,32 +347,66 @@ pub fn apply_property_descriptor(
             .map(|d| d.value)
     };
 
+    // Attributes the descriptor does not mention keep the value they already
+    // have; for a brand-new property they default to `false` (ES `[[DefineOwnProperty]]`
+    // with a partial descriptor).
+    let existing = obj.property_get(key);
+    let current = |pick: fn(&PropertyDescriptor) -> bool| -> bool {
+        existing.as_ref().is_some_and(pick)
+    };
+
     let getter = read("get");
     let setter = read("set");
     if getter.is_some() || setter.is_some() {
-        let mut descriptor = PropertyDescriptor::accessor_descriptor(getter, setter);
-        if let Some(v) = read("enumerable") {
-            descriptor.enumerable = v.to_boolean();
+        // Accessor descriptor. Omitting `get`/`set` preserves the half that is
+        // already installed, so `defineProperty(o, k, {set})` keeps an existing
+        // getter instead of dropping it.
+        let existing_is_accessor = existing
+            .as_ref()
+            .is_some_and(|d| d.getter.is_some() || d.setter.is_some());
+        let mut current_get = if existing_is_accessor {
+            existing.as_ref().and_then(|d| d.getter.clone())
+        } else {
+            None
+        };
+        let mut current_set = if existing_is_accessor {
+            existing.as_ref().and_then(|d| d.setter.clone())
+        } else {
+            None
+        };
+        if let Some(v) = getter {
+            current_get = Some(v);
         }
-        if let Some(v) = read("configurable") {
-            descriptor.configurable = v.to_boolean();
+        if let Some(v) = setter {
+            current_set = Some(v);
         }
+
+        let mut descriptor = PropertyDescriptor::accessor_descriptor(current_get, current_set);
+        descriptor.enumerable = read("enumerable")
+            .map(|v| v.to_boolean())
+            .unwrap_or_else(|| current(|d| d.enumerable));
+        descriptor.configurable = read("configurable")
+            .map(|v| v.to_boolean())
+            .unwrap_or_else(|| current(|d| d.configurable));
         return obj
             .define_property(key.clone(), descriptor)
             .map_err(RuntimeError::TypeError);
     }
 
-    let value = read("value").unwrap_or(Value::Undefined);
+    let value = match read("value") {
+        Some(v) => v,
+        None => existing.as_ref().map(|d| d.value.clone()).unwrap_or(Value::Undefined),
+    };
     let mut descriptor = PropertyDescriptor::data_descriptor(value);
-    if let Some(v) = read("writable") {
-        descriptor.writable = v.to_boolean();
-    }
-    if let Some(v) = read("enumerable") {
-        descriptor.enumerable = v.to_boolean();
-    }
-    if let Some(v) = read("configurable") {
-        descriptor.configurable = v.to_boolean();
-    }
+    descriptor.writable = read("writable")
+        .map(|v| v.to_boolean())
+        .unwrap_or_else(|| current(|d| d.writable));
+    descriptor.enumerable = read("enumerable")
+        .map(|v| v.to_boolean())
+        .unwrap_or_else(|| current(|d| d.enumerable));
+    descriptor.configurable = read("configurable")
+        .map(|v| v.to_boolean())
+        .unwrap_or_else(|| current(|d| d.configurable));
     obj.define_property(key.clone(), descriptor)
         .map_err(RuntimeError::TypeError)
 }

@@ -641,6 +641,12 @@ impl<'a> SSABuilder<'a> {
             Instruction::Arguments { dst } => {
                 SSABuilder::rename_definition(dst, new_versions);
             }
+            Instruction::LoadNewTarget { dst } => {
+                SSABuilder::rename_definition(dst, new_versions);
+            }
+            Instruction::LoadCurrentFunction { dst } => {
+                SSABuilder::rename_definition(dst, new_versions);
+            }
             Instruction::IteratorClose { iter } => {
                 SSABuilder::rename_use(iter, stacks);
             }
@@ -669,6 +675,17 @@ impl<'a> SSABuilder<'a> {
             } => {
                 SSABuilder::rename_definition(dst, new_versions);
                 SSABuilder::rename_use(constructor, stacks);
+                SSABuilder::rename_use(args, stacks);
+            }
+            Instruction::CallSuper {
+                result,
+                callee,
+                this,
+                args,
+            } => {
+                SSABuilder::rename_definition(result, new_versions);
+                SSABuilder::rename_use(callee, stacks);
+                SSABuilder::rename_use(this, stacks);
                 SSABuilder::rename_use(args, stacks);
             }
             Instruction::PropertySet {

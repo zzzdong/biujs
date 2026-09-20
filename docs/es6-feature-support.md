@@ -50,7 +50,7 @@ This engine uses a **static compilation model** with register-based VM:
 | Null literal | ✅ | M0 | `null` |
 | Array literals | ✅ | recent | `[1, 2, 3]` |
 | Object literals | ✅ | recent | `{a: 1, b: 2}` |
-| Template literals | ⚠️ | M1 | Static only (no `${expr}` interpolation) |
+| Template literals | ⚠️ | M1 | Interpolation (`${expr}`) works; tagged templates are basic (no frozen `raw`) |
 
 ### Variables
 
@@ -111,7 +111,8 @@ This engine uses a **static compilation model** with register-based VM:
 |---------|--------|-------|-------|
 | `&&` | ✅ | M1 | Short-circuit |
 | `\|\|` | ✅ | M1 | Short-circuit |
-| `??` | ⚠️ | M1 | Lowered but may be simplified |
+| `??` | ✅ | M2' | Nullish short-circuit (`0 ?? x` is `0`) |
+| `**` / `**=` | ✅ | M2' | Right-associative; unary LHS requires parentheses (parser-enforced) |
 | `!` | ✅ | M1 | |
 | `&`, `\|`, `^`, `<<`, `>>`, `>>>` | ⚠️ | test262 | Parsed + VM, lowering may be simplified |
 
@@ -123,8 +124,8 @@ This engine uses a **static compilation model** with register-based VM:
 | Bracket access (`obj[expr]`) | ✅ | recent | Dynamic property name |
 | Method call (`obj.method()`) | ✅ | recent | Static + dynamic method names |
 | Prototype chain lookup | ✅ | recent | `[[Get]]` via `internal_get` |
-| `in` operator | 🚧 | — | VM opcode exists, stub |
-| `instanceof` | 🚧 | recent | VM opcode implemented, prototype chain traversal working for built-ins |
+| `in` operator | ✅ | M2' | Prototype-chain `[[HasProperty]]` |
+| `instanceof` | ✅ | recent | Prototype chain traversal (`Symbol.hasInstance`: M2' residual) |
 
 ### Function Expressions
 
@@ -144,7 +145,7 @@ This engine uses a **static compilation model** with register-based VM:
 | Sequence (`,`) | ✅ | M1 | |
 | `new` expression | ✅ | recent | Constructor calls with `this` binding |
 | `this` | ✅ | recent | Strict mode only |
-| `delete` | 🚧 | — | Parsed, returns `false` |
+| `delete` | ✅ | M2' | Honours `[[Configurable]]` |
 | `void` | ✅ | M1 | Returns `undefined` |
 
 ---
@@ -190,7 +191,9 @@ This engine uses a **static compilation model** with register-based VM:
 | Object literals | ✅ | recent | |
 | Property read/write | ✅ | recent | |
 | Dynamic property access | ✅ | recent | Bracket notation |
-| Property deletion | 🚧 | — | VM `[[Delete]]` exists |
+| Property deletion | ✅ | M2' | Honours `[[Configurable]]` |
+| Property order | ✅ | M2' | `OrdinaryOwnPropertyKeys`: indices ascending, then strings/symbols in creation order |
+| Computed property names | ✅ | M2' | Object literals and class members, via `Object.defineProperty` |
 | `Object.prototype.toString` | ✅ | recent | Returns `[object ClassName]` |
 | `valueOf()` | ✅ | recent | Returns self |
 | Prototype chain | ✅ | recent | Instances linked via `Builtins` |
@@ -207,9 +210,10 @@ This engine uses a **static compilation model** with register-based VM:
 
 | Feature | Status | Since | Notes |
 |---------|--------|-------|-------|
-| `Object.defineProperty()` | ⚠️ | recent | Basic implementation (simplified descriptor handling) |
-| `Object.getOwnPropertyDescriptor()` | ⚠️ | recent | Basic implementation |
+| `Object.defineProperty()` | ✅ | M2' | Full descriptor on every object kind; partial descriptors merge with the existing property |
+| `Object.getOwnPropertyDescriptor()` | ⚠️ | recent | Basic implementation (symbol keys and bare-function receivers pending M3) |
 | `Object.freeze()` | 🚧 | — | Object trait has methods |
+| `Object.keys/values/entries` | ✅ | M2' | Own enumerable string keys only |
 
 ---
 
@@ -264,10 +268,10 @@ This engine uses a **static compilation model** with register-based VM:
 | Getters / setters | ✅ | M2 | One merged `Object.defineProperty` descriptor per name |
 | `prototype.constructor` back-reference | ✅ | M2 | |
 | `extends` | ✅ | M2 | Prototype created with `Object.create(parent.prototype)`; static inheritance via `setPrototypeOf` |
-| `super()` | ✅ | M2 | Parent constructor resolved at run time from the receiver |
-| `super.method()` / `super.prop` | ⚠️ | M2 | Bound through `Function.prototype.call`; property read uses the parent prototype |
-| `new.target` | ❌ | — | Planned (M2 residual) |
-| Computed method names | ❌ | — | Planned (M2 residual, via `Object.defineProperty`) |
+| `super()` | ✅ | M2' | Resolves the running constructor's own parent; propagates `new.target` |
+| `super.method()` / `super.prop` | ✅ | M2' | Home object recorded per member at class definition, so it is correct at any depth and inside arrows |
+| `new.target` | ✅ | M2' | Per frame: the constructor under `new`, `undefined` otherwise; inherited by arrows; propagated through `super()` |
+| Computed method names | ✅ | M2' | `[expr]() {}`, computed accessors and statics; keys evaluated in source order |
 | Private fields / methods (`#x`) | ❌ | — | Out of scope (ES2022) |
 | Static blocks | ❌ | — | Out of scope (ES2022) |
 
@@ -440,8 +444,8 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 
 | Feature | Milestone |
 |---------|-----------|
-| Computed property names, `new.target`, `**` | M2 residual |
 | Well-known symbols (`toStringTag`, `toPrimitive`, `hasInstance`, `species`) | M2 residual |
+| Tagged templates (tag invocation + strings array) | M2 residual |
 | Built-ins: Object / Array / String / Number / Math / Function / Error completeness | M3 |
 | `JSON`, `Date` | M3 |
 | Generators (`function*`) and full iterator close semantics | M4 |
@@ -453,9 +457,9 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 
 | Test Suite | Count |
 |------------|-------|
-| Unit tests (value, vm, etc.) | 188 |
-| Feature integration test files | 17 |
-| test262 executed / passing | 10240 / 3901 |
+| Unit tests (value, vm, etc.) | 190 |
+| Feature integration test files | 19 |
+| test262 executed / passing | measured per milestone (report absolute count) |
 
 ---
 

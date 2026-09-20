@@ -331,6 +331,14 @@ pub enum Instruction {
         this: Value,
         args: Value,
     },
+    /// `super(...)`: a call whose callee frame inherits the caller's
+    /// `new.target` (ES `SuperCall` → `Construct(func, args, newTarget)`).
+    CallSuper {
+        result: Value,
+        callee: Value,
+        this: Value,
+        args: Value,
+    },
     /// `new` with a dynamic argument list taken from an array value.
     NewSpread {
         dst: Value,
@@ -397,6 +405,16 @@ pub enum Instruction {
         args: Vec<Value>,
     },
     LoadThis {
+        dst: Value,
+    },
+    /// Read the current frame's `new.target` (undefined for a plain call).
+    LoadNewTarget {
+        dst: Value,
+    },
+    /// Read the function object whose body is running (the VM's active frame
+    /// callee). `super` uses it to find the home object recorded on the class
+    /// member at definition time.
+    LoadCurrentFunction {
         dst: Value,
     },
     MakeFuncObj {
@@ -543,6 +561,12 @@ impl Instruction {
                 this,
                 args,
             } => (vec![*result], vec![*callee, *this, *args]),
+            Instruction::CallSuper {
+                result,
+                callee,
+                this,
+                args,
+            } => (vec![*result], vec![*callee, *this, *args]),
             Instruction::NewSpread {
                 dst,
                 constructor,
@@ -596,6 +620,8 @@ impl Instruction {
                 (vec![*dst], used)
             }
             Instruction::LoadThis { dst } => (vec![*dst], vec![]),
+            Instruction::LoadNewTarget { dst } => (vec![*dst], vec![]),
+            Instruction::LoadCurrentFunction { dst } => (vec![*dst], vec![]),
             Instruction::MakeFuncObj { dst, func_id } => (vec![*dst], vec![*func_id]),
             Instruction::MakeArrowFuncObj {
                 dst,
@@ -761,6 +787,14 @@ impl std::fmt::Display for Instruction {
             } => {
                 write!(f, "{result} = call_spread {callee}, {this}, {args}")
             }
+            Instruction::CallSuper {
+                result,
+                callee,
+                this,
+                args,
+            } => {
+                write!(f, "{result} = call_super {callee}, {this}, {args}")
+            }
             Instruction::NewSpread {
                 dst,
                 constructor,
@@ -878,6 +912,12 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::LoadThis { dst } => {
                 write!(f, "{dst} = load_this")
+            }
+            Instruction::LoadNewTarget { dst } => {
+                write!(f, "{dst} = load_new_target")
+            }
+            Instruction::LoadCurrentFunction { dst } => {
+                write!(f, "{dst} = load_current_function")
             }
             Instruction::MakeFuncObj { dst, func_id } => {
                 write!(f, "{dst} = make_func_obj {func_id}")
