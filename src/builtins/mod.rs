@@ -112,6 +112,11 @@ pub fn global_parse_float(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 pub use string::string_constructor;
 pub use symbol::symbol_constructor;
+pub use symbol::{
+    HAS_INSTANCE_SYMBOL_ID, SPECIES_SYMBOL_ID, SYMBOL_DESCRIPTION_NATIVE, TO_PRIMITIVE_SYMBOL_ID,
+    TO_STRING_TAG_SYMBOL_ID, has_instance_symbol_key, register_symbol_value, symbol_description,
+    symbol_value_by_id, to_primitive_symbol_key, to_string_tag_symbol_key,
+};
 
 // ─────────────────────────────────────────────────────────
 // Builtins registry
@@ -286,28 +291,49 @@ impl Builtins {
         Self::link_constructor_prototype(&symbol_fn_val, &self.symbol_prototype);
 
         // Well-known symbols (ES6 §19.4.2): `Symbol.iterator` is required by
-        // the iteration protocol; the others are registered so property
-        // lookups on user code don't break.
+        // the iteration protocol; `toPrimitive` / `toStringTag` / `hasInstance`
+        // are honoured by `ToPrimitive`, `Object.prototype.toString` and
+        // `instanceof`; the rest are registered for property lookups.
         // The *properties of the Symbol constructor* are string-keyed
         // (`Symbol.iterator` reads the "iterator" property); their VALUES are
         // the well-known symbol values used as property keys elsewhere.
-        let well_known: [(&str, u64, &str); 6] = [
+        let well_known: [(&str, u64, &str); 15] = [
             ("iterator", crate::vm::iterator::ITERATOR_SYMBOL_ID, "Symbol.iterator"),
             ("asyncIterator", 0xFFFF_FFFF_FFFF_0001, "Symbol.asyncIterator"),
-            ("hasInstance", 0xFFFF_FFFF_FFFF_0002, "Symbol.hasInstance"),
-            ("isConcatSpreadable", 0xFFFF_FFFF_FFFF_0003, "Symbol.isConcatSpreadable"),
-            ("toPrimitive", 0xFFFF_FFFF_FFFF_0004, "Symbol.toPrimitive"),
-            ("toStringTag", 0xFFFF_FFFF_FFFF_0005, "Symbol.toStringTag"),
+            ("hasInstance", symbol::HAS_INSTANCE_SYMBOL_ID, "Symbol.hasInstance"),
+            ("isConcatSpreadable", symbol::IS_CONCAT_SPREADABLE_SYMBOL_ID, "Symbol.isConcatSpreadable"),
+            ("toPrimitive", symbol::TO_PRIMITIVE_SYMBOL_ID, "Symbol.toPrimitive"),
+            ("toStringTag", symbol::TO_STRING_TAG_SYMBOL_ID, "Symbol.toStringTag"),
+            ("species", symbol::SPECIES_SYMBOL_ID, "Symbol.species"),
+            ("unscopables", 0xFFFF_FFFF_FFFF_0007, "Symbol.unscopables"),
+            ("match", 0xFFFF_FFFF_FFFF_0008, "Symbol.match"),
+            ("matchAll", 0xFFFF_FFFF_FFFF_0009, "Symbol.matchAll"),
+            ("replace", 0xFFFF_FFFF_FFFF_000A, "Symbol.replace"),
+            ("search", 0xFFFF_FFFF_FFFF_000B, "Symbol.search"),
+            ("split", 0xFFFF_FFFF_FFFF_000C, "Symbol.split"),
+            ("dispose", 0xFFFF_FFFF_FFFF_000D, "Symbol.dispose"),
+            ("asyncDispose", 0xFFFF_FFFF_FFFF_000E, "Symbol.asyncDispose"),
         ];
         if let Value::Object(symbol_obj) = &symbol_fn_val {
             for (name, id, description) in well_known {
-                let _ = symbol_obj.borrow_mut().property_set(
-                    PropertyKey::from_str(name),
-                    Value::Symbol(Rc::new(crate::vm::value::SymbolData::new(
-                        Some(description.to_string()),
-                        id,
-                    ))),
-                );
+                let symbol = Value::Symbol(Rc::new(crate::vm::value::SymbolData::new(
+                    Some(description.to_string()),
+                    id,
+                )));
+                symbol::register_symbol_value(&symbol);
+                // Well-known symbols are non-writable, non-enumerable and
+                // non-configurable (ES 19.4.2.1).
+                let desc = PropertyDescriptor {
+                    value: symbol,
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    getter: None,
+                    setter: None,
+                };
+                let _ = symbol_obj
+                    .borrow_mut()
+                    .define_property(PropertyKey::from_str(name), desc);
             }
         }
         globals.insert("Symbol".to_string(), symbol_fn_val);
@@ -410,6 +436,7 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
         "Object.getPrototypeOf" => object::object_get_prototype_of(args),
         "Object.setPrototypeOf" => object::object_set_prototype_of(args),
         "Object.getOwnPropertyNames" => object::object_get_own_property_names(args),
+        "Object.getOwnPropertySymbols" => object::object_get_own_property_symbols(args),
         "Object.getOwnPropertyDescriptor" => object::object_get_own_property_descriptor(args),
         "Object.hasOwn" => object::object_has_own(args),
         "Object.is" => object::object_is(args),

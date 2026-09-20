@@ -158,11 +158,8 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
     };
     let key = match &args[1] {
         Value::String(s) => PropertyKey::from_str(s),
-        _ => {
-            return Err(RuntimeError::TypeError(
-                "Object.getOwnPropertyDescriptor: property key must be a string".to_string(),
-            ));
-        }
+        Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
+        other => PropertyKey::from_str(&other.to_js_string()),
     };
 
     let borrowed = obj.borrow();
@@ -222,12 +219,37 @@ pub fn object_get_own_property_names(args: &[Value]) -> Result<Value, RuntimeErr
     match &args[0] {
         Value::Object(obj_ref) => {
             let borrowed = obj_ref.borrow();
-            let keys = borrowed.own_keys();
-            let str_keys: Vec<Value> = keys.iter().map(|k| Value::string(&k.display())).collect();
+            // String-keyed own properties only (symbols are reported by
+            // `Object.getOwnPropertySymbols`).
+            let str_keys: Vec<Value> = borrowed
+                .own_keys()
+                .into_iter()
+                .filter_map(|k| k.as_str().map(|s| Value::string(s)))
+                .collect();
             Ok(new_array_object_from_vec(str_keys))
         }
         _ => Ok(new_array_object_from_vec(vec![])),
     }
+}
+
+/// `Object.getOwnPropertySymbols(obj)` — own symbol-keyed properties, in
+/// creation order.
+pub fn object_get_own_property_symbols(args: &[Value]) -> Result<Value, RuntimeError> {
+    let Some(Value::Object(obj_ref)) = args.first() else {
+        return Err(RuntimeError::TypeError(
+            "Object.getOwnPropertySymbols called on non-object".to_string(),
+        ));
+    };
+    let symbols: Vec<Value> = obj_ref
+        .borrow()
+        .own_keys()
+        .into_iter()
+        .filter_map(|k| match k {
+            PropertyKey::Symbol(id) => Some(crate::builtins::symbol_value_by_id(id)),
+            _ => None,
+        })
+        .collect();
+    Ok(new_array_object_from_vec(symbols))
 }
 
 pub fn object_get_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -594,6 +616,9 @@ pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins) {
     });
     set_static_method(object_fn, "getOwnPropertyNames", |args| {
         object_get_own_property_names(args)
+    });
+    set_static_method(object_fn, "getOwnPropertySymbols", |args| {
+        object_get_own_property_symbols(args)
     });
     set_static_method(object_fn, "getPrototypeOf", |args| {
         object_get_prototype_of(args)

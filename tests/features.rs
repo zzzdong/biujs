@@ -45,3 +45,5 @@ mod stack_overflow;
 mod symbol_test;
 #[path = "features/variables.rs"]
 mod variables;
+#[path = "features/well_known_symbols.rs"]
+mod well_known_symbols;

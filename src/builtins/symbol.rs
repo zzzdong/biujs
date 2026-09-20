@@ -19,6 +19,67 @@ thread_local! {
     static SYMBOL_REGISTRY: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
+// ─────────────────────────────────────────────────────────
+// Well-known symbols (ES 19.4.2.1)
+// ─────────────────────────────────────────────────────────
+
+/// Ids of the well-known symbols. They live just below `u64::MAX` so they can
+/// never collide with the runtime counter (`SYMBOL_COUNTER` starts at 1), and
+/// every subsystem can name the symbol it needs instead of repeating a literal.
+///
+/// `Symbol.iterator` is defined in `vm::iterator` (the iteration protocol was
+/// the first consumer); the rest live here, next to the Symbol builtin.
+pub const HAS_INSTANCE_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0002;
+pub const IS_CONCAT_SPREADABLE_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0003;
+pub const TO_PRIMITIVE_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0004;
+pub const TO_STRING_TAG_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0005;
+pub const SPECIES_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0006;
+
+/// `Symbol.toPrimitive` as a property key.
+pub fn to_primitive_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(TO_PRIMITIVE_SYMBOL_ID)
+}
+
+/// `Symbol.toStringTag` as a property key.
+pub fn to_string_tag_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(TO_STRING_TAG_SYMBOL_ID)
+}
+
+/// `Symbol.hasInstance` as a property key.
+pub fn has_instance_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(HAS_INSTANCE_SYMBOL_ID)
+}
+
+// ─────────────────────────────────────────────────────────
+// Symbol value registry
+// ─────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Every symbol value ever created, keyed by id.
+    ///
+    /// A `PropertyKey::Symbol` only carries the id, so recovering the *value*
+    /// (with its description) for `Object.getOwnPropertySymbols` and symbol
+    /// property iteration needs this lookup.
+    static SYMBOL_VALUES: RefCell<HashMap<u64, Value>> = RefCell::new(HashMap::new());
+}
+
+/// Remember a freshly created symbol so [`symbol_value_by_id`] can find it.
+pub fn register_symbol_value(value: &Value) {
+    if let Value::Symbol(sym) = value {
+        SYMBOL_VALUES.with(|values| {
+            values.borrow_mut().insert(sym.id, value.clone());
+        });
+    }
+}
+
+/// The symbol value with `id`, falling back to a description-less symbol when
+/// the value predates the registry.
+pub fn symbol_value_by_id(id: u64) -> Value {
+    SYMBOL_VALUES
+        .with(|values| values.borrow().get(&id).cloned())
+        .unwrap_or_else(|| Value::Symbol(Rc::new(SymbolData::new(None, id))))
+}
+
 /// Get reference to the global symbol registry
 fn with_registry<F, R>(f: F) -> R
 where
@@ -53,9 +114,10 @@ pub fn symbol_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 
     // Create Symbol value
     let symbol_data = SymbolData::new(description, id);
-    Ok(Value::Symbol(Rc::new(symbol_data)))
+    let symbol = Value::Symbol(Rc::new(symbol_data));
+    register_symbol_value(&symbol);
+    Ok(symbol)
 }
-
 /// Symbol.for(key) - returns a Symbol from the global registry
 pub fn symbol_for(args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
@@ -92,6 +154,7 @@ pub fn symbol_for(args: &[Value]) -> Result<Value, RuntimeError> {
         let id = SYMBOL_COUNTER.fetch_add(1, Ordering::SeqCst);
         let symbol_data = SymbolData::new(Some(key.clone()), id);
         let symbol = Value::Symbol(Rc::new(symbol_data));
+        register_symbol_value(&symbol);
 
         registry.borrow_mut().insert(key, symbol.clone());
 
@@ -131,49 +194,50 @@ pub fn symbol_key_for(args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
-/// Register Symbol prototype methods
+/// Native name of the `Symbol.prototype.description` getter, dispatched by the
+/// VM in `call_native_by_name`.
+pub const SYMBOL_DESCRIPTION_NATIVE: &str = "__symbol_description__";
+
+/// Register Symbol prototype methods.
+///
+/// `toString` / `valueOf` are registered as *callable* natives (not as
+/// descriptive strings) so that `Symbol.prototype.toString.call(sym)` works;
+/// the VM's `call_prototype_method` performs the actual conversion.
 pub fn register_symbol_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
-    // Symbol.prototype.toString()
-    let to_string_desc = PropertyDescriptor {
-        value: Value::String(Rc::new("function toString() { [native code] }".to_string())),
-        writable: true,
-        enumerable: false,
-        configurable: true,
-        getter: None,
-        setter: None,
-    };
-    proto.borrow_mut().property_set(
-        PropertyKey::from_str("toString"),
-        to_string_desc.value.clone(),
-    );
+    use crate::builtins::mark_prototype_method;
 
-    // Symbol.prototype.valueOf()
-    let value_of_desc = PropertyDescriptor {
-        value: Value::String(Rc::new("function valueOf() { [native code] }".to_string())),
-        writable: true,
-        enumerable: false,
-        configurable: true,
-        getter: None,
-        setter: None,
-    };
-    proto.borrow_mut().property_set(
-        PropertyKey::from_str("valueOf"),
-        value_of_desc.value.clone(),
-    );
+    mark_prototype_method(proto, "toString");
+    mark_prototype_method(proto, "valueOf");
 
-    // Symbol.prototype.description (getter)
+    // `Symbol.prototype.description` is an accessor: the getter unwraps the
+    // symbol and returns its description (or undefined).
+    let getter = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+        SYMBOL_DESCRIPTION_NATIVE,
+    ))));
     let description_desc = PropertyDescriptor {
         value: Value::Undefined,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+        getter: Some(getter),
+        setter: None,
+    };
+    let _ = proto
+        .borrow_mut()
+        .define_property(PropertyKey::from_str("description"), description_desc);
+
+    // `Symbol.prototype[Symbol.toStringTag] === "Symbol"`.
+    let tag_desc = PropertyDescriptor {
+        value: Value::string("Symbol"),
         writable: false,
         enumerable: false,
         configurable: true,
         getter: None,
         setter: None,
     };
-    proto.borrow_mut().property_set(
-        PropertyKey::from_str("description"),
-        description_desc.value.clone(),
-    );
+    let _ = proto
+        .borrow_mut()
+        .define_property(to_string_tag_symbol_key(), tag_desc);
 }
 
 /// Register Symbol static methods

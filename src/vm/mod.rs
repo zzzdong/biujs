@@ -298,12 +298,11 @@ impl VM {
         }
     }
 
-    /// ES `OrdinaryToPrimitive` (https://tc39.es/ecma262/#sec-ordinarytoprimitive).
+    /// ES `ToPrimitive` (https://tc39.es/ecma262/#sec-toprimitive).
     ///
-    /// Returns the primitive value of `val`. Objects are converted by calling
-    /// `valueOf()` then `toString()` (or `Symbol.toPrimitive` when present) and
-    /// returning the first result that is a primitive. This replaces the previous
-    /// fallback that simply stringified objects.
+    /// Returns the primitive value of `val`. An object with
+    /// `Symbol.toPrimitive` converts through it; otherwise `valueOf()` and
+    /// `toString()` are tried in hint order and the first primitive wins.
     pub fn to_primitive(
         &mut self,
         val: &Value,
@@ -312,6 +311,29 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         if !val.is_object() {
             return Ok(val.clone());
+        }
+
+        // ES 7.1.1 ToPrimitive step 2: an object with `Symbol.toPrimitive`
+        // converts through that method instead of OrdinaryToPrimitive, and a
+        // non-primitive result is a TypeError (no fallback to valueOf/toString).
+        let exotic = self.get_member(
+            val,
+            &crate::builtins::to_primitive_symbol_key(),
+            module,
+        )?;
+        if !exotic.is_undefined() {
+            if !exotic.is_callable() {
+                return Err(RuntimeError::TypeError(
+                    "Symbol.toPrimitive is not a function".to_string(),
+                ));
+            }
+            let result = self.invoke(&exotic, val.clone(), &[Value::string(hint)], module)?;
+            if result.is_object() {
+                return Err(RuntimeError::TypeError(
+                    "Cannot convert object to primitive value".to_string(),
+                ));
+            }
+            return Ok(result);
         }
 
         // OrdinaryToPrimitive: call `valueOf()` then `toString()` (or the reverse
@@ -564,6 +586,30 @@ impl VM {
         Ok(rv)
     }
 
+    /// ES 19.1.3.6 `Object.prototype.toString`.
+    ///
+    /// A string-valued `Symbol.toStringTag` takes precedence over the built-in
+    /// class tag (`[object Array]`, `[object Function]`, …). Non-string tags are
+    /// ignored, as the spec requires.
+    fn object_prototype_to_string(
+        &mut self,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        if !matches!(this, Value::Undefined | Value::Null) {
+            let tag = self.get_member(
+                this,
+                &crate::builtins::to_string_tag_symbol_key(),
+                module,
+            )?;
+            if let Value::String(tag) = tag {
+                return Ok(Value::string(&format!("[object {tag}]")));
+            }
+        }
+        crate::builtins::object_prototype_to_string(this, args)
+    }
+
     /// Dispatch a built-in by name, honouring prototype methods.
     ///
     /// `set_prototype_method` registers prototype methods under the synthetic
@@ -577,11 +623,22 @@ impl VM {
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
-            return crate::builtins::object_prototype_to_string(&this, args);
+            return self.object_prototype_to_string(&this, args, module);
+        }
+        // `Symbol.prototype.description` getter: unwrap the receiver.
+        if name == crate::builtins::SYMBOL_DESCRIPTION_NATIVE {
+            return crate::builtins::symbol_description(&this);
         }
         // `Symbol.iterator` factory: returns an internal iterator over `this`.
         if name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
             return self.make_iterator(this, module);
+        }
+        // `String(value)` is ToString(value): an object converts through
+        // ToPrimitive (hint "string"), which can run user code, so it has to
+        // happen here rather than in the builtin layer.
+        if name == "String" && args.len() == 1 {
+            let primitive = self.to_primitive(&args[0], "string", module)?;
+            return Ok(Value::string(&primitive.to_js_string()));
         }
         // Per-iterator `next()` / `return()` methods.
         if let Some(id) = name.strip_prefix(crate::vm::iterator::ITERATOR_NEXT_PREFIX) {
@@ -1159,37 +1216,62 @@ impl VM {
                 // (single, stable) `prototype` object is reachable.
                 let ctor = self.as_object_value(&ctor);
 
-                let result = match ctor {
-                    Value::Object(ctor_ref) => {
-                        let ctor_proto = ctor_ref
-                            .borrow()
-                            .property_get(&PropertyKey::from("prototype"));
-                        match ctor_proto {
-                            Some(desc) => {
-                                let target_proto = desc.value;
-                                // Walk the object's prototype chain
-                                let mut current = match &obj {
-                                    Value::Object(obj_ref) => obj_ref.borrow().get_prototype(),
-                                    _ => None,
-                                };
-                                let mut found = false;
-                                while let Some(proto_ref) = current {
-                                    if Value::Object(Rc::clone(&proto_ref)) == target_proto {
-                                        found = true;
-                                        break;
-                                    }
-                                    current = proto_ref.borrow().get_prototype();
-                                }
-                                found
-                            }
-                            None => false,
+                // ES 12.10.4: a callable `@@hasInstance` on the right-hand side
+                // replaces the ordinary prototype-chain check. The arm must not
+                // return early — `run_instruction` advances the PC at its end.
+                let mut exotic_result: Option<bool> = None;
+                if ctor.is_object() {
+                    let has_instance = self.get_member(
+                        &ctor,
+                        &crate::builtins::has_instance_symbol_key(),
+                        module,
+                    )?;
+                    if !has_instance.is_undefined() {
+                        if !has_instance.is_callable() {
+                            return Err(RuntimeError::TypeError(
+                                "Symbol.hasInstance is not a function".to_string(),
+                            ));
                         }
+                        let result =
+                            self.invoke(&has_instance, ctor.clone(), &[obj.clone()], module)?;
+                        exotic_result = Some(result.to_boolean());
                     }
-                    _ => {
-                        return Err(RuntimeError::TypeError(format!(
-                            "Right-hand side of 'instanceof' is not callable"
-                        )));
-                    }
+                }
+
+                let result = match exotic_result {
+                    Some(found) => found,
+                    None => match ctor {
+                        Value::Object(ctor_ref) => {
+                            let ctor_proto = ctor_ref
+                                .borrow()
+                                .property_get(&PropertyKey::from("prototype"));
+                            match ctor_proto {
+                                Some(desc) => {
+                                    let target_proto = desc.value;
+                                    // Walk the object's prototype chain
+                                    let mut current = match &obj {
+                                        Value::Object(obj_ref) => obj_ref.borrow().get_prototype(),
+                                        _ => None,
+                                    };
+                                    let mut found = false;
+                                    while let Some(proto_ref) = current {
+                                        if Value::Object(Rc::clone(&proto_ref)) == target_proto {
+                                            found = true;
+                                            break;
+                                        }
+                                        current = proto_ref.borrow().get_prototype();
+                                    }
+                                    found
+                                }
+                                None => false,
+                            }
+                        }
+                        _ => {
+                            return Err(RuntimeError::TypeError(
+                                "Right-hand side of 'instanceof' is not callable".to_string(),
+                            ));
+                        }
+                    },
                 };
 
                 self.set_value(operands[0], Value::Bool(result))?;
@@ -1775,6 +1857,14 @@ impl VM {
                             let proto = native_fn.1;
                             drop(borrowed);
 
+                            // `Symbol` is callable but not a constructor
+                            // (ES 19.4.1.1).
+                            if name == "Symbol" {
+                                return Err(RuntimeError::TypeError(
+                                    "Symbol is not a constructor".to_string(),
+                                ));
+                            }
+
                             // Get arguments from the stack (args were pushed in reverse order)
                             let mut args = Vec::with_capacity(arg_count);
                             for i in 0..arg_count {
@@ -2026,7 +2116,16 @@ impl VM {
                         args.push(self.state.raw_stack_value(index));
                     }
 
-                    match crate::builtins::call_native(&name, &args) {
+                    // `String(value)` is ToString(value): objects convert
+                    // through ToPrimitive (hint "string"), which can call user
+                    // code, so it must run in the VM rather than as a native.
+                    let result = if name == "String" && args.len() == 1 {
+                        let primitive = self.to_primitive(&args[0], "string", module)?;
+                        Ok(Value::string(&primitive.to_js_string()))
+                    } else {
+                        crate::builtins::call_native(&name, &args)
+                    };
+                    match result {
                         Ok(result) => {
                             self.state.set_register(Register::Rv, result)?;
                         }
@@ -2590,10 +2689,12 @@ impl VM {
                         .map(|c| Value::string(&c.to_string()))
                         .unwrap_or(Value::Undefined));
                 }
-                self.lookup_on_prototype(&self.primitive_prototype(obj), key)
+                let proto = self.primitive_prototype(obj);
+                self.get_from_prototype(obj, &proto, key, module)
             }
             Value::Number(_) | Value::Bool(_) | Value::Symbol(_) => {
-                self.lookup_on_prototype(&self.primitive_prototype(obj), key)
+                let proto = self.primitive_prototype(obj);
+                self.get_from_prototype(obj, &proto, key, module)
             }
             Value::Undefined => Err(RuntimeError::TypeError(format!(
                 "Cannot read properties of undefined (reading '{}')",
@@ -2604,6 +2705,34 @@ impl VM {
                 key.display()
             ))),
         }
+    }
+
+    /// [[Get]] on a primitive receiver: the property lives on the wrapper's
+    /// prototype, and an accessor has to run with the *primitive* as `this`
+    /// (`Symbol.prototype.description`, `"x".length` is handled by the caller).
+    fn get_from_prototype(
+        &mut self,
+        receiver: &Value,
+        proto: &Option<Rc<RefCell<dyn JSObject>>>,
+        key: &PropertyKey,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let Some(proto_ref) = proto else {
+            return Ok(Value::Undefined);
+        };
+        if let Some((_owner, desc)) =
+            crate::vm::prototype::find_descriptor(Rc::clone(proto_ref), key)
+                .map_err(RuntimeError::TypeError)?
+        {
+            if desc.is_accessor_descriptor() {
+                return match desc.getter {
+                    Some(getter) => self.invoke(&getter, receiver.clone(), &[], module),
+                    None => Ok(Value::Undefined),
+                };
+            }
+            return Ok(desc.value);
+        }
+        Ok(Value::Undefined)
     }
 
     fn lookup_on_prototype(
