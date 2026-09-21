@@ -1,8 +1,8 @@
 # ES6 一致性计划（M2 收尾 → M6）
 
-> **日期**：2026-09-20（初版）；2026-09-21 更新 —— M2' 完成、M3-B1 首批交付（见 §2.1b/§2.2b）
+> **日期**：2026-09-20（初版）；2026-09-21 更新 —— M2' 完成、M3-B1 首批交付（见 §2.1b/§2.2b）；2026-09-21 二批 —— M3-B1 收尾（ToObject 装箱、描述符校验、数组元素访问器、Object.assign 下沉 VM），见 §2.1c/§2.2c；2026-09-21 三批 —— SEH 跨帧展开修复（见 §2.1d）；2026-09-22 四批 —— M3-B2 首批（Array 回调方法泛型化、indexOf/lastIndexOf 分派、String.prototype.indexOf 补齐），见 §2.1e
 > **目标来源**：`README.md:3-4` —— *"A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6** features but without `eval` or eval-like features or `with` statement."*
-> **基线**：test262 **3908 / 10240**（38.16% 通过，6332 失败，14432 跳过）；单元测试 190；feature 集成 17 个文件；runner 启用 89 个套件
+> **基线**：test262 **6015 / 10366**（58.03% 通过，4351 失败，14441 跳过；M3-B2 首批后）；单元测试 190；feature 集成 25 个文件；runner 启用 89 个套件
 > **上一阶段**：M1（迭代器 / for-of / 解构 / 展开 / 模板 / 默认参数）与 M2（class：静态成员、访问器、extends/super、public 字段）已交付
 
 ---
@@ -98,6 +98,102 @@ M2' 验收：三项从跳过表移除（`exponentiation`、`nullish-coalescing` 
 | 单元测试 | 190 | 190（全绿） |
 | feature 集成测试 | 17 个文件 | 22 个文件（308 条断言，5 条既有 `return_in_try_finally` 失败） |
 
+### 2.1c M3-B1 二批（2026-09-21）
+
+> 注：本轮重建了 test262 子模块（钉在 `7e115f46`），分母由 10365 → 10366，个别套件计数与上表 ±1~6。
+
+交付内容（提交前逐套件实测，`git stash` 双向对比确认零回退）：
+
+| 项 | 内容 |
+|----|------|
+| ToObject / 装箱包装 | 新增 `PrimitiveWrapperObject`（vm/object.rs）：`Object(value)` 按规范装箱原始值，包装对象原型经 thread-local 注册表取 `Number/String/Boolean/Symbol.prototype`；`Value::to_number` / `to_js_string`、`valueOf`/`toString` 派发、`Symbol.prototype.description` 均对包装对象解包 |
+| `[[DefineOwnProperty]]` 校验 | `OrdinaryObject::define_property` 实现 ES 6.1.7.3 校验半部（`same_value` + `validate_property_redefinition`）：非可配置属性允许同值重定义与 `writable true→false`，拒绝值变更/属性种类切换；`freeze`/`seal` 现在同步修改描述符 |
+| 数组元素访问器 | `ArrayObject`：索引键的非默认描述符/访问器存入属性表（`holes` 集合 + 密集槽中性化），`length` 可写性可被 `defineProperty` 冻结；`shift/unshift/splice/reverse/sort` 丢弃索引键覆盖项；`delete` 改为洞语义 |
+| `Object.assign` 下沉 VM | `VM::object_assign`：真 `[[Get]]`/`[[Set]]`（source 的 own 访问器会执行、target 的 setter/只读属性生效），target/source 走 ToObject；`CallMethod` 与 `call_native_by_name` 两条派发路径均接入 |
+| 描述符长尾 | `defineProperties`/`create` 的 properties 只取 own **enumerable** 键；`getOwnPropertyDescriptor`/`getOwnPropertyNames` 支持 ToObject（字符串原始值给出索引键与 `length`） |
+
+定向套件通过数（同一命令、同一机器）：
+
+| 套件 | 一批后 | 二批后 |
+|------|--------|--------|
+| `built-ins/Object` | 1465 | **1838**（+373） |
+| `built-ins/Array` | 884 | **926**（+42） |
+| `built-ins/String` | 346 | 348（+2） |
+| `built-ins/Symbol` | 17 | 18（子模块更新后与基线持平） |
+
+**全量复测（2026-09-21，二批后）**：
+
+| 指标 | 一批后 | 二批后 |
+|------|--------|--------|
+| test262 已执行 | 10365 | 10366 |
+| 通过 | 4611 | **5035**（+424） |
+| 失败 | 5754 | 5331 |
+| 通过率（已执行） | 44.49% | **48.57%** |
+| 单元测试 | 190 | 190（全绿） |
+| feature 集成测试 | 308 条断言 | `object_builtins.rs` 新增 7 个用例 / 18 条断言（仍 5 条既有 `return_in_try_finally` 失败） |
+
+**本轮发现的既有缺陷（非本批引入，已登记 §2.3）**：间接调用（闭包先存变量/传参再调用）抛出的原生 `RuntimeError` 不会被外层 JS `try/catch` 捕获，且异常路径疑似伴随数据栈泄漏（`Symbol/keyFor/arg-non-symbol.js` 全文件执行出现 `RangeError: stack overflow`；`git stash` 在基线复现同样失败）。→ **已在三批修复（§2.1d）**。
+
+### 2.1d M3-B1 三批：SEH 跨帧展开（2026-09-21）
+
+**缺陷**：JS 帧内的 `try` 看不到更深层帧抛出的规范错误。最小复现（`git stash` 确认基线同样失败）：
+
+```js
+function f(g) { try { g(); return 'nothrow'; } catch (e) { return 'caught'; } }
+f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸到顶层
+```
+
+**根因**（`src/vm/mod.rs`）：
+1. `SehRecord` 只记录 `rsp`/`rbp`，**不记录调用帧深度**。`handle_throw` 分派到外层 handler 时，中间帧的返回地址仍在 `ctrl_stack` 上，handler 执行完毕后的 `Ret` 弹出的是**抛出函数的**返回地址，控制流回到 `try` 体、再次抛出，直到 SEH 记录耗尽（`Symbol/keyFor/arg-non-symbol.js` 因此把数据栈推到 `RangeError: stack overflow`）。
+2. Rust 驱动的调用（`invoke_with_new_target` / `invoke_construct`，用于原生回调、`call`/`apply`、原生里的 `new`）各自跑一个嵌套循环；异常若在**循环之外**的帧里被处理，嵌套循环会继续执行外层代码，随后 `invoke` 又恢复现场并重复执行（如 `Array.prototype.forEach` 回调抛错）。
+3. `invoke_*` 在 `outcome?` 之后再恢复现场，异常路径的现场从未回滚。
+
+**修复**：
+1. `SehRecord` 增加 `saved_ctrl_depth` / `saved_this_depth` / `saved_construct_depth` / `saved_new_target_depth`（`saved_closure_depth` 原本已记录但从未使用）；`Opcode::Try` 时一并写入。
+2. 新增 `VM::unwind_frames_to(...)`：`handle_throw` 分派（catch 或 finally）前按记录截断 `ctrl_stack`、`this_stack`/`function_stack`/`frame_argc`、`construct_stack`、`new_target_stack`、`closure_var_stack`，并逐层恢复 `this_val`/`function_val` —— handler 运行在**自己的帧**里。
+3. 新增 `VM::invoke_boundaries`：Rust 驱动调用入栈当前 `ctrl_stack` 深度；`handle_throw` 若发现目标记录的 `saved_ctrl_depth <= boundary`（handler 在该调用之外），改为返回 `RuntimeError::Thrown` 让其向外传播，使原生（如 `forEach`）能中止自身工作；外层 `step` 再转为 JS 异常并分派。
+4. `invoke_*` 改为**先恢复调用者上下文再传播**错误。
+
+**效果**（逐套件实测，无一套件下降）：
+
+| 套件 | 二批后 | 三批后 |
+|------|--------|--------|
+| `built-ins/Object` | 1838 | **2025**（+187） |
+| `built-ins/Array` | 926 | **1028**（+102） |
+| `built-ins/Function` | 83 | **151**（+68） |
+| `built-ins/String` | 348 | 365（+17） |
+| `language/statements/class` | 42 | 50（+8） |
+| `built-ins/Symbol` | 18 | 22（+4） |
+| `language/statements/for-of` | 13 | 17（+4） |
+| `language/expressions/addition` | 30 | 33（+3） |
+| `built-ins/Error` | 5 | 7（+2） |
+
+**全量复测（三批后）**：已执行 10366，通过 **5489**（+454），失败 4877，通过率 **52.95%**（48.57% →）；单元 190 全绿；feature 320 条（新增 `tests/features/exception_unwinding.rs`：6 个用例 / 11 条断言；仍 5 条既有 `return_in_try_finally` 失败）。
+
+**残留（既有、非本次引入）**：`try/catch/finally` 的代码生成让 finally 块执行两次（异常路径一次、catch 结束后落入内联 finally 再一次），顶层与跨帧同现；跨帧场景本次反而由 `fcff` 收敛为 `fcf`。另立技术债（§2.3）。
+
+### 2.1e M3-B2 首批：Array 回调方法泛型化 + indexOf 分派（2026-09-22）
+
+**起点**：`built-ins/Array` 失败 1756，其中 `prototype` 占 1658；回调类方法（`reduce`/`reduceRight`/`filter`/`map`/`some`/`every`/`indexOf`/`lastIndexOf`/`forEach`）合计约 1000 例，典型失败是 `TypeError: unknown prototype method: filter` —— `try_array_callback_method` 的 `array_like_elements` 只认真实数组与字符串，泛型（array-like）接收者直接落回普通派发。
+
+**交付**：
+1. 新增 `VM::array_like_entries`（洞感知）：原始值接收者先 ToObject 装箱；`length` 与各索引键经**原型链 `[[Get]]`** 读取（因此 `Boolean.prototype[0] = true` 之类的继承形态可生效）；`length` 走 ToLength 并限幅；不存在的索引记为洞（`None`）。
+2. 回调方法全部改用 `entries`：**跳过洞**（`forEach`/`map`/`filter`/`some`/`every`/`find`/`findIndex`/`reduce`/`reduceRight`），`map` 结果保留长度与洞（`ArrayObject::mark_hole`），`reduce` 无初始值时以首个**存在**元素为累加器；回调第二个参数 `thisArg` 现在会传入（`reduce` 例外，它按规范没有 thisArg）。
+3. `indexOf`/`lastIndexOf` 纳入 VM 路径（ToInteger 的 `position`、SameValueZero、跳洞），并按 `receiver_is_array_like` 分派：字符串与非 array-like 接收者让位给 `String.prototype`（子串语义）；`null`/`undefined` 接收者抛 TypeError。
+4. `String.prototype.indexOf/lastIndexOf` 补齐 `position` 语义（ToInteger 钳位、空串在 `position` 处命中、`lastIndexOf` 默认 +∞）与“无参即 `undefined`”的处理。
+
+**效果**（逐套件实测；String/Array 均按失败 ID 与基线逐一比对，净增无回退）：
+
+| 套件 | 三批后 | 四批后 |
+|------|--------|--------|
+| `built-ins/Array` | 1028 | **1548**（+520） |
+| `built-ins/String` | 365 | 371（+6） |
+| `built-ins/Object` | 2025 | 2025（持平） |
+
+**全量复测**：已执行 10366，通过 **6015**（+110），失败 4351，通过率 **58.03%**；单元 190 全绿；feature 326 条（新增 `tests/features/array_methods.rs`：6 个用例 / 17 条断言；仍 5 条既有 `return_in_try_finally` 失败）。
+
+**本轮发现的既有缺陷**：`new Array(1,2,3)` 的元素顺序被反转（`Opcode::New` 对原生构造器多了一次 `args.reverse()`，而 `collect_call_args` 的约定是 arg0 在 `[rbp-1]`）；`git stash` 确认基线同样输出 `3,2,1`。已登记 §2.3，未在本批改动（会影响 `new Error/Number/Object` 的实参顺序，需单独验证）。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -124,12 +220,16 @@ M2' 验收：三项从跳过表移除（`exponentiation`、`nullish-coalescing` 
 - 属性特性修正：数组 `length`（可写/不可枚举/不可配置）、内置函数 `name`/`length`（不可写/不可枚举/可配置）
 - `Symbol()` 不可 `new`；`Symbol.prototype.description` 为真 getter（原始值接收者的访问器现在会被调用）
 
-**未完成（下一轮）**：`Object.assign`（24 失败）、`Object(values)` 装箱包装对象（~40 失败）、`defineProperties`/`create` 剩余长尾（属性特性校验、`length`/`name` 元数据）、`JSON`/`Date`（B6）。
+**未完成（下一轮）**：~~`Object.assign`、`Object(values)` 装箱、`defineProperties`/`create` 长尾~~ 已在二批交付（见 §2.1c/§2.2c）；`Object` 剩余失败 1223 的主体是描述符属性长尾（`configurable`/`enumerable` 细粒度校验）与引用 `JSON`/`Date` 的用例（38+），后者归 B6。
 
 ### 2.3 已知技术债（计划内需正视，不掩埋）
 
 | 债务 | 影响 | 当前处置 |
 |------|------|----------|
+| ~~间接调用抛出的原生错误不被 JS `try/catch` 捕获~~ | 闭包存变量/传参后调用，内部原生 `RuntimeError` 逃逸到顶层；伴随数据栈泄漏（`RangeError: stack overflow`） | ✅ **2026-09-21 修复**（§2.1d）：SEH 记录调用帧深度 + 分派前回滚帧 + invoke 边界传播 |
+| `try/catch/finally` 的 finally 块被执行两次 | 异常路径跑一次，catch 结束后又落入内联 finally；`return` 与 finally 组合的 5 条 feature 用例仍失败 | 代码生成层缺陷（2026-09-21 登记）：catch 块结束需跳过 finally 块；归 M6 收尾 |
+| `new Array(1,2,3)` 元素顺序反转 | `String(new Array(2,4,8,16,32))` 等用例失败 | 既有缺陷（2026-09-22 登记，`stash` 确认基线同样反转）：`Opcode::New` 对原生构造器多了一次 `args.reverse()`；改动会影响 `new Error/Number/Object` 的实参顺序，需单独验证 |
+| panic 时 `{:?}` 打印含原型环的对象导致宿主栈溢出 | 测试基建隐患（Debug 递归进 builtin 原型环） | 已知；测试避免直接 Debug 对象值 |
 | Rc/RefCell 无环回收 | 循环引用泄漏 | 暂接受 |
 | 闭包值快照语义 | 与规范"引用同一绑定"不同（for-let 按轮捕获等） | 架构决定，相关用例允许失败 |
 | 迭代器 `return()`/`throw()`（IteratorClose 异常路径） | break/异常提前退出时未 close | 正常结束路径已 close；异常路径待 M4 |
@@ -225,8 +325,8 @@ M2' 验收：三项从跳过表移除（`exponentiation`、`nullish-coalescing` 
 
 | 任务 | 内容 | 目标 |
 |------|------|------|
-| B1 `Object` | `assign`、`getOwnPropertySymbols`、`is`/`isExtensible` 族、描述符语义（`writable/enumerable/configurable` 与 `[[DefineOwnProperty]]` 完整规则） | Object 失败 2035 → 目标减半；**首批已交付**：失败 2032 → 1596（通过 1029 → 1465） |
-| B2 `Array` | `from`/`of`/`fill`/`find`/`findIndex`/`copyWithin`/`entries`/`keys`/`values`/`reduceRight`/`sort` 语义、泛型（类数组）路径、稀疏与长度处理 | Array 失败 1975 → 目标减半 |
+| B1 `Object` | `assign`、`getOwnPropertySymbols`、`is`/`isExtensible` 族、描述符语义（`writable/enumerable/configurable` 与 `[[DefineOwnProperty]]` 完整规则） | Object 失败 2035 → 目标减半；**首批已交付**：失败 2032 → 1596（通过 1029 → 1465）；**二批交付（§2.1c）**：失败 → 1223（通过 → 1838，达标 50% 通过率） |
+| B2 `Array` | `from`/`of`/`fill`/`find`/`findIndex`/`copyWithin`/`entries`/`keys`/`values`/`reduceRight`/`sort` 语义、泛型（类数组）路径、稀疏与长度处理 | Array 失败 1975 → 目标减半；**首批已交付（§2.1e）**：回调方法泛型化/洞感知、`indexOf`/`lastIndexOf` 分派 —— 失败 1756 → 1236（通过 1028 → 1548） |
 | B3 `String` | `repeat`/`startsWith`/`endsWith`/`codePointAt`/`codePointAt` 代理对/`normalize`/`at`、`String.raw`、`String` 迭代器与 `[Symbol.iterator]` | String 失败 686 → 目标减半 |
 | B4 `Number` / `Math` | ES6 常量（`EPSILON`/`MAX_SAFE_INTEGER`…）与 `isInteger`/`isSafeInteger`/`parseFloat`；Math 的 `hypot`/`sign`/`clz32`/`imul`/`log2`/`log10`/`cbrt`/`trunc`/`fround` | Math/Number 失败显著下降 |
 | B5 `Function` / `Error` / `NativeErrors` | `name`/`length` 推导、`Error` 子类原型链与 `message` 缺省、`NativeErrors` 各类型 | 三项目标套件 ≥ 60% |
