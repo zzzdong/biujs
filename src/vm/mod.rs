@@ -73,6 +73,17 @@ pub struct VM {
     /// synthetic id that is embedded in the wrapper's name.
     bound_functions: HashMap<u32, BoundFunction>,
     next_bound_id: u32,
+    /// Control-stack depth of the caller for each frame driven by
+    /// `invoke_with_new_target` / `invoke_construct` (Rust-driven calls: native
+    /// callbacks, `call`/`apply`, `new` from a native).
+    ///
+    /// An exception raised inside such a frame must *not* be dispatched to a
+    /// handler in the outer frame from within the nested loop: the native that
+    /// requested the call (e.g. `Array.prototype.forEach`) has to see the error
+    /// so it can abandon its own work. Records at or below the boundary are
+    /// therefore turned back into `RuntimeError::Thrown` and propagated.
+    invoke_boundaries: Vec<usize>,
+}
 }
 
 /// Result of `Function.prototype.bind`: a target plus the pre-bound `this` and
@@ -99,6 +110,7 @@ impl VM {
             steps: 0,
             bound_functions: HashMap::new(),
             next_bound_id: 0,
+            invoke_boundaries: Vec::new(),
         }
     }
 
@@ -118,6 +130,7 @@ impl VM {
         self.current_module_info = Some(module.func_info.clone());
         self.bound_functions.clear();
         self.next_bound_id = 0;
+        self.invoke_boundaries.clear();
         self.steps = 0;
         // Re-register builtins into the fresh state
         self.builtins.register(&mut self.state.globals);
@@ -515,6 +528,10 @@ impl VM {
         let saved_construct = self.state.construct_stack.len();
         let saved_new_target = self.state.new_target_stack.len();
         let saved_function = self.state.function_val.clone();
+        // Control-stack depth of the *caller*: SEH records at or below it belong
+        // to an outer frame and must see the exception propagated, not handled
+        // from inside this nested loop.
+        self.invoke_boundaries.push(self.state.ctrl_stack.len());
 
         // Push the arguments and open the callee's frame at the new stack top,
         // using the same convention as the `Call`/`CallEx` opcodes (arg0 ends up
@@ -568,10 +585,11 @@ impl VM {
             Ok(())
         })();
 
-        outcome?;
-        let rv = self.state.get_register(Register::Rv)?;
+        self.invoke_boundaries.pop();
 
-        // Restore the caller's execution context.
+        // Restore the caller's execution context *before* propagating: the
+        // callee frame is gone either way, whether it returned or was unwound
+        // by an exception escaping to an outer handler.
         self.state.pc = saved_pc;
         self.state.rsp = saved_rsp;
         self.state.rbp = saved_rbp;
@@ -583,6 +601,9 @@ impl VM {
         self.state.function_val = saved_function;
         self.state.construct_stack.truncate(saved_construct);
         self.state.new_target_stack.truncate(saved_new_target);
+
+        outcome?;
+        let rv = self.state.get_register(Register::Rv)?;
         Ok(rv)
     }
 
@@ -1938,6 +1959,10 @@ impl VM {
                     delayed_jump_target: None,
                     delayed_return: false,
                     saved_closure_depth: self.state.closure_var_stack.len(),
+                    saved_ctrl_depth: self.state.ctrl_stack.len(),
+                    saved_this_depth: self.state.this_stack.len(),
+                    saved_construct_depth: self.state.construct_stack.len(),
+                    saved_new_target_depth: self.state.new_target_stack.len(),
                 };
                 self.state.seh_stack.push(record);
             }
@@ -2660,11 +2685,61 @@ impl VM {
         }
     }
 
+    /// Discard the JS frames entered after the `try` that owns the record: an
+    /// exception raised in a nested call must be handled in the frame that
+    /// wrote the `try`, not in the frame that threw.
+    fn unwind_frames_to(
+        &mut self,
+        ctrl_depth: usize,
+        this_depth: usize,
+        construct_depth: usize,
+        new_target_depth: usize,
+        closure_depth: usize,
+    ) {
+        self.state.ctrl_stack.truncate(ctrl_depth);
+        // `this_stack` / `function_stack` / `frame_argc` are parallel: one
+        // entry per active frame, holding the *caller's* binding. Popping them
+        // restores the handler's frame binding one level at a time.
+        while self.state.this_stack.len() > this_depth {
+            if let Some(saved_this) = self.state.this_stack.pop() {
+                self.state.this_val = saved_this;
+            }
+        }
+        while self.state.function_stack.len() > this_depth {
+            if let Some(saved_function) = self.state.function_stack.pop() {
+                self.state.function_val = saved_function;
+            }
+        }
+        self.state.frame_argc.truncate(this_depth);
+        self.state.construct_stack.truncate(construct_depth);
+        self.state.new_target_stack.truncate(new_target_depth);
+        self.state.closure_var_stack.truncate(closure_depth);
+    }
+
     fn handle_throw(&mut self, exc_val: Value) -> Result<(), RuntimeError> {
+        // An exception raised inside a Rust-driven call frame must not be
+        // dispatched to a handler *outside* that frame from here: the native
+        // that asked for the call (a callback loop, `new` from a builtin, …)
+        // has to see the error so it can stop its own work. Turn it back into
+        // a thrown value and let `invoke_*` propagate it to the outer step.
+        if let Some(boundary) = self.invoke_boundary() {
+            if let Some(top) = self.state.seh_stack.last() {
+                if top.saved_ctrl_depth <= boundary {
+                    return Err(RuntimeError::Thrown(exc_val));
+                }
+            }
+        }
         match self.state.seh_stack.pop() {
             Some(mut record) => {
                 self.state.rsp = record.saved_rsp;
                 self.state.rbp = record.saved_rbp;
+                self.unwind_frames_to(
+                    record.saved_ctrl_depth,
+                    record.saved_this_depth,
+                    record.saved_construct_depth,
+                    record.saved_new_target_depth,
+                    record.saved_closure_depth,
+                );
 
                 let finally_pc = record.finally_pc;
                 let handler_pc = record.handler_pc;
@@ -3199,6 +3274,9 @@ impl VM {
         let saved_construct = self.state.construct_stack.len();
         let saved_new_target = self.state.new_target_stack.len();
         let saved_function = self.state.function_val.clone();
+        // See `invoke_with_new_target`: exceptions escaping this frame must be
+        // propagated to the caller rather than handled from inside this loop.
+        self.invoke_boundaries.push(self.state.ctrl_stack.len());
 
         for arg in args.iter().rev() {
             self.state.push(arg.clone())?;
@@ -3243,8 +3321,7 @@ impl VM {
             Ok(())
         })();
 
-        outcome?;
-        let rv = self.state.get_register(Register::Rv)?;
+        self.invoke_boundaries.pop();
 
         self.state.pc = saved_pc;
         self.state.rsp = saved_rsp;
@@ -3257,6 +3334,9 @@ impl VM {
         self.state.function_val = saved_function;
         self.state.construct_stack.truncate(saved_construct);
         self.state.new_target_stack.truncate(saved_new_target);
+
+        outcome?;
+        let rv = self.state.get_register(Register::Rv)?;
         Ok(rv)
     }
 
@@ -3636,6 +3716,18 @@ struct SehRecord {
     delayed_return: bool,
     /// saved closure var stack depth when return was deferred by finally
     saved_closure_depth: usize,
+    /// Call-frame depths captured when the `try` was entered.
+    ///
+    /// An exception raised inside a nested call has to unwind those frames
+    /// before the handler runs: the control stack still holds their return
+    /// addresses, and leaving them there would make the handler resume the
+    /// throwing function instead of continuing in the handler's frame.
+    saved_ctrl_depth: usize,
+    /// Depth of `this_stack` (and its parallel `function_stack` /
+    /// `frame_argc`) — one entry per active JS frame.
+    saved_this_depth: usize,
+    saved_construct_depth: usize,
+    saved_new_target_depth: usize,
 }
 
 #[derive(Debug)]
