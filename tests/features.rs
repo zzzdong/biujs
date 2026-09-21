@@ -7,6 +7,8 @@ pub mod helpers;
 
 #[path = "features/arithmetic_comparison.rs"]
 mod arithmetic_comparison;
+#[path = "features/array_methods.rs"]
+mod array_methods;
 #[path = "features/arrow_functions.rs"]
 mod arrow_functions;
 #[path = "features/arrow_functions_return.rs"]

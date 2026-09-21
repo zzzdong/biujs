@@ -42,6 +42,23 @@ fn is_addressable(operand: Operand) -> bool {
     matches!(operand, Operand::Register(_) | Operand::Stack(_))
 }
 
+/// Whether `val` is a string primitive or a String wrapper object.
+///
+/// `Array.prototype.indexOf.call(value, …)` and `value.indexOf(…)` reach the
+/// same dispatch site, so the string case has to be told apart: strings use
+/// substring search, arrays use per-element comparison.
+fn receiver_is_string(val: &Value) -> bool {
+    match val {
+        Value::String(_) => true,
+        Value::Object(obj_ref) => {
+            obj_ref.borrow().kind() == crate::vm::property::ObjectKind::String
+        }
+        _ => false,
+    }
+}
+
+
+
 /// JavaScript Virtual Machine
 ///
 /// Executes bytecode modules produced by the Compiler.
@@ -84,6 +101,29 @@ pub struct VM {
     /// therefore turned back into `RuntimeError::Thrown` and propagated.
     invoke_boundaries: Vec<usize>,
 }
+
+impl VM {
+    /// Control-stack depth outside the innermost Rust-driven call frame, if any.
+    fn invoke_boundary(&self) -> Option<usize> {
+        self.invoke_boundaries.last().copied()
+    }
+
+    /// Whether `val` carries the `length` + integer-key shape the
+    /// `Array.prototype` methods operate on (real arrays, array-likes, string
+    /// wrappers). Strings are excluded: they use substring search.
+    fn receiver_is_array_like(&self, val: &Value) -> bool {
+        if receiver_is_string(val) {
+            return false;
+        }
+        match val {
+            Value::Object(obj_ref) => crate::vm::prototype::internal_has_property(
+                Rc::clone(obj_ref),
+                &PropertyKey::from_str("length"),
+            )
+            .unwrap_or(false),
+            _ => false,
+        }
+    }
 }
 
 /// Result of `Function.prototype.bind`: a target plus the pre-bound `this` and
@@ -2461,6 +2501,131 @@ impl VM {
         }
     }
 
+    /// Element list of an array-like receiver, hole-aware.
+    ///
+    /// `None` marks an index with no property: the ES callback methods skip
+    /// holes rather than visiting `undefined`. Three details make the generic
+    /// (`Array.prototype.filter.call(x, …)`) path work:
+    ///
+    /// * primitives are boxed first, so `filter.call(false, cb)` reads
+    ///   `length`/`0` off `Boolean.prototype`;
+    /// * `length` and the index keys are read through the prototype chain
+    ///   (`[[Get]]`) — inherited array-like shapes are the norm in test262;
+    /// * `length` goes through ToLength (clamped, non-negative).
+    fn array_like_entries(
+        &mut self,
+        receiver: &Value,
+        module: &Module,
+    ) -> Result<Vec<Option<Value>>, RuntimeError> {
+        // ToObject: a primitive receiver is boxed so its wrapper's prototype
+        // supplies `length` and the index properties.
+        let boxed = match receiver {
+            Value::Object(_) | Value::Function(_) => None,
+            _ => Some(crate::builtins::to_object(receiver)?),
+        };
+        let target = boxed.as_ref().unwrap_or(receiver);
+
+        let Value::Object(obj_ref) = target else {
+            return Ok(Vec::new());
+        };
+        let obj = Rc::clone(obj_ref);
+        let len_value = crate::vm::prototype::internal_get(
+            Rc::clone(&obj),
+            &PropertyKey::from_str("length"),
+            None,
+        )
+        .map_err(RuntimeError::TypeError)?;
+        // ToLength: clamp negatives to 0 and cap the allocation, which keeps a
+        // bogus `length` from trying to materialize billions of slots.
+        let len = len_value.to_number();
+        if !len.is_finite() || len <= 0.0 {
+            return Ok(Vec::new());
+        }
+        let len = (len.trunc() as u64).min(1u64 << 24) as usize;
+
+        let mut entries: Vec<Option<Value>> = Vec::with_capacity(len);
+        for i in 0..len {
+            let key = PropertyKey::from_str(&i.to_string());
+            let present = crate::vm::prototype::internal_has_property(Rc::clone(&obj), &key)
+                .map_err(RuntimeError::TypeError)?;
+            if present {
+                // Through `[[Get]]`, so an accessor element is *invoked*.
+                entries.push(Some(self.get_member(target, &key, module)?));
+            } else {
+                entries.push(None);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// ES `Array.prototype.indexOf` / `lastIndexOf` over the hole-aware element
+    /// list, so generic array-likes (`indexOf.call({length: 2, 0: 'a'}, 'a')`)
+    /// and primitives work the same way as real arrays.
+    fn array_index_of(&self, entries: &[Option<Value>], method: &str, args: &[Value]) -> Value {
+        /// ToInteger: truncate towards zero, `NaN` → 0, infinities saturate.
+        fn to_integer(n: f64) -> i64 {
+            if n.is_nan() {
+                0
+            } else if n.is_infinite() {
+                if n.is_sign_positive() {
+                    i64::MAX
+                } else {
+                    i64::MIN
+                }
+            } else {
+                n.trunc() as i64
+            }
+        }
+
+        /// SameValueZero: like `===`, but `NaN` matches itself.
+        fn same_value_zero(a: &Value, b: &Value) -> bool {
+            if let (Value::Number(x), Value::Number(y)) = (a, b) {
+                if x.is_nan() && y.is_nan() {
+                    return true;
+                }
+            }
+            a.strict_eq(b)
+        }
+
+        let search = args.first().cloned().unwrap_or(Value::Undefined);
+        let len = entries.len() as i64;
+        let from = match args.get(1) {
+            Some(v) if !v.is_undefined() => to_integer(v.to_number()),
+            _ => {
+                if method == "indexOf" {
+                    0
+                } else {
+                    len - 1
+                }
+            }
+        };
+
+        if method == "indexOf" {
+            let start = from.max(0);
+            if start >= len {
+                return Value::Number(-1.0);
+            }
+            for i in start..len {
+                if let Some(element) = &entries[i as usize] {
+                    if same_value_zero(element, &search) {
+                        return Value::Number(i as f64);
+                    }
+                }
+            }
+        } else {
+            let mut i = if from < 0 { -1 } else { from.min(len - 1) };
+            while i >= 0 {
+                if let Some(element) = &entries[i as usize] {
+                    if same_value_zero(element, &search) {
+                        return Value::Number(i as f64);
+                    }
+                }
+                i -= 1;
+            }
+        }
+        Value::Number(-1.0)
+    }
+
     /// Run an `Array.prototype` method that has to call back into user code.
     ///
     /// Returns `Ok(None)` when `method` is not one of those methods, so callers
@@ -2483,17 +2648,49 @@ impl VM {
             "find",
             "findIndex",
             "sort",
+            // No callback, but they need the generic array-like element list:
+            // `Array.prototype.indexOf.call({length: 2, 0: 'a'}, 'a')`.
+            "indexOf",
+            "lastIndexOf",
         ];
         if !CALLBACK_METHODS.contains(&method) {
             return Ok(None);
         }
-        let Some(elements) = self.array_like_elements(receiver) else {
-            // Not array-like: behave like "method not found" and let the caller
-            // continue with its normal lookup (which raises a TypeError).
-            return Ok(None);
+        // `Array.prototype.map.call(null, …)` and friends: ToObject raises.
+        if matches!(receiver, Value::Undefined | Value::Null) {
+            return Err(RuntimeError::TypeError(format!(
+                "Array.prototype.{method} called on null or undefined"
+            )));
+        }
+
+        let entries = match self.array_like_entries(receiver, module) {
+            Ok(entries) => entries,
+            // Not array-like (e.g. `filter.call(undefined, …)`): let the caller
+            // continue with the ordinary dispatch, which raises a TypeError.
+            Err(RuntimeError::TypeError(_)) => return Ok(None),
+            Err(err) => return Err(err),
         };
 
+        // `indexOf` / `lastIndexOf` take a search element, not a callback, and
+        // must not hit the callable check below. Strings keep their own
+        // substring semantics (`"abcab".indexOf("ab")` is 0, not a per-char
+        // scan), so a string receiver falls through to the string builtins.
+        if method == "indexOf" || method == "lastIndexOf" {
+            // `Array.prototype.indexOf.call(x, …)` and `x.indexOf(…)` reach the
+            // same dispatch site. Anything that is not array-like — a string
+            // (substring search) or a wrapper without `length`
+            // (`String.prototype.indexOf.call(new Boolean, …)`) — belongs to
+            // the string builtins.
+            if !self.receiver_is_array_like(receiver) {
+                return Ok(None);
+            }
+            return Ok(Some(self.array_index_of(&entries, method, args)));
+        }
+
         let callback = args.first().cloned().unwrap_or(Value::Undefined);
+        // Second argument is `thisArg`: undefined means "call with undefined
+        // `this`" (only relevant for non-strict callbacks, but observable).
+        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
         let call = |vm: &mut Self,
                     cb: &Value,
                     elem: &Value,
@@ -2501,7 +2698,7 @@ impl VM {
          -> Result<Value, RuntimeError> {
             vm.invoke(
                 cb,
-                Value::Undefined,
+                this_arg.clone(),
                 &[
                     elem.clone(),
                     Value::Number(index as f64),
@@ -2513,7 +2710,12 @@ impl VM {
 
         match method {
             "sort" => {
-                let mut items = elements;
+                // Holes sort to the end; the dense store has no hole marker, so
+                // they are treated as `undefined` (the previous behaviour).
+                let mut items: Vec<Value> = entries
+                    .iter()
+                    .map(|e| e.clone().unwrap_or(Value::Undefined))
+                    .collect();
                 if callback.is_callable() {
                     // Insertion sort: stable and lets the comparator be a
                     // fallible JS call.
@@ -2556,81 +2758,121 @@ impl VM {
                 "{method} callback is not a function"
             ))),
             "forEach" => {
-                for (i, e) in elements.iter().enumerate() {
-                    call(self, &callback, e, i)?;
+                for (i, e) in entries.iter().enumerate() {
+                    if let Some(e) = e {
+                        call(self, &callback, e, i)?;
+                    }
                 }
                 Ok(Some(Value::Undefined))
             }
             "map" => {
-                let mut out = Vec::with_capacity(elements.len());
-                for (i, e) in elements.iter().enumerate() {
-                    out.push(call(self, &callback, e, i)?);
+                // The result keeps the receiver's length *and* its holes.
+                let mut out = Vec::with_capacity(entries.len());
+                let mut holes: Vec<usize> = Vec::new();
+                for (i, e) in entries.iter().enumerate() {
+                    match e {
+                        Some(e) => out.push(call(self, &callback, e, i)?),
+                        None => {
+                            out.push(Value::Undefined);
+                            holes.push(i);
+                        }
+                    }
                 }
-                Ok(Some(crate::vm::object::new_array_object_from_vec(out)))
+                let result = crate::vm::object::new_array_object_from_vec(out);
+                if let Value::Object(result_ref) = &result {
+                    if let Some(arr) = result_ref
+                        .borrow_mut()
+                        .as_any_mut()
+                        .downcast_mut::<crate::vm::object::ArrayObject>()
+                    {
+                        for i in holes {
+                            arr.mark_hole(i);
+                        }
+                    }
+                }
+                Ok(Some(result))
             }
             "filter" => {
                 let mut out = Vec::new();
-                for (i, e) in elements.iter().enumerate() {
-                    if call(self, &callback, e, i)?.to_boolean() {
-                        out.push(e.clone());
+                for (i, e) in entries.iter().enumerate() {
+                    if let Some(e) = e {
+                        if call(self, &callback, e, i)?.to_boolean() {
+                            out.push(e.clone());
+                        }
                     }
                 }
                 Ok(Some(crate::vm::object::new_array_object_from_vec(out)))
             }
             "some" => {
-                for (i, e) in elements.iter().enumerate() {
-                    if call(self, &callback, e, i)?.to_boolean() {
-                        return Ok(Some(Value::Bool(true)));
+                for (i, e) in entries.iter().enumerate() {
+                    if let Some(e) = e {
+                        if call(self, &callback, e, i)?.to_boolean() {
+                            return Ok(Some(Value::Bool(true)));
+                        }
                     }
                 }
                 Ok(Some(Value::Bool(false)))
             }
             "every" => {
-                for (i, e) in elements.iter().enumerate() {
-                    if !call(self, &callback, e, i)?.to_boolean() {
-                        return Ok(Some(Value::Bool(false)));
+                for (i, e) in entries.iter().enumerate() {
+                    if let Some(e) = e {
+                        if !call(self, &callback, e, i)?.to_boolean() {
+                            return Ok(Some(Value::Bool(false)));
+                        }
                     }
                 }
                 Ok(Some(Value::Bool(true)))
             }
             "find" => {
-                for (i, e) in elements.iter().enumerate() {
-                    if call(self, &callback, e, i)?.to_boolean() {
-                        return Ok(Some(e.clone()));
+                for (i, e) in entries.iter().enumerate() {
+                    if let Some(e) = e {
+                        if call(self, &callback, e, i)?.to_boolean() {
+                            return Ok(Some(e.clone()));
+                        }
                     }
                 }
                 Ok(Some(Value::Undefined))
             }
             "findIndex" => {
-                for (i, e) in elements.iter().enumerate() {
-                    if call(self, &callback, e, i)?.to_boolean() {
-                        return Ok(Some(Value::Number(i as f64)));
+                for (i, e) in entries.iter().enumerate() {
+                    if let Some(e) = e {
+                        if call(self, &callback, e, i)?.to_boolean() {
+                            return Ok(Some(Value::Number(i as f64)));
+                        }
                     }
                 }
                 Ok(Some(Value::Number(-1.0)))
             }
             "reduce" | "reduceRight" => {
-                let indices: Vec<usize> = if method == "reduce" {
-                    (0..elements.len()).collect()
-                } else {
-                    (0..elements.len()).rev().collect()
-                };
+                // Indices are visited in order (or reverse) and holes skipped;
+                // without an initial value the accumulator is the first
+                // *present* element.
+                let mut indices: Vec<usize> = (0..entries.len()).collect();
+                if method == "reduceRight" {
+                    indices.reverse();
+                }
                 let (mut acc, start) = match args.get(1) {
                     Some(init) => (init.clone(), 0usize),
                     None => {
-                        let Some(&first) = indices.first() else {
+                        let Some(&first) = indices.iter().find(|&&i| entries[i].is_some()) else {
                             return Err(RuntimeError::TypeError(
                                 "Reduce of empty array with no initial value".to_string(),
                             ));
                         };
-                        (elements[first].clone(), 1)
+                        let first_value = entries[first].clone().unwrap_or(Value::Undefined);
+                        (first_value, indices.iter().position(|&i| i == first).unwrap_or(0) + 1)
                     }
                 };
                 for &i in indices.iter().skip(start) {
+                    let Some(element) = entries[i].clone() else {
+                        continue;
+                    };
+                    // `reduce` has no `thisArg` parameter: the callback runs
+                    // with `undefined` as `this`.
                     acc = self.invoke(
                         &callback,
                         Value::Undefined,
-                        &[acc, elements[i].clone(), Value::Number(i as f64), receiver.clone()],
+                        &[acc, element, Value::Number(i as f64), receiver.clone()],
                         module,
                     )?;
                 }

@@ -117,13 +117,31 @@ pub fn string_pad(obj: &Value, args: &[Value], at_start: bool) -> Result<Value, 
     }))
 }
 
+/// `String.prototype.lastIndexOf(searchString, position)`.
 pub fn string_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = obj.to_js_string();
-    let needle = args.first().map(|v| v.to_js_string()).unwrap_or_default();
-    match s.rfind(&needle) {
-        Some(idx) => Ok(Value::Number(idx as f64)),
-        None => Ok(Value::Number(-1.0)),
+    let search = match args.first() {
+        Some(v) => v.to_js_string(),
+        None => "undefined".to_string(),
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let needle: Vec<char> = search.chars().collect();
+    // No `position` means +Infinity for `lastIndexOf` (clamped to the length),
+    // unlike `indexOf` which starts at 0.
+    let start = string_position(args.get(1), chars.len(), chars.len() as i64);
+    if needle.is_empty() {
+        return Ok(Value::Number(start as f64));
     }
+    let mut i = start as i64;
+    while i >= 0 {
+        let at = i as usize;
+        let end = at + needle.len();
+        if end <= chars.len() && chars[at..end] == needle[..] {
+            return Ok(Value::Number(i as f64));
+        }
+        i -= 1;
+    }
+    Ok(Value::Number(-1.0))
 }
 
 fn string_value_of(obj: &Value) -> Result<Value, RuntimeError> {
@@ -198,15 +216,53 @@ pub fn string_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeErro
     Ok(Value::Bool(s.contains(&args[0].to_js_string())))
 }
 
+/// `String.prototype.indexOf(searchString, position)`.
+///
+/// `position` is ToInteger-clamped into `[0, length]`; an empty search string
+/// matches at `position` (ES 21.1.3.9). Indices are reported in code *units*,
+/// which for the test cases here is the character offset.
 pub fn string_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = obj.to_js_string();
-    if args.is_empty() {
-        return Ok(Value::Number(-1.0));
+    // A missing argument is `undefined`, whose ToString is "undefined" — not
+    // the empty string (`'abc'.indexOf()` is -1).
+    let search = match args.first() {
+        Some(v) => v.to_js_string(),
+        None => "undefined".to_string(),
+    };
+    let len = s.chars().count();
+    let start = string_position(args.get(1), len, 0);
+    if search.is_empty() {
+        return Ok(Value::Number(start as f64));
     }
-    match s.find(&args[0].to_js_string()) {
-        Some(idx) => Ok(Value::Number(idx as f64)),
+    let tail: String = s.chars().skip(start).collect();
+    match tail.find(&search) {
+        Some(offset) => Ok(Value::Number((start + tail[..offset].chars().count()) as f64)),
         None => Ok(Value::Number(-1.0)),
     }
+}
+
+/// ToInteger-clamped start index shared by `indexOf` / `lastIndexOf`.
+///
+/// `default` is the value used when `position` is absent: `0` for `indexOf`,
+/// `length - 1` for `lastIndexOf`.
+fn string_position(position: Option<&Value>, len: usize, default: i64) -> usize {
+    let len = len as i64;
+    let n = match position {
+        Some(v) if !v.is_undefined() => v.to_number(),
+        _ => return default.max(0).min(len) as usize,
+    };
+    let value = if n.is_nan() {
+        0
+    } else if n.is_infinite() {
+        if n.is_sign_positive() {
+            len
+        } else {
+            0
+        }
+    } else {
+        n.trunc() as i64
+    };
+    value.max(0).min(len) as usize
 }
 
 pub fn string_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
