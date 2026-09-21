@@ -158,12 +158,14 @@ fn object_constructor_no_args() {
 
 #[test]
 fn object_constructor_wraps_value() {
+    // ES 19.1.1.1: `Object(value)` returns ToObject(value) — a wrapper object,
+    // abstract-equal to the original primitive.
     let js = r#"
         let x = 42;
         let o = Object(x);
-        o
+        typeof o + " " + (o == x) + " " + (o.constructor === Number)
     "#;
-    assert_eq!(eval_number(js), 42.0);
+    assert_eq!(eval_string(js), "object true true");
 }
 
 /// Object.keys() on a simple object

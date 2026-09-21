@@ -29,7 +29,8 @@ pub fn register_number_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
 }
 
 fn number_value_of(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::Number(obj.to_number()))
+    // Primitive wrappers (`Object(1.1)`) unwrap via ToPrimitive.
+    Ok(Value::Number(obj.to_primitive("number").to_number()))
 }
 
 fn number_to_string_proto(obj: &Value) -> Result<Value, RuntimeError> {

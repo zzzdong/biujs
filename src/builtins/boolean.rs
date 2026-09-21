@@ -33,7 +33,8 @@ pub fn boolean_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 // ─────────────────────────────────────────────────────────
 
 pub fn boolean_value_of(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::Bool(obj.to_boolean()))
+    // Primitive wrappers (`Object(true)`) unwrap via ToPrimitive.
+    Ok(Value::Bool(obj.to_primitive("default").to_boolean()))
 }
 
 pub fn boolean_to_string(obj: &Value) -> Result<Value, RuntimeError> {

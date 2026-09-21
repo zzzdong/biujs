@@ -311,6 +311,14 @@ pub fn symbol_value_of(obj: &Value) -> Result<Value, RuntimeError> {
 
 /// Symbol.prototype.description getter
 pub fn symbol_description(obj: &Value) -> Result<Value, RuntimeError> {
+    // A Symbol wrapper (`Object(sym)`) unwraps to its [[SymbolData]] first.
+    if let Value::Object(obj_ref) = obj {
+        let kind = obj_ref.borrow().kind();
+        if kind == crate::vm::property::ObjectKind::Symbol {
+            let prim = obj.to_primitive("default");
+            return symbol_description(&prim);
+        }
+    }
     match obj {
         Value::Symbol(sym) => match &sym.description {
             Some(desc) => Ok(Value::String(Rc::new(desc.clone()))),

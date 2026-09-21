@@ -676,6 +676,46 @@ impl VM {
         Ok(out)
     }
 
+    /// ES 19.1.2.1 `Object.assign(target, ...sources)`.
+    ///
+    /// Values are read through real `[[Get]]` and written through real
+    /// `[[Set]]`, so own or prototype accessors on either side run; targets
+    /// and sources are boxed with ToObject.
+    fn object_assign(&mut self, args: &[Value], module: &Module) -> Result<Value, RuntimeError> {
+        let Some(target) = args.first() else {
+            return Err(RuntimeError::TypeError(
+                "Object.assign requires at least 1 argument".to_string(),
+            ));
+        };
+        let target = crate::builtins::to_object(target)?;
+        for source in args.iter().skip(1) {
+            if matches!(source, Value::Undefined | Value::Null) {
+                continue;
+            }
+            let source = crate::builtins::to_object(source)?;
+            let keys: Vec<PropertyKey> = match &source {
+                Value::Object(src_ref) => {
+                    let borrowed = src_ref.borrow();
+                    borrowed
+                        .own_keys()
+                        .into_iter()
+                        .filter(|k| {
+                            borrowed
+                                .property_get(k)
+                                .is_some_and(|d| d.enumerable)
+                        })
+                        .collect()
+                }
+                _ => continue,
+            };
+            for key in keys {
+                let value = self.get_member(&source, &key, module)?;
+                self.set_member(&target, key.clone(), value, module)?;
+            }
+        }
+        Ok(target)
+    }
+
     /// ES 19.1.3.6 `Object.prototype.toString`.
     ///
     /// A string-valued `Symbol.toStringTag` takes precedence over the built-in
@@ -807,6 +847,12 @@ impl VM {
         }
         // Static methods are stored under their qualified name ("Array.from").
         if name.contains('.') {
+            // `Object.assign` reads through real `[[Get]]` and writes through
+            // real `[[Set]]` (own or prototype accessors may run), which only
+            // the VM can do.
+            if name == "Object.assign" {
+                return self.object_assign(args, module);
+            }
             // The descriptor arguments are read through [[Get]] first, which
             // only the VM can do (their fields may be accessors).
             if name == "Object.defineProperty" && args.len() >= 3 {
@@ -1749,6 +1795,13 @@ impl VM {
                 // First check: is this a static method on a native function (constructor)?
                 if let Some(name) = crate::builtins::native_function_name(&obj_val) {
                     let static_method = format!("{}.{}", name, method_name);
+                    // `Object.assign` needs real `[[Get]]`/`[[Set]]` (accessors).
+                    if static_method == "Object.assign" {
+                        let result = self.object_assign(&args, module)?;
+                        self.state.set_register(Register::Rv, result)?;
+                        self.state.jump_offset(1);
+                        return Ok(());
+                    }
                     if let Ok(result) = crate::builtins::call_static_method(&static_method, &args) {
                         self.state.set_register(Register::Rv, result)?;
                         self.state.jump_offset(1);

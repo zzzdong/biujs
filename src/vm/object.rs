@@ -231,6 +231,90 @@ impl PropertyTable {
 }
 
 // ─────────────────────────────────────────────────────────
+// Property descriptor validation (ES 6.1.7.3 / 9.1.6.3)
+// ─────────────────────────────────────────────────────────
+
+/// ES `SameValue` (7.2.9): like `===` but `NaN` equals `NaN` and `+0`/`-0`
+/// are distinct.
+pub(crate) fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            if x.is_nan() && y.is_nan() {
+                true
+            } else if *x == 0.0 && *y == 0.0 {
+                x.is_sign_positive() == y.is_sign_positive()
+            } else {
+                x == y
+            }
+        }
+        _ => a.strict_eq(b),
+    }
+}
+
+/// Validation half of `ValidateAndApplyOwnPropertyDescriptor` for an *existing*
+/// property: may `desc` be applied over `current`?
+///
+/// Callers perform the apply step themselves (insert/replace), so this only
+/// decides. The rejection reason doubles as the JS-visible error message.
+pub(crate) fn validate_property_redefinition(
+    current: &PropertyDescriptor,
+    desc: &PropertyDescriptor,
+) -> Result<(), String> {
+    if current.configurable {
+        return Ok(());
+    }
+    if desc.configurable {
+        return Err("Cannot redefine non-configurable property".to_string());
+    }
+    if desc.enumerable != current.enumerable {
+        return Err("Cannot redefine non-configurable property".to_string());
+    }
+    if desc.is_accessor_descriptor() {
+        if current.is_data_descriptor() {
+            return Err(
+                "Cannot redefine non-configurable property: accessor over data".to_string(),
+            );
+        }
+        if let (Some(d), Some(c)) = (&desc.getter, &current.getter) {
+            if !same_value(d, c) {
+                return Err("Cannot redefine non-configurable property: different getter"
+                    .to_string());
+            }
+        }
+        if let (Some(d), Some(c)) = (&desc.setter, &current.setter) {
+            if !same_value(d, c) {
+                return Err("Cannot redefine non-configurable property: different setter"
+                    .to_string());
+            }
+        }
+        if desc.getter.is_some() && current.getter.is_none() {
+            return Err("Cannot redefine non-configurable property: added getter".to_string());
+        }
+        if desc.setter.is_some() && current.setter.is_none() {
+            return Err("Cannot redefine non-configurable property: added setter".to_string());
+        }
+        return Ok(());
+    }
+    if current.is_accessor_descriptor() {
+        // A data (or generic) descriptor over an existing accessor.
+        return Err(
+            "Cannot redefine non-configurable property: data over accessor".to_string(),
+        );
+    }
+    if !current.writable {
+        if !same_value(&desc.value, &current.value) {
+            return Err(
+                "Cannot redefine the value of a non-writable property".to_string(),
+            );
+        }
+        if desc.writable {
+            return Err("Cannot make a non-writable property writable".to_string());
+        }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────
 // OrdinaryObject — standard JS object
 // ─────────────────────────────────────────────────────────
 
@@ -281,22 +365,23 @@ impl OrdinaryObject {
 
     /// Install a property with a full descriptor (`Object.defineProperty`).
     ///
-    /// Fails when an existing property is non-configurable or the object is
-    /// frozen; otherwise the descriptor replaces whatever was there.
+    /// Implements the ES `OrdinaryDefineOwnProperty` rules: a redefinition of a
+    /// non-configurable property only succeeds when nothing observable changes
+    /// (same value on a non-writable data property, same accessor, …); adding
+    /// requires extensibility.
     pub fn define_property(
         &mut self,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        if self.frozen {
-            return Err("Cannot define property on frozen object".to_string());
-        }
-        if let Some(existing) = self.properties.get(&key) {
-            if !existing.configurable {
-                return Err("Cannot redefine non-configurable property".to_string());
+        let current = self.properties.get(&key).cloned();
+        match current {
+            None => {
+                if !self.extensible {
+                    return Err("Cannot add property to non-extensible object".to_string());
+                }
             }
-        } else if !self.extensible {
-            return Err("Cannot add property to non-extensible object".to_string());
+            Some(current) => validate_property_redefinition(&current, &desc)?,
         }
         self.properties.insert(key, desc);
         Ok(true)
@@ -397,6 +482,16 @@ impl JSObject for OrdinaryObject {
         self.frozen = true;
         self.extensible = false;
         self.sealed = true;
+        // Freezing makes every own property non-configurable, and data
+        // properties non-writable as well.
+        for key in self.properties.keys() {
+            if let Some(desc) = self.properties.get_mut(&key) {
+                desc.configurable = false;
+                if desc.is_data_descriptor() {
+                    desc.writable = false;
+                }
+            }
+        }
     }
 
     fn is_sealed(&self) -> bool {
@@ -406,6 +501,12 @@ impl JSObject for OrdinaryObject {
     fn seal(&mut self) {
         self.sealed = true;
         self.extensible = false;
+        // Sealing makes every own property non-configurable.
+        for key in self.properties.keys() {
+            if let Some(desc) = self.properties.get_mut(&key) {
+                desc.configurable = false;
+            }
+        }
     }
 
     fn class_name(&self) -> &'static str {
@@ -431,8 +532,15 @@ impl Default for OrdinaryObject {
 pub struct ArrayObject {
     elements: Vec<Value>,
     /// Non-index own properties (`length` aside): `arr.x = 1`, methods hung
-    /// off an instance, symbol keys. Elements stay in the dense `Vec`.
+    /// off an instance, symbol keys. Elements *with non-default descriptors or
+    /// accessors* also land here, keyed by their index string.
     properties: PropertyTable,
+    /// Indices whose dense slot is not backed by a data property (accessor
+    /// definitions, deletions). Their keys come from `properties` instead.
+    holes: std::collections::BTreeSet<usize>,
+    /// Array `length` starts writable; `Object.defineProperty(arr, "length",
+    /// {writable: false})` can freeze it.
+    length_writable: bool,
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
     extensible: bool,
     frozen: bool,
@@ -444,6 +552,8 @@ impl ArrayObject {
         Self {
             elements: Vec::new(),
             properties: PropertyTable::new(),
+            holes: std::collections::BTreeSet::new(),
+            length_writable: true,
             prototype: None,
             extensible: true,
             frozen: false,
@@ -455,6 +565,8 @@ impl ArrayObject {
         Self {
             elements: Vec::with_capacity(cap),
             properties: PropertyTable::new(),
+            holes: std::collections::BTreeSet::new(),
+            length_writable: true,
             prototype: None,
             extensible: true,
             frozen: false,
@@ -466,6 +578,8 @@ impl ArrayObject {
         Self {
             elements: vec,
             properties: PropertyTable::new(),
+            holes: std::collections::BTreeSet::new(),
+            length_writable: true,
             prototype: None,
             extensible: true,
             frozen: false,
@@ -498,6 +612,41 @@ impl ArrayObject {
             .join(",")
     }
 
+    /// Mark a dense slot as a hole: it contributes no element (no own key,
+    /// `in` reports false), while `length` is unchanged.
+    ///
+    /// `Array.prototype.map` needs this: holes are skipped by the callback but
+    /// the result keeps the receiver's length.
+    pub fn mark_hole(&mut self, index: usize) {
+        if index < self.elements.len() {
+            self.elements[index] = Value::Undefined;
+        }
+        self.properties.remove(&Self::index_key(index));
+        self.holes.insert(index);
+    }
+
+    /// Drop every index-keyed entry from the property table (after a dense
+    /// mutation that renumbers elements, e.g. `shift`/`splice`/`sort`).
+    ///
+    /// Attributes of plain data elements are not observable through these
+    /// operations' fast paths, so the descriptors are simply discarded.
+    fn drop_index_property_entries(&mut self) {
+        self.holes.clear();
+        let index_keys: Vec<PropertyKey> = self
+            .properties
+            .keys()
+            .into_iter()
+            .filter(|k| {
+                k.as_str()
+                    .map(|s| s.parse::<usize>().is_ok())
+                    .unwrap_or(false)
+            })
+            .collect();
+        for key in index_keys {
+            self.properties.remove(&key);
+        }
+    }
+
     pub fn pop(&mut self) -> Value {
         self.elements.pop().unwrap_or(Value::Undefined)
     }
@@ -506,11 +655,14 @@ impl ArrayObject {
         if self.elements.is_empty() {
             return Value::Undefined;
         }
-        Some(self.elements.remove(0)).unwrap_or(Value::Undefined)
+        let value = Some(self.elements.remove(0)).unwrap_or(Value::Undefined);
+        self.drop_index_property_entries();
+        value
     }
 
     pub fn unshift(&mut self, value: Value) -> f64 {
         self.elements.insert(0, value);
+        self.drop_index_property_entries();
         self.elements.len() as f64
     }
 
@@ -530,11 +682,13 @@ impl ArrayObject {
     /// In-place `Array.prototype.reverse`.
     pub fn reverse(&mut self) {
         self.elements.reverse();
+        self.drop_index_property_entries();
     }
 
     /// Replace all elements (used by `Array.prototype.sort`).
     pub fn replace_elements(&mut self, elements: Vec<Value>) {
         self.elements = elements;
+        self.drop_index_property_entries();
     }
 
     pub fn join(&self, separator: &str) -> String {
@@ -577,6 +731,7 @@ impl ArrayObject {
             self.elements.insert(pos, item.clone());
             pos += 1;
         }
+        self.drop_index_property_entries();
         removed
     }
 
@@ -605,16 +760,22 @@ impl JSObject for ArrayObject {
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         match key {
             PropertyKey::Str(s) if s.as_str() == "length" => {
-                // Array `length`: writable, non-enumerable, non-configurable
-                // (ES 10.4.2.1), so `Object.keys([1, 2])` is just the indices.
+                // Array `length`: writable (until frozen so), non-enumerable,
+                // non-configurable (ES 10.4.2.1).
                 Some(PropertyDescriptor {
                     value: Value::Number(self.elements.len() as f64),
-                    writable: true,
+                    writable: self.length_writable,
                     enumerable: false,
                     configurable: false,
                     getter: None,
                     setter: None,
                 })
+            }
+            // An index key with a stored override (non-default attributes or
+            // an accessor) is reported from the property table; plain dense
+            // elements keep the implicit default descriptor.
+            PropertyKey::Str(_) if self.properties.contains_key(key) => {
+                self.properties.get(key).cloned()
             }
             PropertyKey::Str(s) => {
                 // Try parsing index
@@ -637,11 +798,33 @@ impl JSObject for ArrayObject {
 
         match &key {
             PropertyKey::Str(s) if s.as_str() == "length" => {
+                if !self.length_writable {
+                    return Err("Cannot assign to read-only property 'length'".to_string());
+                }
                 // Adjust array length (with the usual ArrayLength validation)
                 let n = value.to_number();
                 let new_len = crate::builtins::validate_array_length(n)
                     .map_err(|_| "Invalid array length".to_string())?;
                 self.elements.resize(new_len, Value::Undefined);
+                Ok(true)
+            }
+            // An existing table entry (index override or named property):
+            // update through the descriptor, keeping the dense slot in sync.
+            PropertyKey::Str(s) if self.properties.contains_key(&key) => {
+                let idx = s.parse::<usize>().ok();
+                let desc = self.properties.get_mut(&key).expect("checked above");
+                if desc.is_accessor_descriptor() {
+                    return Err("Cannot assign to accessor property".to_string());
+                }
+                if !desc.writable {
+                    return Err("Cannot assign to read-only property".to_string());
+                }
+                desc.value = value.clone();
+                if let Some(idx) = idx {
+                    if let Some(slot) = self.elements.get_mut(idx) {
+                        *slot = value;
+                    }
+                }
                 Ok(true)
             }
             PropertyKey::Str(s) => {
@@ -690,9 +873,11 @@ impl JSObject for ArrayObject {
         }
     }
 
-    /// `Object.defineProperty` on an array: index keys keep writing elements
-    /// (the dense store is the element representation), everything else lands
-    /// in the property table with its full descriptor.
+    /// `Object.defineProperty` on an array.
+    ///
+    /// Plain elements (default attributes) stay in the dense store; elements
+    /// with non-default attributes or accessors get a full descriptor in the
+    /// property table (keyed by the index string) so the attributes survive.
     fn define_property(
         &mut self,
         key: PropertyKey,
@@ -706,37 +891,93 @@ impl JSObject for ArrayObject {
                 if desc.is_accessor_descriptor() {
                     return Err("Cannot redefine property: length".to_string());
                 }
+                if desc.configurable {
+                    return Err("Cannot redefine property: length is non-configurable".to_string());
+                }
                 let n = desc.value.to_number();
                 let new_len = crate::builtins::validate_array_length(n)
                     .map_err(|_| "Invalid array length".to_string())?;
+                if !self.length_writable && new_len != self.elements.len() {
+                    return Err("Cannot redefine property: length is non-writable".to_string());
+                }
+                self.length_writable = desc.writable;
                 self.elements.resize(new_len, Value::Undefined);
+                self.holes.retain(|&i| i < new_len);
+                // Drop index-keyed entries beyond the new length.
+                let stale: Vec<PropertyKey> = self
+                    .properties
+                    .keys()
+                    .into_iter()
+                    .filter(|k| {
+                        k.as_str()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .is_some_and(|i| i >= new_len)
+                    })
+                    .collect();
+                for k in stale {
+                    self.properties.remove(&k);
+                }
                 Ok(true)
             }
             PropertyKey::Str(s) => {
                 if let Ok(idx) = s.parse::<usize>() {
-                    if desc.is_accessor_descriptor() {
-                        return Err("Cannot define accessor on array element".to_string());
-                    }
                     if idx >= MAX_DENSE_ELEMENTS {
                         return Err(format!(
                             "Array index {idx} is out of the supported range"
                         ));
                     }
+                    let current = self.property_get(&key);
+                    match current {
+                        Some(current) => validate_property_redefinition(&current, &desc)?,
+                        None if !self.extensible => {
+                            return Err("Cannot add property to non-extensible array".to_string());
+                        }
+                        None => {}
+                    }
+                    if desc.is_accessor_descriptor() {
+                        // Accessors live in the property table; the dense slot
+                        // is turned into a hole so reads find the accessor.
+                        if idx >= self.elements.len() {
+                            self.elements.resize(idx + 1, Value::Undefined);
+                        }
+                        self.elements[idx] = Value::Undefined;
+                        self.holes.insert(idx);
+                        self.properties.insert(key, desc);
+                        return Ok(true);
+                    }
                     if idx >= self.elements.len() {
                         self.elements.resize(idx + 1, Value::Undefined);
                     }
-                    self.elements[idx] = desc.value;
+                    self.elements[idx] = desc.value.clone();
+                    if desc.writable && desc.enumerable && desc.configurable {
+                        // Default data descriptor: no override needed.
+                        self.properties.remove(&key);
+                        self.holes.remove(&idx);
+                    } else {
+                        self.properties.insert(key, desc);
+                    }
                     Ok(true)
-                } else if !self.extensible && !self.properties.contains_key(&key) {
-                    Err("Cannot add property to non-extensible array".to_string())
                 } else {
+                    let current = self.property_get(&key);
+                    match current {
+                        Some(current) => validate_property_redefinition(&current, &desc)?,
+                        None if !self.extensible => {
+                            return Err("Cannot add property to non-extensible array".to_string());
+                        }
+                        None => {}
+                    }
                     self.properties.insert(key, desc);
                     Ok(true)
                 }
             }
             _ => {
-                if !self.extensible && !self.properties.contains_key(&key) {
-                    return Err("Cannot add property to non-extensible array".to_string());
+                let current = self.property_get(&key);
+                match current {
+                    Some(current) => validate_property_redefinition(&current, &desc)?,
+                    None if !self.extensible => {
+                        return Err("Cannot add property to non-extensible array".to_string());
+                    }
+                    None => {}
                 }
                 self.properties.insert(key, desc);
                 Ok(true)
@@ -749,11 +990,28 @@ impl JSObject for ArrayObject {
             return false;
         }
         if let PropertyKey::Str(s) = key {
+            if s.as_str() == "length" {
+                return false;
+            }
             if let Ok(idx) = s.parse::<usize>() {
+                if let Some(desc) = self.properties.get(key) {
+                    if !desc.configurable {
+                        return false;
+                    }
+                }
                 if idx < self.elements.len() {
-                    self.elements.remove(idx);
+                    // Deleting an element leaves a hole; the length is unchanged.
+                    self.properties.remove(key);
+                    self.elements[idx] = Value::Undefined;
+                    self.holes.insert(idx);
                     return true;
                 }
+                return self.properties.remove(key).is_some();
+            }
+        }
+        if let Some(desc) = self.properties.get(key) {
+            if !desc.configurable {
+                return false;
             }
         }
         self.properties.remove(key).is_some()
@@ -762,11 +1020,14 @@ impl JSObject for ArrayObject {
     fn has_property(&self, key: &PropertyKey) -> bool {
         match key {
             PropertyKey::Str(s) if s.as_str() == "length" => true,
-            PropertyKey::Str(s) => s
-                .parse::<usize>()
-                .ok()
-                .map_or(false, |i| i < self.elements.len())
-                || self.properties.contains_key(key),
+            PropertyKey::Str(s) => {
+                if self.properties.contains_key(key) {
+                    return true;
+                }
+                s.parse::<usize>().is_ok_and(|i| {
+                    i < self.elements.len() && !self.holes.contains(&i)
+                })
+            }
             _ => self.properties.contains_key(key),
         }
     }
@@ -776,6 +1037,12 @@ impl JSObject for ArrayObject {
             .elements
             .iter()
             .enumerate()
+            // Holes (deleted/accessor slots) have no data element; slots with
+            // a table override are reported through the table instead.
+            .filter(|(i, _)| {
+                !self.holes.contains(i)
+                    && !self.properties.contains_key(&Self::index_key(*i))
+            })
             .map(|(i, _)| Self::index_key(i))
             .collect();
         keys.push(PropertyKey::from_str("length"));
@@ -809,6 +1076,30 @@ impl JSObject for ArrayObject {
         self.frozen = true;
         self.extensible = false;
         self.sealed = true;
+        for key in self.properties.keys() {
+            if let Some(desc) = self.properties.get_mut(&key) {
+                desc.configurable = false;
+                if desc.is_data_descriptor() {
+                    desc.writable = false;
+                }
+            }
+        }
+        // Frozen data elements: the dense slots get `writable: false`.
+        for i in 0..self.elements.len() {
+            if self.holes.contains(&i) || self.properties.contains_key(&Self::index_key(i)) {
+                continue;
+            }
+            let desc = PropertyDescriptor {
+                value: self.elements[i].clone(),
+                writable: false,
+                enumerable: true,
+                configurable: false,
+                getter: None,
+                setter: None,
+            };
+            self.properties.insert(Self::index_key(i), desc);
+        }
+        self.length_writable = false;
     }
 
     fn is_sealed(&self) -> bool {
@@ -818,6 +1109,11 @@ impl JSObject for ArrayObject {
     fn seal(&mut self) {
         self.sealed = true;
         self.extensible = false;
+        for key in self.properties.keys() {
+            if let Some(desc) = self.properties.get_mut(&key) {
+                desc.configurable = false;
+            }
+        }
     }
 
     fn type_of(&self) -> &'static str {
@@ -1212,5 +1508,200 @@ impl JSObject for NativeFunctionObject {
 
     fn class_name(&self) -> &'static str {
         "Function"
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// PrimitiveWrapperObject — boxing wrapper (`Object(value)`, ToObject)
+// ─────────────────────────────────────────────────────────
+
+/// Object wrapper around a primitive value (ES `ToObject`).
+///
+/// `Object(1.1)`, `Object("ab")`, `Object(true)` and `Object(sym)` return an
+/// object whose prototype is `Number.prototype` / `String.prototype` / … and
+/// which converts back to the wrapped primitive (`obj == 1.1`, stringification,
+/// arithmetic). String wrappers additionally expose the synthesized index keys
+/// and `length` of the wrapped string.
+#[derive(Debug)]
+pub struct PrimitiveWrapperObject {
+    primitive: Value,
+    properties: PropertyTable,
+    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    extensible: bool,
+}
+
+impl PrimitiveWrapperObject {
+    pub fn new(primitive: Value, prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        Self {
+            primitive,
+            properties: PropertyTable::new(),
+            prototype,
+            extensible: true,
+        }
+    }
+
+    fn string_len(&self) -> usize {
+        match &self.primitive {
+            Value::String(s) => s.chars().count(),
+            _ => 0,
+        }
+    }
+}
+
+impl JSObject for PrimitiveWrapperObject {
+    fn kind(&self) -> ObjectKind {
+        match &self.primitive {
+            Value::String(_) => ObjectKind::String,
+            Value::Number(_) => ObjectKind::Number,
+            Value::Bool(_) => ObjectKind::Boolean,
+            Value::Symbol(_) => ObjectKind::Symbol,
+            _ => ObjectKind::Ordinary,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        if let Value::String(s) = &self.primitive {
+            if let PropertyKey::Str(k) = key {
+                if k.as_str() == "length" {
+                    return Some(PropertyDescriptor {
+                        value: Value::Number(s.chars().count() as f64),
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                        getter: None,
+                        setter: None,
+                    });
+                }
+                if let Ok(idx) = k.parse::<usize>() {
+                    return s.chars().nth(idx).map(|c| PropertyDescriptor {
+                        value: Value::string(&c.to_string()),
+                        writable: false,
+                        enumerable: true,
+                        configurable: false,
+                        getter: None,
+                        setter: None,
+                    });
+                }
+            }
+        }
+        self.properties.get(key).cloned()
+    }
+
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        if matches!(self.primitive, Value::String(_)) {
+            if let PropertyKey::Str(s) = &key {
+                // String wrapper index keys and `length` are read-only.
+                if s.as_str() == "length" || s.parse::<usize>().is_ok() {
+                    return Err(
+                        "Cannot assign to read-only property of a String wrapper".to_string()
+                    );
+                }
+            }
+        }
+        self.properties
+            .insert(key, PropertyDescriptor::data_descriptor(value));
+        Ok(true)
+    }
+
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        self.properties.insert(key, desc);
+        Ok(true)
+    }
+
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        if matches!(self.primitive, Value::String(_)) {
+            if let PropertyKey::Str(s) = key {
+                if s.as_str() == "length" || s.parse::<usize>().is_ok() {
+                    return false;
+                }
+            }
+        }
+        self.properties.remove(key).is_some()
+    }
+
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        if let PropertyKey::Str(s) = key {
+            if matches!(self.primitive, Value::String(_)) {
+                if s.as_str() == "length" {
+                    return true;
+                }
+                if let Ok(idx) = s.parse::<usize>() {
+                    return idx < self.string_len();
+                }
+            }
+        }
+        self.properties.contains_key(key)
+    }
+
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        let mut keys: Vec<PropertyKey> = Vec::new();
+        if let Value::String(s) = &self.primitive {
+            for i in 0..s.chars().count() {
+                keys.push(PropertyKey::Str(Rc::new(i.to_string())));
+            }
+        }
+        keys.extend(self.properties.keys());
+        if matches!(self.primitive, Value::String(_)) {
+            keys.push(PropertyKey::from_str("length"));
+        }
+        keys
+    }
+
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.prototype.clone()
+    }
+
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.prototype = proto;
+    }
+
+    fn is_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    fn prevent_extensions(&mut self) {
+        self.extensible = false;
+    }
+
+    fn is_frozen(&self) -> bool {
+        false
+    }
+
+    fn freeze(&mut self) {
+        self.extensible = false;
+    }
+
+    fn is_sealed(&self) -> bool {
+        false
+    }
+
+    fn seal(&mut self) {
+        self.extensible = false;
+    }
+
+    fn class_name(&self) -> &'static str {
+        match &self.primitive {
+            Value::String(_) => "String",
+            Value::Number(_) => "Number",
+            Value::Bool(_) => "Boolean",
+            Value::Symbol(_) => "Symbol",
+            _ => "Object",
+        }
+    }
+
+    fn to_primitive(&self, _hint: &str) -> Result<Value, String> {
+        Ok(self.primitive.clone())
     }
 }

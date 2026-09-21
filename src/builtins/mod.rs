@@ -32,6 +32,56 @@ pub use number::{
 };
 pub use object::{OBJECT_TO_STRING_NATIVE, object_constructor, object_prototype_to_string};
 
+// ─────────────────────────────────────────────────────────
+// Wrapper-object prototypes (for `Object(value)` / ToObject)
+// ─────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Constructor-name → prototype map used by `to_object`. Populated during
+    /// `Builtins::register`; the latest registration wins (one VM per thread
+    /// at a time is the norm, and each `VM::new` re-registers).
+    static WRAPPER_PROTOTYPES: std::cell::RefCell<HashMap<&'static str, Rc<RefCell<dyn JSObject>>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Make `proto` the prototype of wrappers created by `to_object` for the
+/// constructor `name` (`"Number"`, `"String"`, `"Boolean"`, `"Symbol"`,
+/// `"Object"`).
+pub fn register_wrapper_prototype(name: &'static str, proto: Rc<RefCell<dyn JSObject>>) {
+    WRAPPER_PROTOTYPES.with(|map| {
+        map.borrow_mut().insert(name, proto);
+    });
+}
+
+pub fn wrapper_prototype(name: &str) -> Option<Rc<RefCell<dyn JSObject>>> {
+    WRAPPER_PROTOTYPES.with(|map| map.borrow().get(name).cloned())
+}
+
+/// ES `ToObject` (7.1.13): primitives are boxed in a wrapper object whose
+/// prototype is the corresponding built-in prototype; objects pass through;
+/// `undefined`/`null` raise `TypeError`.
+pub fn to_object(value: &Value) -> Result<Value, RuntimeError> {
+    match value {
+        Value::Object(_) | Value::Function(_) => Ok(value.clone()),
+        Value::Undefined | Value::Null => Err(RuntimeError::TypeError(
+            "Cannot convert undefined or null to object".to_string(),
+        )),
+        kind => {
+            let name: &'static str = match kind {
+                Value::Bool(_) => "Boolean",
+                Value::Number(_) => "Number",
+                Value::String(_) => "String",
+                Value::Symbol(_) => "Symbol",
+                _ => "Object",
+            };
+            let proto = wrapper_prototype(name);
+            Ok(Value::Object(Rc::new(RefCell::new(
+                crate::vm::object::PrimitiveWrapperObject::new(value.clone(), proto),
+            ))))
+        }
+    }
+}
+
 /// `parseInt(string, radix)` — parses a leading integer in the given radix.
 pub fn global_parse_int(args: &[Value]) -> Result<Value, RuntimeError> {
     let Some(input) = args.first() else {
@@ -349,6 +399,13 @@ impl Builtins {
                 Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(name)))),
             );
         }
+
+        // Prototype registry for `Object(value)` / ToObject boxing.
+        register_wrapper_prototype("Object", Rc::clone(&self.object_prototype));
+        register_wrapper_prototype("Boolean", Rc::clone(&self.boolean_prototype));
+        register_wrapper_prototype("Number", Rc::clone(&self.number_prototype));
+        register_wrapper_prototype("String", Rc::clone(&self.string_prototype));
+        register_wrapper_prototype("Symbol", Rc::clone(&self.symbol_prototype));
     }
 }
 
@@ -622,7 +679,11 @@ fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
                             return Ok(Value::string(&v.value.to_js_string()));
                         }
                     }
-                    Ok(Value::string("false"))
+                    Ok(Value::string(&obj.to_js_string()))
+                }
+                ObjectKind::Number | ObjectKind::String | ObjectKind::Symbol => {
+                    // Primitive wrappers stringify to the wrapped primitive.
+                    Ok(Value::string(&obj.to_js_string()))
                 }
                 _ => Ok(Value::string(&format!(
                     "[object {}]",
@@ -729,9 +790,18 @@ fn radix_format_frac(mut frac: f64, radix: u32, max_digits: usize) -> String {
 }
 
 fn dispatch_value_of(obj: &Value) -> Result<Value, RuntimeError> {
-    match obj {
-        Value::Object(_) | _ => Ok(obj.clone()),
+    // Primitive wrappers unwrap to the wrapped value; every other object is
+    // its own valueOf result.
+    if let Value::Object(obj_ref) = obj {
+        let kind = obj_ref.borrow().kind();
+        if matches!(
+            kind,
+            ObjectKind::Number | ObjectKind::String | ObjectKind::Boolean | ObjectKind::Symbol
+        ) {
+            return Ok(obj.to_primitive("default"));
+        }
     }
+    Ok(obj.clone())
 }
 
 // ─────────────────────────────────────────────────────────

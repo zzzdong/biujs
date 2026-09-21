@@ -231,7 +231,16 @@ impl Value {
                 }
             }
             Value::Symbol(_) => f64::NAN,
-            Value::Object(_) => f64::NAN,
+            Value::Object(obj) => {
+                // Primitive wrappers convert back to the wrapped primitive;
+                // ordinary objects have no primitive form and stay NaN.
+                let prim = obj.borrow().to_primitive("number").unwrap_or(Value::Undefined);
+                if matches!(prim, Value::Object(_) | Value::Function(_)) {
+                    f64::NAN
+                } else {
+                    prim.to_number()
+                }
+            }
             Value::Function(_) => f64::NAN,
         }
     }
@@ -271,6 +280,13 @@ impl Value {
                         "[object Array]".to_string()
                     }
                 } else {
+                    // Primitive wrappers (`Object(42)`, ToObject boxing) convert
+                    // back to the wrapped primitive.
+                    if let Ok(prim) = obj.borrow().to_primitive("string") {
+                        if !matches!(prim, Value::Object(_) | Value::Function(_)) {
+                            return prim.to_js_string();
+                        }
+                    }
                     format!("[object {}]", obj.borrow().class_name())
                 }
             }

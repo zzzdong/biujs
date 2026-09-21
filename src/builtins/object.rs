@@ -9,13 +9,25 @@ use std::rc::Rc;
 use super::set_static_method;
 
 pub fn object_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
-    if args.is_empty() {
-        let obj = crate::vm::object::OrdinaryObject::new();
-        Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
-            obj,
-        ))))
-    } else {
-        Ok(args[0].clone())
+    match args.first() {
+        // `Object()` / `Object(null)` / `Object(undefined)`: an empty ordinary
+        // object. The prototype comes from the wrapper registry (a plain
+        // `Object()` call reaches this builtin without the VM's `New` prologue,
+        // which would otherwise leave the object prototype-less).
+        None => {
+            let proto = super::wrapper_prototype("Object");
+            let mut obj = crate::vm::object::OrdinaryObject::new();
+            obj.set_prototype(proto);
+            Ok(Value::Object(Rc::new(RefCell::new(obj))))
+        }
+        Some(v) if matches!(v, Value::Undefined | Value::Null) => {
+            let proto = super::wrapper_prototype("Object");
+            let mut obj = crate::vm::object::OrdinaryObject::new();
+            obj.set_prototype(proto);
+            Ok(Value::Object(Rc::new(RefCell::new(obj))))
+        }
+        // `Object(value)`: ToObject — primitives are boxed in wrapper objects.
+        Some(v) => super::to_object(v),
     }
 }
 
@@ -160,13 +172,13 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
             "Object.getOwnPropertyDescriptor requires at least 2 arguments".to_string(),
         ));
     }
-    let obj = match &args[0] {
-        Value::Object(obj_ref) => obj_ref,
-        _ => {
-            return Err(RuntimeError::TypeError(
-                format!("Object.getOwnPropertyDescriptor: first argument must be an object (got {:?}, argc={})", args, args.len()),
-            ));
-        }
+    // ES 19.1.2.6: ToObject(O) — string primitives expose their index keys
+    // and `length`; only undefined/null raise TypeError.
+    let obj_val = super::to_object(&args[0])?;
+    let Value::Object(obj) = &obj_val else {
+        return Err(RuntimeError::TypeError(
+            "Object.getOwnPropertyDescriptor: first argument must be an object".to_string(),
+        ));
     };
     let key = match &args[1] {
         Value::String(s) => PropertyKey::from_str(s),
@@ -228,20 +240,21 @@ pub fn object_get_own_property_names(args: &[Value]) -> Result<Value, RuntimeErr
             "Object.getOwnPropertyNames requires at least 1 argument".to_string(),
         ));
     }
-    match &args[0] {
-        Value::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            // String-keyed own properties only (symbols are reported by
-            // `Object.getOwnPropertySymbols`).
-            let str_keys: Vec<Value> = borrowed
-                .own_keys()
-                .into_iter()
-                .filter_map(|k| k.as_str().map(|s| Value::string(s)))
-                .collect();
-            Ok(new_array_object_from_vec(str_keys))
-        }
-        _ => Ok(new_array_object_from_vec(vec![])),
-    }
+    // ES 19.1.2.7: ToObject(O) — string primitives report index keys and
+    // `length`; undefined/null raise TypeError.
+    let obj_val = super::to_object(&args[0])?;
+    let Value::Object(obj_ref) = &obj_val else {
+        return Ok(new_array_object_from_vec(vec![]));
+    };
+    let borrowed = obj_ref.borrow();
+    // String-keyed own properties only (symbols are reported by
+    // `Object.getOwnPropertySymbols`).
+    let str_keys: Vec<Value> = borrowed
+        .own_keys()
+        .into_iter()
+        .filter_map(|k| k.as_str().map(|s| Value::string(s)))
+        .collect();
+    Ok(new_array_object_from_vec(str_keys))
 }
 
 /// `Object.getOwnPropertySymbols(obj)` — own symbol-keyed properties, in
@@ -340,7 +353,17 @@ pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
                     ));
                 }
             };
-            let keys = props_ref.borrow().own_keys();
+            let keys: Vec<PropertyKey> = props_ref
+                .borrow()
+                .own_keys()
+                .into_iter()
+                .filter(|k| {
+                    props_ref
+                        .borrow()
+                        .property_get(k)
+                        .is_some_and(|d| d.enumerable)
+                })
+                .collect();
             for key in keys {
                 let desc = props_ref
                     .borrow()
@@ -491,39 +514,47 @@ pub fn object_is(args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Bool(result))
 }
 
-/// `Object.assign(target, ...sources)` — copies own enumerable properties.
+/// `Object.assign(target, ...sources)` — copies own enumerable properties
+/// (string and symbol keys). Values of *own accessor* properties cannot be
+/// invoked at this layer, so the VM wraps the whole builtin (see
+/// `VM::object_assign`) when getters need to run; this function is the
+/// data-property fallback used for direct dispatch.
 pub fn object_assign(args: &[Value]) -> Result<Value, RuntimeError> {
     let Some(target) = args.first() else {
         return Err(RuntimeError::TypeError(
             "Object.assign requires at least 1 argument".to_string(),
         ));
     };
-    let Value::Object(target_ref) = target else {
-        return Err(RuntimeError::TypeError(
-            "Object.assign: target is not an object".to_string(),
-        ));
-    };
+    // ES 19.1.2.1: ToObject(target) — primitive targets are boxed.
+    let target = super::to_object(target)?;
     for source in args.iter().skip(1) {
-        if let Value::Object(source_ref) = source {
-            let entries: Vec<(PropertyKey, Value)> = {
-                let borrowed = source_ref.borrow();
-                borrowed
-                    .own_keys()
-                    .into_iter()
-                    .filter_map(|k| {
-                        borrowed
-                            .property_get(&k)
-                            .filter(|d| d.enumerable)
-                            .map(|d| (k, d.value))
-                    })
-                    .collect()
-            };
+        if matches!(source, Value::Undefined | Value::Null) {
+            continue;
+        }
+        let source = super::to_object(source)?;
+        let Value::Object(source_ref) = &source else {
+            continue;
+        };
+        let entries: Vec<(PropertyKey, Value)> = {
+            let borrowed = source_ref.borrow();
+            borrowed
+                .own_keys()
+                .into_iter()
+                .filter_map(|k| {
+                    borrowed
+                        .property_get(&k)
+                        .filter(|d| d.enumerable && d.is_data_descriptor())
+                        .map(|d| (k, d.value))
+                })
+                .collect()
+        };
+        if let Value::Object(target_ref) = &target {
             for (key, value) in entries {
                 let _ = target_ref.borrow_mut().property_set(key, value);
             }
         }
     }
-    Ok(target.clone())
+    Ok(target)
 }
 
 /// `Object.defineProperties(obj, props)`
@@ -546,12 +577,13 @@ pub fn object_define_properties(args: &[Value]) -> Result<Value, RuntimeError> {
         ));
     };
     // Every descriptor is converted *before* any property is defined, so a bad
-    // descriptor leaves the target untouched.
+    // descriptor leaves the target untouched. Only own *enumerable* keys count.
     let descriptors: Vec<(PropertyKey, Value)> = {
         let borrowed = props_ref.borrow();
         borrowed
             .own_keys()
             .into_iter()
+            .filter(|k| borrowed.property_get(k).is_some_and(|d| d.enumerable))
             .filter_map(|k| borrowed.property_get(&k).map(|d| (k, d.value)))
             .collect()
     };
