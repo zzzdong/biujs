@@ -418,6 +418,15 @@ impl Builtins {
         register_wrapper_prototype("Number", Rc::clone(&self.number_prototype));
         register_wrapper_prototype("String", Rc::clone(&self.string_prototype));
         register_wrapper_prototype("Symbol", Rc::clone(&self.symbol_prototype));
+        // Error prototypes: `Error(msg)` without `new` still needs the right
+        // `[[Prototype]]` on the object it returns.
+        register_wrapper_prototype("Error", Rc::clone(&self.error_prototype));
+        register_wrapper_prototype("TypeError", Rc::clone(&self.type_error_prototype));
+        register_wrapper_prototype("ReferenceError", Rc::clone(&self.reference_error_prototype));
+        register_wrapper_prototype("RangeError", Rc::clone(&self.range_error_prototype));
+        register_wrapper_prototype("SyntaxError", Rc::clone(&self.syntax_error_prototype));
+        register_wrapper_prototype("URIError", Rc::clone(&self.uri_error_prototype));
+        register_wrapper_prototype("EvalError", Rc::clone(&self.eval_error_prototype));
     }
 }
 

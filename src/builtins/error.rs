@@ -78,7 +78,7 @@ pub fn create_error_object(
 /// Note: The actual prototype is determined by the constructor function's [[Prototype]]
 /// which is set up in Builtins::register. This function creates the error object
 /// and the VM will set the correct prototype based on the constructor.
-pub fn error_constructor(_error_type: ErrorType, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn error_constructor(error_type: ErrorType, args: &[Value]) -> Result<Value, RuntimeError> {
     // `new Error()` has no own `message`; `new Error(undefined)` neither. The
     // VM installs the constructor's `prototype` afterwards.
     let message = match args.first() {
@@ -86,7 +86,12 @@ pub fn error_constructor(_error_type: ErrorType, args: &[Value]) -> Result<Value
         Some(v) => Some(v.to_js_string()),
     };
 
-    let mut obj = OrdinaryObject::new();
+    // `Error(...)` called *without* `new` must still produce an object whose
+    // `[[Prototype]]` is the matching error prototype (ES 20.5.1.1 step 3).
+    let mut obj = match crate::builtins::wrapper_prototype(error_type.name()) {
+        Some(proto) => OrdinaryObject::with_prototype(proto),
+        None => OrdinaryObject::new(),
+    };
     if let Some(msg) = message {
         obj.define_property(
             PropertyKey::from_str("message"),

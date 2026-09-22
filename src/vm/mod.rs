@@ -2129,39 +2129,24 @@ impl VM {
                             // Call native constructor
                             match crate::builtins::call_native(&name, &args) {
                                 Ok(result) => {
-                                    // For Error constructors, merge the result properties into our object
+                                    // Error constructors return the error object
+                                    // itself; just give it the constructor's
+                                    // `prototype` (which also covers subclassing).
+                                    // Merging the result's properties into a fresh
+                                    // object instead would turn `name` into an own
+                                    // property of every error instance.
                                     if name.ends_with("Error") {
                                         if let Value::Object(result_ref) = &result {
-                                            let result_borrowed = result_ref.borrow();
-                                            // Copy name and message from the result
-                                            if let Some(name_prop) = result_borrowed
-                                                .property_get(&PropertyKey::from_str("name"))
-                                            {
-                                                if let Value::Object(target_ref) = &new_obj_val {
-                                                    target_ref
-                                                        .borrow_mut()
-                                                        .property_set(
-                                                            PropertyKey::from_str("name"),
-                                                            name_prop.value,
-                                                        )
-                                                        .ok();
-                                                }
-                                            }
-                                            if let Some(msg_prop) = result_borrowed
-                                                .property_get(&PropertyKey::from_str("message"))
-                                            {
-                                                if let Value::Object(target_ref) = &new_obj_val {
-                                                    target_ref
-                                                        .borrow_mut()
-                                                        .property_set(
-                                                            PropertyKey::from_str("message"),
-                                                            msg_prop.value,
-                                                        )
-                                                        .ok();
-                                                }
-                                            }
+                                            let proto = proto.clone().unwrap_or_else(|| {
+                                                Rc::clone(&self.builtins.object_prototype)
+                                            });
+                                            result_ref
+                                                .borrow_mut()
+                                                .set_prototype(Some(proto));
+                                            self.state.set_register(Register::Rv, result)?;
+                                        } else {
+                                            self.state.set_register(Register::Rv, new_obj_val)?;
                                         }
-                                        self.state.set_register(Register::Rv, new_obj_val)?;
                                     } else {
                                         self.state.set_register(Register::Rv, result)?;
                                     }
