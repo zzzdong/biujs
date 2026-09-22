@@ -49,10 +49,10 @@ pub fn register_function_statics(
 ) {
     if let Value::Object(obj_ref) = function_fn_val {
         let mut obj = obj_ref.borrow_mut();
-        // .prototype property
-        obj.property_set(
+        // `.prototype` is writable, non-enumerable, non-configurable.
+        obj.define_property(
             PropertyKey::from_str("prototype"),
-            Value::Object(Rc::clone(function_prototype)),
+            super::constructor_prototype_descriptor(Value::Object(Rc::clone(function_prototype))),
         )
         .ok();
     }
@@ -63,27 +63,13 @@ pub fn setup_function_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     let mut p = proto.borrow_mut();
 
     // These are placeholder prototypes — actual implementation requires this-aware calling
-    p.property_set(
-        PropertyKey::from_str("call"),
-        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("call")))),
-    )
-    .ok();
-
-    p.property_set(
-        PropertyKey::from_str("apply"),
-        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("apply")))),
-    )
-    .ok();
-
-    p.property_set(
-        PropertyKey::from_str("bind"),
-        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("bind")))),
-    )
-    .ok();
-
-    p.property_set(
-        PropertyKey::from_str("toString"),
-        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("toString")))),
-    )
-    .ok();
+    for name in ["call", "apply", "bind", "toString"] {
+        p.define_property(
+            PropertyKey::from_str(name),
+            super::method_descriptor(Value::Object(Rc::new(RefCell::new(
+                NativeFunctionObject::new(name),
+            )))),
+        )
+        .ok();
+    }
 }

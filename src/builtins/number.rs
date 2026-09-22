@@ -110,10 +110,11 @@ pub fn register_number_statics(number_fn: &Value, _proto: &Rc<RefCell<dyn JSObje
             ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
             ("NaN", f64::NAN),
         ];
+        // Numeric constants are read-only, non-enumerable, non-configurable.
         for (name, value) in constants {
-            let _ = obj_ref.borrow_mut().property_set(
+            let _ = obj_ref.borrow_mut().define_property(
                 crate::vm::PropertyKey::from_str(name),
-                Value::Number(value),
+                super::constant_descriptor(Value::Number(value)),
             );
         }
     }

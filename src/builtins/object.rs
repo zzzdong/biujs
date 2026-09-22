@@ -699,11 +699,11 @@ pub fn register_object_prototype(proto: &Rc<RefCell<dyn JSObject>>, object_fn: &
     use super::set_prototype_method;
 
     // Dedicated native so that `.call(receiver)` keeps Array/Number semantics.
-    let _ = proto.borrow_mut().property_set(
+    let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("toString"),
-        Value::Object(Rc::new(RefCell::new(
+        super::method_descriptor(Value::Object(Rc::new(RefCell::new(
             crate::vm::object::NativeFunctionObject::new(OBJECT_TO_STRING_NATIVE),
-        ))),
+        )))),
     );
     set_prototype_method(proto, "valueOf", |this, _args| Ok(this.clone()));
     set_prototype_method(proto, "hasOwnProperty", |this, args| {
@@ -720,7 +720,10 @@ pub fn register_object_prototype(proto: &Rc<RefCell<dyn JSObject>>, object_fn: &
     });
     let _ = proto
         .borrow_mut()
-        .property_set(PropertyKey::from_str("constructor"), object_fn.clone());
+        .define_property(
+            PropertyKey::from_str("constructor"),
+            super::method_descriptor(object_fn.clone()),
+        );
 }
 
 pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins) {

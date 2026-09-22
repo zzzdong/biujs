@@ -23,7 +23,7 @@ pub use array::{array_constructor, validate_array_length};
 pub use boolean::boolean_constructor;
 pub use error::{
     ErrorType, create_error_object, error_constructor, runtime_error_to_js_error,
-    setup_error_prototype,
+    setup_error_prototype, setup_native_error_prototype,
 };
 pub use function::{function_constructor, setup_function_prototype};
 pub use number::{
@@ -236,14 +236,14 @@ impl Builtins {
     /// a caught error's `constructor` against `TypeError` and friends).
     fn link_constructor_prototype(fn_val: &Value, proto: &Rc<RefCell<dyn JSObject>>) {
         if let Value::Object(obj_ref) = fn_val {
-            let _ = obj_ref.borrow_mut().property_set(
+            let _ = obj_ref.borrow_mut().define_property(
                 PropertyKey::from_str("prototype"),
-                Value::Object(Rc::clone(proto)),
+                constructor_prototype_descriptor(Value::Object(Rc::clone(proto))),
             );
         }
-        let _ = proto.borrow_mut().property_set(
+        let _ = proto.borrow_mut().define_property(
             PropertyKey::from_str("constructor"),
-            fn_val.clone(),
+            method_descriptor(fn_val.clone()),
         );
     }
 
@@ -286,8 +286,20 @@ impl Builtins {
             globals.insert(name.to_string(), fn_val);
         }
 
-        // Setup Error.prototype methods
+        // Setup Error.prototype methods, then the `name` own property of each
+        // native error prototype (`TypeError.prototype.name === "TypeError"`;
+        // everything else is inherited from `Error.prototype`).
         error::setup_error_prototype(&self.error_prototype, self);
+        for (name, proto) in [
+            ("TypeError", &self.type_error_prototype),
+            ("ReferenceError", &self.reference_error_prototype),
+            ("RangeError", &self.range_error_prototype),
+            ("URIError", &self.uri_error_prototype),
+            ("EvalError", &self.eval_error_prototype),
+            ("SyntaxError", &self.syntax_error_prototype),
+        ] {
+            error::setup_native_error_prototype(proto, name);
+        }
 
         // Register `Symbol.iterator` on the natively iterable prototypes.
         // The factory is dispatched by name in `call_native_by_name`, which
@@ -296,9 +308,9 @@ impl Builtins {
             crate::vm::iterator::ITERATOR_NATIVE_NAME,
         ))));
         for proto in [&self.array_prototype, &self.string_prototype] {
-            let _ = proto.borrow_mut().property_set(
+            let _ = proto.borrow_mut().define_property(
                 crate::vm::iterator::iterator_symbol_key(),
-                iterator_fn.clone(),
+                method_descriptor(iterator_fn.clone()),
             );
         }
 
@@ -406,6 +418,49 @@ impl Builtins {
         register_wrapper_prototype("Number", Rc::clone(&self.number_prototype));
         register_wrapper_prototype("String", Rc::clone(&self.string_prototype));
         register_wrapper_prototype("Symbol", Rc::clone(&self.symbol_prototype));
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// Built-in property attributes (ES 17)
+// ─────────────────────────────────────────────────────────
+
+/// Attribute set of every built-in *method*: writable, non-enumerable,
+/// configurable. Applies to prototype methods, static methods and `constructor`
+/// back-references.
+pub fn method_descriptor(value: Value) -> PropertyDescriptor {
+    PropertyDescriptor {
+        value,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+        getter: None,
+        setter: None,
+    }
+}
+
+/// Attribute set of a built-in *constant* (`Math.PI`, `Number.MAX_VALUE`, …):
+/// read-only, non-enumerable, non-configurable.
+pub fn constant_descriptor(value: Value) -> PropertyDescriptor {
+    PropertyDescriptor {
+        value,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+        getter: None,
+        setter: None,
+    }
+}
+
+/// Attribute set of `C.prototype`: writable, non-enumerable, non-configurable.
+pub fn constructor_prototype_descriptor(value: Value) -> PropertyDescriptor {
+    PropertyDescriptor {
+        value,
+        writable: true,
+        enumerable: false,
+        configurable: false,
+        getter: None,
+        setter: None,
     }
 }
 
@@ -906,11 +961,11 @@ where
             format!("{owner}.{name}")
         };
         let key = PropertyKey::from_str(name);
-        let _ = obj_ref.borrow_mut().property_set(
+        let _ = obj_ref.borrow_mut().define_property(
             key,
-            Value::Object(Rc::new(RefCell::new(
+            method_descriptor(Value::Object(Rc::new(RefCell::new(
                 crate::vm::object::NativeFunctionObject::new(&full),
-            ))),
+            )))),
         );
     }
 }
@@ -1008,7 +1063,7 @@ where
     let method_val = Value::Object(Rc::new(RefCell::new(
         crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}")),
     )));
-    let _ = proto.borrow_mut().property_set(key, method_val);
+    let _ = proto.borrow_mut().define_property(key, method_descriptor(method_val));
 }
 
 /// Like [`set_prototype_method`], but with an explicit `length`, for the few
@@ -1025,9 +1080,10 @@ pub fn set_prototype_method_arity<F>(
     let mut method =
         crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}"));
     method.set_length(arity);
-    let _ = proto
-        .borrow_mut()
-        .property_set(PropertyKey::from_str(name), Value::Object(Rc::new(RefCell::new(method))));
+    let _ = proto.borrow_mut().define_property(
+        PropertyKey::from_str(name),
+        method_descriptor(Value::Object(Rc::new(RefCell::new(method)))),
+    );
 }
 
 /// Register a prototype method whose implementation lives in the VM

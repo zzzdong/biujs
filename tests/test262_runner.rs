@@ -209,13 +209,25 @@ fn should_skip(test: &Test) -> Option<String> {
 // ─────────────────────────────────────────────────────────
 
 /// The `name` property of a thrown JS value, when it is an Error-like object.
+///
+/// `name` lives on the error *prototype* for the standard error types, so the
+/// whole prototype chain has to be walked.
 fn thrown_error_name(val: &Value) -> Option<String> {
-    let obj = val.as_object()?;
-    let desc = obj.borrow().property_get(&biujs::vm::PropertyKey::from_str("name"))?;
-    match desc.value {
-        Value::String(s) => Some(s.to_string()),
-        _ => None,
+    let mut current = val.as_object();
+    let mut depth = 0;
+    while let Some(obj) = current {
+        if let Some(desc) = obj.borrow().property_get(&biujs::vm::PropertyKey::from_str("name")) {
+            if let Value::String(s) = desc.value {
+                return Some(s.to_string());
+            }
+        }
+        current = obj.borrow().get_prototype();
+        depth += 1;
+        if depth > 16 {
+            break;
+        }
     }
+    None
 }
 
 /// Best-effort JS error `name` for a compile-time failure.

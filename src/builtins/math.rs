@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::RuntimeError;
-use crate::vm::object::{JSObject, NativeFunctionObject, OrdinaryObject};
+use crate::vm::object::{NativeFunctionObject, OrdinaryObject};
 use crate::vm::property::PropertyKey;
 use crate::vm::value::Value;
 
@@ -20,14 +20,14 @@ pub fn create_math_object() -> Value {
         "log2", "max", "min", "pow", "random", "round", "sign", "sin", "sinh", "sqrt", "tan",
         "tanh", "trunc",
     ];
+    // Built-in methods are writable, non-enumerable and configurable (ES 17).
     for name in methods {
-        math.property_set(
+        let _ = math.define_property(
             PropertyKey::from_str(name),
-            Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(&format!(
-                "Math.{name}"
-            ))))),
-        )
-        .ok();
+            super::method_descriptor(Value::Object(Rc::new(RefCell::new(
+                NativeFunctionObject::new(&format!("Math.{name}")),
+            )))),
+        );
     }
 
     let constants: [(&str, f64); 8] = [
@@ -40,9 +40,12 @@ pub fn create_math_object() -> Value {
         ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
         ("SQRT2", std::f64::consts::SQRT_2),
     ];
+    // `Math` constants are read-only, non-enumerable, non-configurable.
     for (name, value) in constants {
-        math.property_set(PropertyKey::from_str(name), Value::Number(value))
-            .ok();
+        let _ = math.define_property(
+            PropertyKey::from_str(name),
+            super::constant_descriptor(Value::Number(value)),
+        );
     }
 
     Value::Object(Rc::new(RefCell::new(math)))

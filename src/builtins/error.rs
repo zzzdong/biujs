@@ -40,23 +40,37 @@ impl ErrorType {
 // Error constructors
 // ─────────────────────────────────────────────────────────
 
-/// Create an Error object with the given message and prototype
+/// `{ writable: true, enumerable: false, configurable: true }` — the attribute
+/// set of an error's own `message` (ES 20.5.1.1).
+fn error_message_descriptor(value: Value) -> crate::vm::property::PropertyDescriptor {
+    crate::vm::property::PropertyDescriptor {
+        value,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+        getter: None,
+        setter: None,
+    }
+}
+
+/// Create an Error object with the given message and prototype.
+///
+/// Only `message` is an own property: `name` and `toString` are inherited from
+/// the error prototype (ES 20.5.3.1 only defines it on the prototype), and an
+/// error constructed without a message has no own `message` at all.
 pub fn create_error_object(
     message: Option<String>,
     prototype: Rc<RefCell<dyn JSObject>>,
-    name: &str,
+    _name: &str,
 ) -> Value {
     let mut obj = OrdinaryObject::with_prototype(Rc::clone(&prototype));
-
-    // Set message property
-    let msg = message.unwrap_or_default();
-    obj.property_set(PropertyKey::from_str("message"), Value::string(&msg))
+    if let Some(msg) = message {
+        obj.define_property(
+            PropertyKey::from_str("message"),
+            error_message_descriptor(Value::string(&msg)),
+        )
         .ok();
-
-    // Set name property
-    obj.property_set(PropertyKey::from_str("name"), Value::string(name))
-        .ok();
-
+    }
     Value::Object(Rc::new(RefCell::new(obj)))
 }
 
@@ -64,24 +78,22 @@ pub fn create_error_object(
 /// Note: The actual prototype is determined by the constructor function's [[Prototype]]
 /// which is set up in Builtins::register. This function creates the error object
 /// and the VM will set the correct prototype based on the constructor.
-pub fn error_constructor(error_type: ErrorType, args: &[Value]) -> Result<Value, RuntimeError> {
-    let message = args.first().map(|v| v.to_js_string());
+pub fn error_constructor(_error_type: ErrorType, args: &[Value]) -> Result<Value, RuntimeError> {
+    // `new Error()` has no own `message`; `new Error(undefined)` neither. The
+    // VM installs the constructor's `prototype` afterwards.
+    let message = match args.first() {
+        None | Some(Value::Undefined) => None,
+        Some(v) => Some(v.to_js_string()),
+    };
 
-    // Create a placeholder error object - the VM will set the correct prototype
-    // based on the constructor function's prototype property
     let mut obj = OrdinaryObject::new();
-
-    // Set message property
-    let msg = message.unwrap_or_default();
-    obj.property_set(PropertyKey::from_str("message"), Value::string(&msg))
+    if let Some(msg) = message {
+        obj.define_property(
+            PropertyKey::from_str("message"),
+            error_message_descriptor(Value::string(&msg)),
+        )
         .ok();
-
-    // Set name property
-    obj.property_set(
-        PropertyKey::from_str("name"),
-        Value::string(error_type.name()),
-    )
-    .ok();
+    }
 
     Ok(Value::Object(Rc::new(RefCell::new(obj))))
 }
@@ -172,15 +184,52 @@ pub fn error_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> {
 // Setup error prototype methods
 // ─────────────────────────────────────────────────────────
 
-/// Setup Error.prototype with standard methods
+/// Setup `Error.prototype`: `name`, `message` and `toString`
+/// (ES 20.5.3.1–20.5.3.4; `constructor` is wired up by the caller).
 pub fn setup_error_prototype(
     proto: &Rc<RefCell<dyn JSObject>>,
     _builtins: &crate::builtins::Builtins,
 ) {
     use crate::builtins::set_prototype_method;
+    use crate::vm::property::PropertyDescriptor;
+
+    // `Error.prototype.name` / `.message` are writable, non-enumerable,
+    // configurable; `toString` is an ordinary built-in method.
+    let writable_string = |value: Value| PropertyDescriptor {
+        value,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+        getter: None,
+        setter: None,
+    };
+    let _ = proto
+        .borrow_mut()
+        .define_property(PropertyKey::from_str("name"), writable_string(Value::string("Error")));
+    let _ = proto
+        .borrow_mut()
+        .define_property(PropertyKey::from_str("message"), writable_string(Value::string("")));
 
     // Error.prototype.toString
     set_prototype_method(proto, "toString", |this, _args| {
         error_prototype_to_string(this)
     });
+}
+
+/// Install the own `name` of a native error prototype (`TypeError.prototype.name`
+/// is `"TypeError"`; everything else is inherited from `Error.prototype`).
+pub fn setup_native_error_prototype(proto: &Rc<RefCell<dyn JSObject>>, name: &str) {
+    use crate::vm::property::PropertyDescriptor;
+
+    let _ = proto.borrow_mut().define_property(
+        PropertyKey::from_str("name"),
+        PropertyDescriptor {
+            value: Value::string(name),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            getter: None,
+            setter: None,
+        },
+    );
 }

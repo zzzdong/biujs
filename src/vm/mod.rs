@@ -4019,16 +4019,21 @@ impl std::fmt::Display for RuntimeError {
             RuntimeError::InternalError(msg) => write!(f, "InternalError: {msg}"),
             RuntimeError::Thrown(val) => {
                 // Error-like objects should render as `Name: message`, not
-                // `[object Object]`, so failures are diagnosable.
-                if let Value::Object(obj_ref) = val {
+                // `[object Object]`, so failures are diagnosable. `name` /
+                // `message` are prototype properties for the standard error
+                // types, so the whole chain has to be consulted.
+                if let Some(obj_ref) = val.as_object() {
                     let get = |prop: &str| -> Option<String> {
-                        obj_ref
-                            .borrow()
-                            .property_get(&PropertyKey::from_str(prop))
-                            .and_then(|d| match d.value {
-                                Value::String(s) => Some(s.to_string()),
-                                _ => None,
-                            })
+                        crate::vm::prototype::find_descriptor(
+                            Rc::clone(&obj_ref),
+                            &PropertyKey::from_str(prop),
+                        )
+                        .ok()
+                        .flatten()
+                        .and_then(|(_, d)| match d.value {
+                            Value::String(s) => Some(s.to_string()),
+                            _ => None,
+                        })
                     };
                     let name = get("name").unwrap_or_else(|| "Error".to_string());
                     match get("message") {

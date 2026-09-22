@@ -248,19 +248,25 @@ pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Rc<RefCell<dyn 
             "Symbol.for",
         ))));
         obj.borrow_mut()
-            .property_set(PropertyKey::from_str("for"), for_fn);
+            .define_property(
+                PropertyKey::from_str("for"),
+                super::method_descriptor(for_fn),
+            );
 
         // Symbol.keyFor
         let key_for_fn = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
             "Symbol.keyFor",
         ))));
         obj.borrow_mut()
-            .property_set(PropertyKey::from_str("keyFor"), key_for_fn);
+            .define_property(
+                PropertyKey::from_str("keyFor"),
+                super::method_descriptor(key_for_fn),
+            );
 
         // Set Symbol.prototype
-        obj.borrow_mut().property_set(
+        obj.borrow_mut().define_property(
             PropertyKey::from_str("prototype"),
-            Value::Object(Rc::clone(symbol_proto)),
+            super::constructor_prototype_descriptor(Value::Object(Rc::clone(symbol_proto))),
         );
     }
 }
