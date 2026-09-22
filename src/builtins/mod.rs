@@ -82,6 +82,16 @@ pub fn to_object(value: &Value) -> Result<Value, RuntimeError> {
     }
 }
 
+/// ES `ToUint16` (7.1.6): `ToNumber` first, then the value modulo 2**16.
+pub fn to_uint16(n: f64) -> u16 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    let truncated = n.trunc();
+    let rem = truncated % 65_536.0;
+    (rem as i64 % 65_536) as u16
+}
+
 /// `parseInt(string, radix)` — parses a leading integer in the given radix.
 pub fn global_parse_int(args: &[Value]) -> Result<Value, RuntimeError> {
     let Some(input) = args.first() else {
@@ -605,6 +615,7 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
         "Array.of" => Ok(array::array_constructor(args)?),
         "Array.from" => array::array_from(args),
         "String.fromCharCode" => string::string_from_char_code(args),
+        "String.fromCodePoint" => string::string_from_code_point(args),
         "Symbol.for" => symbol::symbol_for(args),
         "Symbol.keyFor" => symbol::symbol_key_for(args),
         _ => Err(RuntimeError::TypeError(format!(
@@ -1040,7 +1051,7 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         | "values" | "toReversed" => 0,
         "slice" | "splice" | "copyWithin" | "with" | "toSpliced" => 2,
         // ── String ──
-        "String.fromCharCode" | "String.raw" => 1,
+        "String.fromCharCode" | "String.fromCodePoint" | "String.raw" => 1,
         "charAt" | "charCodeAt" | "codePointAt" | "startsWith" | "endsWith" | "repeat"
         | "padStart" | "padEnd" => 1,
         "substring" | "split" | "replace" | "replaceAll" => 2,

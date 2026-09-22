@@ -1457,15 +1457,27 @@ impl NativeFunctionObject {
     }
 
     /// Install the standard `length` / `name` own properties (ES 10.2.9/10.2.10):
-    /// non-writable, non-enumerable, configurable. `length` comes from the
-    /// built-in arity table; the synthetic `__proto_method__` prefix used for
-    /// prototype-method dispatch is stripped from `name`.
+    /// non-writable, non-enumerable, configurable.
+    ///
+    /// `length` comes from the built-in arity table. `name` is derived from the
+    /// dispatch name, which is *not* the same string: the synthetic
+    /// `__proto_method__` prefix and the `Owner.` prefix used for static-method
+    /// dispatch are stripped (`Object.keys.name` is `"keys"`, not
+    /// `"Object.keys"`), while `self.name` keeps the dispatch name intact.
     fn install_metadata(&mut self) {
-        let display = self
-            .name
-            .strip_prefix(crate::builtins::PROTO_METHOD_PREFIX)
-            .unwrap_or(&self.name)
-            .to_string();
+        let display = if let Some(method) = self.name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX)
+        {
+            method.to_string()
+        } else if self.name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
+            // `Array.prototype[Symbol.iterator].name` is "[Symbol.iterator]".
+            "[Symbol.iterator]".to_string()
+        } else {
+            self.name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&self.name)
+                .to_string()
+        };
         self.set_length(crate::builtins::builtin_arity(&self.name));
         self.properties.insert(
             PropertyKey::from_str("name"),

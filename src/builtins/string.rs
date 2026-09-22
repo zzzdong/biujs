@@ -49,14 +49,33 @@ pub fn register_string_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     });
 }
 
-/// `String.fromCharCode(...)`
+/// `String.fromCharCode(...)` — each argument is `ToUint16`-truncated, so a
+/// BMP code unit (including lone surrogates) is appended to the result.
 pub fn string_from_char_code(args: &[Value]) -> Result<Value, RuntimeError> {
     let mut out = String::new();
     for arg in args {
-        let code = arg.to_number() as u32;
-        if let Some(c) = char::from_u32(code & 0xFFFF) {
-            out.push(c);
+        let unit = super::to_uint16(arg.to_number());
+        // Lone surrogates are valid in JS strings but not in Rust's `String`,
+        // so they are encoded as the replacement character.
+        out.push(char::from_u32(unit as u32).unwrap_or('\u{FFFD}'));
+    }
+    Ok(Value::string(&out))
+}
+
+/// `String.fromCodePoint(...)` — each argument must be a valid code point
+/// (ES 21.1.2.2); invalid ones raise a `RangeError`.
+pub fn string_from_code_point(args: &[Value]) -> Result<Value, RuntimeError> {
+    let mut out = String::new();
+    for arg in args {
+        let n = arg.to_number();
+        // ToIntegerOrInfinity, then the range check.
+        let code = if n.is_nan() { 0.0 } else { n.trunc() };
+        if !code.is_finite() || code < 0.0 || code > 0x10_FFFF as f64 {
+            return Err(RuntimeError::RangeError(
+                "Invalid code point".to_string(),
+            ));
         }
+        out.push(char::from_u32(code as u32).unwrap_or('\u{FFFD}'));
     }
     Ok(Value::string(&out))
 }
@@ -65,6 +84,9 @@ pub fn string_from_char_code(args: &[Value]) -> Result<Value, RuntimeError> {
 pub fn register_string_statics(string_fn: &Value) {
     super::set_static_method(string_fn, "fromCharCode", |args| {
         string_from_char_code(args)
+    });
+    super::set_static_method(string_fn, "fromCodePoint", |args| {
+        string_from_code_point(args)
     });
 }
 
