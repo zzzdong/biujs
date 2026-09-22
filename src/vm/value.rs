@@ -476,25 +476,8 @@ fn string_numeric_literal(text: &str) -> f64 {
 }
 
 fn format_number(n: f64) -> String {
-    if n.is_nan() {
-        "NaN".to_string()
-    } else if n == 0.0 || n == -0.0 {
-        "0".to_string()
-    } else if n.is_infinite() {
-        if n.is_sign_positive() {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
-    } else {
-        let s = n.to_string();
-        if s.contains('.') {
-            let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-            trimmed.to_string()
-        } else {
-            s
-        }
-    }
+    // One implementation of `Number::toString` for the whole engine.
+    crate::builtins::number_to_string(n)
 }
 
 // ─────────────────────────────────────────────────────────

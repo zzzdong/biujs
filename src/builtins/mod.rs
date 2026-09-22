@@ -786,26 +786,63 @@ fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
     }
 }
 
+/// ES 7.1.12.1 `Number::toString(x, 10)`.
+///
+/// The shortest round-trip digits come from Rust's `{:e}` formatting; the
+/// choice between fixed and exponential notation is the spec's own rule
+/// (exponents below -6 or at/above 21 switch to `e` notation), which plain
+/// `f64::to_string` does not follow: `String(1e21)` is `"1e+21"`, and
+/// `String(0.0000001)` is `"1e-7"`.
 pub fn number_to_string(n: f64) -> String {
     if n.is_nan() {
-        "NaN".to_string()
-    } else if n == 0.0 || n == -0.0 {
-        "0".to_string()
-    } else if n.is_infinite() {
-        if n.is_sign_positive() {
-            "Infinity".to_string()
-        } else {
-            "-Infinity".to_string()
-        }
+        return "NaN".to_string();
+    }
+    if n == 0.0 {
+        // Also covers `-0`.
+        return "0".to_string();
+    }
+    if n < 0.0 {
+        return format!("-{}", number_to_string(-n));
+    }
+    if n.is_infinite() {
+        return "Infinity".to_string();
+    }
+
+    // `s * 10^(n_es - k)` is exactly `n`, with `k = |s|` minimal.
+    let scientific = format!("{n:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` always emits an exponent");
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    let n_es = exponent + 1;
+
+    if k <= n_es && n_es <= 21 {
+        // Integers: the digits, then `n_es - k` zeros.
+        let mut out = digits;
+        out.push_str(&"0".repeat((n_es - k) as usize));
+        out
+    } else if 0 < n_es && n_es <= 21 {
+        // A decimal point inside the digits.
+        let (head, tail) = digits.split_at(n_es as usize);
+        format!("{head}.{tail}")
+    } else if -6 < n_es && n_es <= 0 {
+        // `0.` followed by `-n_es` zeros, then the digits.
+        format!("0.{}{}", "0".repeat((-n_es) as usize), digits)
     } else {
-        let s = n.to_string();
-        if s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        let e = n_es - 1;
+        let sign = if e >= 0 { '+' } else { '-' };
+        let e_abs = e.abs();
+        if k == 1 {
+            format!("{digits}e{sign}{e_abs}")
         } else {
-            s
+            let (head, tail) = digits.split_at(1);
+            format!("{head}.{tail}e{sign}{e_abs}")
         }
     }
 }
+
 
 pub fn number_to_string_radix(n: f64, radix: u32) -> String {
     if n.is_nan() {
