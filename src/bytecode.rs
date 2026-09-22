@@ -276,6 +276,8 @@ pub enum Opcode {
     IterClose,
     /// to_string dst, src — ES ToString (objects via ToPrimitive("string"))
     ToString,
+    /// to_number dst, src — ES ToNumber (objects via ToPrimitive("number"))
+    ToNumber,
     /// make_rest dst, from_index — collect arguments[from_index..] into an array
     MakeRest,
     /// call_spread result, callee, this, args — call with args taken from an array
@@ -367,6 +369,7 @@ impl fmt::Display for Opcode {
             Opcode::Arguments => write!(f, "arguments"),
             Opcode::IterClose => write!(f, "iter_close"),
             Opcode::ToString => write!(f, "to_string"),
+            Opcode::ToNumber => write!(f, "to_number"),
             Opcode::MakeRest => write!(f, "make_rest"),
             Opcode::CallSpread => write!(f, "call_spread"),
             Opcode::CallSuperSpread => write!(f, "call_super_spread"),

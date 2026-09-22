@@ -554,7 +554,9 @@ impl ArrayObject {
             properties: PropertyTable::new(),
             holes: std::collections::BTreeSet::new(),
             length_writable: true,
-            prototype: None,
+            // Arrays created by the engine (literals, `Array(...)`, `map`,
+            // `slice`, …) inherit from `Array.prototype` unconditionally.
+            prototype: crate::builtins::wrapper_prototype("Array"),
             extensible: true,
             frozen: false,
             sealed: false,
@@ -567,7 +569,9 @@ impl ArrayObject {
             properties: PropertyTable::new(),
             holes: std::collections::BTreeSet::new(),
             length_writable: true,
-            prototype: None,
+            // Arrays created by the engine (literals, `Array(...)`, `map`,
+            // `slice`, …) inherit from `Array.prototype` unconditionally.
+            prototype: crate::builtins::wrapper_prototype("Array"),
             extensible: true,
             frozen: false,
             sealed: false,
@@ -580,7 +584,9 @@ impl ArrayObject {
             properties: PropertyTable::new(),
             holes: std::collections::BTreeSet::new(),
             length_writable: true,
-            prototype: None,
+            // Arrays created by the engine (literals, `Array(...)`, `map`,
+            // `slice`, …) inherit from `Array.prototype` unconditionally.
+            prototype: crate::builtins::wrapper_prototype("Array"),
             extensible: true,
             frozen: false,
             sealed: false,
@@ -1438,17 +1444,12 @@ pub struct NativeFunctionObject {
 
 impl NativeFunctionObject {
     pub fn new(name: &str) -> Self {
-        Self::build(name, None)
-    }
-
-    pub fn with_prototype(name: &str, proto: Rc<RefCell<dyn JSObject>>) -> Self {
-        Self::build(name, Some(proto))
-    }
-
-    fn build(name: &str, prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        // Every built-in function object inherits from `Function.prototype`
+        // (ES 17); the function's own `prototype` property is an ordinary own
+        // property installed separately (`link_constructor_prototype`).
         let mut obj = Self {
             name: name.to_string(),
-            prototype,
+            prototype: crate::builtins::wrapper_prototype("Function"),
             properties: PropertyTable::new(),
         };
         obj.install_metadata();

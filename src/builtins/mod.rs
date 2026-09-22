@@ -206,6 +206,10 @@ impl Builtins {
         let function_proto = new_proto(Some(Rc::clone(&object_proto)), "Function");
         let symbol_proto = new_proto(Some(Rc::clone(&object_proto)), "Symbol");
 
+        // Needed before any built-in function object is created: every one of
+        // them inherits from `Function.prototype`.
+        register_wrapper_prototype("Function", Rc::clone(&function_proto));
+
         // Set up Function.prototype with standard methods
         setup_function_prototype(&function_proto);
 
@@ -251,7 +255,7 @@ impl Builtins {
         use crate::vm::object::NativeFunctionObject;
 
         let object_fn_val = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::with_prototype("Object", Rc::clone(&self.object_prototype)),
+            NativeFunctionObject::new("Object"),
         )));
         object::register_object_statics(&object_fn_val, self);
         Self::link_constructor_prototype(&object_fn_val, &self.object_prototype);
@@ -259,7 +263,7 @@ impl Builtins {
         globals.insert("Object".to_string(), object_fn_val);
 
         let array_fn_val = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::with_prototype("Array", Rc::clone(&self.array_prototype)),
+            NativeFunctionObject::new("Array"),
         )));
         array::register_array_prototype(&self.array_prototype);
         array::register_array_statics(&array_fn_val);
@@ -279,7 +283,7 @@ impl Builtins {
 
         for (name, proto) in error_constructors {
             let fn_val = Value::Object(Rc::new(RefCell::new(
-                NativeFunctionObject::with_prototype(name, Rc::clone(&proto)),
+                NativeFunctionObject::new(name),
             )));
 
             Self::link_constructor_prototype(&fn_val, &proto);
@@ -315,14 +319,14 @@ impl Builtins {
         }
 
         let bool_fn_val = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::with_prototype("Boolean", Rc::clone(&self.boolean_prototype)),
+            NativeFunctionObject::new("Boolean"),
         )));
         boolean::register_boolean_prototype(&self.boolean_prototype);
         Self::link_constructor_prototype(&bool_fn_val, &self.boolean_prototype);
         globals.insert("Boolean".to_string(), bool_fn_val);
 
         let number_fn_val = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::with_prototype("Number", Rc::clone(&self.number_prototype)),
+            NativeFunctionObject::new("Number"),
         )));
         number::register_number_statics(&number_fn_val, &self.number_prototype);
         number::register_number_prototype(&self.number_prototype);
@@ -330,7 +334,7 @@ impl Builtins {
         globals.insert("Number".to_string(), number_fn_val);
 
         let string_fn_val = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::with_prototype("String", Rc::clone(&self.string_prototype)),
+            NativeFunctionObject::new("String"),
         )));
         string::register_string_prototype(&self.string_prototype);
         string::register_string_statics(&string_fn_val);
@@ -338,7 +342,7 @@ impl Builtins {
         globals.insert("String".to_string(), string_fn_val);
 
         let function_fn_val = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::with_prototype("Function", Rc::clone(&self.function_prototype)),
+            NativeFunctionObject::new("Function"),
         )));
         function::register_function_statics(&function_fn_val, &self.function_prototype);
         Self::link_constructor_prototype(&function_fn_val, &self.function_prototype);
@@ -346,7 +350,7 @@ impl Builtins {
 
         // Symbol constructor
         let symbol_fn_val = Value::Object(Rc::new(RefCell::new(
-            NativeFunctionObject::with_prototype("Symbol", Rc::clone(&self.symbol_prototype)),
+            NativeFunctionObject::new("Symbol"),
         )));
         symbol::register_symbol_statics(&symbol_fn_val, &self.symbol_prototype);
         symbol::register_symbol_prototype(&self.symbol_prototype);
@@ -412,7 +416,9 @@ impl Builtins {
             );
         }
 
-        // Prototype registry for `Object(value)` / ToObject boxing.
+        // Prototype registry for `Object(value)` / ToObject boxing, and for the
+        // array objects the engine creates outside the `New` prologue.
+        register_wrapper_prototype("Array", Rc::clone(&self.array_prototype));
         register_wrapper_prototype("Object", Rc::clone(&self.object_prototype));
         register_wrapper_prototype("Boolean", Rc::clone(&self.boolean_prototype));
         register_wrapper_prototype("Number", Rc::clone(&self.number_prototype));

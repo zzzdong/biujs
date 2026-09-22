@@ -222,14 +222,7 @@ impl Value {
                 }
             }
             Value::Number(n) => *n,
-            Value::String(s) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    0.0
-                } else {
-                    trimmed.parse::<f64>().unwrap_or(f64::NAN)
-                }
-            }
+            Value::String(s) => string_numeric_literal(s.trim()),
             Value::Symbol(_) => f64::NAN,
             Value::Object(obj) => {
                 // Primitive wrappers convert back to the wrapped primitive;
@@ -437,8 +430,50 @@ fn leave_to_string() {
 }
 
 // ─────────────────────────────────────────────────────────
-// Number formatting helper
+// Number conversion / formatting helpers
 // ─────────────────────────────────────────────────────────
+
+/// ES `StringNumericLiteral` (7.1.4.1) → number.
+///
+/// Rust's `f64::from_str` rejects the `0x` / `0o` / `0b` radix prefixes and the
+/// non-finite names, all of which the grammar accepts (`Number("0x10")` is 16,
+/// `Number("Infinity")` is `+∞`). `text` must already be trimmed; an empty
+/// string is 0.
+fn string_numeric_literal(text: &str) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1.0, rest),
+        None => (1.0, text.strip_prefix('+').unwrap_or(text)),
+    };
+    if digits.eq_ignore_ascii_case("infinity") {
+        return sign * f64::INFINITY;
+    }
+    let radix = match digits.as_bytes() {
+        [b'0', b'x' | b'X', ..] => Some(16),
+        [b'0', b'o' | b'O', ..] => Some(8),
+        [b'0', b'b' | b'B', ..] => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let body = &digits[2..];
+        if body.is_empty() {
+            return f64::NAN;
+        }
+        // Accumulate in f64: a radix literal may exceed u64 (and even f64's
+        // exact integer range, which is fine — the value is approximate).
+        let mut acc = 0.0f64;
+        for c in body.chars() {
+            match c.to_digit(radix) {
+                Some(d) => acc = acc * radix as f64 + d as f64,
+                None => return f64::NAN,
+            }
+        }
+        return sign * acc;
+    }
+    sign * digits.parse::<f64>().unwrap_or(f64::NAN)
+}
 
 fn format_number(n: f64) -> String {
     if n.is_nan() {

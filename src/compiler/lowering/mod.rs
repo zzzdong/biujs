@@ -1304,11 +1304,9 @@ impl<'a> JSASTLower<'a> {
 
         match unary.operator {
             UnaryOperator::UnaryNegation => self.builder.unaryop(Opcode::Neg, arg),
-            UnaryOperator::UnaryPlus => {
-                // +expr → ToNumber(expr) — use Addx with 0
-                let zero = Value::Primitive(Primitive::Float(0.0));
-                self.builder.binop(Opcode::Addx, zero, arg)
-            }
+            // `+expr` → ToNumber(expr). It must not go through `Addx`, whose
+            // string operand triggers concatenation (`+"5"` was `"05"`).
+            UnaryOperator::UnaryPlus => self.builder.unaryop(Opcode::ToNumber, arg),
             UnaryOperator::LogicalNot => self.builder.unaryop(Opcode::Not, arg),
             UnaryOperator::BitwiseNot => {
                 // ~expr → bitwise NOT
@@ -1370,8 +1368,19 @@ impl<'a> JSASTLower<'a> {
         }
     }
 
-    fn lower_update(&mut self, update: &UpdateExpression<'_>) -> Value {
+    /// `ToNumber(current) \u{00b1} 1`, returning `(oldNumeric, newValue)`.
+    ///
+    /// ES 13.4.4/13.4.5 operate on `ToNumeric(GetValue(x))`, and the postfix
+    /// form yields that *converted* value: `var s = "5"; s++` yields the number
+    /// 5 (and stores 6), not the string `"5"`.
+    fn lower_update_step(&mut self, current: Value, op: Opcode) -> (Value, Value) {
         let one = Value::Primitive(Primitive::Float(1.0));
+        let numeric = self.builder.unaryop(Opcode::ToNumber, current);
+        let new_val = self.builder.binop(op, numeric, one);
+        (numeric, new_val)
+    }
+
+    fn lower_update(&mut self, update: &UpdateExpression<'_>) -> Value {
         let op = match update.operator {
             UpdateOperator::Increment => Opcode::Addx,
             UpdateOperator::Decrement => Opcode::Subx,
@@ -1386,29 +1395,29 @@ impl<'a> JSASTLower<'a> {
                     let current = self
                         .builder
                         .load_external_variable(ident.name.to_string());
-                    let new_val = self.builder.binop(op, current, one);
+                    let (old_num, new_val) = self.lower_update_step(current, op);
                     self.builder
                         .store_external_variable(ident.name.to_string(), new_val);
-                    return if update.prefix { new_val } else { current };
+                    return if update.prefix { new_val } else { old_num };
                 }
                 match self.symbols.lookup(ident.name.as_str()) {
                     Some(var) => {
                         let current = var.0;
-                        let new_val = self.builder.binop(op, current, one);
+                        let (old_num, new_val) = self.lower_update_step(current, op);
                         self.builder.assign(current, new_val);
                         self.sync_global(&ident.name.to_string(), new_val);
                         // prefix returns new value, postfix returns old value
-                        if update.prefix { new_val } else { current }
+                        if update.prefix { new_val } else { old_num }
                     }
                     None => {
                         // Undeclared target: treat as a global slot.
                         let current = self
                             .builder
                             .load_external_variable(ident.name.to_string());
-                        let new_val = self.builder.binop(op, current, one);
+                        let (old_num, new_val) = self.lower_update_step(current, op);
                         self.builder
                             .store_external_variable(ident.name.to_string(), new_val);
-                        if update.prefix { new_val } else { current }
+                        if update.prefix { new_val } else { old_num }
                     }
                 }
             }
@@ -1417,18 +1426,18 @@ impl<'a> JSASTLower<'a> {
                 let current = self
                     .builder
                     .get_property(object, member.property.name.as_str());
-                let new_val = self.builder.binop(op, current, one);
+                let (old_num, new_val) = self.lower_update_step(current, op);
                 self.builder
                     .set_property(object, member.property.name.as_str(), new_val);
-                if update.prefix { new_val } else { current }
+                if update.prefix { new_val } else { old_num }
             }
             SimpleAssignmentTarget::ComputedMemberExpression(member) => {
                 let object = self.lower_expression(&member.object);
                 let index = self.lower_expression(&member.expression);
                 let current = self.builder.index_get(object, index);
-                let new_val = self.builder.binop(op, current, one);
+                let (old_num, new_val) = self.lower_update_step(current, op);
                 self.builder.index_set(object, index, new_val);
-                if update.prefix { new_val } else { current }
+                if update.prefix { new_val } else { old_num }
             }
             _ => {
                 log::warn!(

@@ -1615,6 +1615,16 @@ impl VM {
                 };
                 self.set_value(operands[0], Value::string(&s))?;
             }
+            Opcode::ToNumber => {
+                // ES 7.1.4 ToNumber: objects convert through
+                // ToPrimitive(hint "number"), which may run user code.
+                let src = self.get_value(operands[1])?;
+                let prim = match self.to_primitive(&src, "number", module) {
+                    Ok(v) => v,
+                    Err(_) => src.clone(),
+                };
+                self.set_value(operands[0], Value::Number(prim.to_number()))?;
+            }
 
             // ===== Object/Array Operations =====
             Opcode::MakeArray => {
@@ -2087,14 +2097,19 @@ impl VM {
                                 ));
                             }
                         } else if borrowed.kind() == ObjectKind::NativeFunction {
-                            // Handle native constructors (like Object, Array, Error, etc.)
-                            let native_fn = borrowed
+                            // Built-in constructor (`new Array(…)`, `new Object()`,
+                            // `new Error(…)`, …).
+                            let name = borrowed
                                 .as_any()
                                 .downcast_ref::<NativeFunctionObject>()
-                                .map(|f| (f.name.clone(), f.get_prototype()))
+                                .map(|f| f.name.clone())
                                 .unwrap_or_default();
-                            let name = native_fn.0;
-                            let proto = native_fn.1;
+                            // The instance prototype is `C.prototype`, *not* the
+                            // constructor's own `[[Prototype]]` (which is
+                            // `Function.prototype`).
+                            let proto = borrowed
+                                .property_get(&PropertyKey::from_str("prototype"))
+                                .map(|d| d.value);
                             drop(borrowed);
 
                             // `Symbol` is callable but not a constructor
@@ -2105,51 +2120,23 @@ impl VM {
                                 ));
                             }
 
-                            // Get arguments from the stack (args were pushed in reverse order)
-                            let mut args = Vec::with_capacity(arg_count);
-                            for i in 0..arg_count {
-                                let index = self.state.rbp - i - 1;
-                                args.push(self.state.raw_stack_value(index));
-                            }
-                            // Reverse to get original order
-                            args.reverse();
+                            let args = self.collect_call_args(arg_count)?;
 
-                            // Create a new object with the correct prototype
+                            // The `this` object the constructor would receive.
                             let mut new_obj = crate::vm::object::OrdinaryObject::new();
-                            if let Some(ref p) = proto {
-                                new_obj.set_prototype(Some(Rc::clone(p)));
-                            } else {
-                                new_obj.set_prototype(Some(Rc::clone(
-                                    &self.builtins.object_prototype,
-                                )));
+                            match &proto {
+                                Some(Value::Object(p)) => new_obj.set_prototype(Some(Rc::clone(p))),
+                                _ => new_obj
+                                    .set_prototype(Some(Rc::clone(&self.builtins.object_prototype))),
                             }
                             let new_obj_val = Value::Object(Rc::new(RefCell::new(new_obj)));
                             self.state.this_val = new_obj_val.clone();
 
-                            // Call native constructor
                             match crate::builtins::call_native(&name, &args) {
                                 Ok(result) => {
-                                    // Error constructors return the error object
-                                    // itself; just give it the constructor's
-                                    // `prototype` (which also covers subclassing).
-                                    // Merging the result's properties into a fresh
-                                    // object instead would turn `name` into an own
-                                    // property of every error instance.
-                                    if name.ends_with("Error") {
-                                        if let Value::Object(result_ref) = &result {
-                                            let proto = proto.clone().unwrap_or_else(|| {
-                                                Rc::clone(&self.builtins.object_prototype)
-                                            });
-                                            result_ref
-                                                .borrow_mut()
-                                                .set_prototype(Some(proto));
-                                            self.state.set_register(Register::Rv, result)?;
-                                        } else {
-                                            self.state.set_register(Register::Rv, new_obj_val)?;
-                                        }
-                                    } else {
-                                        self.state.set_register(Register::Rv, result)?;
-                                    }
+                                    let rv =
+                                        self.finish_native_construct(result, &proto, new_obj_val);
+                                    self.state.set_register(Register::Rv, rv)?;
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -3671,6 +3658,44 @@ impl VM {
         let new_obj_val = Value::Object(Rc::new(RefCell::new(new_obj)));
 
         self.invoke_construct(&boxed_ctor, new_obj_val, args, module)
+    }
+
+    /// Result value of `new C(…)` for a built-in constructor `C`.
+    ///
+    /// Built-ins either return a fully formed object (Array, Object, Error, …),
+    /// a primitive (String/Number/Boolean, which the constructor wraps in an
+    /// object), or nothing at all — in which case the `this` object created for
+    /// the call is the result.
+    fn finish_native_construct(
+        &self,
+        result: Value,
+        proto: &Option<Value>,
+        this_obj: Value,
+    ) -> Value {
+        let proto_ref = match proto {
+            Some(Value::Object(p)) => Some(Rc::clone(p)),
+            _ => None,
+        };
+        match &result {
+            Value::Object(obj_ref) => {
+                // A result that already has a `[[Prototype]]` was built by the
+                // constructor itself (`Error(...)`, `Object(x)` returning `x`);
+                // do not rewire it.
+                if obj_ref.borrow().get_prototype().is_none() {
+                    if let Some(proto) = proto_ref {
+                        obj_ref.borrow_mut().set_prototype(Some(proto));
+                    }
+                }
+                result
+            }
+            // `new String("x")` / `new Number(1)` / `new Boolean(true)`.
+            Value::String(_) | Value::Number(_) | Value::Bool(_) => Value::Object(Rc::new(
+                RefCell::new(crate::vm::object::PrimitiveWrapperObject::new(
+                    result, proto_ref,
+                )),
+            )),
+            _ => this_obj,
+        }
     }
 
     fn call_builtin_method(
