@@ -31,6 +31,8 @@ mod debug_instanceof2;
 mod debug_propset;
 #[path = "features/es6_syntax.rs"]
 mod es6_syntax;
+#[path = "features/error_builtins.rs"]
+mod error_builtins;
 #[path = "features/exception_unwinding.rs"]
 mod exception_unwinding;
 #[path = "features/functions.rs"]

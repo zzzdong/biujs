@@ -326,6 +326,10 @@ pub struct OrdinaryObject {
     extensible: bool,
     frozen: bool,
     sealed: bool,
+    /// `[[Class]]` as reported by `Object.prototype.toString` (ES 19.1.3.6).
+    /// `"Object"` for everything the engine creates except error instances,
+    /// which all report `"Error"`.
+    class_name: &'static str,
 }
 
 impl OrdinaryObject {
@@ -336,6 +340,15 @@ impl OrdinaryObject {
             extensible: true,
             frozen: false,
             sealed: false,
+            class_name: "Object",
+        }
+    }
+
+    /// An ordinary object with a non-default `[[Class]]`.
+    pub fn with_class_name(class_name: &'static str) -> Self {
+        Self {
+            class_name,
+            ..Self::new()
         }
     }
 
@@ -346,6 +359,7 @@ impl OrdinaryObject {
             extensible: true,
             frozen: false,
             sealed: false,
+            class_name: "Object",
         }
     }
 
@@ -360,6 +374,7 @@ impl OrdinaryObject {
             extensible: true,
             frozen: false,
             sealed: false,
+            class_name: "Object",
         }
     }
 
@@ -510,7 +525,7 @@ impl JSObject for OrdinaryObject {
     }
 
     fn class_name(&self) -> &'static str {
-        "Object"
+        self.class_name
     }
 }
 

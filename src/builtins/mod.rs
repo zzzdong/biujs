@@ -316,6 +316,18 @@ impl Builtins {
             )));
 
             Self::link_constructor_prototype(&fn_val, &proto);
+            if name == "Error" {
+                // `Error.isError(value)`: true for objects carrying
+                // `[[ErrorData]]`, which the engine marks with the `[[Class]]`
+                // "Error" (that is also what `Object.prototype.toString`
+                // reports).
+                set_static_method(&fn_val, "isError", |args| {
+                    Ok(Value::Bool(matches!(
+                        args.first(),
+                        Some(Value::Object(o)) if o.borrow().class_name() == "Error"
+                    )))
+                });
+            }
             globals.insert(name.to_string(), fn_val);
         }
 
@@ -496,11 +508,13 @@ pub fn constant_descriptor(value: Value) -> PropertyDescriptor {
     }
 }
 
-/// Attribute set of `C.prototype`: writable, non-enumerable, non-configurable.
+/// Attribute set of a *built-in* `C.prototype`: read-only, non-enumerable,
+/// non-configurable (ES 17). User functions' `F.prototype` is writable —
+/// see `new_function_object`.
 pub fn constructor_prototype_descriptor(value: Value) -> PropertyDescriptor {
     PropertyDescriptor {
         value,
-        writable: true,
+        writable: false,
         enumerable: false,
         configurable: false,
         getter: None,
@@ -652,6 +666,10 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
         "Array.from" => array::array_from(args),
         "String.fromCharCode" => string::string_from_char_code(args),
         "String.fromCodePoint" => string::string_from_code_point(args),
+        "Error.isError" => Ok(Value::Bool(matches!(
+            args.first(),
+            Some(Value::Object(o)) if o.borrow().class_name() == "Error"
+        ))),
         "Symbol.for" => symbol::symbol_for(args),
         "Symbol.keyFor" => symbol::symbol_key_for(args),
         _ => Err(RuntimeError::TypeError(format!(
@@ -786,24 +804,26 @@ fn dispatch_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
     match obj {
         Value::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            match borrowed.kind() {
+            let (kind, class_name) = {
+                let borrowed = obj_ref.borrow();
+                (borrowed.kind(), borrowed.class_name())
+            };
+            match kind {
                 ObjectKind::Array => {
-                    if let Some(arr) = borrowed
+                    if let Some(arr) = obj_ref
+                        .borrow()
                         .as_any()
                         .downcast_ref::<crate::vm::object::ArrayObject>()
                     {
                         Ok(Value::string(&arr.join_elements()))
                     } else {
-                        Ok(Value::string(&format!(
-                            "[object {}]",
-                            borrowed.class_name()
-                        )))
+                        Ok(Value::string(&format!("[object {class_name}]")))
                     }
                 }
                 ObjectKind::Boolean => {
                     // Boolean wrapper — unwrap
-                    if let Some(inner) = borrowed
+                    if let Some(inner) = obj_ref
+                        .borrow()
                         .as_any()
                         .downcast_ref::<crate::vm::object::OrdinaryObject>()
                     {
@@ -817,10 +837,12 @@ fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
                     // Primitive wrappers stringify to the wrapped primitive.
                     Ok(Value::string(&obj.to_js_string()))
                 }
-                _ => Ok(Value::string(&format!(
-                    "[object {}]",
-                    borrowed.class_name()
-                ))),
+                // `new Error("x").toString()` is "Error: x": an error instance
+                // stringifies through `Error.prototype.toString`, which by-name
+                // dispatch cannot see (any ordinary object would otherwise fall
+                // through to `[object <Class>]`).
+                _ if class_name == "Error" => error::error_prototype_to_string(obj),
+                _ => Ok(Value::string(&format!("[object {class_name}]"))),
             }
         }
         Value::Bool(b) => Ok(Value::string(&b.to_string())),
@@ -1114,6 +1136,7 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         "Object" | "Array" | "Boolean" | "Number" | "String" | "Function" | "Error"
         | "TypeError" | "ReferenceError" | "RangeError" | "SyntaxError" | "URIError"
         | "EvalError" => 1,
+        "Error.isError" => 1,
         "Symbol" => 0,
         // ── Global functions ──
         "parseInt" => 2,
