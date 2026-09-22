@@ -27,6 +27,10 @@ pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "lastIndexOf", |this, args| array_last_index_of(this, args));
     set_prototype_method(proto, "fill", |this, args| array_fill(this, args));
     set_prototype_method(proto, "toString", |this, _args| array_to_string(this));
+    set_prototype_method(proto, "at", |this, args| array_at(this, args));
+    set_prototype_method(proto, "copyWithin", |this, args| {
+        array_copy_within(this, args)
+    });
 
     // Callback-driven methods: the VM runs the algorithm so it can call the
     // user-supplied function for each element.
@@ -42,6 +46,13 @@ pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
         "findIndex",
         "sort",
     ] {
+        mark_prototype_method(proto, name);
+    }
+
+    // `entries` / `keys` / `values` return iterators, which only the VM can
+    // build: they are dispatched by `call_native_by_name` through the iterator
+    // registry.
+    for name in ["entries", "keys", "values"] {
         mark_prototype_method(proto, name);
     }
 }
@@ -266,8 +277,135 @@ fn to_uint32(n: f64) -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────
+// Generic (array-like) helpers
+// ─────────────────────────────────────────────────────────
+
+/// `ToObject(this)` for the generic Array.prototype paths.
+fn to_object(obj: &Value) -> Result<Rc<RefCell<dyn JSObject>>, RuntimeError> {
+    match super::to_object(obj) {
+        Ok(Value::Object(o)) => Ok(o),
+        Ok(_) => Err(RuntimeError::TypeError(
+            "Array.prototype method called on a non-object".to_string(),
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+/// `ToLength(Get(O, \"length\"))` — saturating, so a huge `length` cannot make
+/// the caller allocate or loop forever.
+fn generic_length(obj: &Value) -> u64 {
+    let raw = match obj {
+        Value::Object(o) => o
+            .borrow()
+            .property_get(&PropertyKey::from_str("length"))
+            .map(|d| d.value.to_number()),
+        _ => None,
+    };
+    let n = raw.unwrap_or(f64::NAN);
+    if n.is_nan() || n <= 0.0 {
+        0
+    } else if n.is_infinite() {
+        u64::MAX
+    } else {
+        n.trunc().min((1u64 << 53) as f64) as u64
+    }
+}
+
+fn generic_get(obj: &Value, index: u64) -> Value {
+    match obj {
+        Value::Object(o) => o
+            .borrow()
+            .property_get(&PropertyKey::from_str(&index.to_string()))
+            .map(|d| d.value)
+            .unwrap_or(Value::Undefined),
+        _ => Value::Undefined,
+    }
+}
+
+fn generic_set(obj: &Value, index: u64, value: Value) -> Result<(), RuntimeError> {
+    match obj {
+        Value::Object(o) => o
+            .borrow_mut()
+            .property_set(PropertyKey::from_str(&index.to_string()), value)
+            .map(|_| ())
+            .map_err(RuntimeError::TypeError),
+        _ => Ok(()),
+    }
+}
+
+/// `ToIntegerOrInfinity(arg)` resolved against a length: negatives count from
+/// the end and the result is clamped into `[0, len]` (ES 23.1.3.3 steps 5-9).
+fn relative_index(arg: Option<&Value>, len: u64) -> u64 {
+    let n = super::to_integer_or_infinity(arg);
+    let len_i = len.min(i64::MAX as u64) as i64;
+    let index = if n < 0 { n.saturating_add(len_i) } else { n };
+    index.clamp(0, len_i) as u64
+}
+
+// ─────────────────────────────────────────────────────────
 // Prototype methods
 // ─────────────────────────────────────────────────────────
+
+/// `Array.prototype.at(index)` — code-unit free, negative indices count from
+/// the end (ES 23.1.3.1).
+pub fn array_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Value::Object(obj_ref) = obj {
+        if let Some(arr) = obj_ref.borrow().as_any().downcast_ref::<ArrayObject>() {
+            let len = arr.len() as i64;
+            let n = super::to_integer_or_infinity(args.first());
+            let index = if n < 0 { n + len } else { n };
+            if index < 0 || index >= len {
+                return Ok(Value::Undefined);
+            }
+            return Ok(arr.get(index as usize).cloned().unwrap_or(Value::Undefined));
+        }
+    }
+    let object = to_object(obj)?;
+    let len = generic_length(obj);
+    let n = super::to_integer_or_infinity(args.first());
+    let len_i = len.min(i64::MAX as u64) as i64;
+    let index = if n < 0 { n.saturating_add(len_i) } else { n };
+    if index < 0 || index >= len_i {
+        return Ok(Value::Undefined);
+    }
+    let _ = object;
+    Ok(generic_get(obj, index as u64))
+}
+
+/// `Array.prototype.copyWithin(target, start, end)`.
+///
+/// The range is read into a buffer first, which makes overlapping source and
+/// destination ranges behave as the spec requires (the algorithm is defined in
+/// terms of a snapshot of the values, not of the live elements).
+pub fn array_copy_within(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let len = if let Value::Object(obj_ref) = obj {
+        if let Some(arr) = obj_ref.borrow().as_any().downcast_ref::<ArrayObject>() {
+            arr.len() as u64
+        } else {
+            generic_length(obj)
+        }
+    } else {
+        generic_length(obj)
+    };
+
+    let to = relative_index(args.first(), len);
+    let from = relative_index(args.get(1), len);
+    let end = match args.get(2) {
+        Some(v) if !v.is_undefined() => relative_index(Some(v), len),
+        _ => len,
+    };
+    // ToLength(2**53) must not be looped over.
+    let count = end.saturating_sub(from).min(len.saturating_sub(to));
+
+    let mut buffer: Vec<Value> = Vec::with_capacity(count.min(1 << 20) as usize);
+    for k in 0..count {
+        buffer.push(generic_get(obj, from + k));
+    }
+    for (k, value) in buffer.into_iter().enumerate() {
+        generic_set(obj, to + k as u64, value)?;
+    }
+    Ok(obj.clone())
+}
 
 pub fn array_push(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     match obj {

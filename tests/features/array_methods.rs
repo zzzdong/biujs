@@ -133,3 +133,68 @@ fn index_of_is_generic_and_string_receivers_keep_substring_search() {
     assert_eq!(eval_number("'abc'.indexOf('b', -1)"), 1.0);
     assert_eq!(eval_number("'abc'.lastIndexOf('')"), 3.0);
 }
+
+// ──────────────────────────────
+// ES6/ES2022 additions: at / copyWithin / entries / keys / values
+// ──────────────────────────────
+
+#[test]
+fn array_at_supports_negative_index() {
+    assert_eq!(eval_string("[1, 2, 3].at(-1) + ''"), "3");
+    assert_eq!(eval_string("[1, 2, 3].at(0) + ''"), "1");
+    assert!(eval_bool("[1].at(5) === undefined"));
+    assert_eq!(eval_string("Array.prototype.at.call({ length: 2, 0: 'a', 1: 'b' }, -1)"), "b");
+}
+
+#[test]
+fn array_copy_within_copies_ranges() {
+    assert_eq!(eval_string("[1, 2, 3, 4, 5].copyWithin(0, 3).join(',')"), "4,5,3,4,5");
+    assert_eq!(eval_string("[1, 2, 3, 4, 5].copyWithin(1, 3, 4).join(',')"), "1,4,3,4,5");
+    // Overlapping ranges behave as if the source were snapshotted.
+    assert_eq!(eval_string("[1, 2, 3, 4, 5].copyWithin(0, 1).join(',')"), "2,3,4,5,5");
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 3, 0: 1, 1: 2, 2: 3 }; \
+               Array.prototype.copyWithin.call(o, 0, 1); \
+               return o[0] + ',' + o[1] + ',' + o[2]; })()"
+        ),
+        "2,3,3"
+    );
+}
+
+#[test]
+fn array_entries_keys_values_are_iterators() {
+    assert_eq!(
+        eval_string(
+            "(function () { var out = []; var it = ['a', 'b'].entries(); \
+               var step = it.next(); \
+               while (!step.done) { out.push(step.value[0] + ':' + step.value[1]); step = it.next(); } \
+               return out.join(','); })()"
+        ),
+        "0:a,1:b"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var out = []; for (var k of ['a', 'b'].keys()) { out.push(k); } \
+               return out.join(','); })()"
+        ),
+        "0,1"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var out = []; for (var v of ['a', 'b'].values()) { out.push(v); } \
+               return out.join(','); })()"
+        ),
+        "a,b"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var out = []; \
+               for (var e of Array.prototype.entries.call({ length: 2, 0: 'x', 1: 'y' })) { \
+                 out.push(e[0] + e[1]); } \
+               return out.join(','); })()"
+        ),
+        "0x,1y"
+    );
+    assert!(eval_bool("typeof ['a'].keys()[Symbol.iterator] === 'function'"));
+}

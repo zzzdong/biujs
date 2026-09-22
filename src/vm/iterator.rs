@@ -97,6 +97,13 @@ impl JSObject for NativeIteratorObject {
     }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        // A native iterator is itself iterable: `it[Symbol.iterator]` is the
+        // standard iterator factory (which hands the same iterator back).
+        if *key == crate::vm::iterator::iterator_symbol_key() {
+            return Some(PropertyDescriptor::data_descriptor(Value::Object(
+                Rc::new(RefCell::new(NativeFunctionObject::new(ITERATOR_NATIVE_NAME))),
+            )));
+        }
         let native_name = match key.as_str() {
             Some("next") => format!("{ITERATOR_NEXT_PREFIX}{}", self.id),
             Some("return") => format!("{ITERATOR_RETURN_PREFIX}{}", self.id),
@@ -124,7 +131,8 @@ impl JSObject for NativeIteratorObject {
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        matches!(key.as_str(), Some("next") | Some("return"))
+        *key == crate::vm::iterator::iterator_symbol_key()
+            || matches!(key.as_str(), Some("next") | Some("return"))
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {

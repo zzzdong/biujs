@@ -906,6 +906,35 @@ impl VM {
             if let Some(result) = self.try_array_callback_method(&this, method, args, module)? {
                 return Ok(result);
             }
+            // `entries` / `keys` / `values` return a *fresh* iterator over a
+            // snapshot; only the VM can mint iterator objects (they live in the
+            // iterator registry so `next()` can find its state).
+            if matches!(method, "entries" | "keys" | "values") {
+                if let Some(items) = self.array_like_elements(&this) {
+                    let snapshot: Vec<Value> = match method {
+                        "entries" => items
+                            .iter()
+                            .enumerate()
+                            .map(|(i, value)| {
+                                Value::Object(Rc::new(RefCell::new(
+                                    crate::vm::object::ArrayObject::from_vec(vec![
+                                        Value::Number(i as f64),
+                                        value.clone(),
+                                    ]),
+                                )))
+                            })
+                            .collect(),
+                        "keys" => (0..items.len())
+                            .map(|i| Value::Number(i as f64))
+                            .collect(),
+                        _ => items,
+                    };
+                    let snapshot_val = Value::Object(Rc::new(RefCell::new(
+                        crate::vm::object::ArrayObject::from_vec(snapshot),
+                    )));
+                    return self.make_iterator(snapshot_val, module);
+                }
+            }
             return crate::builtins::call_prototype_method(&this, method, args);
         }
         // Static methods are stored under their qualified name ("Array.from").
@@ -3316,6 +3345,30 @@ impl VM {
         use crate::vm::iterator::NativeIteratorState;
         if std::env::var("BIUJS_TRACE_ITER").is_ok() {
             eprintln!("[make_iter] src_type={}", src.type_of());
+        }
+
+        // A native iterator is its own iterator, so `for (x of arr.keys())`
+        // must not try to call `[Symbol.iterator]` on it (which would recurse).
+        if let Value::Object(obj_ref) = &src {
+            if obj_ref
+                .borrow()
+                .as_any()
+                .downcast_ref::<crate::vm::iterator::NativeIteratorObject>()
+                .is_some()
+            {
+                let id = self.next_iterator_id;
+                self.next_iterator_id += 1;
+                let iter_val = Value::Object(Rc::new(RefCell::new(
+                    crate::vm::iterator::NativeIteratorObject::new(
+                        id,
+                        crate::vm::iterator::NativeIteratorState::Js {
+                            iterator: src.clone(),
+                        },
+                    ),
+                )));
+                self.iterator_registry.insert(id, iter_val.clone());
+                return Ok(iter_val);
+            }
         }
 
         let state = match &src {

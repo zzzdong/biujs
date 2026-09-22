@@ -715,7 +715,23 @@ pub fn call_prototype_method(
         "padStart" => string::string_pad(obj, args, true),
         "padEnd" => string::string_pad(obj, args, false),
         "codePointAt" => string::string_code_point_at(obj, args),
-        "at" if !matches!(obj, Value::Object(_)) => string::string_at(obj, args),
+        // `at` exists on both Array.prototype and String.prototype. Strings
+        // (primitives and wrappers) always take the string path; any other
+        // object with a `length` is an array-like, which is what
+        // `Array.prototype.at.call({length: …})` needs.
+        "at" => {
+            let string_like = matches!(obj, Value::String(_))
+                || matches!(obj, Value::Object(o)
+                    if matches!(o.borrow().kind(), ObjectKind::String | ObjectKind::Number | ObjectKind::Boolean));
+            let array_like = matches!(obj, Value::Object(o)
+                if o.borrow().property_get(&PropertyKey::from_str("length")).is_some());
+            if !string_like && array_like {
+                array::array_at(obj, args)
+            } else {
+                string::string_at(obj, args)
+            }
+        }
+        "copyWithin" => array::array_copy_within(obj, args),
         "normalize" => string::string_normalize(obj, args),
         "localeCompare" => string::string_locale_compare(obj, args),
         "split" => string::string_split(obj, args),
