@@ -45,6 +45,44 @@ fn has_tests() -> bool {
     test262_root().join("language").exists()
 }
 
+/// The `tests/test262` submodule directory (the superproject's checkout).
+fn test262_submodule_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test262")
+}
+
+/// The revision the submodule is currently checked out at.
+///
+/// `None` when git is unavailable or the submodule is not initialised.
+fn test262_revision() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(test262_submodule_root())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The revision recorded in `tests/test262.pin`: the frozen conformance
+/// baseline every published pass rate was measured against.
+fn pinned_test262_revision() -> Option<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test262.pin");
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("rev") else {
+            continue;
+        };
+        if let Some(value) = rest.trim().strip_prefix('=') {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
 static HARNESS_CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 fn harness(name: &str) -> Option<&'static str> {
@@ -506,6 +544,32 @@ const SUITES: &[&str] = &[
     "built-ins/Symbol",
 ];
 
+/// The submodule must stay at the revision the baselines were measured on.
+///
+/// Moving test262 silently changes the denominator (and the contents) of every
+/// published pass rate, so bumping it is a deliberate change: checkout the new
+/// revision, re-run the full suite, record the numbers, and update
+/// `tests/test262.pin` plus the docs in the same commit (§6.7).
+#[test]
+fn test262_at_pinned_revision() {
+    if !has_tests() {
+        eprintln!("test262 submodule not initialised, skipping the revision check");
+        return;
+    }
+    let Some(actual) = test262_revision() else {
+        eprintln!("git unavailable, skipping the test262 revision check");
+        return;
+    };
+    let pinned =
+        pinned_test262_revision().expect("tests/test262.pin must record a `rev = <sha>` line");
+    assert_eq!(
+        actual,
+        pinned,
+        "tests/test262 drifted away from the pinned conformance baseline; \
+         re-run the full suite, then update tests/test262.pin and the docs (§6.7)"
+    );
+}
+
 #[test]
 fn test262_report() {
     if !has_tests() {
@@ -572,6 +636,18 @@ fn test262_report() {
     }
 
     println!("\n================ test262 summary ================");
+    // Print the revision the numbers belong to: a pass rate is only meaningful
+    // together with the test suite it was measured on (§6.7).
+    match (test262_revision(), pinned_test262_revision()) {
+        (Some(actual), Some(pinned)) if actual == pinned => {
+            println!("test262 revision: {actual} (pinned baseline)");
+        }
+        (Some(actual), Some(pinned)) => println!(
+            "test262 revision: {actual} — NOT the pinned baseline {pinned} (see docs §6.7)"
+        ),
+        (Some(actual), None) => println!("test262 revision: {actual} (no tests/test262.pin)"),
+        (None, _) => println!("test262 revision: unknown (git unavailable)"),
+    }
     println!(
         "{:<48} {:>7} {:>7} {:>7}",
         "suite", "passed", "skipped", "failed"

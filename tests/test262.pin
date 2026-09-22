@@ -1,0 +1,17 @@
+# test262 conformance baseline — pinned revision.
+#
+# Every pass/fail count published in docs/es6-conformance-plan.md §2.1x was
+# measured against this revision of the `tests/test262` submodule, so the pin is
+# what makes those numbers reproducible.  The runner prints the revision it
+# actually used in the summary report, and
+#
+#     cargo test --release --test test262_runner test262_at_pinned_revision
+#
+# fails when the submodule has drifted away from the pin.
+#
+# Bumping is a deliberate decision (docs/es6-conformance-plan.md §6.7):
+# checkout the new revision, re-run the full suite, record the numbers, then
+# update this file and the counts in the docs in the same commit.
+rev = 7e115f46ac64340827d505fa928ad436cb7ba5a6
+date = 2026-05-21
+url = https://github.com/tc39/test262.git

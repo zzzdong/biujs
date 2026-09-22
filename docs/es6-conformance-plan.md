@@ -2,7 +2,7 @@
 
 > **日期**：2026-09-20（初版）；2026-09-21 更新 —— M2' 完成、M3-B1 首批交付（见 §2.1b/§2.2b）；2026-09-21 二批 —— M3-B1 收尾（ToObject 装箱、描述符校验、数组元素访问器、Object.assign 下沉 VM），见 §2.1c/§2.2c；2026-09-21 三批 —— SEH 跨帧展开修复（见 §2.1d）；2026-09-22 四批 —— M3-B2 首批（Array 回调方法泛型化、indexOf/lastIndexOf 分派、String.prototype.indexOf 补齐），见 §2.1e
 > **目标来源**：`README.md:3-4` —— *"A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6** features but without `eval` or eval-like features or `with` statement."*
-> **基线**：test262 **7677 / 10552**（72.75% 通过，2875 失败，14415 跳过；M3-B6 后）；单元测试 190；feature 集成 28 个文件（359 / 364 条通过，余 5 条既有 try-finally 失败）；runner 启用 90 个套件
+> **基线**：test262 **7677 / 10552**（72.75% 通过，2875 失败，14415 跳过；M3-B6 后）——全部数字都在**冻结修订 `7e115f4`（2026-05-21）**上测得，见 §6.7 与 `tests/test262.pin`；单元测试 190；feature 集成 28 个文件（359 / 364 条通过，余 5 条既有 try-finally 失败）；runner 启用 90 个套件
 > **上一阶段**：M1（迭代器 / for-of / 解构 / 展开 / 模板 / 默认参数）与 M2（class：静态成员、访问器、extends/super、public 字段）已交付
 
 ---
@@ -677,6 +677,23 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
    `ulimit -v 6000000; TEST262_FAILURES=20000 cargo test --release --test test262_runner -- --nocapture`。
    VM 仍在演进，一个无界物化/循环（如 §2.1l 的 `splice` 结果数组）就足以吃满宿主内存并打断整个回归；
    加上限后失败会以"进程被限"的形式立刻暴露，而不是拖垮开发机。
+7. **test262 修订已冻结**（2026-09-22 定）：`tests/test262.pin` 记录基线所依据的 submodule 修订
+   （`7e115f46ac64340827d505fa928ad436cb7ba5a6`，2026-05-21，tc39/test262）；
+   汇总报表会打印本次实际用的修订，`cargo test --release --test test262_runner test262_at_pinned_revision`
+   在 submodule 漂移时失败——这样每个 §2.1x 的通过数都对应唯一可复现的用例集。
+   **选型取舍**：
+   - 更老的修订会丢覆盖，且风格更差：把 pin 往前推到 2016-06（ES6 刚定稿）时，我们启用的目录里
+     Array 2619 / Object 3079 / String 971 / Number 228 个用例，而现在（pin）是 3081 / 3411 / 1223 / 340
+     ——ES6 的一致性用例在定稿后仍在大量补写；同时老用例普遍依赖 sloppy mode 与 ES5 语义，
+     与"strict only"的目标相性更差。
+   - 逐日跟随上游会让分母无声漂移：pin 之后上游又有 73 个提交，其中只有 5 个触及我们启用的目录
+     （4 例 object-rest 解构用例、1 例 `Array.prototype[Symbol.unscopables].at`、26 例 ES5 `Object`
+     用例重写），其余集中在 Intl / TypedArray / modules / Temporal 等范围外领域。范围外的
+     *特性*由 `UNSUPPORTED_FEATURES` / `UNSUPPORTED_PATTERNS` 处理，不需要靠"固定老修订"来回避。
+   - 结论：现代修订 + 受治理的跳过表，比"固定到 ES6 时代的修订"信号更强、更可解释。
+   **升级流程**（显式决策，不做隐式漂移）：`git -C tests/test262 checkout <rev>` → 全量回归
+   （带内存上限）→ 记录新 §2.1x 的逐套件数字 → 更新 `tests/test262.pin`（rev/date）与
+   §2.1x/`es6-feature-support.md`/README 的计数 → 同一个提交里完成。
 
 ---
 
