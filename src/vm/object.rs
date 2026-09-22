@@ -1302,14 +1302,39 @@ impl JSObject for FunctionObject {
 
 /// Create a `Value::Object` wrapping a FunctionObject with a prototype property
 ///
-/// A normal function owns a `prototype` object (ES 9.2.3) whose `[[Prototype]]`
-/// is `Object.prototype` and which links back through `constructor`. The
-/// back-reference is stored as a bare `Value::Function(id)` rather than as the
-/// boxed function object, so that no `Rc` cycle is created (the value compares
-/// equal to the boxed form and is boxed on demand by property access).
-pub fn new_function_object(func_id: u32, name: &str) -> Value {
+/// A normal function owns `length`, `name` and `prototype` own properties, in
+/// that order (ES 9.2.3 / 9.2.4 / 10.2.5). Its `prototype` object's
+/// `[[Prototype]]` is `Object.prototype` and it links back through
+/// `constructor`. The back-reference is stored as a bare `Value::Function(id)`
+/// rather than as the boxed function object, so that no `Rc` cycle is created
+/// (the value compares equal to the boxed form and is boxed on demand by
+/// property access).
+pub fn new_function_object(func_id: u32, name: &str, arity: usize) -> Value {
     let func_obj = FunctionObject::new(func_id, name);
     let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
+
+    /// `{ writable: false, enumerable: false, configurable: true }`
+    fn fn_meta(value: Value) -> PropertyDescriptor {
+        PropertyDescriptor {
+            value,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            getter: None,
+            setter: None,
+        }
+    }
+
+    obj_ref.borrow_mut().define_property(
+        crate::vm::property::PropertyKey::from_str("length"),
+        fn_meta(Value::Number(arity as f64)),
+    )
+    .ok();
+    obj_ref.borrow_mut().define_property(
+        crate::vm::property::PropertyKey::from_str("name"),
+        fn_meta(Value::string(name)),
+    )
+    .ok();
 
     // `F.prototype` inherits from `Object.prototype` (ES 9.2.3 step 4).
     let proto_obj = match crate::builtins::wrapper_prototype("Object") {
@@ -1354,9 +1379,13 @@ pub fn new_function_object(func_id: u32, name: &str) -> Value {
 
 /// Create a `Value::Object` wrapping an Arrow FunctionObject with captured `this`, the enclosing
 /// frame's `new.target`, and captured vars.
+///
+/// An arrow is not a constructor: it owns `length` and `name` but has no
+/// `prototype` property (ES 9.2.3 applies only to non-arrow functions).
 pub fn new_arrow_function_object(
     func_id: u32,
     name: &str,
+    arity: usize,
     captured_this: Value,
     captured_new_target: Value,
     captured_vars: Vec<(String, Value)>,
@@ -1365,7 +1394,21 @@ pub fn new_arrow_function_object(
     func_obj.captured_new_target = Some(captured_new_target);
     let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
 
-    // Arrow functions don't have a prototype property
+    let mut borrowed = obj_ref.borrow_mut();
+    borrowed
+        .define_property(
+            PropertyKey::from_str("length"),
+            function_metadata_descriptor(Value::Number(arity as f64)),
+        )
+        .ok();
+    borrowed
+        .define_property(
+            PropertyKey::from_str("name"),
+            function_metadata_descriptor(Value::string(name)),
+        )
+        .ok();
+    drop(borrowed);
+
     Value::Object(obj_ref)
 }
 // ─────────────────────────────────────────────────────────
@@ -1385,43 +1428,70 @@ pub struct NativeFunctionObject {
     pub name: String,
     /// `[[Prototype]]` of the function object itself.
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
-    /// Own properties (`prototype`, static methods, …).
+    /// Own properties (`length`, `name`, `prototype`, static methods, …).
+    ///
+    /// `length` / `name` live here like any other own property so that
+    /// `Object.getOwnPropertyDescriptor`, `delete` and redefinition behave
+    /// uniformly instead of going through special cases.
     properties: PropertyTable,
 }
 
 impl NativeFunctionObject {
     pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            prototype: None,
-            properties: PropertyTable::new(),
-        }
+        Self::build(name, None)
     }
 
     pub fn with_prototype(name: &str, proto: Rc<RefCell<dyn JSObject>>) -> Self {
-        Self {
-            name: name.to_string(),
-            prototype: Some(proto),
-            properties: PropertyTable::new(),
-        }
+        Self::build(name, Some(proto))
     }
 
-    /// Install the standard `length` / `name` own properties.
-    pub fn with_metadata(mut self, length: usize) -> Self {
-        self.properties.insert(
-            PropertyKey::from_str("length"),
-            PropertyDescriptor::writable_data_descriptor(Value::Number(length as f64), false),
-        );
+    fn build(name: &str, prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        let mut obj = Self {
+            name: name.to_string(),
+            prototype,
+            properties: PropertyTable::new(),
+        };
+        obj.install_metadata();
+        obj
+    }
+
+    /// Install the standard `length` / `name` own properties (ES 10.2.9/10.2.10):
+    /// non-writable, non-enumerable, configurable. `length` comes from the
+    /// built-in arity table; the synthetic `__proto_method__` prefix used for
+    /// prototype-method dispatch is stripped from `name`.
+    fn install_metadata(&mut self) {
         let display = self
             .name
             .strip_prefix(crate::builtins::PROTO_METHOD_PREFIX)
             .unwrap_or(&self.name)
             .to_string();
+        self.set_length(crate::builtins::builtin_arity(&self.name));
         self.properties.insert(
             PropertyKey::from_str("name"),
-            PropertyDescriptor::writable_data_descriptor(Value::string(&display), false),
+            function_metadata_descriptor(Value::string(&display)),
         );
-        self
+    }
+
+    /// Overwrite the `length` own property (used where the arity table cannot
+    /// tell two same-named built-ins apart).
+    pub fn set_length(&mut self, length: usize) {
+        self.properties.insert(
+            PropertyKey::from_str("length"),
+            function_metadata_descriptor(Value::Number(length as f64)),
+        );
+    }
+}
+
+/// `{ writable: false, enumerable: false, configurable: true }` — the attribute
+/// set shared by `Function.length` / `Function.name`.
+pub(crate) fn function_metadata_descriptor(value: Value) -> PropertyDescriptor {
+    PropertyDescriptor {
+        value,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+        getter: None,
+        setter: None,
     }
 }
 
@@ -1439,32 +1509,6 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        // Built-in functions expose `name` (and `length = 0`, which is close
-        // enough for the arity checks test262 performs on some built-ins).
-        if let PropertyKey::Str(s) = key {
-            if s.as_str() == "name" {
-                // Function `name` / `length`: non-writable, non-enumerable,
-                // configurable (ES 10.2.9 / 10.2.10).
-                return Some(PropertyDescriptor {
-                    value: Value::string(&self.name),
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                    getter: None,
-                    setter: None,
-                });
-            }
-            if s.as_str() == "length" {
-                return Some(PropertyDescriptor {
-                    value: Value::Number(0.0),
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                    getter: None,
-                    setter: None,
-                });
-            }
-        }
         self.properties.get(key).cloned()
     }
 
@@ -1488,19 +1532,11 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        if let PropertyKey::Str(s) = key {
-            if s.as_str() == "name" || s.as_str() == "length" {
-                return true;
-            }
-        }
         self.properties.contains_key(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        let mut keys: Vec<PropertyKey> = self.properties.keys();
-        keys.push(PropertyKey::from_str("name"));
-        keys.push(PropertyKey::from_str("length"));
-        keys
+        self.properties.keys()
     }
 
     fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {

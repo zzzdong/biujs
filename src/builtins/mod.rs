@@ -924,6 +924,77 @@ pub const CLASS_CTOR_FLAG: &str = "__isClassCtor__";
 
 pub const PROTO_METHOD_PREFIX: &str = "__proto_method__";
 
+/// Declared arity (`length`) of a built-in, keyed by the name it is registered
+/// under: `"Array"` (constructor), `"Object.keys"` (static), `"push"`
+/// (prototype method, registered as `"__proto_method__push"`) or `"Math.atan"`.
+///
+/// Mirrors the ES clause headings, where optional parameters (brackets) and
+/// rest parameters do *not* count towards `length`. `Number.prototype.toString`
+/// is the only built-in whose `length` (1) differs from the same-named method
+/// elsewhere (0), so it is registered explicitly by `register_number_prototype`.
+///
+/// Every entry is verified against test262's `**/length.js` tests by
+/// `tests/features/builtin_metadata.rs`; a name missing from this table keeps
+/// `length === 0`, which is what most predicates want anyway.
+pub fn builtin_arity(registered_name: &str) -> usize {
+    let name = registered_name
+        .strip_prefix(PROTO_METHOD_PREFIX)
+        .unwrap_or(registered_name);
+    match name {
+        // ── Constructors ──
+        "Object" | "Array" | "Boolean" | "Number" | "String" | "Function" | "Error"
+        | "TypeError" | "ReferenceError" | "RangeError" | "SyntaxError" | "URIError"
+        | "EvalError" => 1,
+        "Symbol" => 0,
+        // ── Global functions ──
+        "parseInt" => 2,
+        "parseFloat" | "isNaN" | "isFinite" => 1,
+        // ── Object ──
+        "hasOwnProperty" | "isPrototypeOf" | "propertyIsEnumerable" => 1,
+        "Object.keys" | "Object.values" | "Object.entries" | "Object.getPrototypeOf"
+        | "Object.getOwnPropertyNames" | "Object.getOwnPropertySymbols"
+        | "Object.isExtensible" | "Object.isFrozen" | "Object.isSealed"
+        | "Object.preventExtensions" | "Object.seal" | "Object.freeze" => 1,
+        "Object.assign" | "Object.create" | "Object.setPrototypeOf"
+        | "Object.getOwnPropertyDescriptor" | "Object.hasOwn" | "Object.is" => 2,
+        "Object.defineProperties" => 2,
+        "Object.defineProperty" => 3,
+        // ── Array ──
+        "Array.isArray" | "Array.from" => 1,
+        "Array.of" => 0,
+        "push" | "unshift" | "indexOf" | "includes" | "join" | "concat" | "lastIndexOf"
+        | "fill" | "at" | "every" | "some" | "filter" | "map" | "forEach" | "reduce"
+        | "reduceRight" | "find" | "findIndex" | "sort" | "flat" | "flatMap"
+        | "findLast" | "findLastIndex" => 1,
+        "pop" | "shift" | "reverse" | "toString" | "toLocaleString" | "entries" | "keys"
+        | "values" | "toReversed" => 0,
+        "slice" | "splice" | "copyWithin" | "with" | "toSpliced" => 2,
+        // ── String ──
+        "String.fromCharCode" | "String.raw" => 1,
+        "charAt" | "charCodeAt" | "codePointAt" | "startsWith" | "endsWith" | "repeat"
+        | "padStart" | "padEnd" => 1,
+        "substring" | "split" | "replace" | "replaceAll" => 2,
+        "normalize" | "trim" | "trimStart" | "trimEnd" | "toUpperCase" | "toLowerCase"
+        | "valueOf" => 0,
+        "search" | "match" | "localeCompare" => 1,
+        // ── Function ──
+        "call" | "bind" => 1,
+        "apply" => 2,
+        // ── Number ──
+        "Number.isNaN" | "Number.isFinite" | "Number.isInteger" | "Number.isSafeInteger"
+        | "Number.parseFloat" => 1,
+        "Number.parseInt" => 2,
+        "toFixed" | "toExponential" | "toPrecision" => 1,
+        // ── Symbol ──
+        "Symbol.for" | "Symbol.keyFor" => 1,
+        // ── Math ──
+        "Math.atan2" | "Math.hypot" | "Math.imul" | "Math.max" | "Math.min" | "Math.pow" => 2,
+        "Math.random" => 0,
+        m if m.starts_with("Math.") => 1,
+        _ => 0,
+    }
+}
+
 /// Register a prototype method that the VM implements itself.
 ///
 /// The closure is *not* stored: `call_prototype_method` (or the VM, for methods
@@ -938,6 +1009,25 @@ where
         crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}")),
     )));
     let _ = proto.borrow_mut().property_set(key, method_val);
+}
+
+/// Like [`set_prototype_method`], but with an explicit `length`, for the few
+/// built-ins whose arity cannot be derived from their name alone
+/// (`Number.prototype.toString.length` is 1 while every other `toString` is 0).
+pub fn set_prototype_method_arity<F>(
+    proto: &Rc<RefCell<dyn JSObject>>,
+    name: &str,
+    arity: usize,
+    _f: F,
+) where
+    F: Fn(&Value, &[Value]) -> Result<Value, RuntimeError> + 'static,
+{
+    let mut method =
+        crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}"));
+    method.set_length(arity);
+    let _ = proto
+        .borrow_mut()
+        .property_set(PropertyKey::from_str(name), Value::Object(Rc::new(RefCell::new(method))));
 }
 
 /// Register a prototype method whose implementation lives in the VM

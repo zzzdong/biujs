@@ -85,10 +85,7 @@ impl Compiler {
         for func in &unit.functions {
             func_info.insert(
                 func.id.as_usize() as u32,
-                (
-                    func.signature.name.to_string(),
-                    func.signature.params.len(),
-                ),
+                (func.signature.name.to_string(), func.signature.arity),
             );
         }
 

@@ -26,12 +26,27 @@ impl FuncParam {
 pub struct FuncSignature {
     pub name: Name,
     pub params: Vec<FuncParam>,
+    /// `ExpectedArgumentCount` (ES 9.2.4): the number of parameters before the
+    /// first one with an initializer or rest element. Exposed as `fn.length`,
+    /// which is *not* the same as `params.len()`.
+    pub arity: usize,
 }
 impl FuncSignature {
     pub fn new(name: impl Into<Name>, params: Vec<FuncParam>) -> Self {
+        let arity = params.len();
         Self {
             name: name.into(),
             params,
+            arity,
+        }
+    }
+
+    /// Same as [`FuncSignature::new`], but with an explicit `fn.length`.
+    pub fn with_arity(name: impl Into<Name>, params: Vec<FuncParam>, arity: usize) -> Self {
+        Self {
+            name: name.into(),
+            params,
+            arity,
         }
     }
 }

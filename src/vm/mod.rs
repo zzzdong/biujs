@@ -201,17 +201,9 @@ impl VM {
             Some((name, arity)) => (name, arity),
             None => (String::new(), 0),
         };
-        let obj = crate::vm::object::new_function_object(id, &name);
-        // `fn.name` and `fn.length` are ordinary own properties of a function.
-        if let Value::Object(ref obj_ref) = obj {
-            let mut borrowed = obj_ref.borrow_mut();
-            let _ = borrowed
-                .property_set(PropertyKey::from_str("name"), Value::string(&name));
-            let _ = borrowed.property_set(
-                PropertyKey::from_str("length"),
-                Value::Number(arity as f64),
-            );
-        }
+        // `fn.length` / `fn.name` / `fn.prototype` are installed by the
+        // constructor (non-writable, non-enumerable, configurable).
+        let obj = crate::vm::object::new_function_object(id, &name, arity);
         // Attach Function.prototype so `f.call`, `f.bind`, … resolve.
         if let Value::Object(ref obj_ref) = obj {
             obj_ref
@@ -2304,9 +2296,18 @@ impl VM {
                     .last()
                     .cloned()
                     .unwrap_or(Value::Undefined);
+                // `fn.length` / `fn.name` come from the compiler's per-function
+                // metadata, exactly as for ordinary functions.
+                let (arrow_name, arrow_arity) = self
+                    .current_module_info
+                    .as_ref()
+                    .and_then(|info| info.get(&func_id))
+                    .cloned()
+                    .unwrap_or((String::new(), 0));
                 let obj_val = crate::vm::object::new_arrow_function_object(
                     func_id,
-                    "<arrow>",
+                    &arrow_name,
+                    arrow_arity,
                     captured_this,
                     captured_new_target,
                     captured_vars,

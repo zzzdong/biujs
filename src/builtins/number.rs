@@ -16,7 +16,9 @@ use super::set_static_method;
 
 pub fn register_number_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "valueOf", |this, _args| number_value_of(this));
-    set_prototype_method(proto, "toString", |this, args| {
+    // `Number.prototype.toString.length` is 1 (radix counts despite the
+    // brackets in the heading); every other `toString` is 0.
+    super::set_prototype_method_arity(proto, "toString", 1, |this, args| {
         number_to_string_with_radix(this, args)
     });
     set_prototype_method(proto, "toFixed", |this, args| number_to_fixed(this, args));

@@ -2051,7 +2051,9 @@ impl<'a> JSASTLower<'a> {
     }
 
     fn lower_arrow_function(&mut self, arrow: &ArrowFunctionExpression<'_>) -> Value {
-        let name = "<arrow>".to_string();
+        // An anonymous arrow's `name` is the empty string (ES 14.2.16); name
+        // inference from the assignment target is not implemented.
+        let name = String::new();
 
         // Arrow functions with expression body need automatic return
         let is_expression_body = arrow.expression;
@@ -2215,7 +2217,17 @@ impl<'a> JSASTLower<'a> {
             .iter()
             .map(|p| FuncParam::new(self.binding_pattern_name(&p.pattern)))
             .collect();
-        let func_sig = FuncSignature::new(name.clone(), sig_params);
+        // `fn.length` counts only the leading parameters without an initializer
+        // (`function f(a, b = 1, c)` has length 1). Rest parameters live in
+        // `FormalParameters::rest`, so they are not part of `params` at all.
+        let arity = params
+            .iter()
+            .take_while(|p| {
+                p.initializer.is_none()
+                    && !matches!(p.pattern, BindingPattern::AssignmentPattern(_))
+            })
+            .count();
+        let func_sig = FuncSignature::with_arity(name.clone(), sig_params, arity);
         let func_id = self.builder.module_mut().declare_function(func_sig.clone());
 
         let mut func = IrFunction::new(func_id, func_sig);
