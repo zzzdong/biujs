@@ -535,7 +535,12 @@ fn test262_report() {
         let _ = std::io::stdout().flush();
         rows.push((suite.to_string(), r.passed, r.skipped, r.failures.len() as u32));
 
-        if !filters.is_empty() && !r.failures.is_empty() {
+        // Failure details are printed when a suite filter is given, or when
+        // `TEST262_FAILURES` is set explicitly (useful to aggregate reasons
+        // across the whole run).
+        let want_failures =
+            !filters.is_empty() || std::env::var("TEST262_FAILURES").is_ok();
+        if want_failures && !r.failures.is_empty() {
             let limit: usize = std::env::var("TEST262_FAILURES")
                 .ok()
                 .and_then(|v| v.parse().ok())
