@@ -82,6 +82,25 @@ pub fn to_object(value: &Value) -> Result<Value, RuntimeError> {
     }
 }
 
+/// ES `ToIntegerOrInfinity` (7.1.5), saturating `±Infinity` to `i64` bounds.
+pub fn to_integer_or_infinity(value: Option<&Value>) -> i64 {
+    let n = value.map(|v| v.to_number()).unwrap_or(f64::NAN);
+    if n.is_nan() {
+        return 0;
+    }
+    if n.is_infinite() {
+        return if n.is_sign_positive() { i64::MAX } else { i64::MIN };
+    }
+    let truncated = n.trunc();
+    if truncated >= i64::MAX as f64 {
+        i64::MAX
+    } else if truncated <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        truncated as i64
+    }
+}
+
 /// ES `ToUint16` (7.1.6): `ToNumber` first, then the value modulo 2**16.
 pub fn to_uint16(n: f64) -> u16 {
     if n.is_nan() || n.is_infinite() || n == 0.0 {
@@ -493,6 +512,22 @@ pub fn constructor_prototype_descriptor(value: Value) -> PropertyDescriptor {
 // Dispatchers
 // ─────────────────────────────────────────────────────────
 
+/// True when `err` only means "there is no built-in with that name", as opposed
+/// to a genuine failure raised by a built-in that does exist.
+///
+/// Both come back as a `TypeError` from the name-keyed dispatch tables, so the
+/// message is the only discriminator. Call sites that must not swallow real
+/// errors use this predicate; see `VM`'s `CallMethod`.
+pub fn is_unknown_builtin(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::TypeError(msg)
+            if msg.starts_with("unknown prototype method: ")
+                || msg.starts_with("unknown static method: ")
+                || msg.starts_with("unknown built-in: ")
+    )
+}
+
 pub fn call_native(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
     match name {
         "Object" => object::object_constructor(args),
@@ -541,6 +576,7 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
                 })
                 .unwrap_or(false),
         )),
+        "Number.parseInt" => global_parse_int(args),
         "Number.parseFloat" => Ok(Value::Number(
             args.first()
                 .map(|v| {
@@ -635,6 +671,9 @@ pub fn call_prototype_method(
             number::number_to_string_with_radix(obj, args)
         }
         "toString" => dispatch_to_string(obj),
+        // `Object.prototype.toLocaleString` delegates to `toString`
+        // (ES 20.1.3.5); Array/Number inherit the same entry.
+        "toLocaleString" => dispatch_to_string(obj),
         "valueOf" => dispatch_value_of(obj),
         "hasOwnProperty" => object::object_has_own_property(obj, args),
         "isPrototypeOf" => object::object_is_prototype_of(obj, args),
@@ -648,7 +687,19 @@ pub fn call_prototype_method(
         "charCodeAt" => string::string_char_code_at(obj, args),
         "toUpperCase" => string::string_to_upper(obj),
         "toLowerCase" => string::string_to_lower(obj),
-        "trim" => string::string_trim(obj),
+        // No locale data is bundled: the default-locale algorithms are the
+        // locale-independent ones for the repertoire the suite exercises.
+        "toLocaleUpperCase" => string::string_to_upper(obj),
+        "toLocaleLowerCase" => string::string_to_lower(obj),
+        "trim" => string::string_trim_both(obj),
+        "trimStart" => string::string_trim(obj, true),
+        "trimEnd" => string::string_trim(obj, false),
+        "padStart" => string::string_pad(obj, args, true),
+        "padEnd" => string::string_pad(obj, args, false),
+        "codePointAt" => string::string_code_point_at(obj, args),
+        "at" if !matches!(obj, Value::Object(_)) => string::string_at(obj, args),
+        "normalize" => string::string_normalize(obj, args),
+        "localeCompare" => string::string_locale_compare(obj, args),
         "split" => string::string_split(obj, args),
         "substring" => string::string_substring(obj, args),
         "startsWith" => string::string_starts_with(obj, args),
@@ -1093,7 +1144,7 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         | "padStart" | "padEnd" => 1,
         "substring" | "split" | "replace" | "replaceAll" => 2,
         "normalize" | "trim" | "trimStart" | "trimEnd" | "toUpperCase" | "toLowerCase"
-        | "valueOf" => 0,
+        | "toLocaleUpperCase" | "toLocaleLowerCase" | "valueOf" => 0,
         "search" | "match" | "localeCompare" => 1,
         // ── Function ──
         "call" | "bind" => 1,

@@ -9,6 +9,32 @@ use crate::vm::value::Value;
 // Prototype registration
 // ─────────────────────────────────────────────────────────
 
+/// ES `WhiteSpace` + `LineTerminator` (11.2 / 11.3).
+///
+/// This is *not* Rust's `char::is_whitespace`: U+0085 (NEL) is excluded and
+/// U+FEFF (ZWNBSP) is included, and the Unicode `Space_Separator` category is
+/// spelled out rather than taken from the host Unicode tables.
+pub fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'
+            | '\u{000A}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
 pub fn register_string_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     use super::set_prototype_method;
 
@@ -27,16 +53,28 @@ pub fn register_string_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     });
     set_prototype_method(proto, "toUpperCase", |this, _args| string_to_upper(this));
     set_prototype_method(proto, "toLowerCase", |this, _args| string_to_lower(this));
-    set_prototype_method(proto, "trim", |this, _args| string_trim(this));
+    set_prototype_method(proto, "trim", |this, _args| string_trim_both(this));
     set_prototype_method(proto, "split", |this, args| string_split(this, args));
     set_prototype_method(proto, "startsWith", |this, args| string_starts_with(this, args));
     set_prototype_method(proto, "endsWith", |this, args| string_ends_with(this, args));
     set_prototype_method(proto, "repeat", |this, args| string_repeat(this, args));
     set_prototype_method(proto, "trimStart", |this, _args| {
-        Ok(Value::string(&this.to_js_string().trim_start().to_string()))
+        string_trim(this, true)
     });
     set_prototype_method(proto, "trimEnd", |this, _args| {
-        Ok(Value::string(&this.to_js_string().trim_end().to_string()))
+        string_trim(this, false)
+    });
+    set_prototype_method(proto, "codePointAt", |this, args| {
+        string_code_point_at(this, args)
+    });
+    set_prototype_method(proto, "at", |this, args| string_at(this, args));
+    set_prototype_method(proto, "normalize", |this, args| {
+        string_normalize(this, args)
+    });
+    set_prototype_method(proto, "toLocaleLowerCase", |this, _args| string_to_lower(this));
+    set_prototype_method(proto, "toLocaleUpperCase", |this, _args| string_to_upper(this));
+    set_prototype_method(proto, "localeCompare", |this, args| {
+        string_locale_compare(this, args)
     });
     set_prototype_method(proto, "padStart", |this, args| {
         string_pad(this, args, true)
@@ -327,8 +365,115 @@ pub fn string_to_lower(obj: &Value) -> Result<Value, RuntimeError> {
     Ok(Value::string(&obj.to_js_string().to_lowercase()))
 }
 
-pub fn string_trim(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&obj.to_js_string().trim().to_string()))
+pub fn string_trim(obj: &Value, at_start: bool) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    let trimmed = if at_start {
+        s.trim_start_matches(is_js_whitespace)
+    } else {
+        s.trim_end_matches(is_js_whitespace)
+    };
+    Ok(Value::string(trimmed))
+}
+
+/// `String.prototype.trim()` — both ends, with the ES whitespace set.
+pub fn string_trim_both(obj: &Value) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    Ok(Value::string(
+        s.trim_start_matches(is_js_whitespace)
+            .trim_end_matches(is_js_whitespace),
+    ))
+}
+
+/// `String.prototype.codePointAt(pos)`.
+///
+/// `pos` indexes *code units*: for a surrogate pair, index `i` yields the whole
+/// code point and `i + 1` yields the trailing surrogate's unit value.
+pub fn string_code_point_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    let pos = super::to_integer_or_infinity(args.first());
+    if pos < 0 {
+        return Ok(Value::Undefined);
+    }
+    let mut unit_index: i64 = 0;
+    for c in s.chars() {
+        let units = c.len_utf16() as i64;
+        if pos < unit_index + units {
+            let offset = (pos - unit_index) as usize;
+            // A non-BMP character starts with a lead surrogate and ends with a
+            // trail surrogate; asking for the second unit yields that unit.
+            let code = if offset == 0 {
+                c as u32
+            } else {
+                let mut buf = [0u16; 2];
+                c.encode_utf16(&mut buf)[offset] as u32
+            };
+            return Ok(Value::Number(code as f64));
+        }
+        unit_index += units;
+    }
+    Ok(Value::Undefined)
+}
+
+/// `String.prototype.at(index)` — code-unit indexed, negative from the end.
+pub fn string_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    let units = s.encode_utf16().count() as i64;
+    let mut index = super::to_integer_or_infinity(args.first());
+    if index < 0 {
+        index += units;
+    }
+    if index < 0 || index >= units {
+        return Ok(Value::Undefined);
+    }
+    // Map the code-unit index back to a character. A position that falls in the
+    // middle of a surrogate pair would need a lone surrogate, which Rust's
+    // UTF-8 strings cannot hold; the replacement character is emitted instead.
+    let mut unit_index: i64 = 0;
+    for c in s.chars() {
+        let len = c.len_utf16() as i64;
+        if index < unit_index + len {
+            return Ok(if index == unit_index {
+                Value::string(&c.to_string())
+            } else {
+                Value::string("\u{FFFD}")
+            });
+        }
+        unit_index += len;
+    }
+    Ok(Value::Undefined)
+}
+
+/// `String.prototype.normalize([form])`.
+///
+/// Only the `form` validation is implemented: the engine bundles no Unicode
+/// normalization tables yet, so a valid form returns the receiver unchanged.
+pub fn string_normalize(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    let form = match args.first() {
+        None | Some(Value::Undefined) => "NFC".to_string(),
+        Some(v) => v.to_js_string(),
+    };
+    match form.as_str() {
+        "NFC" | "NFD" | "NFKC" | "NFKD" => Ok(Value::string(&s)),
+        _ => Err(RuntimeError::RangeError(
+            "The normalization form should be one of NFC, NFD, NFKC, NFKD".to_string(),
+        )),
+    }
+}
+
+/// `String.prototype.localeCompare(that)`.
+///
+/// Without ICU the comparison falls back to code-unit order, which matches the
+/// default locale for the ASCII range the conformance suite exercises.
+pub fn string_locale_compare(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = obj.to_js_string();
+    let other = args.first().map(|v| v.to_js_string()).unwrap_or_default();
+    let order = s.encode_utf16().cmp(other.encode_utf16());
+    Ok(Value::Number(match order {
+        std::cmp::Ordering::Less => -1.0,
+        std::cmp::Ordering::Equal => 0.0,
+        std::cmp::Ordering::Greater => 1.0,
+    }))
 }
 
 pub fn string_split(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {

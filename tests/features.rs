@@ -47,6 +47,8 @@ mod object_builtins;
 mod objects_and_arrays;
 #[path = "features/stack_overflow.rs"]
 mod stack_overflow;
+#[path = "features/string_es6.rs"]
+mod string_es6;
 #[path = "features/symbol_test.rs"]
 mod symbol_test;
 #[path = "features/variables.rs"]

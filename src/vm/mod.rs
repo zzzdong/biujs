@@ -1882,20 +1882,43 @@ impl VM {
                         self.state.jump_offset(1);
                         return Ok(());
                     }
-                    if let Ok(result) = crate::builtins::call_static_method(&static_method, &args) {
+                    // Statics that read their inputs through `[[Get]]` (a
+                    // descriptor object's fields may be accessors) can only be
+                    // carried out by the VM, which is what the prototype-chain
+                    // lookup below reaches through `call_native_by_name`. Trying
+                    // them against the plain builtin layer first would either
+                    // fail or lose the getter side effects.
+                    let vm_handled_static = matches!(
+                        static_method.as_str(),
+                        "Object.defineProperty" | "Object.defineProperties" | "Object.create"
+                    );
+                    if !vm_handled_static {
+                        // A missing static falls through to the prototype chain,
+                        // but a static that *exists* and fails (RangeError,
+                        // TypeError, …) must propagate rather than be swallowed
+                        // by the fallback.
+                        match crate::builtins::call_static_method(&static_method, &args) {
+                            Ok(result) => {
+                                self.state.set_register(Register::Rv, result)?;
+                                self.state.jump_offset(1);
+                                return Ok(());
+                            }
+                            Err(err) if crate::builtins::is_unknown_builtin(&err) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
+
+                // Try built-in prototype method dispatch. As above: only
+                // "no such method" may fall through.
+                match crate::builtins::call_prototype_method(&obj_val, &method_name, &args) {
+                    Ok(result) => {
                         self.state.set_register(Register::Rv, result)?;
                         self.state.jump_offset(1);
                         return Ok(());
                     }
-                }
-
-                // Try built-in prototype method dispatch
-                if let Ok(result) =
-                    crate::builtins::call_prototype_method(&obj_val, &method_name, &args)
-                {
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(());
+                    Err(err) if crate::builtins::is_unknown_builtin(&err) => {}
+                    Err(err) => return Err(err),
                 }
 
                 // Look up user-defined method on the object's prototype chain
