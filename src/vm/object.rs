@@ -1301,25 +1301,52 @@ impl JSObject for FunctionObject {
 }
 
 /// Create a `Value::Object` wrapping a FunctionObject with a prototype property
+///
+/// A normal function owns a `prototype` object (ES 9.2.3) whose `[[Prototype]]`
+/// is `Object.prototype` and which links back through `constructor`. The
+/// back-reference is stored as a bare `Value::Function(id)` rather than as the
+/// boxed function object, so that no `Rc` cycle is created (the value compares
+/// equal to the boxed form and is boxed on demand by property access).
 pub fn new_function_object(func_id: u32, name: &str) -> Value {
     let func_obj = FunctionObject::new(func_id, name);
     let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
 
-    // Create a prototype object for this function
-    let proto_obj = new_ordinary_object();
+    // `F.prototype` inherits from `Object.prototype` (ES 9.2.3 step 4).
+    let proto_obj = match crate::builtins::wrapper_prototype("Object") {
+        Some(object_proto) => new_ordinary_object_with_prototype(object_proto),
+        None => new_ordinary_object(),
+    };
 
-    // Set the prototype property on the function object
     if let Value::Object(ref proto_ref) = proto_obj {
+        // `F.prototype.constructor` — writable, non-enumerable, configurable.
+        proto_ref.borrow_mut().define_property(
+            crate::vm::property::PropertyKey::from_str("constructor"),
+            PropertyDescriptor {
+                value: Value::Function(func_id),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                getter: None,
+                setter: None,
+            },
+        )
+        .ok();
+
+        // `F.prototype` itself — writable, non-enumerable, non-configurable.
         obj_ref
             .borrow_mut()
-            .property_set(
+            .define_property(
                 crate::vm::property::PropertyKey::from("prototype"),
-                proto_obj.clone(),
+                PropertyDescriptor {
+                    value: proto_obj.clone(),
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                    getter: None,
+                    setter: None,
+                },
             )
             .ok();
-
-        // Note: We don't set constructor property on prototype to avoid circular reference
-        // This is a simplification - in a full implementation, we'd need to handle this differently
     }
 
     Value::Object(obj_ref)
