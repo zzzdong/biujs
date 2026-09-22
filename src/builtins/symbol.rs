@@ -45,6 +45,11 @@ pub fn to_string_tag_symbol_key() -> PropertyKey {
     PropertyKey::Symbol(TO_STRING_TAG_SYMBOL_ID)
 }
 
+/// `Symbol.isConcatSpreadable` as a property key.
+pub fn is_concat_spreadable_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(IS_CONCAT_SPREADABLE_SYMBOL_ID)
+}
+
 /// `Symbol.hasInstance` as a property key.
 pub fn has_instance_symbol_key() -> PropertyKey {
     PropertyKey::Symbol(HAS_INSTANCE_SYMBOL_ID)

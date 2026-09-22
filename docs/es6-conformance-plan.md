@@ -2,7 +2,7 @@
 
 > **日期**：2026-09-20（初版）；2026-09-21 更新 —— M2' 完成、M3-B1 首批交付（见 §2.1b/§2.2b）；2026-09-21 二批 —— M3-B1 收尾（ToObject 装箱、描述符校验、数组元素访问器、Object.assign 下沉 VM），见 §2.1c/§2.2c；2026-09-21 三批 —— SEH 跨帧展开修复（见 §2.1d）；2026-09-22 四批 —— M3-B2 首批（Array 回调方法泛型化、indexOf/lastIndexOf 分派、String.prototype.indexOf 补齐），见 §2.1e
 > **目标来源**：`README.md:3-4` —— *"A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6** features but without `eval` or eval-like features or `with` statement."*
-> **基线**：test262 **7416 / 10365**（71.55% 通过，2949 失败，14437 跳过；M3-B2 二批后）；单元测试 190；feature 集成 27 个文件（346 / 351 条通过，余 5 条既有 try-finally 失败）；runner 启用 89 个套件
+> **基线**：test262 **7481 / 10365**（72.18% 通过，2884 失败，14437 跳过；M3-B2 三批后）；单元测试 190；feature 集成 27 个文件（352 / 357 条通过，余 5 条既有 try-finally 失败）；runner 启用 89 个套件
 > **上一阶段**：M1（迭代器 / for-of / 解构 / 展开 / 模板 / 默认参数）与 M2（class：静态成员、访问器、extends/super、public 字段）已交付
 
 ---
@@ -361,7 +361,7 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 ### 2.1k 本轮总览（2026-09-22，十二个提交）
 
-**逐套件对照**（起点 = §2.1e 结束时的全量；本批结束 = `0612fab`）：
+**逐套件对照**（起点 = §2.1e 结束时的全量；§2.1j 结束于 `0612fab`，§2.1l 结束于本批提交）：
 
 | 套件 | 起点 | 现在 | 变化 | 通过率 |
 |------|------|------|------|--------|
@@ -377,7 +377,7 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 | `built-ins/Boolean` | 16 | **26** | +10 | — |
 | `language/statements/class` | 50 | **64** | +14 | — |
 | `language/statements/for-of` | 17 | **24** | +7 | — |
-| **全量** | **6021** | **7416** | **+1395** | 58.09% → **71.55%** |
+| **全量** | **6021** | **7481** | **+1460** | 58.09% → **72.18%** |
 
 **M3 完成标准核对**：Object/Array/String 三套件通过率 **83% / 63% / 56%**，均 ≥ 50%（达成）；B4 的 Math/Number 失败数大幅下降（Math 134 → 19、Number 175 → 104）；B5 三套件 59% / 47% / 76%，其中 Function 与 Error 未到 60% —— 两者的剩余失败都不是 ES6 核心语义（`Function/prototype/toString` 需要源码文本；`Error/prototype/stack` 是 ES2026 提案）。
 
@@ -386,6 +386,40 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 **未采纳的尝试（记录以免重复踩坑）**：把 runner 的跳过表按"范围外（ES2019+ / Annex B / RegExp 依赖）/ 未实现 / 架构排除"三组扩容后，失败数 2949 → 2554、通过率升到 74.34%，**但通过绝对数从 7416 掉到 7401** —— `Symbol.match`/`Symbol.replace`/`Array.prototype.flat`/`Object.fromEntries`/`__proto__` 这类标签会连带跳过少量**本来通过**的用例（这些 well-known symbol 与部分 Annex B 形态已实现）。按 §2.1 的 KPI 约定（通过绝对数为主指标）已回退该改动；今后扩容跳过表需逐标签核验"是否会跳过已通过用例"。
 
 **下轮建议顺序**：B2 泛型收尾（约 70 例，最集中的剩余项）→ B6 `JSON.parse/stringify`（165 例未启用，且 35 例 `Function/prototype/toString` 依赖 JSON）→ 参数/接收者类型校验的成体系补强（294 例的最大桶）→ M4 生成器、M5 `Map`/`Set`。
+
+### 2.1l M3-B2 三批：Array 泛型（类数组）路径收尾（2026-09-22）
+
+**起点**：`built-ins/Array` 1807（§2.1j 之后）。非回调类方法合计约 70 例失败，典型是 `TypeError: not an array`。
+
+**根因**：
+
+1. `push`/`pop`/`shift`/`unshift`/`reverse`/`join`/`slice`/`concat`/`splice`/`fill` 一律先 `downcast_ref::<ArrayObject>()`，不是真数组就抛 `TypeError`。但规范把这一族全部定义为按 `length` + `HasProperty` + 索引 `[[Get]]`/`[[Set]]`/`[[Delete]]` 的**泛型**算法，`Array.prototype.X.call(arrayLike, …)` 是它们的正式用法。
+2. `splice()` 无参时不删除任何元素（ES 23.1.3.28 step 5：`start` 不存在 → `actualDeleteCount = 0`，只有 `splice(start)` 才删 `len - start`）。实现按 `len - start` 处理，等于"清空整个类数组"。
+3. 同名方法在 `Array.prototype` 与 `String.prototype` 上都存在（`at`/`concat`/`includes`/`indexOf`/`slice`），派发却按 `kind == Array` 二选一 —— `Array.prototype.at.call({length: 2, …})` 因此落到字符串实现并返回 `"]"`。
+4. 规范允许类数组声明 `length = 2^53 - 1`（test262 有多个这样的用例），逐元素实现会直接按该长度分配/循环。
+
+**交付**：
+
+1. `array.rs` 新增泛型层：`to_object`、`generic_length`（ToLength + 饱和到 2^53-1）、`generic_get`/`generic_set`/`generic_has`（走原型链）/`generic_delete`/`generic_set_length`、`relative_index`；上述十个方法改为"真数组快路径 + 泛型回退"。
+2. **稀疏感知**：`own_index_keys_below` + `generic_window_move` 只搬运**存在的**索引，并删除"源缺失的目标索引"；`reverse` 按索引对重写（一侧存在则搬到另一侧、两侧存在则交换、两侧皆无则不动）。于是 `length` 接近 2^53 的 `shift`/`unshift`/`reverse`/`splice` 是 O(存在索引) 而非 O(length)。
+3. **物化上限**：新增 `MAX_GENERIC_ELEMENTS = 2^22`，逐元素构建结果的路径（`fill` 区间、`copyWithin` 缓冲、`splice` 的结果数组、`slice`/`concat` 输出）超限即抛 `RangeError("Invalid array length")`；`join` 先用 `(len - 1) × 分隔符字节数` 预判，超过 `MAX_JOIN_LENGTH` 抛 `TypeError`（与参考引擎的报错类型一致）。
+4. `splice` 语义修正（无参不删除、`deleteCount` 缺省为 `len - start`、`new_len > 2^53 - 1` → TypeError）；`concat` 接入 `IsConcatSpreadable`（新增 `symbol::is_concat_spreadable_symbol_key`）：数组默认可展开、非数组默认不可展开、`Symbol.isConcatSpreadable` 优先。
+5. `at`/`concat`/`includes`/`indexOf`/`slice` 的派发统一改用新增的 `string_prototype_receiver`：字符串原始值或包装对象走 String 实现，其余对象走 Array 泛型实现。
+
+**OOM 事故与护栏（重要）**：本批第一次全量回归把测试进程打爆（OOM，宿主内存被吃满）。根因是 `splice` 的"结果数组"按 `delete_count` 逐元素物化，而 `Array.prototype.splice.call({length: 2**53 - 1})` 的 `delete_count` 是 2^53-1 —— 恰好叠加了上面第 2 条语义错误。修复后该场景 `delete_count = 0`（只做 `Set(length)`），逐元素路径另有 `MAX_GENERIC_ELEMENTS` 护栏。**并立下约定：此后所有回归（全量与定向）都带内存上限运行**（见 §6.6）。
+
+**效果**（逐套件实测，无一套件下降）：
+
+| 套件 | 起点 | 本批后 | 变化 |
+|------|------|--------|------|
+| `built-ins/Array` | 1807 | **1870** | +63 |
+| `built-ins/String` | 562 | **564** | +2 |
+
+**全量复测**：通过 **7416 → 7481**（+65），失败 2949 → 2884，通过率 71.55% → **72.18%**；本次运行带 `ulimit -v 6000000`，全程未触限（94s）；单元 190 全绿；features 346 → 352 通过（`tests/features/array_methods.rs` 新增 6 个用例 / 20 条断言）。
+
+**验证方式**：泛型语义先把 25 条断言与 node 逐字对照（`join` 的分隔符计数、"空洞也要占位"、`splice` 的增/减/等长三支、`@@isConcatSpreadable` 三种形态），再覆盖 2^53 量级的边界（`splice` 无参/单参/超限、`splice` 近上限增减、`fill` 近上限），全部与 node 一致后才跑全量。
+
+**残留**：泛型路径**无法执行访问器**（`[[Get]]` 直接读属性表），`Array/prototype/reverse/length-exceeding-integer-limit-with-object.js` 这类"靠 getter 抛错提前中止"的用例仍失败；`length` 超过 `MAX_GENERIC_ELEMENTS` 的逐元素操作抛 RangeError，属引擎偏差（参考引擎会做稀疏写、或实际超时不可完成）。
 
 ### 2.2 已交付（M0 → M2'）
 
@@ -437,6 +471,8 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 | `normalize` 无 Unicode 规范化数据 | 只做 form 校验（非法抛 RangeError），合法 form 原样返回 | 2026-09-22 登记：需引入规范化表（新依赖），归 M6 |
 | class 方法带 `prototype`、缺 `name` 推导 | 方法按规范不应有 `prototype`；`var f = function () {}` 的 `name` 应为 `"f"` | 2026-09-22 登记：需 `SetFunctionName`，归 M6 |
 | `entries`/`keys`/`values` 的迭代器 `it[Symbol.iterator]() !== it` | 迭代器本身可被 for-of 遍历，但不满足自返 | 2026-09-22 登记（§2.1j）：少量用例 |
+| **Array 泛型路径不执行访问器** | 泛型（类数组）路径的 `[[Get]]` 直接读属性表，索引上的 getter 不会被调用：`Array/prototype/reverse/length-exceeding-integer-limit-with-object.js`（靠 getter 抛错提前中止）等用例失败 | 2026-09-22 登记（§2.1l）：需要把泛型路径改为经 VM 的 `[[Get]]`，属跨层改动，归 M6 |
+| 泛型路径的物化上限（`MAX_GENERIC_ELEMENTS = 2^22`） | `length` 超过上限的逐元素操作（`fill`/`copyWithin`/`splice` 结果）抛 RangeError，而参考引擎会做稀疏写 | 2026-09-22 登记（§2.1l）：有意为之——本引擎数组是 `Vec` 支撑，无法表示 2^53 长度；先保证不 OOM |
 
 ### 2.4 跨块活跃性修复（2026-09-20）
 
@@ -590,6 +626,10 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
    `TEST262_SUITES=... TEST262_FAILURES=300 ... | grep FAIL | sed ... | sort | uniq -c | sort -rn`，用于排下一轮优先级。
 4. **性能护栏**：记录全量耗时基线；劣化 > 2× 需定位（热点：慢路径迭代的 `invoke`、内置方法派发）。
 5. **单元测试**：190 个保持全绿；新增运行时机制（生成器帧、微任务）需补单元测试。
+6. **内存护栏**：全量与定向回归**一律带内存上限**运行，例如
+   `ulimit -v 6000000; TEST262_FAILURES=20000 cargo test --release --test test262_runner -- --nocapture`。
+   VM 仍在演进，一个无界物化/循环（如 §2.1l 的 `splice` 结果数组）就足以吃满宿主内存并打断整个回归；
+   加上限后失败会以"进程被限"的形式立刻暴露，而不是拖垮开发机。
 
 ---
 

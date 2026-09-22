@@ -193,8 +193,9 @@ pub use string::string_constructor;
 pub use symbol::symbol_constructor;
 pub use symbol::{
     HAS_INSTANCE_SYMBOL_ID, SPECIES_SYMBOL_ID, SYMBOL_DESCRIPTION_NATIVE, TO_PRIMITIVE_SYMBOL_ID,
-    TO_STRING_TAG_SYMBOL_ID, has_instance_symbol_key, register_symbol_value, symbol_description,
-    symbol_value_by_id, to_primitive_symbol_key, to_string_tag_symbol_key,
+    TO_STRING_TAG_SYMBOL_ID, has_instance_symbol_key, is_concat_spreadable_symbol_key,
+    register_symbol_value, symbol_description, symbol_value_by_id, to_primitive_symbol_key,
+    to_string_tag_symbol_key,
 };
 
 // ─────────────────────────────────────────────────────────
@@ -715,20 +716,12 @@ pub fn call_prototype_method(
         "padStart" => string::string_pad(obj, args, true),
         "padEnd" => string::string_pad(obj, args, false),
         "codePointAt" => string::string_code_point_at(obj, args),
-        // `at` exists on both Array.prototype and String.prototype. Strings
-        // (primitives and wrappers) always take the string path; any other
-        // object with a `length` is an array-like, which is what
-        // `Array.prototype.at.call({length: …})` needs.
+        // `at` exists on both Array.prototype and String.prototype.
         "at" => {
-            let string_like = matches!(obj, Value::String(_))
-                || matches!(obj, Value::Object(o)
-                    if matches!(o.borrow().kind(), ObjectKind::String | ObjectKind::Number | ObjectKind::Boolean));
-            let array_like = matches!(obj, Value::Object(o)
-                if o.borrow().property_get(&PropertyKey::from_str("length")).is_some());
-            if !string_like && array_like {
-                array::array_at(obj, args)
-            } else {
+            if string_prototype_receiver(obj) {
                 string::string_at(obj, args)
+            } else {
+                array::array_at(obj, args)
             }
         }
         "copyWithin" => array::array_copy_within(obj, args),
@@ -761,55 +754,46 @@ pub fn call_prototype_method(
     }
 }
 
+/// Names shared by `Array.prototype` and `String.prototype` (`at`, `concat`,
+/// `includes`, `indexOf`, `slice`) are dispatched by name, so the receiver has
+/// to pick the implementation. A string primitive, or a wrapper around a
+/// primitive, always means the String one; every other object is treated as the
+/// Array one (its generic path covers array-likes and non-array receivers).
+fn string_prototype_receiver(obj: &Value) -> bool {
+    matches!(obj, Value::String(_))
+        || matches!(obj, Value::Object(o)
+            if matches!(o.borrow().kind(), ObjectKind::String | ObjectKind::Number | ObjectKind::Boolean))
+}
+
 fn dispatch_concat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    match obj {
-        Value::Object(obj_ref) => {
-            if obj_ref.borrow().kind() == ObjectKind::Array {
-                array::array_concat(obj, args)
-            } else {
-                string::string_concat(obj, args)
-            }
-        }
-        _ => string::string_concat(obj, args),
+    if string_prototype_receiver(obj) {
+        string::string_concat(obj, args)
+    } else {
+        array::array_concat(obj, args)
     }
 }
 
 fn dispatch_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    match obj {
-        Value::Object(obj_ref) => {
-            if obj_ref.borrow().kind() == ObjectKind::Array {
-                array::array_includes(obj, args)
-            } else {
-                string::string_includes(obj, args)
-            }
-        }
-        _ => string::string_includes(obj, args),
+    if string_prototype_receiver(obj) {
+        string::string_includes(obj, args)
+    } else {
+        array::array_includes(obj, args)
     }
 }
 
 fn dispatch_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    match obj {
-        Value::Object(obj_ref) => {
-            if obj_ref.borrow().kind() == ObjectKind::Array {
-                array::array_index_of(obj, args)
-            } else {
-                string::string_index_of(obj, args)
-            }
-        }
-        _ => string::string_index_of(obj, args),
+    if string_prototype_receiver(obj) {
+        string::string_index_of(obj, args)
+    } else {
+        array::array_index_of(obj, args)
     }
 }
 
 fn dispatch_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    match obj {
-        Value::Object(obj_ref) => {
-            if obj_ref.borrow().kind() == ObjectKind::Array {
-                array::array_slice(obj, args)
-            } else {
-                string::string_slice(obj, args)
-            }
-        }
-        _ => string::string_slice(obj, args),
+    if string_prototype_receiver(obj) {
+        string::string_slice(obj, args)
+    } else {
+        array::array_slice(obj, args)
     }
 }
 

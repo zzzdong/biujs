@@ -198,3 +198,164 @@ fn array_entries_keys_values_are_iterators() {
     );
     assert!(eval_bool("typeof ['a'].keys()[Symbol.iterator] === 'function'"));
 }
+
+// ──────────────────────────────
+// Generic (array-like) mutating methods
+// ──────────────────────────────
+
+#[test]
+fn mutating_methods_work_on_array_likes() {
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 3, 0: 'a', 1: 'b', 2: 'c' }; \
+               var v = Array.prototype.pop.call(o); \
+               return v + '/' + o.length + '/' + (2 in o); })()"
+        ),
+        "c/2/false"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 1, 0: 'a' }; \
+               var n = Array.prototype.push.call(o, 'b', 'c'); \
+               return n + '/' + o[1] + o[2]; })()"
+        ),
+        "3/bc"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 2, 0: 'b', 1: 'c' }; \
+               Array.prototype.unshift.call(o, 'a'); \
+               return o.length + '/' + o[0] + o[1] + o[2]; })()"
+        ),
+        "3/abc"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 3, 0: 'a', 1: 'b', 2: 'c' }; \
+               var v = Array.prototype.shift.call(o); \
+               return v + '/' + o.length + '/' + o[0]; })()"
+        ),
+        "a/2/b"
+    );
+}
+
+#[test]
+fn reverse_keeps_sparse_shape() {
+    // A pair with one side present moves that value to the other side.
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 4, 0: 'a' }; \
+               Array.prototype.reverse.call(o); \
+               return (0 in o) + ',' + (3 in o) + ',' + o[3]; })()"
+        ),
+        "false,true,a"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 3, 0: 'a', 1: 'b', 2: 'c' }; \
+               Array.prototype.reverse.call(o); \
+               return o[0] + o[1] + o[2]; })()"
+        ),
+        "cba"
+    );
+}
+
+#[test]
+fn join_and_slice_keep_holes() {
+    // Every index past the first contributes a separator, present or not.
+    assert_eq!(
+        eval_string("Array.prototype.join.call({ length: 3, 0: 'a', 2: 'c' }, '-')"),
+        "a--c"
+    );
+    assert_eq!(
+        eval_string("Array.prototype.join.call({ length: 2, 0: null, 1: undefined })"),
+        ","
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var out = Array.prototype.slice.call({ length: 3, 0: 'a', 2: 'c' }); \
+               return out.length + '/' + (1 in out) + '/' + out[2]; })()"
+        ),
+        "3/false/c"
+    );
+}
+
+#[test]
+fn concat_honours_is_concat_spreadable() {
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 2, 0: 'x', 1: 'y' }; \
+               o[Symbol.isConcatSpreadable] = true; \
+               return [0].concat(o).join(','); })()"
+        ),
+        "0,x,y"
+    );
+    assert_eq!(
+        eval_number(
+            "(function () { var o = { length: 2, 0: 'x', 1: 'y' }; \
+               return [0].concat(o).length; })()"
+        ),
+        2.0
+    );
+    assert_eq!(
+        eval_number(
+            "(function () { var a = [1, 2]; a[Symbol.isConcatSpreadable] = false; \
+               return [0].concat(a).length; })()"
+        ),
+        2.0
+    );
+}
+
+#[test]
+fn splice_on_array_likes() {
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 4, 0: 'a', 1: 'b', 2: 'c', 3: 'd' }; \
+               var rem = Array.prototype.splice.call(o, 1, 2, 'X'); \
+               return rem.join(',') + '/' + o.length + '/' + o[0] + o[1] + o[2]; })()"
+        ),
+        "b,c/3/aXd"
+    );
+    // `splice()` with no arguments deletes nothing (ES 23.1.3.28 step 5).
+    assert_eq!(
+        eval_string(
+            "(function () { var a = [1, 2, 3]; var rem = a.splice(); \
+               return rem.length + '/' + a.length; })()"
+        ),
+        "0/3"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = { length: 3, 0: 'a', 1: 'b', 2: 'c' }; \
+               var rem = Array.prototype.splice.call(o, 1); \
+               return rem.length + '/' + o.length; })()"
+        ),
+        "2/1"
+    );
+}
+
+#[test]
+fn absurd_lengths_do_not_allocate() {
+    // A receiver may claim `length = 2^53 - 1`; the sparse paths must handle it
+    // and the element-by-element paths must refuse instead of allocating.
+    assert!(eval_bool(
+        "(function () { var o = { length: Math.pow(2, 53) - 1 }; \
+           Array.prototype.splice.call(o); \
+           return o.length === Math.pow(2, 53) - 1; })()"
+    ));
+    assert!(eval_bool(
+        "(function () { var o = { length: Math.pow(2, 53) - 1 }; \
+           try { Array.prototype.splice.call(o, 0, 0, null); return false; } \
+           catch (e) { return e instanceof TypeError; } })()"
+    ));
+    assert!(eval_bool(
+        "(function () { var o = { length: Math.pow(2, 53) }; \
+           try { Array.prototype.fill.call(o, 1); return false; } \
+           catch (e) { return e instanceof RangeError; } })()"
+    ));
+    assert!(eval_bool(
+        "(function () { var v = {}; var o = { length: Math.pow(2, 53) - 1 }; \
+           Array.prototype.fill.call(o, v, Math.pow(2, 53) - 4, Math.pow(2, 53) - 1); \
+           return o[Math.pow(2, 53) - 2] === v; })()"
+    ));
+}
