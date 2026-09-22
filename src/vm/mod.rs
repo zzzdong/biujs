@@ -813,6 +813,16 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        // Box bare `Value::Function(id)` arguments (and the receiver) into their
+        // memoized function objects before handing them to the builtin layer.
+        // The builtin layer matches on `Value::Object` — `Object.keys(fn)`,
+        // `Object.getOwnPropertyDescriptor(fn, "length")` and friends all used
+        // to report "first argument must be an object" for a plain function
+        // reference, and `ToObject` passes the bare form through unchanged.
+        let boxed_args: Vec<Value> = args.iter().map(|a| self.as_object_value(a)).collect();
+        let args: &[Value] = &boxed_args;
+        let this: Value = self.as_object_value(&this);
+
         if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
             return self.object_prototype_to_string(&this, args, module);
         }
@@ -1788,11 +1798,18 @@ impl VM {
                 // Read the outgoing arguments. These live below the *new* frame
                 // pointer, so they must not go through the "missing argument"
                 // rule (which is about the callee's own parameters).
-                let mut args = Vec::with_capacity(arg_count);
+                let mut raw_args = Vec::with_capacity(arg_count);
                 for i in 0..arg_count {
                     let index = self.state.rbp - i - 1;
-                    args.push(self.state.raw_stack_value(index));
+                    raw_args.push(self.state.raw_stack_value(index));
                 }
+                // Box bare function references: the builtin layer matches on
+                // `Value::Object`, so `Object.keys(fn)` & friends would
+                // otherwise be handed a `Value::Function(id)` it cannot read.
+                let args: Vec<Value> = raw_args
+                    .iter()
+                    .map(|a| self.as_object_value(a))
+                    .collect();
 
                 if let Some(key) = symbol_key {
                     let method_val = match &obj_val {
