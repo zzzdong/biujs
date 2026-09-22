@@ -150,9 +150,11 @@ pub fn runtime_error_to_js_error(
             Rc::clone(&builtins.range_error_prototype),
             "RangeError",
         ),
+        // `SyntaxError` must be a *SyntaxError*: JSON.parse and the compiler's
+        // diagnostics are matched by `e instanceof SyntaxError` / `e.name`.
         RuntimeError::SyntaxError(msg) => create_error_object(
             Some(msg.clone()),
-            Rc::clone(&builtins.error_prototype),
+            Rc::clone(&builtins.syntax_error_prototype),
             "SyntaxError",
         ),
         RuntimeError::InternalError(msg) => create_error_object(

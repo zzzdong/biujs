@@ -2,9 +2,9 @@
 
 > **Last updated**: 2026-09-22
 > **Engine version**: 0.1.0
-> **Total tests**: 190 unit + 27 feature files (346 assertions passing of 351) + test262 10365 executed / **7416 passing** (71.55%; was 4611 at the M3-B1 second batch) — per-suite table in `docs/es6-conformance-plan.md` §2.1f
+> **Total tests**: 190 unit + 28 feature files (359 assertions passing of 364) + test262 10552 executed / **7677 passing** (72.75%; was 4611 at the M3-B1 second batch) — per-suite table in `docs/es6-conformance-plan.md` §2.1m
 >
-> Roadmap: see `docs/es6-conformance-plan.md` (M2' done → M3 mostly done: B1/B2/B3/B4 delivered, B5 first pass; B6 `JSON`/`Date` open).
+> Roadmap: see `docs/es6-conformance-plan.md` (M2' done → M3 mostly done: B1/B2/B3/B4/B5/B6-`JSON` delivered; `Date` open).
 
 ## Project Goal
 
@@ -313,7 +313,7 @@ This engine uses a **static compilation model** with register-based VM:
 | `Symbol` | ⚠️ | M1/M2' | `Symbol()` non-constructable; well-known symbols defined with spec attributes; `description` getter, `toString`/`valueOf`, `Symbol.for`/`keyFor`; `Object.getOwnPropertySymbols` works |
 | `Error` | ✅ | recent / M3 | All error types; `Error.prototype.name`/`message`, per-native prototypes own `name`/`message`, instance `[[Class]]` `"Error"`, `Error.prototype.toString` per ES 20.5.3.4, `Error.isError`, `new Error(msg, {cause})`; `stack` (ES2026 proposal) not implemented |
 | `Math` | ✅ | recent / M3 | Abs…trunc incl. the ES6 additions (hypot, sign, clz32, imul, log2/log10, cbrt, trunc, fround, expm1, log1p, sinh…); methods `{writable:true, enumerable:false, configurable:true}` and constants read-only (ES 17) |
-| `JSON` | ❌ | — | Planned (M3-B6) |
+| `JSON` | ✅ | M3-B6 | `JSON.parse(text[, reviver])` (strict ECMA-404 parser, reviver walk with `CreateDataProperty` semantics) and `JSON.stringify(value[, replacer[, space]])` (`toJSON`, function/array replacer, number/string `space`, cycle detection, spec `finalize` indentation); `JSON[Symbol.toStringTag] === "JSON"`; `JSON.rawJSON`/`isRawJSON` (ES2025) and lone-surrogate escaping (ES2025) are out of scope |
 | `Map` / `Set` / `WeakMap` / `WeakSet` | ❌ | — | Planned (M5) |
 
 ### Utility
@@ -458,7 +458,7 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 | Well-known symbols (`toStringTag`, `toPrimitive`, `hasInstance`, `species`) | M2 residual |
 | Tagged templates (tag invocation + strings array) | M2 residual |
 | Built-ins: Object / Array / String / Number / Math / Function / Error completeness | M3 (B1/B2/B3/B4 delivered; B5 first pass) |
-| `JSON`, `Date` | M3 |
+| `Date` | M3 |
 | Generators (`function*`) and full iterator close semantics | M4 |
 | `Map`, `Set`, `WeakMap`, `WeakSet`, `Promise` | M5 |
 | `Proxy`, `Reflect` | M5 |
@@ -469,8 +469,8 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 | Test Suite | Count |
 |------------|-------|
 | Unit tests (value, vm, etc.) | 190 |
-| Feature integration test files | 27 (346 passing / 351 assertions, 5 pre-existing `return_in_try_finally` failures) |
-| test262 executed / passing | 10365 / 7416 (71.55%) |
+| Feature integration test files | 28 (359 passing / 364 assertions, 5 pre-existing `return_in_try_finally` failures) |
+| test262 executed / passing | 10552 / 7677 (72.75%) |
 
 ---
 
@@ -511,3 +511,4 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 | 2026-09-21 | ✅ M3-B1 (`Object`) batches 1-3: ToObject boxing, `[[DefineOwnProperty]]` validation, array element accessors, `Object.assign` in the VM, SEH cross-frame unwinding → test262 4611 passing |
 | 2026-09-22 | ✅ M3-B1/B2/B3/B4/B5 (12 commits, `docs/es6-conformance-plan.md` §2.1f): `F.prototype.constructor`, function `length`/`name` metadata + builtin arity table, built-in property attributes, native-constructor prototype chain, real `ToNumber` opcode, `Number::toString`, String method dispatch + `codePointAt`/`at`/`normalize`/`toLocale*`/`pad*`/ES whitespace `trim`, built-in error propagation, `Error` semantics (`[[Class]]`, `toString`, `isError`, `cause`), bound-function construction, `Array.prototype.at`/`copyWithin`/`entries`/`keys`/`values` → test262 6015 → **7416 passing** (71.55%) |
 | 2026-09-22 | 🐛 Fixed two latent correctness bugs found by the above: built-in errors were silently swallowed by the `CallMethod` fallback (`is_unknown_builtin`), and `new` on a built-in constructor passed arguments in reverse order |
+| 2026-09-22 | ✅ M3-B6 `JSON` (`docs/es6-conformance-plan.md` §2.1m): namespace object, ECMA-404 parser, full serializer (`toJSON`/`replacer`/`space`/cycles) and reviver walk in the VM; `built-ins/JSON` enabled (112 passing) plus `SyntaxError`/`ToPrimitive`/array-hole/`join` fixes → test262 7481 → **7677 passing** (72.75%) |

@@ -626,11 +626,7 @@ impl ArrayObject {
 
     /// Join array elements with comma separator (like Array.prototype.toString)
     pub fn join_elements(&self) -> String {
-        self.elements
-            .iter()
-            .map(|v| v.to_js_string())
-            .collect::<Vec<_>>()
-            .join(",")
+        self.join(",")
     }
 
     /// Mark a dense slot as a hole: it contributes no element (no own key,
@@ -712,10 +708,15 @@ impl ArrayObject {
         self.drop_index_property_entries();
     }
 
+    /// `Array.prototype.join`: `null` and `undefined` (and holes, which are
+    /// stored as `undefined`) contribute the empty string (ES 23.1.3.15).
     pub fn join(&self, separator: &str) -> String {
         self.elements
             .iter()
-            .map(|v| v.to_js_string())
+            .map(|v| match v {
+                Value::Undefined | Value::Null => String::new(),
+                other => other.to_js_string(),
+            })
             .collect::<Vec<_>>()
             .join(separator)
     }
@@ -801,6 +802,12 @@ impl JSObject for ArrayObject {
             PropertyKey::Str(s) => {
                 // Try parsing index
                 if let Ok(idx) = s.parse::<usize>() {
+                    // A hole is *absent*, so it must not shadow an inherited
+                    // property: after `delete arr[1]`, `arr[1]` still sees
+                    // `Array.prototype[1]` (and `has_property`/`own_keys` agree).
+                    if self.holes.contains(&idx) {
+                        return None;
+                    }
                     self.elements
                         .get(idx)
                         .map(|v| PropertyDescriptor::data_descriptor(v.clone()))
@@ -862,6 +869,10 @@ impl JSObject for ArrayObject {
                     if idx >= self.elements.len() {
                         self.elements.resize(idx + 1, Value::Undefined);
                     }
+                    // Assigning to a hole gives the index a value again, so it
+                    // stops being absent (`delete arguments[0]` followed by
+                    // `arguments[0] = x` must be observable).
+                    self.holes.remove(&idx);
                     self.elements[idx] = value;
                     Ok(true)
                 } else if let Some(existing) = self.properties.get(&key) {

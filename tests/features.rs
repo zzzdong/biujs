@@ -37,6 +37,8 @@ mod error_builtins;
 mod exception_unwinding;
 #[path = "features/functions.rs"]
 mod functions;
+#[path = "features/json.rs"]
+mod json;
 #[path = "features/language_semantics.rs"]
 mod language_semantics;
 #[path = "features/logical_typeof.rs"]

@@ -2,6 +2,7 @@ mod array;
 mod boolean;
 mod error;
 mod function;
+mod json;
 mod math;
 mod number;
 mod object;
@@ -26,6 +27,10 @@ pub use error::{
     setup_error_prototype, setup_native_error_prototype,
 };
 pub use function::{function_constructor, setup_function_prototype};
+pub use json::{
+    json_number, json_parse, json_stringify, own_enumerable_string_keys, quote_json_string,
+    register_json,
+};
 pub use number::{
     number_constructor, number_is_finite, number_is_integer, number_is_nan, number_to_exponential,
     number_to_fixed, number_to_precision,
@@ -448,6 +453,7 @@ impl Builtins {
 
         // `Math` — a plain namespace object of numeric helpers.
         globals.insert("Math".to_string(), math::create_math_object());
+        globals.insert("JSON".to_string(), json::register_json());
 
         // Global convenience functions (they are plain functions, not
         // constructors, so they have no `prototype` slot).
@@ -667,6 +673,19 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
         "Array.from" => array::array_from(args),
         "String.fromCharCode" => string::string_from_char_code(args),
         "String.fromCodePoint" => string::string_from_code_point(args),
+        // Fallbacks for the direct-dispatch path; the VM intercepts both before
+        // reaching here so that `toJSON`/`replacer`/`reviver` can run.
+        "JSON.parse" => {
+            let text = args
+                .first()
+                .map(|v| v.to_js_string())
+                .unwrap_or_else(|| "undefined".to_string());
+            json::json_parse(&text)
+        }
+        "JSON.stringify" => match json::json_stringify(args.first().unwrap_or(&Value::Undefined))? {
+            Some(text) => Ok(Value::string(&text)),
+            None => Ok(Value::Undefined),
+        },
         "Error.isError" => Ok(Value::Bool(matches!(
             args.first(),
             Some(Value::Object(o)) if o.borrow().class_name() == "Error"
@@ -1137,6 +1156,9 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         | "TypeError" | "ReferenceError" | "RangeError" | "SyntaxError" | "URIError"
         | "EvalError" => 1,
         "Error.isError" => 1,
+        // ── JSON ──
+        "JSON.parse" => 2,
+        "JSON.stringify" => 3,
         "Symbol" => 0,
         // ── Global functions ──
         "parseInt" => 2,

@@ -120,6 +120,7 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "import.meta",
     "import-assertions",
     "Intl",
+    "json-parse-with-source",
     "logical-assignment",
     "Map",
     "modules",
@@ -141,12 +142,14 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "WeakRef",
     "WeakSet",
     "u180e",
+    "well-formed-json-stringify",
 ];
 
 /// Source patterns biujs cannot handle at all.
 const UNSUPPORTED_PATTERNS: &[&str] = &[
     "eval(",
-    "JSON",
+    // `JSON` used to be listed here while it was unimplemented; it is now a
+    // real built-in, so tests that exercise it must run.
     "Date",
     "RegExp",
     "$DONOTEVALUATE",
@@ -494,6 +497,7 @@ const SUITES: &[&str] = &[
     "built-ins/Boolean",
     "built-ins/Error",
     "built-ins/Function",
+    "built-ins/JSON",
     "built-ins/Math",
     "built-ins/NativeErrors",
     "built-ins/Number",

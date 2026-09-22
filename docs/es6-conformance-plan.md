@@ -2,7 +2,7 @@
 
 > **日期**：2026-09-20（初版）；2026-09-21 更新 —— M2' 完成、M3-B1 首批交付（见 §2.1b/§2.2b）；2026-09-21 二批 —— M3-B1 收尾（ToObject 装箱、描述符校验、数组元素访问器、Object.assign 下沉 VM），见 §2.1c/§2.2c；2026-09-21 三批 —— SEH 跨帧展开修复（见 §2.1d）；2026-09-22 四批 —— M3-B2 首批（Array 回调方法泛型化、indexOf/lastIndexOf 分派、String.prototype.indexOf 补齐），见 §2.1e
 > **目标来源**：`README.md:3-4` —— *"A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6** features but without `eval` or eval-like features or `with` statement."*
-> **基线**：test262 **7481 / 10365**（72.18% 通过，2884 失败，14437 跳过；M3-B2 三批后）；单元测试 190；feature 集成 27 个文件（352 / 357 条通过，余 5 条既有 try-finally 失败）；runner 启用 89 个套件
+> **基线**：test262 **7677 / 10552**（72.75% 通过，2875 失败，14415 跳过；M3-B6 后）；单元测试 190；feature 集成 28 个文件（359 / 364 条通过，余 5 条既有 try-finally 失败）；runner 启用 90 个套件
 > **上一阶段**：M1（迭代器 / for-of / 解构 / 展开 / 模板 / 默认参数）与 M2（class：静态成员、访问器、extends/super、public 字段）已交付
 
 ---
@@ -421,6 +421,50 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 **残留**：泛型路径**无法执行访问器**（`[[Get]]` 直接读属性表），`Array/prototype/reverse/length-exceeding-integer-limit-with-object.js` 这类"靠 getter 抛错提前中止"的用例仍失败；`length` 超过 `MAX_GENERIC_ELEMENTS` 的逐元素操作抛 RangeError，属引擎偏差（参考引擎会做稀疏写、或实际超时不可完成）。
 
+### 2.1m M3-B6：`JSON`（2026-09-22）
+
+**起点**：通过 7481 / 10365（72.18%）。`JSON` 全局不存在（`ReferenceError: undefined variable: JSON` 35 例，主要集中在 `Function/prototype/toString`），计划的 B6 明确列了 `parse`/`stringify`（165 例未启用）。
+
+**根因**：
+
+1. 没有 `JSON` 内建：`JSON.parse`/`JSON.stringify` 都无从谈起。两者都不是纯函数——`stringify` 要跑 `toJSON`/`replacer`、每个属性读都要经 `[[Get]]`（访问器会执行）、还要检测循环引用；`parse` 的 reviver 是用户代码。所以算法必须落在 VM 侧，builtin 层只能提供纯数据版本。
+2. runner 的 `UNSUPPORTED_PATTERNS` 里还留着字面量 `"JSON"`（JSON 未实现时期的权宜之计），只要用例源码里出现 "JSON" 就整片跳过——`Function/prototype/toString` 的一批用例因此既不在通过数里、也不在失败池里，掩盖了真实缺口。
+3. 三个既有缺陷被本批用例暴露：
+   - `RuntimeError::SyntaxError` 被映射到 `Error.prototype`，于是 `JSON.parse` 的错误 `e.name` 是 `"Error"`、`e instanceof SyntaxError` 为 false。
+   - `OrdinaryToPrimitive` 不跳过不可调用的方法、且方法查找不走 `[[Get]]`：`{ toString: null, get valueOf() { throw } }` 取不到 `valueOf`（getter 不执行），`JSON.parse(obj)` 因此得不到 Abrupt completion。
+   - `ArrayObject::property_get` 对洞返回 `undefined` 而不是 `None`，洞会**遮蔽**原型属性：`delete arr[1]` 之后 `arr[1]` 取不到 `Array.prototype[1]`（`in`/`hasOwnProperty` 却已经按"洞即缺失"处理，两者不一致）。
+
+**交付**：
+
+1. 新增 `src/builtins/json.rs`：
+   - `register_json()`：`JSON` 命名空间对象（两个 own 方法 `{writable:true, enumerable:false, configurable:true}`、`JSON[Symbol.toStringTag] === "JSON"`、不可调用/不可构造）；
+   - `json_parse()`：严格 ECMA-404 递归下降解析器（只认四种空白、无尾逗号/注释/前导零、`\uXXXX` 代理对合并、重复键后者胜、`__proto__` 作为普通 own 属性）；
+   - `quote_json_string()`/`json_number()`：字符串转义与非有限数 → `null`；
+   - `json_stringify()`：纯数据版序列化（builtin 派发路径的兜底）。
+2. VM 侧实现完整算法：`json_stringify_full`（replacer 函数/属性列表、space 数字或字符串、`toJSON`、包装对象按 `ToNumber`/`ToString` 解包而 `[[BooleanData]]` 直接读槽、循环引用 → TypeError、gap/缩进按规范 `finalize`）、`json_parse_full`（`ToString(text)`，Symbol 抛 TypeError）、`json_internalize`（自底向上走 reviver，写回用 `CreateDataProperty` 语义——失败即忽略，因此 reviver 里造出的不可配置属性保持不变）。
+3. runner：启用 `built-ins/JSON`，删除 `"JSON"` 跳过模式，并按"范围外"新增两个跳过标签（`json-parse-with-source` = ES2025 `JSON.rawJSON`、`well-formed-json-stringify` = ES2025 孤立代理转义）。
+4. 顺带修掉上面第 3 条的三处既有缺陷（`SyntaxError` 原型映射、`OrdinaryToPrimitive` 的调用性检查 + `[[Get]]` 查找、`ArrayObject` 洞的可见性），并让 `Array.prototype.join` 对 `null`/`undefined` 贡献空串（原先输出 `"null"`/`"undefined"`，`[true, null, "x"].join("|")` 应为 `true||x`）。
+5. 测试基建：`tests/helpers.rs` 新增 `describe()`——期望类型不符时不再 `{:?}` 打印对象（内置原型的环会让 Debug 递归并把测试进程打爆，§2.3 的老债），改为按类型摘要。
+
+**验证方式**：先与 node 逐字对照 45 条断言（parse 的错误分类、重复键、转义、代理对、reviver 的替换/删除/嵌套、stringify 的省略/装箱/`toJSON`/replacer/space/循环/键序/缩进、命名空间对象形状），全部一致（仅 `"\ud83d\ude00".length` 因码点存储偏差为 1 而非 2）后才跑套件。
+
+**效果**（逐套件实测，无一套件下降）：
+
+| 套件 | 起点 | 本批后 | 变化 |
+|------|------|--------|------|
+| `built-ins/JSON` | 未启用 | **112** | +112（114 执行 / 51 跳过） |
+| `built-ins/Object` | 2548 | **2597** | +49 |
+| `built-ins/Array` | 1870 | **1903** | +33 |
+| `language/expressions/delete` | 36 | **37** | +1 |
+| `language/computed-property-names` | 33 | **34** | +1 |
+| `built-ins/Function` | 189 | 189 | ±0（新增 1 例执行但失败：`Function.prototype.toString` 需要源码文本） |
+
+**全量复测**：通过 **7481 → 7677**（+196），失败 2884 → 2875，已执行 10365 → 10552（JSON 用例进入分母），通过率 72.18% → **72.75%**；本次运行带 `ulimit -v 6000000`；单元 190 全绿；features 352 → 359 通过（新增 `tests/features/json.rs` 7 个用例 / 30 条断言）。
+
+**过程记录**：首次全量跑出 `language/statements/function` 通过数 -1（`S13_A13_T3.js`：`delete arguments[0]` 后再 `arguments[0] = "A"`）。原因是洞修复只做了一半——`property_get` 认洞、`property_set` 却不把洞"复活"。修好后该套件回到 105. 这次回退是靠**逐套件通过数比对**（而非总数）发现的，再次说明 §6.1 的三级验证有必要。
+
+**残留**：`built-ins/JSON` 仅 2 例失败——`prop-desc.js`（`verifyProperty(this, "JSON", …)` 依赖顶层 `this` 是全局对象，与"strict only"目标冲突）、`stringify/value-tojson-not-function.js`（用 `/re/` 正则字面量，RegExp 范围外）。51 例跳过中，`json-parse-with-source`/`well-formed-json-stringify` 为 ES2025，其余为 `Proxy`/`BigInt`/`Reflect.construct`/`cross-realm`。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -471,6 +515,7 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 | `normalize` 无 Unicode 规范化数据 | 只做 form 校验（非法抛 RangeError），合法 form 原样返回 | 2026-09-22 登记：需引入规范化表（新依赖），归 M6 |
 | class 方法带 `prototype`、缺 `name` 推导 | 方法按规范不应有 `prototype`；`var f = function () {}` 的 `name` 应为 `"f"` | 2026-09-22 登记：需 `SetFunctionName`，归 M6 |
 | `entries`/`keys`/`values` 的迭代器 `it[Symbol.iterator]() !== it` | 迭代器本身可被 for-of 遍历，但不满足自返 | 2026-09-22 登记（§2.1j）：少量用例 |
+| **嵌套函数捕获外层局部变量不可靠** | 非箭头闭包读/写外层函数的局部变量（含对象）可能得到 `undefined` 或抛 `ReferenceError: undefined variable: X`，且同一段代码在不同嵌套上下文里表现不同。最小复现（在 HEAD 上同样存在，非本轮引入）：`function outer(){ var o = {n:1}; function inner(){ return o.n; } return inner(); }` → 期望 1，实测 ReferenceError；`var inner = function(){ return o.n; }` 形态则静默返回 undefined。箭头函数（`var f = () => o.n`）与"把闭包作为实参传给别的函数"两种形态正常 | 2026-09-22 登记（§2.1m 由 JSON reviver 用例暴露）：与 §5 的"创建时值快照"决定同源，根治要把捕获改成引用绑定（或按调用读取），归 M6；在此之前用例应避免依赖该形态 |
 | **Array 泛型路径不执行访问器** | 泛型（类数组）路径的 `[[Get]]` 直接读属性表，索引上的 getter 不会被调用：`Array/prototype/reverse/length-exceeding-integer-limit-with-object.js`（靠 getter 抛错提前中止）等用例失败 | 2026-09-22 登记（§2.1l）：需要把泛型路径改为经 VM 的 `[[Get]]`，属跨层改动，归 M6 |
 | 泛型路径的物化上限（`MAX_GENERIC_ELEMENTS = 2^22`） | `length` 超过上限的逐元素操作（`fill`/`copyWithin`/`splice` 结果）抛 RangeError，而参考引擎会做稀疏写 | 2026-09-22 登记（§2.1l）：有意为之——本引擎数组是 `Vec` 支撑，无法表示 2^53 长度；先保证不 OOM |
 
@@ -503,18 +548,20 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数（§2.1f 后） | 主要缺口 |
+| 套件 | 失败数（§2.1m 后） | 主要缺口 |
 |------|--------------------|----------|
-| `built-ins/Array` | 976 | 泛型（类数组）路径（`splice`/`push`/`pop`/`concat`/`shift`/`reverse` ≈ 70）、`Symbol.species`、`resizable-arraybuffer` 类用例 |
-| `built-ins/Object` | 513 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`、描述符长尾（sloppy-mode 依赖的 ES5 用例不可解） |
-| `built-ins/String` | 443 | 主要被 `replace`/`match`/`search`/`split`（RegExp，范围外）占据；其余是 `String.prototype.X.call(obj)` 的接收者 ToString（需要 VM 参与） |
-| `built-ins/Number` | 104 | `toString(radix)`/`toFixed`/`toExponential`/`toPrecision` 的精确格式化、`toLocaleString` |
-| `built-ins/Function` | 130 | `prototype/toString`（36，需源码文本）、`bind` 细节、`Symbol.hasInstance` |
+| `built-ins/Array` | 900 | 泛型路径的长尾（`Symbol.species`、`@@isConcatSpreadable` 与 species 交互）、`resizable-arraybuffer` 类用例、sloppy-mode 依赖的 ES5 用例 |
+| `built-ins/Object` | 514 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |
+| `built-ins/String` | 441 | 主要被 `replace`/`match`/`search`/`split`（RegExp，范围外）占据；其余是 `String.prototype.X.call(obj)` 的接收者 ToString（需要 VM 参与） |
+| `built-ins/Function` | 131 | `prototype/toString`（36，需源码文本）、`bind` 细节、`Symbol.hasInstance` |
 | `language/statements/class` | 124 | 字段初始化次序、私有字段（范围外）、`Symbol` 交互 |
-| `built-ins/Symbol` | 34 | `Symbol.prototype[Symbol.toPrimitive]`、`Symbol.for/keyFor` 细节、描述符 |
+| `built-ins/Number` | 104 | `toString(radix)`/`toFixed`/`toExponential`/`toPrecision` 的精确格式化、`toLocaleString` |
+| `language/statements/for-of` | 40 | 用户自定义迭代器的 `return()`/`throw()`、字符串码元 |
 | `built-ins/Error` | 39 | `Error.prototype.stack`（22，ES2026 提案）、`toString` 的按名派发归属问题 |
+| `built-ins/Symbol` | 34 | `Symbol.prototype[Symbol.toPrimitive]`、`Symbol.for/keyFor` 细节、描述符 |
 | `built-ins/NativeErrors` | 20 | 少量描述符与 `new.target` 交互 |
 | `built-ins/Math` | 19 | 常量描述符、`fround`/`hypot` 边界 |
+| `built-ins/JSON` | 2 | 顶层 `this`、RegExp 字面量（均非 JSON 语义问题） |
 
 ### 3.2 跳过池（未执行 —— 决定下一步解锁顺序）
 
@@ -566,7 +613,7 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 | B3 `String` | `repeat`/`startsWith`/`endsWith`/`codePointAt`/代理对/`normalize`/`at`、`String.raw`、`String` 迭代器与 `[Symbol.iterator]` | String 失败 686 → 目标减半；**两批已交付（§2.1f）**：失败 → 443（通过 371 → 562），达成目标。`String.raw`、`normalize` 的真实规范化数据、`replace/match/search` 的 RegExp 形态仍未做 |
 | B4 `Number` / `Math` | ES6 常量（`EPSILON`/`MAX_SAFE_INTEGER`…）与 `isInteger`/`isSafeInteger`/`parseFloat`；Math 的 `hypot`/`sign`/`clz32`/`imul`/`log2`/`log10`/`cbrt`/`trunc`/`fround` | Math/Number 失败显著下降；**已交付（§2.1f）**：`Number::toString` 规范格式化 + 属性特性 + arity，Math 失败 134 → **19**、Number 175 → **104** |
 | B5 `Function` / `Error` / `NativeErrors` | `name`/`length` 推导、`Error` 子类原型链与 `message` 缺省、`NativeErrors` 各类型 | 三项目标套件 ≥ 60%；**首批已交付（§2.1f）**：59% / 47% / 76%（Error 剩余主要是 `stack` 提案与 `Function.prototype.toString` 源码文本，非 ES6 语义） |
-| B6 `JSON` / `Date`（新增模块） | `parse`/`stringify`（无 reviver 的完整语义优先）、`Date` 构造与常用取值方法 | 解锁 165 / 594 个用例（Date 允许部分失败） |
+| B6 `JSON` / `Date`（新增模块） | `parse`/`stringify`、`Date` 构造与常用取值方法 | **JSON 已交付（§2.1m）**：`JSON.parse`/`stringify` 完整语义（含 reviver/replacer/space/toJSON），套件启用后 112 通过 / 2 失败 / 51 跳过；`Date` 仍未做（594 例） |
 
 **完成标准**：每个 B 任务独立提交；提交前全量不回退；`tests/features/` 每任务 ≥ 5 条断言；Object/Array/String 三套件通过率各 ≥ 50%。
 

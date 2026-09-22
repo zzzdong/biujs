@@ -398,7 +398,15 @@ impl VM {
         };
 
         for name in [first, second] {
-            let method = self.lookup_property_on_object(val, name);
+            // `[[Get]]`, not a descriptor lookup: the method may be an accessor
+            // whose getter has to run (and can throw).
+            let method = self.get_member(val, &PropertyKey::from_str(name), module)?;
+            // `OrdinaryToPrimitive` skips a method that is missing or not
+            // callable and falls through to the next name — a `{ toString: null,
+            // get valueOf() { … } }` object must reach `valueOf`.
+            if !method.is_callable() {
+                continue;
+            }
             let result = if method.is_user_function() {
                 // User-defined valueOf/toString: invoke it re-entrantly.
                 self.call_reentrant(&method, val.clone(), module)?
@@ -769,6 +777,368 @@ impl VM {
         Ok(target)
     }
 
+    /// ES 25.5.2 `JSON.stringify(value[, replacer[, space]])`.
+    ///
+    /// The traversal has to run in the VM: `toJSON` and `replacer` are user
+    /// functions, and every property read goes through `[[Get]]` (so accessors
+    /// fire). The builtin layer only has a data-only fallback
+    /// (`builtins::json_stringify`).
+    fn json_stringify_full(
+        &mut self,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let value = args.first().cloned().unwrap_or(Value::Undefined);
+        let replacer = args.get(1).cloned().unwrap_or(Value::Undefined);
+
+        // ── replacer: a function, or an array of property names ──
+        let mut replacer_fn: Option<Value> = None;
+        let mut property_list: Option<Vec<String>> = None;
+        if replacer.is_callable() {
+            replacer_fn = Some(replacer.clone());
+        } else if matches!(&replacer, Value::Object(o) if o.borrow().kind() == ObjectKind::Array) {
+            let mut list: Vec<String> = Vec::new();
+            for item in self.array_like_elements(&replacer).unwrap_or_default() {
+                let name = match &item {
+                    Value::String(s) => Some(s.to_string()),
+                    Value::Number(n) => Some(crate::builtins::number_to_string(*n)),
+                    Value::Object(o) => match o.borrow().kind() {
+                        // A boxed String/Number counts, converted with `ToString`
+                        // (so a user `toString` wins over the internal slot);
+                        // any other object does not.
+                        ObjectKind::String | ObjectKind::Number => {
+                            let primitive = self.to_primitive(&item, "string", module)?;
+                            Some(primitive.to_js_string())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    if !list.contains(&name) {
+                        list.push(name);
+                    }
+                }
+            }
+            property_list = Some(list);
+        }
+
+        // ── space → gap (ES 25.5.2.1 steps 5-8) ──
+        let space = args.get(2).cloned().unwrap_or(Value::Undefined);
+        let space = match &space {
+            Value::Object(o) => match o.borrow().kind() {
+                ObjectKind::Number => {
+                    let primitive = self.to_primitive(&space, "number", module)?;
+                    Value::Number(primitive.to_number())
+                }
+                ObjectKind::String => {
+                    let primitive = self.to_primitive(&space, "string", module)?;
+                    Value::string(&primitive.to_js_string())
+                }
+                _ => space.clone(),
+            },
+            other => other.clone(),
+        };
+        let gap = match &space {
+            Value::Number(_) => " "
+                .repeat(crate::builtins::to_integer_or_infinity(Some(&space)).clamp(0, 10) as usize),
+            Value::String(s) => s.chars().take(10).collect(),
+            _ => String::new(),
+        };
+
+        // The value is reached through a synthetic wrapper object holding it
+        // under the empty key, exactly as the spec's algorithm starts.
+        let mut wrapper = crate::vm::object::OrdinaryObject::new();
+        if let Some(proto) = crate::builtins::wrapper_prototype("Object") {
+            wrapper.set_prototype(Some(proto));
+        }
+        let _ = wrapper.define_property(
+            PropertyKey::from_str(""),
+            crate::vm::property::PropertyDescriptor::data_descriptor(value),
+        );
+        let wrapper = Value::Object(Rc::new(RefCell::new(wrapper)));
+
+        let mut indent = String::new();
+        let mut stack: Vec<Value> = Vec::new();
+        let serialized = self.json_serialize_property(
+            "",
+            &wrapper,
+            &gap,
+            &replacer_fn,
+            &property_list,
+            &mut indent,
+            &mut stack,
+            module,
+        )?;
+        Ok(match serialized {
+            Some(text) => Value::string(&text),
+            None => Value::Undefined,
+        })
+    }
+
+    /// `SerializeJSONProperty(state, key, holder)` (ES 25.5.2.2).
+    ///
+    /// `None` means the value must be omitted (object member) or replaced by
+    /// `null` (array element).
+    #[allow(clippy::too_many_arguments)]
+    fn json_serialize_property(
+        &mut self,
+        key: &str,
+        holder: &Value,
+        gap: &str,
+        replacer_fn: &Option<Value>,
+        property_list: &Option<Vec<String>>,
+        indent: &mut String,
+        stack: &mut Vec<Value>,
+        module: &Module,
+    ) -> Result<Option<String>, RuntimeError> {
+        let mut value = self.get_member(holder, &PropertyKey::from_str(key), module)?;
+
+        // `toJSON` first (a Date or a user object can define one).
+        if value.as_object().is_some() || matches!(value, Value::Function(_)) {
+            let to_json = self.get_member(&value, &PropertyKey::from_str("toJSON"), module)?;
+            if to_json.is_callable() {
+                value = self.invoke(&to_json, value.clone(), &[Value::string(key)], module)?;
+            }
+        }
+        if let Some(replacer) = replacer_fn {
+            value = self.invoke(
+                replacer,
+                holder.clone(),
+                &[Value::string(key), value.clone()],
+                module,
+            )?;
+        }
+        // Boxed primitives serialize as the primitive they wrap.
+        let wrapper_kind = match &value {
+            Value::Object(obj_ref) => Some(obj_ref.borrow().kind()),
+            _ => None,
+        };
+        // Boxed primitives: the spec asks for `ToNumber` / `ToString` (which run
+        // user `valueOf` / `toString`), except for `[[BooleanData]]` where the
+        // internal slot is read directly.
+        match wrapper_kind {
+            Some(ObjectKind::Number) => {
+                let primitive = self.to_primitive(&value, "number", module)?;
+                value = Value::Number(primitive.to_number());
+            }
+            Some(ObjectKind::String) => {
+                let primitive = self.to_primitive(&value, "string", module)?;
+                value = Value::string(&primitive.to_js_string());
+            }
+            Some(ObjectKind::Boolean) => value = Value::Bool(value.to_number() != 0.0),
+            _ => {}
+        }
+
+        match &value {
+            Value::Null => Ok(Some("null".to_string())),
+            Value::Bool(b) => Ok(Some(if *b { "true" } else { "false" }.to_string())),
+            Value::String(s) => {
+                let mut out = String::new();
+                crate::builtins::quote_json_string(s, &mut out);
+                Ok(Some(out))
+            }
+            Value::Number(n) => Ok(Some(crate::builtins::json_number(*n))),
+            // A function is not serializable, even when boxed as an object.
+            Value::Object(obj_ref) if obj_ref.borrow().kind() == ObjectKind::Function => Ok(None),
+            Value::Object(obj_ref) => {
+                if obj_ref.borrow().kind() == ObjectKind::Array {
+                    self.json_serialize_array(
+                        &value,
+                        gap,
+                        replacer_fn,
+                        property_list,
+                        indent,
+                        stack,
+                        module,
+                    )
+                } else {
+                    self.json_serialize_object(
+                        &value,
+                        gap,
+                        replacer_fn,
+                        property_list,
+                        indent,
+                        stack,
+                        module,
+                    )
+                }
+            }
+            // `undefined`, functions and symbols.
+            _ => Ok(None),
+        }
+    }
+
+    /// `SerializeJSONObject` (ES 25.5.2.4).
+    #[allow(clippy::too_many_arguments)]
+    fn json_serialize_object(
+        &mut self,
+        value: &Value,
+        gap: &str,
+        replacer_fn: &Option<Value>,
+        property_list: &Option<Vec<String>>,
+        indent: &mut String,
+        stack: &mut Vec<Value>,
+        module: &Module,
+    ) -> Result<Option<String>, RuntimeError> {
+        if stack.iter().any(|v| v.strict_eq(value)) {
+            return Err(RuntimeError::TypeError(
+                "Converting circular structure to JSON".to_string(),
+            ));
+        }
+        stack.push(value.clone());
+        let stepback = indent.clone();
+        indent.push_str(gap);
+        let inner = indent.clone();
+
+        let keys: Vec<String> = match property_list {
+            Some(list) => list.clone(),
+            None => crate::builtins::own_enumerable_string_keys(value),
+        };
+        let mut partial = Vec::new();
+        for key in keys {
+            if let Some(serialized) = self.json_serialize_property(
+                &key,
+                value,
+                gap,
+                replacer_fn,
+                property_list,
+                indent,
+                stack,
+                module,
+            )? {
+                let mut quoted = String::new();
+                crate::builtins::quote_json_string(&key, &mut quoted);
+                let colon = if gap.is_empty() { ":" } else { ": " };
+                partial.push(format!("{quoted}{colon}{serialized}"));
+            }
+        }
+        stack.pop();
+        *indent = stepback.clone();
+        Ok(Some(finalize_json(partial, gap, &inner, &stepback, '{', '}')))
+    }
+
+    /// `SerializeJSONArray` (ES 25.5.2.5).
+    #[allow(clippy::too_many_arguments)]
+    fn json_serialize_array(
+        &mut self,
+        value: &Value,
+        gap: &str,
+        replacer_fn: &Option<Value>,
+        property_list: &Option<Vec<String>>,
+        indent: &mut String,
+        stack: &mut Vec<Value>,
+        module: &Module,
+    ) -> Result<Option<String>, RuntimeError> {
+        if stack.iter().any(|v| v.strict_eq(value)) {
+            return Err(RuntimeError::TypeError(
+                "Converting circular structure to JSON".to_string(),
+            ));
+        }
+        stack.push(value.clone());
+        let stepback = indent.clone();
+        indent.push_str(gap);
+        let inner = indent.clone();
+
+        let len = self.array_like_elements(value).map(|v| v.len()).unwrap_or(0);
+        let mut partial = Vec::new();
+        for index in 0..len {
+            let serialized = self.json_serialize_property(
+                &index.to_string(),
+                value,
+                gap,
+                replacer_fn,
+                property_list,
+                indent,
+                stack,
+                module,
+            )?;
+            partial.push(serialized.unwrap_or_else(|| "null".to_string()));
+        }
+        stack.pop();
+        *indent = stepback.clone();
+        Ok(Some(finalize_json(partial, gap, &inner, &stepback, '[', ']')))
+    }
+
+    /// ES 25.5.1 `JSON.parse(text[, reviver])`.
+    fn json_parse_full(
+        &mut self,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let text_value = args.first().cloned().unwrap_or(Value::Undefined);
+        // `ToString(text)`: a symbol has no string form (7.1.17 step 2), and
+        // objects convert through `ToPrimitive("string")`, so a user `toString`
+        // runs (and can throw).
+        if matches!(text_value, Value::Symbol(_)) {
+            return Err(RuntimeError::TypeError(
+                "Cannot convert a Symbol value to a string".to_string(),
+            ));
+        }
+        let primitive = self.to_primitive(&text_value, "string", module)?;
+        let text = primitive.to_js_string();
+        let parsed = crate::builtins::json_parse(&text)?;
+
+        let reviver = args.get(1).cloned().unwrap_or(Value::Undefined);
+        if !reviver.is_callable() {
+            return Ok(parsed);
+        }
+
+        let mut holder = crate::vm::object::OrdinaryObject::new();
+        if let Some(proto) = crate::builtins::wrapper_prototype("Object") {
+            holder.set_prototype(Some(proto));
+        }
+        let _ = holder.define_property(
+            PropertyKey::from_str(""),
+            crate::vm::property::PropertyDescriptor::data_descriptor(parsed),
+        );
+        let holder = Value::Object(Rc::new(RefCell::new(holder)));
+        self.json_internalize(&holder, "", &reviver, module)
+    }
+
+    /// `InternalizeJSONProperty` (ES 25.5.1.1): walk bottom-up, letting the
+    /// reviver replace or delete each property.
+    fn json_internalize(
+        &mut self,
+        holder: &Value,
+        name: &str,
+        reviver: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let value = self.get_member(holder, &PropertyKey::from_str(name), module)?;
+        if matches!(&value, Value::Object(_)) {
+            let is_array = matches!(&value, Value::Object(o) if o.borrow().kind() == ObjectKind::Array);
+            let keys: Vec<String> = if is_array {
+                (0..self.array_like_elements(&value).map(|v| v.len()).unwrap_or(0))
+                    .map(|i| i.to_string())
+                    .collect()
+            } else {
+                crate::builtins::own_enumerable_string_keys(&value)
+            };
+            for key in keys {
+                let new_element = self.json_internalize(&value, &key, reviver, module)?;
+                let key = PropertyKey::from_str(&key);
+                if matches!(new_element, Value::Undefined) {
+                    self.delete_member(&value, &key)?;
+                } else if let Value::Object(obj_ref) = &value {
+                    // `CreateDataProperty` (not `[[Set]]`): a failure — e.g. a
+                    // non-configurable property the reviver created — is
+                    // ignored, and the existing value simply stays.
+                    let _ = obj_ref.borrow_mut().define_property(
+                        key,
+                        crate::vm::property::PropertyDescriptor::data_descriptor(new_element),
+                    );
+                }
+            }
+        }
+        self.invoke(
+            reviver,
+            holder.clone(),
+            &[Value::string(name), value],
+            module,
+        )
+    }
+
     /// ES 19.1.3.6 `Object.prototype.toString`.
     ///
     /// A string-valued `Symbol.toStringTag` takes precedence over the built-in
@@ -960,6 +1330,14 @@ impl VM {
                     name,
                     &[args[0].clone(), props],
                 );
+            }
+            // `JSON.stringify` runs `toJSON`/`replacer` and reads through
+            // `[[Get]]`; `JSON.parse`'s reviver is user code.
+            if name == "JSON.stringify" {
+                return self.json_stringify_full(args, module);
+            }
+            if name == "JSON.parse" {
+                return self.json_parse_full(args, module);
             }
             if name == "Object.create" && args.len() >= 2 && !args[1].is_undefined() {
                 let props = self.to_property_descriptors(&args[1], module)?;
@@ -3791,6 +4169,30 @@ impl VM {
             }
         }
     }
+}
+
+/// `finalize` for the JSON serializer (ES 25.5.2.4 step 9 / 25.5.2.5 step 10).
+///
+/// `inner` is the indent of the members, `stepback` the indent of the opening
+/// line — with a gap the closing bracket lines up with the opening one.
+fn finalize_json(
+    partial: Vec<String>,
+    gap: &str,
+    inner: &str,
+    stepback: &str,
+    open: char,
+    close: char,
+) -> String {
+    if partial.is_empty() {
+        return format!("{open}{close}");
+    }
+    if gap.is_empty() {
+        return format!("{open}{}{close}", partial.join(","));
+    }
+    format!(
+        "{open}\n{inner}{}\n{stepback}{close}",
+        partial.join(&format!(",\n{inner}"))
+    )
 }
 
 impl Default for VM {
