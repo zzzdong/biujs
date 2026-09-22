@@ -2,7 +2,7 @@
 
 > **日期**：2026-09-20（初版）；2026-09-21 更新 —— M2' 完成、M3-B1 首批交付（见 §2.1b/§2.2b）；2026-09-21 二批 —— M3-B1 收尾（ToObject 装箱、描述符校验、数组元素访问器、Object.assign 下沉 VM），见 §2.1c/§2.2c；2026-09-21 三批 —— SEH 跨帧展开修复（见 §2.1d）；2026-09-22 四批 —— M3-B2 首批（Array 回调方法泛型化、indexOf/lastIndexOf 分派、String.prototype.indexOf 补齐），见 §2.1e
 > **目标来源**：`README.md:3-4` —— *"A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6** features but without `eval` or eval-like features or `with` statement."*
-> **基线**：test262 **6015 / 10366**（58.03% 通过，4351 失败，14441 跳过；M3-B2 首批后）；单元测试 190；feature 集成 25 个文件；runner 启用 89 个套件
+> **基线**：test262 **7416 / 10365**（71.55% 通过，2949 失败，14437 跳过；M3-B2 二批后）；单元测试 190；feature 集成 27 个文件（346 / 351 条通过，余 5 条既有 try-finally 失败）；runner 启用 89 个套件
 > **上一阶段**：M1（迭代器 / for-of / 解构 / 展开 / 模板 / 默认参数）与 M2（class：静态成员、访问器、extends/super、public 字段）已交付
 
 ---
@@ -194,6 +194,56 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 **本轮发现的既有缺陷**：`new Array(1,2,3)` 的元素顺序被反转（`Opcode::New` 对原生构造器多了一次 `args.reverse()`，而 `collect_call_args` 的约定是 arg0 在 `[rbp-1]`）；`git stash` 确认基线同样输出 `3,2,1`。已登记 §2.3，未在本批改动（会影响 `new Error/Number/Object` 的实参顺序，需单独验证）。
 
+### 2.1f M3-B1 收尾 + B2 二批 + B3 + B4 + B5（2026-09-22，十二个提交）
+
+**起点**：`6015 / 10366`（58.03%）。**结果**：`7416 / 10365`（**71.55%**，+1401 通过、
+失败 4351 → 2949），无任何套件回退；单元 190 全绿，feature 集成 326 → 351 条断言（346 通过；
+新增 `string_es6.rs` 14 条、`error_builtins.rs` 8 条、`array_methods.rs` 3 条）。
+
+| 提交 | 内容 | 关键点 |
+|------|------|--------|
+| `dc252d2` | 用户函数 `F.prototype.constructor` 反向链接 | 此前刻意省略（怕 Rc 环）；反向引用存裸 `Value::Function(id)` 即无环。修好 `assert.throws` 里 `thrown.constructor.name` 崩溃（约 72 例，多为 for-of 迭代器关闭语义与加法 ToPrimitive 抛错路径） |
+| `f452e97` | 内置派发前把裸函数引用装箱 | `Object.keys(fn)` / `getOwnPropertyDescriptor(fn, …)` 曾报 "first argument must be an object"；ToObject 对裸函数是原样透传 |
+| `92fbf0f` | 函数 `length`/`name` 元数据 | 内置函数 `length` 恒为 0 且 `name` 带合成前缀；新增 `builtin_arity` 表（键=注册名，值取自 test262 `**/length.js`），用户函数按 ES 9.2.4 的 ExpectedArgumentCount（遇首个 initializer 即止），箭头函数补 `length`/`name` 且无 `prototype`；`length`/`name` 改为真实 own property `{writable:false, enumerable:false, configurable:true}` |
+| `a6138fa` | 内置属性特性 | 方法 `{w:t,e:f,c:t}`、常量 `{w:f,e:f,c:f}`、`C.prototype` `{w:f,e:f,c:f}`；`Math` 方法与常量、`Number` 常量、`Symbol` 静态与 well-known 属性全部按规范；错误对象的 `name` 从实例搬到原型（`Error.prototype.name` / `TypeError.prototype.name` 等），`RuntimeError` 的 Display 与 runner 的 `thrown_error_name` 随之改为沿原型链查找 |
+| `9ab858a` | 上一条的回归修复 | 不带 `new` 调用 `Error(...)` 时无人设原型；`New` 路径原本靠"把结果的 name/message 合并进新对象"补名字，改为直接给结果对象挂构造器的 `prototype` |
+| `9cb3f3f` | 原型链 + ToNumber | 内置函数对象的 `[[Prototype]]` 改为 `Function.prototype`（`Array instanceof Function`、`Object.getPrototypeOf(Array)`、`Function.prototype` 上的自定义属性）；`New` 的实例原型取 `C.prototype`、结果经 `finish_native_construct` 归一（原始值装箱）、去掉多叠加的一次 `args.reverse()`（`new Array(2,4)` 元素顺序反了）；新增 `Opcode::ToNumber`，一元加号与自增自减改走它（`+"5"` 原为 `"05"`、`var s="5"; s++` 原为 `"51|51"`），字符串数字字面量支持 `0x/0o/0b` 与 Infinity |
+| `de62484` | B3 首批 | 内置函数 `name` 去属主前缀（`Object.keys.name === "keys"`，影响所有 `**/name.js`）；新增 `String.fromCodePoint`；`String.fromCharCode` 的 ToUint16（`fromCharCode(-1)` 原为 0，应为 65535） |
+| `e2b6702` | `Number::toString`（ES 7.1.12.1） | 最短往返数字 + 规范的定长/指数记数法切换：`String(1e21)` → `"1e+21"`、`String(1e-7)` → `"1e-7"`；与 node 对 27 个边界值逐一比对 |
+| `2ada1f7` | B3 二批 + **内置方法错误传播修复** | `trimStart/trimEnd/padStart/padEnd` 有注册无派发；补 `codePointAt`/`at`/`normalize`/`toLocale*`/`localeCompare`；`trim*` 改用 ES 空白集（U+FEFF 属空白、U+0085 不属）。**关键**：`CallMethod` 的快速派发写成 `if let Ok(..)`，把内置方法抛出的真实错误当"没有此方法"吞掉，新增 `is_unknown_builtin` 区分二者；`Object.defineProperty/defineProperties/create` 从快速路径排除（必须走 VM 读 `[[Get]]`） |
+| `67506ca` | B5 | 错误对象 `[[Class]]` 为 `"Error"`（`Object.prototype.toString.call(new TypeError())`）、`Error.prototype.toString` 按 ES 20.5.3.4（非对象 this 抛 TypeError、name/message 走原型链、undefined 回退）、NativeError 原型补 own `message`、`Error.isError`、`new Error(m,{cause})`、`C.prototype` 只读；`VM::construct`（NewSpread 用）与 `New` 操作码共用新的 `native_construct`，并支持 `new (f.bind(…))(…)` |
+| `0612fab` | B2 二批 | `Array.prototype.at` / `copyWithin`（快照式重叠语义）/ `entries`/`keys`/`values`（迭代器只能由 VM 铸造，注册名走 `mark_prototype_method`，在 `call_native_by_name` 内用 `array_like_elements` 取快照后 `make_iterator`）；顺带修 `NativeIteratorObject` 缺 `Symbol.iterator` 导致 `for (x of arr.keys())` 递归报错 |
+
+**逐套件实测**（起点 → 本次结束）：
+
+| 套件 | 2.1e 后 | 现在 | 变化 |
+|------|---------|------|------|
+| `built-ins/Object` | 2025 | **2548** | +523（通过率 83%） |
+| `built-ins/Array` | 1548 | **1807** | +259（63%） |
+| `built-ins/String` | 371 | **562** | +191（56%） |
+| `built-ins/Math` | 155 | **270** | +115（93%） |
+| `built-ins/Number` | 110 | **180** | +70（63%） |
+| `built-ins/Function` | 151 | **189** | +38（59%） |
+| `built-ins/NativeErrors` | 24 | **62** | +38（76%） |
+| `built-ins/Error` | 7 | **34** | +27（47%） |
+| `built-ins/Symbol` | 22 | **37** | +15 |
+| `built-ins/Boolean` | 16 | **26** | +10 |
+| `language/statements/class` | 53 | **64** | +11 |
+| `language/statements/for-of` | 21 | **24** | +3 |
+
+**M3 完成标准核对**：Object/Array/String 三套件通过率 **83% / 63% / 56%**，均 ≥ 50%（达成）；
+B4 的 Math/Number 显著下降（Math 失败 134 → 19）；B5 三套件 59% / 47% / 76%，Function 与
+Error 未达 60% —— Error 的剩余失败集中在 `Error/prototype/stack`（22 例，ES2026 的
+`error-stack-accessor` 提案，范围外）与 `Function/prototype/toString`（36 例，需要源码文本），
+两者都不是 ES6 核心语义。
+
+**未采纳的尝试（记录以免重复踩坑）**：把跳过表按"范围外（ES2019+ / Annex B / RegExp 依赖）/
+未实现/架构排除"三组扩容，可让失败数 2949 → 2554、通过率 71.55% → 74.34%，但**通过绝对数从
+7416 掉到 7401**：`Symbol.match/replace/search/split/matchAll`、`Array.prototype.flat`、
+`Object.fromEntries`、`__proto__/__getter__/__setter__` 这类标签会连带跳过少量**本来通过**的
+用例（这些 well-known symbol 与部分 Annex B 形态已实现）。按 §2.1 的 KPI 约定（通过绝对数为
+主指标），已回退该改动；今后扩容跳过表需逐标签核验"是否会跳过已通过用例"。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -267,18 +317,18 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数 | 主要缺口 |
-|------|--------|----------|
-| `built-ins/Object` | 2032 | ES6 静态方法（`assign`/`getOwnPropertySymbols`/`is` 细节）、属性描述符语义、原型方法 |
-| `built-ins/Array` | 1975 | `from`/`of`/`fill`/`find`/`findIndex`/`copyWithin`/`entries`/`keys`/`values`、泛型调用、类数组路径 |
-| `built-ins/String` | 686 | ES6 增补（`repeat`/`startsWith`/`endsWith`/`codePointAt`/`normalize`/`raw`）、迭代器 |
-| `built-ins/Function` | 245 | `name`/`length` 语义、`hasInstance`、`toString` |
-| `built-ins/Number` | 175 | ES6 常量与 `isInteger`/`isSafeInteger`/`parseFloat` |
-| `language/statements/class` | 155 | 计算属性名、`new.target`、字段初始化次序、描述符可枚举性细节 |
-| `built-ins/Math` | 134 | ES6 数值方法（`hypot`/`sign`/`clz32`/`imul`/`log2`/`cbrt`…） |
-| `built-ins/Error` / `NativeErrors` | 70 / 58 | 子类原型链、`message` 缺省、`stack` 约定 |
-| `built-ins/Symbol` | 62 | well-known symbols、`Symbol.for/keyFor`、描述 |
-| `language/statements/for-of` | 51 | 用户自定义迭代器、`IteratorClose`、字符串码元 |
+| 套件 | 失败数（§2.1f 后） | 主要缺口 |
+|------|--------------------|----------|
+| `built-ins/Array` | 976 | 泛型（类数组）路径（`splice`/`push`/`pop`/`concat`/`shift`/`reverse` ≈ 70）、`Symbol.species`、`resizable-arraybuffer` 类用例 |
+| `built-ins/Object` | 513 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`、描述符长尾（sloppy-mode 依赖的 ES5 用例不可解） |
+| `built-ins/String` | 443 | 主要被 `replace`/`match`/`search`/`split`（RegExp，范围外）占据；其余是 `String.prototype.X.call(obj)` 的接收者 ToString（需要 VM 参与） |
+| `built-ins/Number` | 104 | `toString(radix)`/`toFixed`/`toExponential`/`toPrecision` 的精确格式化、`toLocaleString` |
+| `built-ins/Function` | 130 | `prototype/toString`（36，需源码文本）、`bind` 细节、`Symbol.hasInstance` |
+| `language/statements/class` | 124 | 字段初始化次序、私有字段（范围外）、`Symbol` 交互 |
+| `built-ins/Symbol` | 34 | `Symbol.prototype[Symbol.toPrimitive]`、`Symbol.for/keyFor` 细节、描述符 |
+| `built-ins/Error` | 39 | `Error.prototype.stack`（22，ES2026 提案）、`toString` 的按名派发归属问题 |
+| `built-ins/NativeErrors` | 20 | 少量描述符与 `new.target` 交互 |
+| `built-ins/Math` | 19 | 常量描述符、`fround`/`hypot` 边界 |
 
 ### 3.2 跳过池（未执行 —— 决定下一步解锁顺序）
 
@@ -326,10 +376,10 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 | 任务 | 内容 | 目标 |
 |------|------|------|
 | B1 `Object` | `assign`、`getOwnPropertySymbols`、`is`/`isExtensible` 族、描述符语义（`writable/enumerable/configurable` 与 `[[DefineOwnProperty]]` 完整规则） | Object 失败 2035 → 目标减半；**首批已交付**：失败 2032 → 1596（通过 1029 → 1465）；**二批交付（§2.1c）**：失败 → 1223（通过 → 1838，达标 50% 通过率） |
-| B2 `Array` | `from`/`of`/`fill`/`find`/`findIndex`/`copyWithin`/`entries`/`keys`/`values`/`reduceRight`/`sort` 语义、泛型（类数组）路径、稀疏与长度处理 | Array 失败 1975 → 目标减半；**首批已交付（§2.1e）**：回调方法泛型化/洞感知、`indexOf`/`lastIndexOf` 分派 —— 失败 1756 → 1236（通过 1028 → 1548） |
-| B3 `String` | `repeat`/`startsWith`/`endsWith`/`codePointAt`/`codePointAt` 代理对/`normalize`/`at`、`String.raw`、`String` 迭代器与 `[Symbol.iterator]` | String 失败 686 → 目标减半 |
-| B4 `Number` / `Math` | ES6 常量（`EPSILON`/`MAX_SAFE_INTEGER`…）与 `isInteger`/`isSafeInteger`/`parseFloat`；Math 的 `hypot`/`sign`/`clz32`/`imul`/`log2`/`log10`/`cbrt`/`trunc`/`fround` | Math/Number 失败显著下降 |
-| B5 `Function` / `Error` / `NativeErrors` | `name`/`length` 推导、`Error` 子类原型链与 `message` 缺省、`NativeErrors` 各类型 | 三项目标套件 ≥ 60% |
+| B2 `Array` | `from`/`of`/`fill`/`find`/`findIndex`/`copyWithin`/`entries`/`keys`/`values`/`reduceRight`/`sort` 语义、泛型（类数组）路径、稀疏与长度处理 | Array 失败 1975 → 目标减半；**首批（§2.1e）** 回调方法泛型化/洞感知/`indexOf` 分派；**二批（§2.1f）** `at`/`copyWithin`/`entries`/`keys`/`values` —— 失败 1756 → **976**（通过 1028 → **1807**），达成目标。剩余主体是 `pop`/`push`/`splice`/`concat` 等非回调方法的泛型路径 |
+| B3 `String` | `repeat`/`startsWith`/`endsWith`/`codePointAt`/代理对/`normalize`/`at`、`String.raw`、`String` 迭代器与 `[Symbol.iterator]` | String 失败 686 → 目标减半；**两批已交付（§2.1f）**：失败 → 443（通过 371 → 562），达成目标。`String.raw`、`normalize` 的真实规范化数据、`replace/match/search` 的 RegExp 形态仍未做 |
+| B4 `Number` / `Math` | ES6 常量（`EPSILON`/`MAX_SAFE_INTEGER`…）与 `isInteger`/`isSafeInteger`/`parseFloat`；Math 的 `hypot`/`sign`/`clz32`/`imul`/`log2`/`log10`/`cbrt`/`trunc`/`fround` | Math/Number 失败显著下降；**已交付（§2.1f）**：`Number::toString` 规范格式化 + 属性特性 + arity，Math 失败 134 → **19**、Number 175 → **104** |
+| B5 `Function` / `Error` / `NativeErrors` | `name`/`length` 推导、`Error` 子类原型链与 `message` 缺省、`NativeErrors` 各类型 | 三项目标套件 ≥ 60%；**首批已交付（§2.1f）**：59% / 47% / 76%（Error 剩余主要是 `stack` 提案与 `Function.prototype.toString` 源码文本，非 ES6 语义） |
 | B6 `JSON` / `Date`（新增模块） | `parse`/`stringify`（无 reviver 的完整语义优先）、`Date` 构造与常用取值方法 | 解锁 165 / 594 个用例（Date 允许部分失败） |
 
 **完成标准**：每个 B 任务独立提交；提交前全量不回退；`tests/features/` 每任务 ≥ 5 条断言；Object/Array/String 三套件通过率各 ≥ 50%。

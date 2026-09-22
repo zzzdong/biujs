@@ -1,10 +1,10 @@
 # ES6 Feature Support Status
 
-> **Last updated**: 2026-09-21
+> **Last updated**: 2026-09-22
 > **Engine version**: 0.1.0
-> **Total tests**: 190 unit + 22 feature files + test262 10365 executed / **4611 passing** (44.5%; was 3908 at M2 end) — per-suite table in `docs/es6-conformance-plan.md` §2.1b
+> **Total tests**: 190 unit + 27 feature files (346 assertions passing of 351) + test262 10365 executed / **7416 passing** (71.55%; was 4611 at the M3-B1 second batch) — per-suite table in `docs/es6-conformance-plan.md` §2.1f
 >
-> Roadmap: see `docs/es6-conformance-plan.md` (M2' done → M3 in progress).
+> Roadmap: see `docs/es6-conformance-plan.md` (M2' done → M3 mostly done: B1/B2/B3/B4 delivered, B5 first pass; B6 `JSON`/`Date` open).
 
 ## Project Goal
 
@@ -88,9 +88,9 @@ This engine uses a **static compilation model** with register-based VM:
 | `*` (multiplication) | ✅ | M0 | |
 | `/` (division) | ✅ | M0 | |
 | `%` (remainder) | ✅ | M0 | |
-| `++` (increment) | ✅ | M1 | Prefix & postfix |
-| `--` (decrement) | ✅ | M1 | Prefix & postfix |
-| Unary `+` | ✅ | M1 | `+expr` → ToNumber |
+| `++` (increment) | ✅ | M1 / M3 | Prefix & postfix; operates on `ToNumeric(old)` and the postfix form yields that converted value (`var s = "5"; s++` → `5`, `s` → `6`) |
+| `--` (decrement) | ✅ | M1 / M3 | Same as `++` |
+| Unary `+` | ✅ | M1 / M3 | `+expr` → `ToNumber` opcode (it used to lower to `0 + expr`, which concatenated strings: `+"5"` was `"05"`) |
 | Unary `-` | ✅ | M0 | |
 | Unary `!` | ✅ | M1 | |
 | Unary `~` | ✅ | M1 | Bitwise NOT (32-bit signed integer) |
@@ -202,8 +202,9 @@ This engine uses a **static compilation model** with register-based VM:
 
 | Feature | Status | Since | Notes |
 |---------|--------|-------|-------|
-| `.toString()` | ✅ | recent | |
+| `.toString()` | ✅ | recent / M3 | `[object Class]`; error instances report `[object Error]` and stringify through `Error.prototype.toString` |
 | `.valueOf()` | ✅ | recent | |
+| `.hasOwnProperty()` / `.isPrototypeOf()` / `.propertyIsEnumerable()` / `.toLocaleString()` | ✅ | M3 | Method attributes `{writable:true, enumerable:false, configurable:true}` |
 
 
 ### Static Object Methods
@@ -236,7 +237,14 @@ This engine uses a **static compilation model** with register-based VM:
 |---------|--------|-------|-------|
 | `.toString()` | ✅ | recent | Elements joined by `,` |
 | `.valueOf()` | ✅ | recent | |
-| `.push()` | ✅ | recent | Via MakeArray + ArrayPush |
+| `.push()` / `.pop()` / `.shift()` / `.unshift()` | ✅ | recent | Fast array path; generic (array-like) receivers still `TypeError` for the mutating ones (open item of B2) |
+| `.indexOf()` / `.lastIndexOf()` / `.includes()` / `.join()` / `.slice()` / `.concat()` / `.splice()` / `.reverse()` / `.fill()` | ✅ | recent / M3 | `indexOf`/`lastIndexOf` are hole-aware and fall back to `String.prototype` semantics for string receivers (M3-B2 first batch) |
+| `.map()` / `.filter()` / `.forEach()` / `.some()` / `.every()` / `.reduce()` / `.reduceRight()` / `.find()` / `.findIndex()` / `.sort()` | ✅ | M3 | VM-side generic + hole-aware (`Array.prototype.map.call({length:2, 0:'a'}, …)`); `thisArg` is passed |
+| `.at()` / `.copyWithin()` | ✅ | M3 | `at` supports negative indices and array-likes; `copyWithin` snapshots the source range, so overlapping copies match the spec |
+| `.entries()` / `.keys()` / `.values()` | ✅ | M3 | Real iterator objects (VM iterator registry); the iterators are themselves iterable |
+| `Array.from()` / `Array.of()` / `Array.isArray()` | ✅ | recent | `length = 1 / 0 / 1` |
+| `Array.prototype[Symbol.iterator]` | ✅ | M1 / M3 | Non-enumerable, `length = 0`, `name === "[Symbol.iterator]"` |
+| `Array` constructor | ✅ | M3 | `Array instanceof Function`, `Object.getPrototypeOf(Array) === Function.prototype`, `Array.prototype` is read-only/non-configurable, `new Array(...spread)` keeps argument order |
 
 ---
 
@@ -297,13 +305,16 @@ This engine uses a **static compilation model** with register-based VM:
 | Object | Status | Notes |
 |--------|--------|-------|
 | `Object` | ✅ | recent | Static: keys, values, entries, assign, defineProperty, defineProperties, getOwnPropertyDescriptor(s), getOwnPropertyNames, getOwnPropertySymbols, getPrototypeOf, setPrototypeOf, create, hasOwn, is, isExtensible/isFrozen/isSealed, preventExtensions/seal/freeze; prototype: toString, valueOf, hasOwnProperty, isPrototypeOf, propertyIsEnumerable, toLocaleString |
-| `Array` | ✅ | recent | Constructor + prototype: push, pop, shift, unshift, indexOf, lastIndexOf, includes, join, slice, concat, splice, reverse, fill, toString; `length` attributes; non-index own properties |
-| `Function` | ✅ | recent | Constructor and prototype methods (no dynamic code evaluation) |
+| `Array` | ✅ | recent / M3 | See the Array.prototype table above; non-index own properties, `length` attributes |
+| `Function` | ✅ | recent / M3 | Constructor (no dynamic code evaluation); `call`/`apply`/`bind` incl. `new (f.bind(…))(…)`; user functions own `length`/`name`/`prototype` with spec attributes |
 | `Boolean` | ✅ | recent | Constructor + prototype: valueOf, toString |
-| `Number` | ✅ | recent | Constructor + static (isFinite, isInteger, isNaN) + prototype (valueOf, toString, toFixed, toExponential, toPrecision) |
-| `String` | ✅ | recent | Constructor + prototype: charAt, charCodeAt, concat, includes, indexOf, slice, substring, toUpperCase, toLowerCase, trim, split, startsWith, endsWith, repeat |
+| `Number` | ✅ | recent / M3 | Static: isFinite, isInteger, isNaN, isSafeInteger, parseFloat, parseInt + 8 constants (read-only, non-enumerable, non-configurable); prototype: valueOf, toString (radix, `length = 1`), toFixed, toExponential, toPrecision; `Number::toString` follows ES 7.1.12.1 (`String(1e21)` → `"1e+21"`) |
+| `String` | ✅ | recent / M3 | Constructor + statics `fromCharCode`/`fromCodePoint`/`raw`(open); prototype: charAt, charCodeAt, codePointAt (surrogate-aware), at, concat, includes, indexOf, lastIndexOf, slice, substring, toUpperCase/LowerCase, toLocaleUpperCase/LowerCase, trim/trimStart/trimEnd (ES whitespace set), padStart, padEnd, split, startsWith, endsWith, repeat, normalize (form validation only — no Unicode tables), localeCompare (code-unit order), valueOf/toString |
 | `Symbol` | ⚠️ | M1/M2' | `Symbol()` non-constructable; well-known symbols defined with spec attributes; `description` getter, `toString`/`valueOf`, `Symbol.for`/`keyFor`; `Object.getOwnPropertySymbols` works |
-| `Error` | ✅ | recent | All error types implemented (Error, TypeError, ReferenceError, RangeError, URIError, EvalError) |
+| `Error` | ✅ | recent / M3 | All error types; `Error.prototype.name`/`message`, per-native prototypes own `name`/`message`, instance `[[Class]]` `"Error"`, `Error.prototype.toString` per ES 20.5.3.4, `Error.isError`, `new Error(msg, {cause})`; `stack` (ES2026 proposal) not implemented |
+| `Math` | ✅ | recent / M3 | Abs…trunc incl. the ES6 additions (hypot, sign, clz32, imul, log2/log10, cbrt, trunc, fround, expm1, log1p, sinh…); methods `{writable:true, enumerable:false, configurable:true}` and constants read-only (ES 17) |
+| `JSON` | ❌ | — | Planned (M3-B6) |
+| `Map` / `Set` / `WeakMap` / `WeakSet` | ❌ | — | Planned (M5) |
 
 ### Utility
 
@@ -326,7 +337,7 @@ This engine uses a **static compilation model** with register-based VM:
 | Operation | Status | Since | Notes |
 |-----------|--------|-------|-------|
 | ToBoolean | ✅ | M0 | |
-| ToNumber | ✅ | M0 | `""` → `0`, trimmed whitespace → `0` |
+| ToNumber | ✅ | M0 / M3 | `""` → `0`, trimmed whitespace → `0`; `StringNumericLiteral` radix prefixes `0x`/`0o`/`0b` and `Infinity` (M3) |
 | ToString | ✅ | M0 | |
 | ToPrimitive | ✅ | recent | hint "default"/"number"/"string" |
 | ToPropertyKey | ✅ | recent | |
@@ -446,7 +457,7 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 |---------|-----------|
 | Well-known symbols (`toStringTag`, `toPrimitive`, `hasInstance`, `species`) | M2 residual |
 | Tagged templates (tag invocation + strings array) | M2 residual |
-| Built-ins: Object / Array / String / Number / Math / Function / Error completeness | M3 |
+| Built-ins: Object / Array / String / Number / Math / Function / Error completeness | M3 (B1/B2/B3/B4 delivered; B5 first pass) |
 | `JSON`, `Date` | M3 |
 | Generators (`function*`) and full iterator close semantics | M4 |
 | `Map`, `Set`, `WeakMap`, `WeakSet`, `Promise` | M5 |
@@ -458,8 +469,8 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 | Test Suite | Count |
 |------------|-------|
 | Unit tests (value, vm, etc.) | 190 |
-| Feature integration test files | 22 |
-| test262 executed / passing | 10365 / 4611 (44.5%) |
+| Feature integration test files | 27 (346 passing / 351 assertions, 5 pre-existing `return_in_try_finally` failures) |
+| test262 executed / passing | 10365 / 7416 (71.55%) |
 
 ---
 
@@ -497,3 +508,6 @@ These are in scope for the ES6 goal and scheduled in `docs/es6-conformance-plan.
 | 2026-09-20 | ✅ M2: class static members/fields, accessors, `extends`/`super`, `prototype.constructor`, class constructors require `new` |
 | 2026-09-20 | 🐛 Implicit return now clears Rv (constructors returned a leftover object); accessors use the receiver as `this` |
 | 2026-09-20 | 📈 test262 2444 → 3901 passing (10240 executed) |
+| 2026-09-21 | ✅ M3-B1 (`Object`) batches 1-3: ToObject boxing, `[[DefineOwnProperty]]` validation, array element accessors, `Object.assign` in the VM, SEH cross-frame unwinding → test262 4611 passing |
+| 2026-09-22 | ✅ M3-B1/B2/B3/B4/B5 (12 commits, `docs/es6-conformance-plan.md` §2.1f): `F.prototype.constructor`, function `length`/`name` metadata + builtin arity table, built-in property attributes, native-constructor prototype chain, real `ToNumber` opcode, `Number::toString`, String method dispatch + `codePointAt`/`at`/`normalize`/`toLocale*`/`pad*`/ES whitespace `trim`, built-in error propagation, `Error` semantics (`[[Class]]`, `toString`, `isError`, `cause`), bound-function construction, `Array.prototype.at`/`copyWithin`/`entries`/`keys`/`values` → test262 6015 → **7416 passing** (71.55%) |
+| 2026-09-22 | 🐛 Fixed two latent correctness bugs found by the above: built-in errors were silently swallowed by the `CallMethod` fallback (`is_unknown_builtin`), and `new` on a built-in constructor passed arguments in reverse order |
