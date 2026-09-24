@@ -4373,23 +4373,98 @@ impl VM {
         let Value::Object(obj_ref) = &gen_value else {
             return Err(RuntimeError::TypeError("not a generator".to_string()));
         };
-        let mut gobj = obj_ref.borrow_mut();
-        let Some(gobj) = gobj
-            .as_any_mut()
-            .downcast_mut::<crate::vm::object::GeneratorObject>()
-        else {
-            return Err(RuntimeError::TypeError("not a generator".to_string()));
+        // The borrow must end before anything below re-borrows the generator
+        // (the `throw` path has to put the frame back).
+        let (suspended, delegates) = {
+            let mut borrowed = obj_ref.borrow_mut();
+            let Some(gobj) = borrowed
+                .as_any_mut()
+                .downcast_mut::<crate::vm::object::GeneratorObject>()
+            else {
+                return Err(RuntimeError::TypeError("not a generator".to_string()));
+            };
+            let suspended = gobj.suspended.take();
+            let delegates = suspended
+                .as_ref()
+                .map(|f| f.delegates.clone())
+                .unwrap_or_default();
+            // A generator that has not started yet still becomes completed, and
+            // the completion is what the caller sees.
+            gobj.state = crate::vm::object::GeneratorState::Completed;
+            (suspended, delegates)
         };
-        // A generator that has not started yet still becomes completed, and the
-        // completion is what the caller sees.
-        gobj.state = crate::vm::object::GeneratorState::Completed;
-        let delegates = gobj.suspended.take().map(|f| f.delegates).unwrap_or_default();
-        drop(gobj);
-        // ES 14.4.14 step 5.c: `yield*` closes its delegate with the abrupt
-        // completion before the generator finishes.
-        let value = completion?;
-        self.close_delegates(&delegates, &value, module)?;
-        Ok(Self::iterator_result(value, true))
+
+        // ES 14.4.14 step 5: `yield*` forwards the abrupt completion to the
+        // delegate it is parked on — `return(v)` closes it, `throw(e)` calls its
+        // `throw` method. Only the innermost delegate is involved.
+        match (completion, delegates.last().cloned()) {
+            (Ok(value), Some(iter)) => {
+                // Step 5.c: `GetMethod(iterator, "return")`; an absent one means
+                // the completion simply stands.
+                self.close_delegates(&[iter], &value, module)?;
+                Ok(Self::iterator_result(value, true))
+            }
+            (Ok(value), None) => Ok(Self::iterator_result(value, true)),
+            (Err(RuntimeError::Thrown(reason)), Some(iter)) => {
+                // `MakeIterator` wraps a JS iterator in a native object that
+                // only knows `next`/`return`, so the delegate's own `throw` has
+                // to be looked up on the iterator it wraps.
+                let iter = self.delegate_js_iterator(&iter).unwrap_or(iter);
+                let throw_method =
+                    self.get_member(&iter, &PropertyKey::from_str("throw"), module)?;
+                if !throw_method.is_callable() {
+                    // No `throw` on the delegate: the completion reaches the
+                    // generator body itself, which means resuming it — and that
+                    // needs the frame's exception handlers, which this subset
+                    // does not carry yet (see §2.1u of the conformance plan).
+                    return Err(RuntimeError::Thrown(reason));
+                }
+                let inner = self.invoke(&throw_method, iter, &[reason], module)?;
+                if !inner.is_object() {
+                    return Err(RuntimeError::TypeError(
+                        "iterator.throw() returned a non-object value".to_string(),
+                    ));
+                }
+                let done = self
+                    .get_member(&inner, &PropertyKey::from_str("done"), module)?
+                    .to_boolean();
+                let value = self.get_member(&inner, &PropertyKey::from_str("value"), module)?;
+                if done {
+                    Ok(Self::iterator_result(value, true))
+                } else {
+                    // The delegate produced another value: the generator stays
+                    // suspended where it was, still parked on the delegate.
+                    let Value::Object(obj_ref) = &gen_value else {
+                        return Err(RuntimeError::TypeError("not a generator".to_string()));
+                    };
+                    let mut gobj = obj_ref.borrow_mut();
+                    if let Some(gobj) = gobj
+                        .as_any_mut()
+                        .downcast_mut::<crate::vm::object::GeneratorObject>()
+                    {
+                        gobj.state = crate::vm::object::GeneratorState::SuspendedYield;
+                        gobj.suspended = suspended;
+                    }
+                    Ok(Self::iterator_result(value, false))
+                }
+            }
+            (Err(err), _) => Err(err),
+        }
+    }
+
+    /// The JS iterator behind a `MakeIterator` wrapper, when there is one.
+    fn delegate_js_iterator(&self, iter: &Value) -> Option<Value> {
+        let Value::Object(obj_ref) = iter else {
+            return None;
+        };
+        let borrowed = obj_ref.borrow();
+        let it = borrowed
+            .as_any()
+            .downcast_ref::<crate::vm::iterator::NativeIteratorObject>()?;
+        match &*it.state().borrow() {
+            crate::vm::iterator::NativeIteratorState::Js { iterator } => Some(iterator.clone()),
+            _ => None,
+        }
     }
 
     /// `IteratorClose` for every iterator a `yield*` left open, innermost first.

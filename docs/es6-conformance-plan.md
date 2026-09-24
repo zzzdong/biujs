@@ -759,6 +759,37 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 
 **残留**：`star-rhs-iter-thrw-*`（12 例）仍未过 —— 它们要求 `throw()` **恢复函数体**并把异常抛在 `yield` 的位置上，这样 `try`/`catch` 能接住、`finally` 能跑；这需要 `SuspendedFrame` 带上 SEH 记录（§2.1p 起就明确排除）。同样地，`return()` 也还没跑 `finally`。这两件事归同一个后续任务：**给生成器的挂起帧补上异常处理器**。
 
+### 2.1v `yield*` 的 `throw` 转发（2026-09-25）
+
+**起点**：通过 7976 / 10825（73.68%）。§2.1u 之后 `language/expressions/yield` 的 26 例失败分成两半：`star-rhs-iter-thrw-*`（12）与 `star-rhs-iter-rtrn-*`（11）。
+
+读了一遍用例才发现两半的要求**不一样**：
+
+- `thrw` 那半要的是 `yield*` 的委托协议本身 —— 停在 `yield*` 上时 `throw(e)` 要调委托迭代器自己的 `throw` 方法（`star-rhs-iter-thrw-thrw-invoke.js` 断言 `callCount === 1`、`args[0] === 7777`、`thisValue === spyIterator`）。**这不需要 SEH**，只需要把委托转发的另一半（throw）也接上。
+- `rtrn` 那半要的是"生成器被恢复"（`-rtrn-no-rtrn.js` 断言 `hitFinally === true`），那才是真正需要 SEH 的部分。
+
+所以先做不需要 SEH、且能独立验证的那一半。
+
+**交付**：
+
+1. `generator_abrupt` 的 throw 分支：`GetMethod(iterator, "throw")` → 调用 → 结果必须是对象 → `done` 为真则以 `IteratorValue` 完成生成器，为假则产出该值且**生成器保持挂起**（仍停在同一个委托上）。委托没有 `throw` 方法时，完成生成器并把异常抛给调用方。
+2. `VM::delegate_js_iterator`：`MakeIterator` 的包装对象只认识 `next` / `return`，没有 `throw`，所以委托的 `throw` 必须到它包裹的那个 JS 迭代器上找 —— 这也顺带让接收者变成 `spyIterator` 本身（用例断言的就是这个）。
+
+**踩到的坑**：`generator_abrupt` 里 `let mut gobj = obj_ref.borrow_mut();` 之后用 `let Some(gobj) = gobj.as_any_mut()…` **遮蔽**了同一个名字 —— 外层的 `RefMut` 并不会因此释放，而是活到函数结束。下游的 throw 分支要把挂起帧放回去，于是二次 `borrow_mut()` 直接 panic（`RefCell already borrowed`）。改成把借用包在一个块里、只把 `(suspended, delegates)` 带出来。
+
+**效果**：
+
+| 套件 | §2.1u 后 | 本批后 | 变化 |
+|------|----------|--------|------|
+| `language/expressions/yield` | 30 | **31** | +1 |
+| 全量 | 7976 / 10825（73.68%） | **7977 / 10825**（73.69%） | +1 |
+
+单元 190 全绿；features 401 → 402 通过（`generators.rs` 新增 1 个用例 / 2 条断言）。
+
+**净收益仍然很小（+1），如实记录**：用例里剩下的失败大多已经不再是"委托没被调用"，而是更细的东西 —— 委托的 `throw` 自己抛出的异常要**以 JS 异常的形式**回到 `iter.throw()` 的调用方（现在多半直接逃逸到顶层），以及 `-rtrn-*` 那半需要的"恢复函数体跑 finally"。前者是异常传播路径的问题，后者是 SEH。两个都在下面的同一条任务里。
+
+**下一步（同一个任务）**：给 `SuspendedFrame` 带上 SEH 记录，让 `return()` / `throw()` 真正恢复函数体。这一件事同时解决：`-rtrn-*` 的"执行被恢复"、`-thrw-*` 的异常回到调用方、以及 §2.1p 以来"生成器体不能带 `try`"这条限制。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -846,7 +877,7 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数（§2.1u 后） | 主要缺口 |
+| 套件 | 失败数（§2.1v 后） | 主要缺口 |
 |------|--------------------|----------|
 | `built-ins/Array` | 857 | `flat`/`flatMap`（ES2019）、`findLast*` 与 change-array-by-copy（ES2023）整体缺失；`resizable-arraybuffer` 类用例；sloppy-mode 依赖的 ES5 用例 |
 | `built-ins/Object` | 499 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |

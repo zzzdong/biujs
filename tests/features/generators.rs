@@ -370,3 +370,47 @@ fn breaking_out_of_for_of_closes_the_generator() {
         "12"
     );
 }
+
+#[test]
+fn throw_is_forwarded_to_the_delegate() {
+    // ES 14.4.14 step 5.b: while parked on a `yield*`, `throw(e)` calls the
+    // delegate's own `throw` with `e`, and the delegate is the receiver.
+    assert_eq!(
+        eval_string(
+            "var calls = 0, args, receiver;
+             var spy = {
+               next: function() { return { done: false }; },
+               throw: function() {
+                 calls += 1; args = arguments; receiver = this;
+                 return { done: true };
+               }
+             };
+             var iterable = {};
+             iterable[Symbol.iterator] = function() { return spy; };
+             function* g() { yield* iterable; }
+             var it = g();
+             it.next();
+             it.throw(7777);
+             [calls, args.length, args[0], receiver === spy].join('|')"
+        ),
+        "1|1|7777|true"
+    );
+    // A delegate that answers `{ done: false, value: v }` yields again, and the
+    // generator stays suspended rather than completing.
+    assert_eq!(
+        eval_string(
+            "var spy = {
+               next: function() { return { done: false }; },
+               throw: function() { return { done: false, value: 2222 }; }
+             };
+             var iterable = {};
+             iterable[Symbol.iterator] = function() { return spy; };
+             function* g() { yield* iterable; }
+             var it = g();
+             it.next();
+             var r = it.throw(1);
+             [r.value, r.done].join('|')"
+        ),
+        "2222|false"
+    );
+}
