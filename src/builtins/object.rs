@@ -475,10 +475,13 @@ pub fn object_has_own(args: &[Value]) -> Result<Value, RuntimeError> {
             "Object.hasOwn requires at least 2 arguments".to_string(),
         ));
     }
-    match &args[0] {
+    // ES 20.1.2.13 step 2: `? ToObject(O)` — primitives do not answer `false`.
+    let target = super::to_object(&args[0])?;
+    match &target {
         Value::Object(obj_ref) => {
             let key = match &args[1] {
                 Value::String(s) => PropertyKey::from_str(s),
+                Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
                 _ => PropertyKey::from_str(&args[1].to_js_string()),
             };
             let borrowed = obj_ref.borrow();
@@ -614,6 +617,9 @@ pub fn object_prototype_to_string(obj: &Value, _args: &[Value]) -> Result<Value,
 
 /// `Object.prototype.hasOwnProperty(V)`
 pub fn object_has_own_property(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    // ES 20.1.3.3: `ToObject(this)` first, so `hasOwnProperty.call(null, "x")`
+    // is a TypeError rather than `false`.
+    super::require_object_coercible(obj)?;
     let key = match args.first() {
         Some(Value::String(s)) => PropertyKey::from_str(s),
         Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),
@@ -641,10 +647,12 @@ pub fn object_has_own_property(obj: &Value, args: &[Value]) -> Result<Value, Run
 /// `Object.prototype.isPrototypeOf(V)` — is `this` anywhere on `V`'s
 /// prototype chain?
 pub fn object_is_prototype_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    // ES 20.1.3.5: `ToObject(this)`, then walk V's chain — `null`/`undefined`
+    // receivers raise a TypeError instead of answering `false`.
+    super::require_object_coercible(obj)?;
     let Value::Object(target) = obj else {
-        // ES: ToObject(this) then walk V's chain; a primitive receiver has no
-        // object identity, so the answer is false for object arguments and a
-        // TypeError for primitives (handled by the caller's ToObject).
+        // A primitive receiver has no object identity, so no object can have it
+        // on its prototype chain.
         return Ok(Value::Bool(false));
     };
     let Some(Value::Object(candidate)) = args.first() else {
@@ -670,6 +678,8 @@ pub fn object_property_is_enumerable(
     obj: &Value,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
+    // ES 20.1.3.4: `ToObject(this)` first.
+    super::require_object_coercible(obj)?;
     let key = match args.first() {
         Some(Value::String(s)) => PropertyKey::from_str(s),
         Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),

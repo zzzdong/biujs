@@ -82,11 +82,19 @@ impl Compiler {
         // Function metadata (declared name + arity) travels with the module so
         // function objects can expose `name` and `length`.
         let mut func_info: HashMap<u32, (String, usize)> = HashMap::new();
+        let mut generators: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut derived_ctors: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for func in &unit.functions {
             func_info.insert(
                 func.id.as_usize() as u32,
                 (func.signature.name.to_string(), func.signature.arity),
             );
+            if func.signature.is_generator {
+                generators.insert(func.id.as_usize() as u32);
+            }
+            if func.signature.is_derived_ctor {
+                derived_ctors.insert(func.id.as_usize() as u32);
+            }
         }
 
         for idx in 0..function_count {
@@ -126,6 +134,8 @@ impl Compiler {
             unit.constants,
             symtab,
             func_info,
+            generators,
+            derived_ctors,
             all_codes,
         ))
     }

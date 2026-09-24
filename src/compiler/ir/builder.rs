@@ -300,6 +300,14 @@ pub trait InstBuilder {
         self.emit(Instruction::IteratorClose { iter });
     }
 
+    /// `yield expr` inside a generator: `src` is what `next()` reports, `dst`
+    /// is what the *resuming* `next(v)` supplies.
+    fn yield_(&mut self, src: Option<Value>) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::Yield { dst, src });
+        dst
+    }
+
     fn iterate_next(&mut self, iter: Value) -> (Value, Value) {
         let next = self.alloc();
         let has_next = self.alloc();

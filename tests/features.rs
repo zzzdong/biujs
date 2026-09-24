@@ -9,6 +9,8 @@ pub mod helpers;
 mod arithmetic_comparison;
 #[path = "features/array_methods.rs"]
 mod array_methods;
+#[path = "features/array_species.rs"]
+mod array_species;
 #[path = "features/arrow_functions.rs"]
 mod arrow_functions;
 #[path = "features/arrow_functions_return.rs"]
@@ -23,6 +25,8 @@ mod complex;
 mod const_var_test;
 #[path = "features/control_flow.rs"]
 mod control_flow;
+#[path = "features/coercion_errors.rs"]
+mod coercion_errors;
 #[path = "features/debug_instanceof.rs"]
 mod debug_instanceof;
 #[path = "features/debug_instanceof2.rs"]
@@ -37,6 +41,8 @@ mod error_builtins;
 mod exception_unwinding;
 #[path = "features/functions.rs"]
 mod functions;
+#[path = "features/generators.rs"]
+mod generators;
 #[path = "features/json.rs"]
 mod json;
 #[path = "features/language_semantics.rs"]

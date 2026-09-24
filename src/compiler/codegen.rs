@@ -302,6 +302,14 @@ impl Codegen {
                         let iter = self.gen_operand(iter);
                         self.codes.push(Bytecode::single(Opcode::IterClose, iter));
                     }
+                    Instruction::Yield { dst, src } => {
+                        let dst = self.gen_operand(dst);
+                        let src = match src {
+                            Some(src) => self.gen_operand(src),
+                            None => Operand::new_immd(-1),
+                        };
+                        self.codes.push(Bytecode::double(Opcode::Yield, dst, src));
+                    }
                     Instruction::ToString { dst, src } => {
                         let dst = self.gen_operand(dst);
                         let src = self.gen_operand(src);

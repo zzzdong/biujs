@@ -578,6 +578,17 @@ impl ArrayObject {
         }
     }
 
+    /// `length` still writable, and the array not frozen — the precondition the
+    /// mutating `Array.prototype` methods rely on.
+    ///
+    /// Those methods operate directly on the dense store, which bypasses the
+    /// `[[Set]]` checks that would otherwise reject an assignment to a
+    /// read-only `length`; every one of them ends with `? Set(O, "length", …,
+    /// true)`, so it has to be validated explicitly.
+    pub fn length_is_writable(&self) -> bool {
+        self.length_writable && !self.frozen
+    }
+
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             elements: Vec::with_capacity(cap),
@@ -1497,6 +1508,9 @@ impl NativeFunctionObject {
         } else if self.name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
             // `Array.prototype[Symbol.iterator].name` is "[Symbol.iterator]".
             "[Symbol.iterator]".to_string()
+        } else if self.name == crate::builtins::ARRAY_SPECIES_NATIVE {
+            // `Array[Symbol.species]`'s getter is named like any other accessor.
+            "get [Symbol.species]".to_string()
         } else {
             self.name
                 .rsplit('.')
@@ -1805,5 +1819,184 @@ impl JSObject for PrimitiveWrapperObject {
 
     fn to_primitive(&self, _hint: &str) -> Result<Value, String> {
         Ok(self.primitive.clone())
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// GeneratorObject — `function*` instances (ES 25.4)
+// ─────────────────────────────────────────────────────────
+
+/// ES 25.4.2 generator states.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GeneratorState {
+    /// `function*` called, body not started.
+    SuspendedStart,
+    /// Paused at a `yield`.
+    SuspendedYield,
+    /// Running (re-entry is a TypeError in the spec; here it cannot happen
+    /// because resume is not re-entrant).
+    Executing,
+    /// The body returned or threw.
+    Completed,
+}
+
+/// A generator frame that has been lifted out of the VM's value stack.
+///
+/// The VM keeps locals, arguments and expression temporaries in one contiguous
+/// slice of `data_stack`, so a generator can be suspended by copying that slice
+/// out and resumed by copying it back — no separate frame representation, and no
+/// change to how the body is compiled.
+#[derive(Debug, Clone)]
+pub struct SuspendedFrame {
+    /// The frame's slice of the value stack, arguments first.
+    pub data: Vec<Value>,
+    /// Number of leading slots that are arguments: `[rbp-argc, rbp)`.
+    pub argc: usize,
+    /// `rsp - rbp` at suspension time.
+    pub bp_offset: usize,
+    /// Index of the `Yield` instruction that suspended the frame; resuming
+    /// writes the sent value and continues at `pc + 1`.
+    pub pc: usize,
+    pub this: Value,
+    pub function_val: Value,
+    pub closure_maps: Vec<std::collections::HashMap<String, Value>>,
+    /// The 19-slot register file. It is **global**, not per frame, so a value
+    /// held in a register across a `yield` has to travel with the frame.
+    pub registers: [Value; 19],
+    // NOTE: no SEH records here — a `try` around a `yield` is out of scope for
+    // the first generator increment (M4 follow-up), so a generator body with an
+    // exception handler is simply not resumable across it.
+}
+
+/// A generator object.
+///
+/// `next()` is a native (`__gen_next__<id>`) rather than an own property, so it
+/// can reach the VM and drive the body; `[Symbol.iterator]` returns the object
+/// itself, which is what makes it usable in `for-of` and spread.
+#[derive(Debug)]
+pub struct GeneratorObject {
+    pub id: u64,
+    pub func_id: u32,
+    pub state: GeneratorState,
+    /// Arguments captured at call time (used for the very first resume).
+    pub args: Vec<Value>,
+    pub this: Value,
+    pub captured_new_target: Option<Value>,
+    pub captured_vars: Vec<(String, Value)>,
+    /// `Some` only while suspended at a `yield`.
+    pub suspended: Option<SuspendedFrame>,
+    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+}
+
+impl GeneratorObject {
+    pub fn new(id: u64, func_id: u32, args: Vec<Value>, this: Value) -> Self {
+        Self {
+            id,
+            func_id,
+            state: GeneratorState::SuspendedStart,
+            args,
+            this,
+            captured_new_target: None,
+            captured_vars: Vec::new(),
+            suspended: None,
+            prototype: None,
+        }
+    }
+}
+
+impl JSObject for GeneratorObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Generator
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        // Generators are iterable: `gen[Symbol.iterator]()` is `gen` itself.
+        if *key == crate::vm::iterator::iterator_symbol_key() {
+            return Some(PropertyDescriptor::data_descriptor(Value::Object(
+                Rc::new(RefCell::new(NativeFunctionObject::new(&format!(
+                    "{}{}",
+                    crate::vm::iterator::GENERATOR_ITERATOR_PREFIX,
+                    self.id
+                )))),
+            )));
+        }
+        let native_name = match key.as_str() {
+            Some("next") => format!(
+                "{}{}",
+                crate::vm::iterator::GENERATOR_NEXT_PREFIX,
+                self.id
+            ),
+            _ => return None,
+        };
+        Some(PropertyDescriptor::data_descriptor(Value::Object(
+            Rc::new(RefCell::new(NativeFunctionObject::new(&native_name))),
+        )))
+    }
+
+    fn property_set(&mut self, _key: PropertyKey, _value: Value) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn define_property(
+        &mut self,
+        _key: PropertyKey,
+        _desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn property_delete(&mut self, _key: &PropertyKey) -> bool {
+        true
+    }
+
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        *key == crate::vm::iterator::iterator_symbol_key()
+            || matches!(key.as_str(), Some("next"))
+    }
+
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        vec![PropertyKey::from_str("next")]
+    }
+
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.prototype.clone()
+    }
+
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.prototype = proto;
+    }
+
+    fn is_extensible(&self) -> bool {
+        true
+    }
+
+    fn prevent_extensions(&mut self) {}
+
+    fn is_frozen(&self) -> bool {
+        false
+    }
+
+    fn freeze(&mut self) {}
+
+    fn is_sealed(&self) -> bool {
+        false
+    }
+
+    fn seal(&mut self) {}
+
+    fn class_name(&self) -> &'static str {
+        "Generator"
+    }
+
+    fn to_primitive(&self, _hint: &str) -> Result<Value, String> {
+        Ok(Value::string("[object Generator]"))
     }
 }

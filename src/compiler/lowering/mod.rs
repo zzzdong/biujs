@@ -336,6 +336,9 @@ impl<'a> JSASTLower<'a> {
         // With `extends P`, the prototype must inherit from `P.prototype`;
         // without it, a fresh object is enough.
         let mut super_ctor: Option<Value> = None;
+        // A constructor of a class with `extends` is "derived": `this` starts
+        // uninitialized and only `super()` binds it (ES 9.2.2).
+        let has_heritage = class.super_class.is_some();
         let proto = match &class.super_class {
             Some(super_expr) => {
                 let parent = self.lower_expression(super_expr);
@@ -365,13 +368,21 @@ impl<'a> JSASTLower<'a> {
                     &[],
                     false,
                     &instance_fields,
-                ));
+                    false,
+                    has_heritage,));
             }
         }
 
         // 4. If no constructor, create a default one
         let constructor_id = constructor_id.unwrap_or_else(|| {
             let func_sig = FuncSignature::new(class_name.clone(), vec![]);
+            // The default constructor of a derived class forwards every
+            // argument: `constructor(...args) { super(...args); }` (ES 14.5.15).
+            let func_sig = if has_heritage {
+                func_sig.as_derived_ctor()
+            } else {
+                func_sig
+            };
             let func_id = self.builder.module_mut().declare_function(func_sig.clone());
             let mut func = IrFunction::new(func_id, func_sig);
             let symbols = self.symbols.clone();
@@ -380,6 +391,13 @@ impl<'a> JSASTLower<'a> {
             let entry = func_lower.create_block("default_ctor");
             func_lower.builder.set_entry(entry);
             func_lower.builder.switch_to_block(entry);
+            if has_heritage {
+                let parent = func_lower.lower_super_ctor();
+                let argv = func_lower.builder.make_rest(0);
+                func_lower
+                    .builder
+                    .call_super(parent, Value::Primitive(Primitive::Undefined), argv);
+            }
             func_lower.builder.return_(None);
             func_lower
                 .builder
@@ -446,7 +464,8 @@ impl<'a> JSASTLower<'a> {
                         &[],
                         false,
                         &[],
-                    );
+                        func.generator,
+                        false,);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
                     let desc = self.method_descriptor(func_val);
                     self.define_member(proto, key, desc);
@@ -462,7 +481,8 @@ impl<'a> JSASTLower<'a> {
                         &[],
                         false,
                         &[],
-                    );
+                        func.generator,
+                        false,);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
                     let desc = self.method_descriptor(func_val);
                     self.define_member(func_obj, key, desc);
@@ -478,7 +498,8 @@ impl<'a> JSASTLower<'a> {
                         &[],
                         false,
                         &[],
-                    );
+                        func.generator,
+                        false,);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
                     let (getter, setter) = if *is_get {
                         (Some(func_val), None)
@@ -499,7 +520,8 @@ impl<'a> JSASTLower<'a> {
                         &[],
                         false,
                         &[],
-                    );
+                        func.generator,
+                        false,);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
                     let (getter, setter) = if *is_get {
                         (Some(func_val), None)
@@ -685,6 +707,57 @@ impl<'a> JSASTLower<'a> {
     /// body:     bind lhs = item; body; → cond   ← continue target
     /// close:    IteratorClose(it) → after       ← break target
     /// ```
+    /// `yield* expr` (ES 14.4.14) desugared to `next()` + `yield`.
+    ///
+    /// ```text
+    /// iter = GetIterator(expr); sent = undefined
+    /// cond: r = iter.next(sent)
+    ///       if (r.done) → done
+    /// body: sent = yield r.value → cond
+    /// done: result = r.value; IteratorClose(iter) → after
+    /// ```
+    ///
+    /// The desugaring is what makes the sent value reach the delegate: it is
+    /// the value of the `yield` inside the loop, so `next(v)` supplies exactly
+    /// the argument the inner iterator's `next` should see.
+    fn lower_yield_delegate(&mut self, expr: &Expression<'_>) -> Value {
+        let src = self.lower_expression(expr);
+        let iter = self.builder.make_iterator(src);
+
+        let sent = self.builder.alloc();
+        self.builder
+            .assign(sent, Value::Primitive(Primitive::Undefined));
+        let result = self.builder.alloc();
+        self.builder
+            .assign(result, Value::Primitive(Primitive::Undefined));
+
+        let cond_blk = self.create_block("delegate_cond");
+        let body_blk = self.create_block("delegate_body");
+        let done_blk = self.create_block("delegate_done");
+        let after_blk = self.create_block("delegate_after");
+
+        self.builder.jump(cond_blk);
+        self.builder.switch_to_block(cond_blk);
+        let step = self.builder.call_property(iter, "next", vec![sent]);
+        let is_done = self.builder.get_property(step, "done");
+        self.builder.br_if(is_done, done_blk, body_blk);
+
+        self.builder.switch_to_block(body_blk);
+        let value = self.builder.get_property(step, "value");
+        let next_sent = self.builder.yield_(Some(value));
+        self.builder.assign(sent, next_sent);
+        self.builder.jump(cond_blk);
+
+        self.builder.switch_to_block(done_blk);
+        let returned = self.builder.get_property(step, "value");
+        self.builder.assign(result, returned);
+        self.builder.iterator_close(iter);
+        self.builder.jump(after_blk);
+
+        self.builder.switch_to_block(after_blk);
+        result
+    }
+
     fn lower_for_of(&mut self, for_of: &ForOfStatement<'_>) {
         if for_of.r#await {
             log::warn!("for-await not supported; treating as for-of");
@@ -1194,6 +1267,24 @@ impl<'a> JSASTLower<'a> {
                 }
             }
             Expression::ClassExpression(class) => self.lower_class(class),
+            // `yield` / `yield*` (ES 14.4).
+            Expression::YieldExpression(y) if !y.delegate => {
+                let src = y
+                    .argument
+                    .as_ref()
+                    .map(|arg| self.lower_expression(arg));
+                self.builder.yield_(src)
+            }
+            Expression::YieldExpression(y) => {
+                // `yield*` cannot be a single instruction: the value sent by
+                // the next `next(v)` has to reach the delegate's `next`, which
+                // is a loop over the iterator result protocol.
+                let arg = y
+                    .argument
+                    .as_ref()
+                    .expect("`yield*` always has an argument");
+                self.lower_yield_delegate(arg)
+            }
             Expression::MetaProperty(meta) => {
                 // `new.target` (ES 14.2.3) reads the current frame's constructor
                 // slot: the constructor for a `[[Construct]]` frame, otherwise
@@ -1685,7 +1776,10 @@ impl<'a> JSASTLower<'a> {
     fn lower_call(&mut self, call: &CallExpression<'_>) -> Value {
         // `super(...)` — call the parent constructor with the current `this`.
         if matches!(&call.callee, Expression::Super(_)) {
-            let this = self.builder.load_this();
+            // No `load_this` here on purpose: in a derived constructor `this` is
+            // uninitialized until `super()` runs, and reading it would raise.
+            // `CallSuperSpread` takes the receiver from the frame instead.
+            let this = Value::Primitive(Primitive::Undefined);
             let super_ctor = self.lower_super_ctor();
             // `this` is passed to `call_spread` separately, so it must not
             // appear in the argument array as well.
@@ -2101,10 +2195,13 @@ impl<'a> JSASTLower<'a> {
                 .collect::<Vec<String>>(),
             true,
             &[],
-        );
+            false,
+            false,);
 
-        // At runtime, capture the current `this` value
-        let captured_this = self.builder.load_this();
+        // At runtime, capture the current `this` value. No `load_this` here on
+        // purpose: in a derived constructor `this` is still uninitialized, and
+        // an arrow that only calls `super()` must not trip over reading it —
+        // `MakeArrowFuncObj` takes the frame's `this` instead.
 
         // Capture each free variable that exists in the current symbol table
         for name in &free_idents {
@@ -2120,7 +2217,8 @@ impl<'a> JSASTLower<'a> {
         }
 
         // Create arrow function object with captured `this` and captured vars
-        self.builder.make_arrow_func_obj(func_val, captured_this)
+        self.builder
+            .make_arrow_func_obj(func_val, Value::Primitive(Primitive::Undefined))
     }
 
     fn lower_function_expr(&mut self, func: &Function<'_>) -> Value {
@@ -2131,7 +2229,17 @@ impl<'a> JSASTLower<'a> {
             .unwrap_or_else(|| "<anonymous>".to_string());
 
         if let Some(body) = &func.body {
-            self.lower_function_inner(Some(name), &func.params.items, body, None, false, &[], false, &[])
+            self.lower_function_inner(
+                Some(name),
+                &func.params.items,
+                body,
+                None,
+                false,
+                &[],
+                false,
+                &[],
+                func.generator,
+                false,)
         } else {
             Value::Primitive(Primitive::Null)
         }
@@ -2195,7 +2303,8 @@ impl<'a> JSASTLower<'a> {
                 &[],
                 false,
                 &[],
-            );
+                func.generator,
+                false,);
             Some((name, func_id_val))
         } else {
             None
@@ -2218,6 +2327,8 @@ impl<'a> JSASTLower<'a> {
         captured_names: &[String],
         is_arrow: bool,
         instance_fields: &[&PropertyDefinition<'_>],
+        is_generator: bool,
+        is_derived_ctor: bool,
     ) -> Value {
         // During hoisting, there may be no current block yet
         let curr = self.builder.try_current_block();
@@ -2237,6 +2348,16 @@ impl<'a> JSASTLower<'a> {
             })
             .count();
         let func_sig = FuncSignature::with_arity(name.clone(), sig_params, arity);
+        let func_sig = if is_generator {
+            func_sig.as_generator()
+        } else {
+            func_sig
+        };
+        let func_sig = if is_derived_ctor {
+            func_sig.as_derived_ctor()
+        } else {
+            func_sig
+        };
         let func_id = self.builder.module_mut().declare_function(func_sig.clone());
 
         let mut func = IrFunction::new(func_id, func_sig);

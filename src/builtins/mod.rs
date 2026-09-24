@@ -20,7 +20,7 @@ use crate::vm::value::Value;
 
 pub use crate::vm::ObjectKind;
 
-pub use array::{array_constructor, validate_array_length};
+pub use array::{ARRAY_SPECIES_NATIVE, array_constructor, validate_array_length};
 pub use boolean::boolean_constructor;
 pub use error::{
     ErrorType, create_error_object, error_constructor, runtime_error_to_js_error,
@@ -116,6 +116,102 @@ pub fn to_uint16(n: f64) -> u16 {
     (rem as i64 % 65_536) as u16
 }
 
+// ─────────────────────────────────────────────────────────
+// Abstract operations with their abrupt completions
+// ─────────────────────────────────────────────────────────
+//
+// `Value::to_number` / `Value::to_js_string` are the *total* implementations:
+// they always produce something, because the places that use them (array `join`,
+// `format!`-style diagnostics, the `ToString` opcode) have no `Result` channel.
+// A built-in defined by the spec with `? ToNumber(x)` / `? ToString(x)` cannot
+// use those: `ToNumber(Symbol)` and `ToString(Symbol)` are TypeErrors, and
+// silently turning them into `NaN` / `"Symbol()"` is what made whole families of
+// `return-abrupt-*` tests fail. The helpers below are the throwing counterparts.
+
+/// ES `RequireObjectCoercible` (7.2.1).
+///
+/// `undefined` and `null` have no object form, so every built-in that starts
+/// with `Let O be ? ToObject(this)` — or needs the *receiver itself* rather than
+/// a wrapper — reports a TypeError here.
+pub fn require_object_coercible(value: &Value) -> Result<&Value, RuntimeError> {
+    match value {
+        Value::Undefined | Value::Null => Err(RuntimeError::TypeError(
+            "Cannot convert undefined or null to object".to_string(),
+        )),
+        other => Ok(other),
+    }
+}
+
+/// ES `ToString` (7.1.12) as an operation that can be abrupt.
+pub fn to_string_throwing(value: &Value) -> Result<String, RuntimeError> {
+    match value {
+        Value::Symbol(_) => Err(RuntimeError::TypeError(
+            "Cannot convert a Symbol value to a string".to_string(),
+        )),
+        _ => Ok(value.to_js_string()),
+    }
+}
+
+/// ES `ToNumber` (7.1.3) as an operation that can be abrupt.
+pub fn to_number_throwing(value: &Value) -> Result<f64, RuntimeError> {
+    match value {
+        Value::Symbol(_) => Err(RuntimeError::TypeError(
+            "Cannot convert a Symbol value to a number".to_string(),
+        )),
+        _ => Ok(value.to_number()),
+    }
+}
+
+/// The preamble shared by nearly every `String.prototype` method:
+/// `RequireObjectCoercible(this)` followed by `ToString(this)`.
+pub fn string_receiver(value: &Value) -> Result<String, RuntimeError> {
+    require_object_coercible(value)?;
+    to_string_throwing(value)
+}
+
+/// ES `ToIntegerOrInfinity` (7.1.5) that propagates `ToNumber`'s abrupt
+/// completion, saturating `±Infinity` to `i64` bounds.
+pub fn to_integer_or_infinity_throwing(value: Option<&Value>) -> Result<i64, RuntimeError> {
+    let n = match value {
+        Some(v) => to_number_throwing(v)?,
+        None => f64::NAN,
+    };
+    Ok(to_integer_or_infinity_from(n))
+}
+
+fn to_integer_or_infinity_from(n: f64) -> i64 {
+    if n.is_nan() {
+        return 0;
+    }
+    if n.is_infinite() {
+        return if n.is_sign_positive() { i64::MAX } else { i64::MIN };
+    }
+    let truncated = n.trunc();
+    if truncated >= i64::MAX as f64 {
+        i64::MAX
+    } else if truncated <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        truncated as i64
+    }
+}
+
+/// ES `ToLength` (7.1.19) that propagates `ToNumber`'s abrupt completion.
+pub fn to_length_throwing(value: &Value) -> Result<u64, RuntimeError> {
+    let n = to_number_throwing(value)?;
+    Ok(to_length_from(n))
+}
+
+fn to_length_from(n: f64) -> u64 {
+    if n.is_nan() || n <= 0.0 {
+        0
+    } else if n.is_infinite() {
+        (1u64 << 53) - 1
+    } else {
+        n.trunc().min(((1u64 << 53) - 1) as f64) as u64
+    }
+}
+
 /// `parseInt(string, radix)` — parses a leading integer in the given radix.
 pub fn global_parse_int(args: &[Value]) -> Result<Value, RuntimeError> {
     let Some(input) = args.first() else {
@@ -199,8 +295,8 @@ pub use symbol::symbol_constructor;
 pub use symbol::{
     HAS_INSTANCE_SYMBOL_ID, SPECIES_SYMBOL_ID, SYMBOL_DESCRIPTION_NATIVE, TO_PRIMITIVE_SYMBOL_ID,
     TO_STRING_TAG_SYMBOL_ID, has_instance_symbol_key, is_concat_spreadable_symbol_key,
-    register_symbol_value, symbol_description, symbol_value_by_id, to_primitive_symbol_key,
-    to_string_tag_symbol_key,
+    register_symbol_value, species_symbol_key, symbol_description, symbol_value_by_id,
+    to_primitive_symbol_key, to_string_tag_symbol_key,
 };
 
 // ─────────────────────────────────────────────────────────
@@ -711,7 +807,13 @@ pub fn call_prototype_method(
         "toString" => dispatch_to_string(obj),
         // `Object.prototype.toLocaleString` delegates to `toString`
         // (ES 20.1.3.5); Array/Number inherit the same entry.
-        "toLocaleString" => dispatch_to_string(obj),
+        // ES 20.1.3.5: unlike `Object.prototype.toString`, whose prologue
+        // special-cases `undefined`/`null` into `[[object Undefined]]` /
+        // `[[object Null]]`, `toLocaleString` starts with `ToObject(this)`.
+        "toLocaleString" => {
+            require_object_coercible(obj)?;
+            dispatch_to_string(obj)
+        }
         "valueOf" => dispatch_value_of(obj),
         "hasOwnProperty" => object::object_has_own_property(obj, args),
         "isPrototypeOf" => object::object_is_prototype_of(obj, args),
@@ -1000,6 +1102,10 @@ fn radix_format_frac(mut frac: f64, radix: u32, max_digits: usize) -> String {
 }
 
 fn dispatch_value_of(obj: &Value) -> Result<Value, RuntimeError> {
+    // ES 20.1.3.6: `Object.prototype.valueOf` starts with `ToObject(this)`, so
+    // `const valueOf = Object.prototype.valueOf; valueOf()` is a TypeError
+    // rather than the receiver echoed back.
+    require_object_coercible(obj)?;
     // Primitive wrappers unwrap to the wrapped value; every other object is
     // its own valueOf result.
     if let Value::Object(obj_ref) = obj {

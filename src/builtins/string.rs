@@ -129,22 +129,26 @@ pub fn register_string_statics(string_fn: &Value) {
 }
 
 pub fn string_starts_with(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
-    Ok(Value::Bool(
-        s.starts_with(&args.first().map(|v| v.to_js_string()).unwrap_or_default()),
-    ))
+    let s = super::string_receiver(obj)?;
+    let search = args.first().map_or(Ok("undefined".to_string()), |v| {
+        super::to_string_throwing(v)
+    })?;
+    Ok(Value::Bool(s.starts_with(&search)))
 }
 
 pub fn string_ends_with(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
-    Ok(Value::Bool(
-        s.ends_with(&args.first().map(|v| v.to_js_string()).unwrap_or_default()),
-    ))
+    let s = super::string_receiver(obj)?;
+    let search = args.first().map_or(Ok("undefined".to_string()), |v| {
+        super::to_string_throwing(v)
+    })?;
+    Ok(Value::Bool(s.ends_with(&search)))
 }
 
 pub fn string_repeat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
-    let count = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+    let s = super::string_receiver(obj)?;
+    let count = args
+        .first()
+        .map_or(Ok(0.0), super::to_number_throwing)?;
     if count < 0.0 || count.is_infinite() {
         return Err(RuntimeError::RangeError("Invalid count value".to_string()));
     }
@@ -156,13 +160,17 @@ pub fn string_repeat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError>
 }
 
 pub fn string_pad(obj: &Value, args: &[Value], at_start: bool) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
-    let target = args.first().map(|v| v.to_number()).unwrap_or(0.0) as usize;
-    let fill = args
-        .get(1)
-        .map(|v| v.to_js_string())
-        .filter(|f| !f.is_empty())
-        .unwrap_or_else(|| " ".to_string());
+    let s = super::string_receiver(obj)?;
+    let target = args.first().map_or(Ok(0.0), super::to_number_throwing)? as usize;
+    let fill = match args.get(1) {
+        Some(v) => super::to_string_throwing(v)?,
+        None => String::new(),
+    };
+    let fill = if fill.is_empty() {
+        " ".to_string()
+    } else {
+        fill
+    };
     let len = s.chars().count();
     if target <= len || target > 1 << 20 {
         return Ok(Value::string(&s));
@@ -179,16 +187,16 @@ pub fn string_pad(obj: &Value, args: &[Value], at_start: bool) -> Result<Value, 
 
 /// `String.prototype.lastIndexOf(searchString, position)`.
 pub fn string_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     let search = match args.first() {
-        Some(v) => v.to_js_string(),
+        Some(v) => super::to_string_throwing(v)?,
         None => "undefined".to_string(),
     };
     let chars: Vec<char> = s.chars().collect();
     let needle: Vec<char> = search.chars().collect();
     // No `position` means +Infinity for `lastIndexOf` (clamped to the length),
     // unlike `indexOf` which starts at 0.
-    let start = string_position(args.get(1), chars.len(), chars.len() as i64);
+    let start = string_position(args.get(1), chars.len(), chars.len() as i64)?;
     if needle.is_empty() {
         return Ok(Value::Number(start as f64));
     }
@@ -205,11 +213,11 @@ pub fn string_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, Runtim
 }
 
 fn string_value_of(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&obj.to_js_string()))
+    Ok(Value::string(&super::string_receiver(obj)?))
 }
 
 fn string_to_string(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&obj.to_js_string()))
+    Ok(Value::string(&super::string_receiver(obj)?))
 }
 
 // ─────────────────────────────────────────────────────────
@@ -233,12 +241,8 @@ pub fn string_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 // ─────────────────────────────────────────────────────────
 
 pub fn string_char_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
-    let idx = if args.is_empty() {
-        0
-    } else {
-        args[0].to_number() as usize
-    };
+    let s = super::string_receiver(obj)?;
+    let idx = position_arg(args.first())?;
     if let Some(c) = s.chars().nth(idx) {
         Ok(Value::string(&c.to_string()))
     } else {
@@ -247,12 +251,8 @@ pub fn string_char_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError
 }
 
 pub fn string_char_code_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
-    let idx = if args.is_empty() {
-        0
-    } else {
-        args[0].to_number() as usize
-    };
+    let s = super::string_receiver(obj)?;
+    let idx = position_arg(args.first())?;
     if let Some(c) = s.chars().nth(idx) {
         Ok(Value::Number(c as u32 as f64))
     } else {
@@ -261,19 +261,21 @@ pub fn string_char_code_at(obj: &Value, args: &[Value]) -> Result<Value, Runtime
 }
 
 pub fn string_concat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let mut s = obj.to_js_string();
+    let mut s = super::string_receiver(obj)?;
     for arg in args {
-        s.push_str(&arg.to_js_string());
+        s.push_str(&super::to_string_throwing(arg)?);
     }
     Ok(Value::string(&s))
 }
 
 pub fn string_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     if args.is_empty() {
         return Ok(Value::Bool(false));
     }
-    Ok(Value::Bool(s.contains(&args[0].to_js_string())))
+    Ok(Value::Bool(
+        s.contains(&super::to_string_throwing(&args[0])?),
+    ))
 }
 
 /// `String.prototype.indexOf(searchString, position)`.
@@ -282,15 +284,15 @@ pub fn string_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeErro
 /// matches at `position` (ES 21.1.3.9). Indices are reported in code *units*,
 /// which for the test cases here is the character offset.
 pub fn string_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     // A missing argument is `undefined`, whose ToString is "undefined" — not
     // the empty string (`'abc'.indexOf()` is -1).
     let search = match args.first() {
-        Some(v) => v.to_js_string(),
+        Some(v) => super::to_string_throwing(v)?,
         None => "undefined".to_string(),
     };
     let len = s.chars().count();
-    let start = string_position(args.get(1), len, 0);
+    let start = string_position(args.get(1), len, 0)?;
     if search.is_empty() {
         return Ok(Value::Number(start as f64));
     }
@@ -305,11 +307,15 @@ pub fn string_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeErro
 ///
 /// `default` is the value used when `position` is absent: `0` for `indexOf`,
 /// `length - 1` for `lastIndexOf`.
-fn string_position(position: Option<&Value>, len: usize, default: i64) -> usize {
+fn string_position(
+    position: Option<&Value>,
+    len: usize,
+    default: i64,
+) -> Result<usize, RuntimeError> {
     let len = len as i64;
     let n = match position {
-        Some(v) if !v.is_undefined() => v.to_number(),
-        _ => return default.max(0).min(len) as usize,
+        Some(v) if !v.is_undefined() => super::to_number_throwing(v)?,
+        _ => return Ok(default.max(0).min(len) as usize),
     };
     let value = if n.is_nan() {
         0
@@ -322,32 +328,33 @@ fn string_position(position: Option<&Value>, len: usize, default: i64) -> usize 
     } else {
         n.trunc() as i64
     };
-    value.max(0).min(len) as usize
+    Ok(value.max(0).min(len) as usize)
+}
+
+/// `ToNumber(arg)` for a code-unit position (`charAt` / `charCodeAt`).
+///
+/// A missing argument is `undefined` → `NaN` → `ToInteger` 0, as the spec's
+/// `? ToIntegerOrInfinity(pos)` prescribes for every method here.
+fn position_arg(arg: Option<&Value>) -> Result<usize, RuntimeError> {
+    let n = arg.map_or(Ok(f64::NAN), super::to_number_throwing)?;
+    Ok(if n.is_nan() || n <= 0.0 {
+        0
+    } else if n.is_infinite() {
+        usize::MAX
+    } else {
+        n.trunc() as usize
+    })
 }
 
 pub fn string_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len();
-    let start = if args.is_empty() {
-        0
-    } else {
-        let n = args[0].to_number() as i64;
-        if n < 0 {
-            ((len as i64) + n).max(0) as usize
-        } else {
-            (n as usize).min(len)
-        }
-    };
+    let start = slice_bound(args.first(), len)?;
     let end = if args.len() < 2 {
         len
     } else {
-        let n = args[1].to_number() as i64;
-        if n < 0 {
-            ((len as i64) + n).max(0) as usize
-        } else {
-            (n as usize).min(len)
-        }
+        slice_bound(args.get(1), len)?
     };
     if start >= end || start >= len {
         return Ok(Value::string(""));
@@ -357,16 +364,43 @@ pub fn string_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     Ok(Value::string(&result))
 }
 
+/// `ToNumber(arg)` clamped to `[0, len]`, counting negatives from the end —
+/// the bound conversion shared by `slice` and `substring`.
+fn slice_bound(arg: Option<&Value>, len: usize) -> Result<usize, RuntimeError> {
+    let n = arg.map_or(Ok(f64::NAN), super::to_number_throwing)?;
+    if n.is_nan() {
+        return Ok(0);
+    }
+    let n = if n.is_infinite() {
+        if n.is_sign_positive() {
+            len as i64
+        } else {
+            0
+        }
+    } else {
+        n.trunc() as i64
+    };
+    Ok(if n < 0 {
+        ((len as i64) + n).max(0) as usize
+    } else {
+        (n as usize).min(len)
+    })
+}
+
 pub fn string_to_upper(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&obj.to_js_string().to_uppercase()))
+    Ok(Value::string(
+        &super::string_receiver(obj)?.to_uppercase(),
+    ))
 }
 
 pub fn string_to_lower(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&obj.to_js_string().to_lowercase()))
+    Ok(Value::string(
+        &super::string_receiver(obj)?.to_lowercase(),
+    ))
 }
 
 pub fn string_trim(obj: &Value, at_start: bool) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     let trimmed = if at_start {
         s.trim_start_matches(is_js_whitespace)
     } else {
@@ -377,7 +411,7 @@ pub fn string_trim(obj: &Value, at_start: bool) -> Result<Value, RuntimeError> {
 
 /// `String.prototype.trim()` — both ends, with the ES whitespace set.
 pub fn string_trim_both(obj: &Value) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     Ok(Value::string(
         s.trim_start_matches(is_js_whitespace)
             .trim_end_matches(is_js_whitespace),
@@ -389,8 +423,8 @@ pub fn string_trim_both(obj: &Value) -> Result<Value, RuntimeError> {
 /// `pos` indexes *code units*: for a surrogate pair, index `i` yields the whole
 /// code point and `i + 1` yields the trailing surrogate's unit value.
 pub fn string_code_point_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
-    let pos = super::to_integer_or_infinity(args.first());
+    let s = super::string_receiver(obj)?;
+    let pos = super::to_integer_or_infinity_throwing(args.first())?;
     if pos < 0 {
         return Ok(Value::Undefined);
     }
@@ -416,9 +450,9 @@ pub fn string_code_point_at(obj: &Value, args: &[Value]) -> Result<Value, Runtim
 
 /// `String.prototype.at(index)` — code-unit indexed, negative from the end.
 pub fn string_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     let units = s.encode_utf16().count() as i64;
-    let mut index = super::to_integer_or_infinity(args.first());
+    let mut index = super::to_integer_or_infinity_throwing(args.first())?;
     if index < 0 {
         index += units;
     }
@@ -448,10 +482,10 @@ pub fn string_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 /// Only the `form` validation is implemented: the engine bundles no Unicode
 /// normalization tables yet, so a valid form returns the receiver unchanged.
 pub fn string_normalize(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     let form = match args.first() {
         None | Some(Value::Undefined) => "NFC".to_string(),
-        Some(v) => v.to_js_string(),
+        Some(v) => super::to_string_throwing(v)?,
     };
     match form.as_str() {
         "NFC" | "NFD" | "NFKC" | "NFKD" => Ok(Value::string(&s)),
@@ -466,8 +500,11 @@ pub fn string_normalize(obj: &Value, args: &[Value]) -> Result<Value, RuntimeErr
 /// Without ICU the comparison falls back to code-unit order, which matches the
 /// default locale for the ASCII range the conformance suite exercises.
 pub fn string_locale_compare(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
-    let other = args.first().map(|v| v.to_js_string()).unwrap_or_default();
+    let s = super::string_receiver(obj)?;
+    let other = match args.first() {
+        Some(v) => super::to_string_throwing(v)?,
+        None => "undefined".to_string(),
+    };
     let order = s.encode_utf16().cmp(other.encode_utf16());
     Ok(Value::Number(match order {
         std::cmp::Ordering::Less => -1.0,
@@ -477,13 +514,13 @@ pub fn string_locale_compare(obj: &Value, args: &[Value]) -> Result<Value, Runti
 }
 
 pub fn string_split(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     if args.is_empty() {
         return Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
             vec![Value::string(&s)],
         )))));
     }
-    let sep = args[0].to_js_string();
+    let sep = super::to_string_throwing(&args[0])?;
     let parts: Vec<Value> = if sep.is_empty() {
         s.chars().map(|c| Value::string(&c.to_string())).collect()
     } else {
@@ -494,21 +531,42 @@ pub fn string_split(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     )))))
 }
 
+/// `ToInteger` for a `substring` bound: negatives count as 0 (unlike `slice`).
+fn to_substring_bound(n: f64, len: usize) -> usize {
+    if n.is_nan() {
+        return 0;
+    }
+    let n = if n.is_infinite() {
+        if n.is_sign_positive() {
+            len as i64
+        } else {
+            0
+        }
+    } else {
+        n.trunc() as i64
+    };
+    if n < 0 {
+        0
+    } else {
+        (n as usize).min(len)
+    }
+}
+
 pub fn string_substring(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = obj.to_js_string();
+    let s = super::string_receiver(obj)?;
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len();
     let start = if args.is_empty() {
         0
     } else {
-        let n = args[0].to_number() as i64;
-        if n < 0 { 0 } else { (n as usize).min(len) }
+        let n = super::to_number_throwing(&args[0])?;
+        to_substring_bound(n, len)
     };
     let end = if args.len() < 2 {
         len
     } else {
-        let n = args[1].to_number() as i64;
-        if n < 0 { 0 } else { (n as usize).min(len) }
+        let n = super::to_number_throwing(&args[1])?;
+        to_substring_bound(n, len)
     };
     let from = start.min(end);
     let to = start.max(end);

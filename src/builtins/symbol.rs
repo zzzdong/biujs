@@ -55,6 +55,11 @@ pub fn has_instance_symbol_key() -> PropertyKey {
     PropertyKey::Symbol(HAS_INSTANCE_SYMBOL_ID)
 }
 
+/// `Symbol.species` as a property key (ES 19.4.2.13).
+pub fn species_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(SPECIES_SYMBOL_ID)
+}
+
 // ─────────────────────────────────────────────────────────
 // Symbol value registry
 // ─────────────────────────────────────────────────────────

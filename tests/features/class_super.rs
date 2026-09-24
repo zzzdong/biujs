@@ -94,3 +94,94 @@ fn super_within_base_class_reads_object_prototype() {
         true
     );
 }
+
+#[test]
+fn derived_class_needs_super_before_this() {
+    // ES 9.2.2: a derived constructor's `this` is uninitialized until
+    // `super()` runs — returning without it is a ReferenceError.
+    assert_eq!(
+        eval_string(
+            "class Custom extends Error { constructor() {} }
+             var n = 'none';
+             try { new Custom('foo'); } catch (e) { n = e.name; }
+             n"
+        ),
+        "ReferenceError"
+    );
+    // The same error is catchable from an enclosing frame, not just in place.
+    assert_eq!(
+        eval_string(
+            "class Custom extends Error { constructor() {} }
+             function attempt(cb) {
+               try { cb(); return 'no-throw'; } catch (e) { return e.name; }
+             }
+             attempt(function() { new Custom(); })"
+        ),
+        "ReferenceError"
+    );
+    // Touching `this` before `super()` raises too.
+    assert_eq!(
+        eval_string(
+            "class P {}
+             class C extends P { constructor() { this.x = 1; } }
+             var n = 'none';
+             try { new C(); } catch (e) { n = e.name; }
+             n"
+        ),
+        "ReferenceError"
+    );
+}
+
+#[test]
+fn default_derived_constructor_forwards_arguments() {
+    // `class C extends P {}` is `constructor(...args) { super(...args); }`.
+    assert_eq!(
+        eval_number(
+            "class P { constructor(x) { this.x = x; } }
+             class C extends P {}
+             new C(9).x"
+        ),
+        9.0
+    );
+    assert_eq!(
+        eval_number(
+            "class P { constructor(x, y) { this.s = x + y; } }
+             class C extends P {}
+             new C(1, 2).s"
+        ),
+        3.0
+    );
+    // ...and the parent's own initialisation reaches the derived `this`.
+    assert_eq!(
+        eval_string(
+            "class P { constructor() { this.tag = 'p'; } }
+             class C extends P { constructor() { super(); this.own = 'c'; } }
+             var c = new C();
+             c.tag + '/' + c.own"
+        ),
+        "p/c"
+    );
+}
+
+#[test]
+fn super_call_binds_this_in_arrow_bodies() {
+    // An arrow that only calls `super()` must not have to read `this` first.
+    assert_eq!(
+        eval_number(
+            "var count = 0;
+             class A { constructor() { count++; } }
+             class B extends A { constructor() { (() => super())(); } }
+             new B();
+             count"
+        ),
+        1.0
+    );
+    assert_eq!(
+        eval_string(
+            "class P { m() { return 'p'; } }
+             class Q extends P { m() { return 'q>' + (() => super.m())(); } }
+             new Q().m()"
+        ),
+        "q>p"
+    );
+}

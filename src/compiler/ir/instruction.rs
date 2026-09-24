@@ -314,6 +314,15 @@ pub enum Instruction {
     IteratorClose {
         iter: Value,
     },
+    /// `yield expr` / `yield`: suspend the enclosing generator.
+    ///
+    /// `src` is the yielded value (absent means `undefined`). `dst` receives
+    /// the value the *next* `next(v)` call sends back in, so the resume path
+    /// writes it once the frame has been restored.
+    Yield {
+        dst: Value,
+        src: Option<Value>,
+    },
     /// ES ToString: primitives directly; objects via ToPrimitive("string").
     ToString {
         dst: Value,
@@ -553,6 +562,7 @@ impl Instruction {
                 has_next,
             } => (vec![*item, *has_next], vec![*iter]),
             Instruction::IteratorClose { iter } => (vec![], vec![*iter]),
+            Instruction::Yield { dst, src } => (vec![*dst], src.iter().copied().collect()),
             Instruction::ToString { dst, src } => (vec![*dst], vec![*src]),
             Instruction::MakeRest { dst, .. } => (vec![*dst], vec![]),
             Instruction::CallSpread {
@@ -773,6 +783,10 @@ impl std::fmt::Display for Instruction {
             Instruction::IteratorClose { iter } => {
                 write!(f, "iterator_close {iter}")
             }
+            Instruction::Yield { dst, src } => match src {
+                Some(src) => write!(f, "{dst} = yield {src}"),
+                None => write!(f, "{dst} = yield"),
+            },
             Instruction::ToString { dst, src } => {
                 write!(f, "{dst} = to_string {src}")
             }

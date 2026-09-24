@@ -154,7 +154,6 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "class-static-block",
     "cross-realm",
     "dynamic-import",
-    "generators",
     "import.meta",
     "import-assertions",
     "Intl",
@@ -196,7 +195,8 @@ const UNSUPPORTED_PATTERNS: &[&str] = &[
     "Function('",
     "$ERROR",
     "print(",
-    "yield ",
+    // `yield ` used to be listed here while generators were unimplemented; the
+    // subset in §2.1p handles them, so tests exercising `yield` must run.
     "await ",
     "import(",
     "import ",
@@ -204,8 +204,9 @@ const UNSUPPORTED_PATTERNS: &[&str] = &[
     "with (",
     "with(",
     "label:",
+    // `function*` used to be listed here while generators were unimplemented;
+    // the M4-G1 subset handles them, so generator sources must run.
     "=>*",
-    "function*",
     "async ",
 ];
 
@@ -444,6 +445,9 @@ fn run_suite(subdir: &str) -> SuiteResult {
 /// Every test262 subdirectory relevant to biujs's supported feature set.
 const SUITES: &[&str] = &[
     "language/statements/for-of",
+    "language/statements/generators",
+    "language/expressions/generators",
+    "language/expressions/yield",
     "language/statements/for-in",
     "language/destructuring",
     "language/expressions/assignment/destructuring",

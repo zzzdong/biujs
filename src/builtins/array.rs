@@ -120,6 +120,36 @@ pub fn register_array_statics(array_fn: &Value) {
     });
     set_static_method(array_fn, "of", |args| array_constructor(args));
     set_static_method(array_fn, "from", |args| array_from(args));
+    register_species_accessor(array_fn);
+}
+
+/// Native name of the `get Array[Symbol.species]` accessor.
+pub const ARRAY_SPECIES_NATIVE: &str = "__array_species__";
+
+/// ES 22.1.2.5: `Array[Symbol.species]` is an accessor whose getter returns
+/// its receiver (`get [Symbol.species]() { return this; }`).
+///
+/// It is what makes `ArraySpeciesCreate` (VM side) able to tell "no override"
+/// from "inherited default": without it every subclass instance would look like
+/// it had no species and would silently get an `Array` back.
+fn register_species_accessor(array_fn: &Value) {
+    let Value::Object(obj) = array_fn else {
+        return;
+    };
+    let getter = Value::Object(Rc::new(RefCell::new(
+        crate::vm::object::NativeFunctionObject::new(ARRAY_SPECIES_NATIVE),
+    )));
+    let desc = crate::vm::property::PropertyDescriptor {
+        value: Value::Undefined,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+        getter: Some(getter),
+        setter: None,
+    };
+    let _ = obj
+        .borrow_mut()
+        .define_property(super::species_symbol_key(), desc);
 }
 
 /// `Array.prototype.toString()`
@@ -387,11 +417,37 @@ fn generic_delete_range(obj: &Value, from: u64, to: u64, len: u64) -> Result<(),
 
 /// `ToIntegerOrInfinity(arg)` resolved against a length: negatives count from
 /// the end and the result is clamped into `[0, len]` (ES 23.1.3.3 steps 5-9).
-fn relative_index(arg: Option<&Value>, len: u64) -> u64 {
-    let n = super::to_integer_or_infinity(arg);
+///
+/// `ToNumber`'s abrupt completion is propagated, so a `Symbol` argument raises
+/// a TypeError instead of silently reading as `0`.
+fn relative_index(arg: Option<&Value>, len: u64) -> Result<u64, RuntimeError> {
+    let n = super::to_integer_or_infinity_throwing(arg)?;
     let len_i = len.min(i64::MAX as u64) as i64;
     let index = if n < 0 { n.saturating_add(len_i) } else { n };
-    index.clamp(0, len_i) as u64
+    Ok(index.clamp(0, len_i) as u64)
+}
+
+/// `ToNumber(arg)` clamped into `[0, len]` with negatives counting from the end —
+/// the bound shared by `slice` and the `start` of `splice`/`indexOf`.
+fn clamped_index(arg: Option<&Value>, len: usize) -> Result<usize, RuntimeError> {
+    let n = arg.map_or(Ok(f64::NAN), super::to_number_throwing)?;
+    if n.is_nan() {
+        return Ok(0);
+    }
+    let n = if n.is_infinite() {
+        if n.is_sign_positive() {
+            len as i64
+        } else {
+            0
+        }
+    } else {
+        n.trunc() as i64
+    };
+    Ok(if n < 0 {
+        ((len as i64) + n).max(0) as usize
+    } else {
+        (n as usize).min(len)
+    })
 }
 
 /// `IsConcatSpreadable(value)` (ES 23.1.3.1.1): an Array is spread unless
@@ -425,7 +481,7 @@ pub fn array_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(arr) = obj_ref.borrow().as_any().downcast_ref::<ArrayObject>() {
             let len = arr.len() as i64;
-            let n = super::to_integer_or_infinity(args.first());
+            let n = super::to_integer_or_infinity_throwing(args.first())?;
             let index = if n < 0 { n + len } else { n };
             if index < 0 || index >= len {
                 return Ok(Value::Undefined);
@@ -435,7 +491,7 @@ pub fn array_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     }
     to_object(obj)?;
     let len = generic_length(obj);
-    let n = super::to_integer_or_infinity(args.first());
+    let n = super::to_integer_or_infinity_throwing(args.first())?;
     let len_i = len.min(i64::MAX as u64) as i64;
     let index = if n < 0 { n.saturating_add(len_i) } else { n };
     if index < 0 || index >= len_i {
@@ -460,10 +516,10 @@ pub fn array_copy_within(obj: &Value, args: &[Value]) -> Result<Value, RuntimeEr
         generic_length(obj)
     };
 
-    let to = relative_index(args.first(), len);
-    let from = relative_index(args.get(1), len);
+    let to = relative_index(args.first(), len)?;
+    let from = relative_index(args.get(1), len)?;
     let end = match args.get(2) {
-        Some(v) if !v.is_undefined() => relative_index(Some(v), len),
+        Some(v) if !v.is_undefined() => relative_index(Some(v), len)?,
         _ => len,
     };
     // ToLength(2**53) must not be looped over.
@@ -484,10 +540,26 @@ pub fn array_copy_within(obj: &Value, args: &[Value]) -> Result<Value, RuntimeEr
     Ok(obj.clone())
 }
 
+/// ES `Set(O, "length", …, true)` (`Throw` = true) for the real-array fast
+/// paths, which mutate the dense store directly and so skip `[[Set]]`.
+///
+/// `push`/`pop`/`shift`/`unshift` all perform this Set — `pop` and `shift` even
+/// when the array is empty — hence `Object.freeze(a); a.push()` is a TypeError
+/// rather than a silent no-op.
+fn set_length_throwing(array_obj: &ArrayObject) -> Result<(), RuntimeError> {
+    if !array_obj.length_is_writable() {
+        return Err(RuntimeError::TypeError(
+            "Cannot assign to read-only property 'length'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// `Array.prototype.push(...items)` (ES 23.1.3.20).
 pub fn array_push(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
+            set_length_throwing(array_obj)?;
             for arg in args {
                 array_obj.push(arg.clone());
             }
@@ -512,6 +584,9 @@ pub fn array_push(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 pub fn array_pop(obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
+            // Step 3 performs `Set(O, "length", 0, true)` even for an empty
+            // array, so a non-writable length aborts before anything changes.
+            set_length_throwing(array_obj)?;
             return Ok(array_obj.pop());
         }
     }
@@ -534,6 +609,7 @@ pub fn array_pop(obj: &Value) -> Result<Value, RuntimeError> {
 pub fn array_shift(obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
+            set_length_throwing(array_obj)?;
             return Ok(array_obj.shift());
         }
     }
@@ -554,6 +630,7 @@ pub fn array_shift(obj: &Value) -> Result<Value, RuntimeError> {
 pub fn array_unshift(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
+            set_length_throwing(array_obj)?;
             for arg in args.iter().rev() {
                 array_obj.unshift(arg.clone());
             }
@@ -643,7 +720,7 @@ pub fn array_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError
                 let from = if args.len() < 2 {
                     0
                 } else {
-                    args[1].to_number() as usize
+                    clamped_index(Some(&args[1]), array_obj.len())?
                 };
                 Ok(Value::Number(array_obj.index_of(&args[0], from) as f64))
             } else {
@@ -683,7 +760,7 @@ pub fn array_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, Runtime
             }
             let from = match args.get(1) {
                 Some(v) => {
-                    let n = v.to_number();
+                    let n = super::to_number_throwing(v)?;
                     if n.is_nan() {
                         0
                     } else {
@@ -715,21 +792,21 @@ pub fn array_fill(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
         if let Some(array_obj) = arr.as_any_mut().downcast_mut::<ArrayObject>() {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             let len = array_obj.len();
-            let resolve = |arg: Option<&Value>, default: usize| -> usize {
+            let resolve = |arg: Option<&Value>, default: usize| -> Result<usize, RuntimeError> {
                 match arg {
                     Some(v) => {
-                        let n = v.to_number();
-                        if n < 0.0 {
+                        let n = super::to_number_throwing(v)?;
+                        Ok(if n < 0.0 {
                             ((len as f64) + n).max(0.0) as usize
                         } else {
                             (n as usize).min(len)
-                        }
+                        })
                     }
-                    None => default,
+                    None => Ok(default),
                 }
             };
-            let start = resolve(args.get(1), 0);
-            let end = resolve(args.get(2), len);
+            let start = resolve(args.get(1), 0)?;
+            let end = resolve(args.get(2), len)?;
             for i in start..end {
                 if let Some(slot) = array_obj.get_mut(i) {
                     *slot = value.clone();
@@ -741,9 +818,9 @@ pub fn array_fill(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     to_object(obj)?;
     let len = generic_length(obj);
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let start = relative_index(args.get(1), len);
+    let start = relative_index(args.get(1), len)?;
     let end = match args.get(2) {
-        Some(v) if !v.is_undefined() => relative_index(Some(v), len),
+        Some(v) if !v.is_undefined() => relative_index(Some(v), len)?,
         _ => len,
     };
     if end.saturating_sub(start) > MAX_GENERIC_ELEMENTS {
@@ -816,25 +893,11 @@ pub fn array_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
         let arr = obj_ref.borrow();
         if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
             let len = array_obj.len();
-            let start = if args.is_empty() {
-                0
-            } else {
-                let n = args[0].to_number() as i64;
-                if n < 0 {
-                    ((len as i64) + n).max(0) as usize
-                } else {
-                    (n as usize).min(len)
-                }
-            };
+            let start = clamped_index(args.first(), len)?;
             let end = if args.len() < 2 {
                 len
             } else {
-                let n = args[1].to_number() as i64;
-                if n < 0 {
-                    ((len as i64) + n).max(0) as usize
-                } else {
-                    (n as usize).min(len)
-                }
+                clamped_index(args.get(1), len)?
             };
             let sliced = array_obj.slice(start, end);
             return Ok(Value::Object(Rc::new(RefCell::new(sliced))));
@@ -842,9 +905,9 @@ pub fn array_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     }
     to_object(obj)?;
     let len = generic_length(obj);
-    let start = relative_index(args.first(), len);
+    let start = relative_index(args.first(), len)?;
     let end = match args.get(1) {
-        Some(v) if !v.is_undefined() => relative_index(Some(v), len),
+        Some(v) if !v.is_undefined() => relative_index(Some(v), len)?,
         _ => len,
     };
     let count = end.saturating_sub(start);
@@ -900,16 +963,7 @@ pub fn array_splice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
         let mut arr = obj_ref.borrow_mut();
         if let Some(array_obj) = arr.as_any_mut().downcast_mut::<ArrayObject>() {
             let len = array_obj.len();
-            let start = if args.is_empty() {
-                0
-            } else {
-                let n = args[0].to_number() as i64;
-                if n < 0 {
-                    ((len as i64) + n).max(0) as usize
-                } else {
-                    (n as usize).min(len)
-                }
-            };
+            let start = clamped_index(args.first(), len)?;
             // Step 5 of ES 23.1.3.28: with no arguments at all `start` is not
             // present, so nothing is deleted (only `splice(start)` deletes the
             // range `len - start`).
@@ -918,7 +972,15 @@ pub fn array_splice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
             } else if args.len() < 2 || args[1].is_undefined() {
                 len - start
             } else {
-                (args[1].to_number() as usize).min(len - start)
+                let n = super::to_number_throwing(&args[1])?;
+                let n = if n.is_nan() || n < 0.0 {
+                    0usize
+                } else if n.is_infinite() {
+                    len - start
+                } else {
+                    n.trunc() as usize
+                };
+                n.min(len - start)
             };
             let insert_items: Vec<Value> = if args.len() > 2 {
                 args[2..].to_vec()
@@ -934,7 +996,7 @@ pub fn array_splice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
 
     to_object(obj)?;
     let len = generic_length(obj);
-    let start = relative_index(args.first(), len);
+    let start = relative_index(args.first(), len)?;
     let delete_count = if args.is_empty() {
         // `splice()` with no arguments: `start` is not present, so nothing is
         // removed (ES 23.1.3.28 step 5).
@@ -943,7 +1005,7 @@ pub fn array_splice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
         match args.get(1) {
             None | Some(Value::Undefined) => len - start,
             Some(v) => {
-                let n = super::to_integer_or_infinity(Some(v));
+                let n = super::to_integer_or_infinity_throwing(Some(v))?;
                 n.max(0).min((len - start) as i64) as u64
             }
         }

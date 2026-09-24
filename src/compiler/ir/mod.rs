@@ -30,6 +30,13 @@ pub struct FuncSignature {
     /// first one with an initializer or rest element. Exposed as `fn.length`,
     /// which is *not* the same as `params.len()`.
     pub arity: usize,
+    /// `function*`. A call to such a function does not push a frame: it builds
+    /// a generator object whose body runs one `yield` at a time (ES 25.4).
+    pub is_generator: bool,
+    /// Constructor of a class with an `extends` clause (ES 9.2.2
+    /// `[[ConstructorKind]] = derived`): its `this` is uninitialized until
+    /// `super()` binds it.
+    pub is_derived_ctor: bool,
 }
 impl FuncSignature {
     pub fn new(name: impl Into<Name>, params: Vec<FuncParam>) -> Self {
@@ -38,6 +45,8 @@ impl FuncSignature {
             name: name.into(),
             params,
             arity,
+            is_generator: false,
+            is_derived_ctor: false,
         }
     }
 
@@ -47,7 +56,21 @@ impl FuncSignature {
             name: name.into(),
             params,
             arity,
+            is_generator: false,
+            is_derived_ctor: false,
         }
+    }
+
+    /// Mark the function as a generator (`function*`).
+    pub fn as_generator(mut self) -> Self {
+        self.is_generator = true;
+        self
+    }
+
+    /// Mark the function as a derived-class constructor.
+    pub fn as_derived_ctor(mut self) -> Self {
+        self.is_derived_ctor = true;
+        self
     }
 }
 

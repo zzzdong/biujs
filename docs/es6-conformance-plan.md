@@ -385,7 +385,9 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 **未采纳的尝试（记录以免重复踩坑）**：把 runner 的跳过表按"范围外（ES2019+ / Annex B / RegExp 依赖）/ 未实现 / 架构排除"三组扩容后，失败数 2949 → 2554、通过率升到 74.34%，**但通过绝对数从 7416 掉到 7401** —— `Symbol.match`/`Symbol.replace`/`Array.prototype.flat`/`Object.fromEntries`/`__proto__` 这类标签会连带跳过少量**本来通过**的用例（这些 well-known symbol 与部分 Annex B 形态已实现）。按 §2.1 的 KPI 约定（通过绝对数为主指标）已回退该改动；今后扩容跳过表需逐标签核验"是否会跳过已通过用例"。
 
-**下轮建议顺序**：B2 泛型收尾（约 70 例，最集中的剩余项）→ B6 `JSON.parse/stringify`（165 例未启用，且 35 例 `Function/prototype/toString` 依赖 JSON）→ 参数/接收者类型校验的成体系补强（294 例的最大桶）→ M4 生成器、M5 `Map`/`Set`。
+**下轮建议顺序**：B2 泛型收尾（约 70 例）→ B6 `JSON.parse/stringify`（165 例）→ 参数/接收者类型校验的成体系补强（294 例的最大桶）→ M4 生成器、M5 `Map`/`Set`。
+
+> **进度更新（2026-09-23）**：前三步已全部交付（B2 三批见 §2.1l、JSON 见 §2.1m、类型校验见 §2.1n），并在 M3 内部把当时识别出的最高 ROI 一处也做掉了（`ArraySpeciesCreate`，ES6 核心 —— 见 §2.1o）。全量 6021 → **7785**，通过率 58.09% → **73.78%**。下一步按原顺序进入 **M4 生成器**（跳过池最大单项，4061 例）。若要继续在 M3 内部刮：剩下最大的一块是 ES2019+ 缺失方法（`flat`/`flatMap` 18+4、`Object.fromEntries` 24、`findLast*` 42、change-array-by-copy 62），但它们都在 §1.2 的范围外清单里。
 
 ### 2.1l M3-B2 三批：Array 泛型（类数组）路径收尾（2026-09-22）
 
@@ -465,6 +467,202 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 **残留**：`built-ins/JSON` 仅 2 例失败——`prop-desc.js`（`verifyProperty(this, "JSON", …)` 依赖顶层 `this` 是全局对象，与"strict only"目标冲突）、`stringify/value-tojson-not-function.js`（用 `/re/` 正则字面量，RegExp 范围外）。51 例跳过中，`json-parse-with-source`/`well-formed-json-stringify` 为 ES2025，其余为 `Proxy`/`BigInt`/`Reflect.construct`/`cross-realm`。
 
+### 2.1n M3-B7：抽象操作的错误语义（2026-09-23）
+
+**起点**：通过 7677 / 10552（72.75%）。§2.1k 把"参数/接收者类型校验的成体系补强"排在 B2 泛型收尾与 JSON 之后，理由是失败原因聚合里 `Expected a TypeError to be thrown` 以 **291 例**成为最大单项（其次才是 Uint8Array 88、`Cannot convert undefined or null to object` 87）。
+
+**根因**（291 例按强制转换语义归拢后是四个共性问题，而不是 291 个独立缺陷）：
+
+1. `Value::to_number` / `Value::to_js_string` 是**全函数**：无论如何都产出一个值，因为它们的使用方（`array_join`、`ToString` 操作码、诊断格式化）没有 `Result` 通道。而规范里 `? ToNumber(x)` / `? ToString(x)` 是**可能中断**的 —— `ToNumber(Symbol)`、`ToString(Symbol)` 都是 TypeError。缺了这条通道，`[].copyWithin(0, Symbol())` 静默读成 `0`、`String.prototype.trim.call(Symbol())` 安静返回。这正是 §2.3 已登记的 `ToString(Symbol)` 老债。
+2. 内置方法的接收者缺少 `RequireObjectCoercible`：`String.prototype.X.call(undefined)` 走到了 `to_js_string()`、产出 `"[object Object]"` 之类的噪声而不是 TypeError。`Object.prototype.valueOf/hasOwnProperty/propertyIsEnumerable/isPrototypeOf/toLocaleString` 与 `Object.hasOwn` 同样不加校验地返回 `false`/原值。
+3. Array **快路径绕过 `[[Set]]`**：`ArrayObject` 直接改 `Vec`，于是 `Object.freeze(a); a.push()`、`Object.defineProperty(a,'length',{writable:false}); a.pop()` 都静默成功；而规范里这四个方法都以 `? Set(O,"length",…,true)` 收尾，必须抛 TypeError。
+4. `set_member` 对"无处安放的赋值"静默 no-op —— 非可写属性、无 setter 的访问器、原始值的属性。§2.3 记为"引擎不追踪 strict 来源"，但 G1 已经写明引擎是 strict-only（§1.1 的硬约束 1），所以那句注释本身就是错的方向。
+
+**交付**：
+
+1. `src/builtins/mod.rs` 新增抽象操作的**抛错通道**（与全函数版并存，不改动后者的任何调用方）：
+   - `require_object_coercible`（ES 7.2.1）、`to_string_throwing`、`to_number_throwing`；
+   - `string_receiver` —— String 原型方法共用的开场（RequireObjectCoercible + ToString）；
+   - `to_integer_or_infinity_throwing` / `to_length_throwing`（底层 `to_integer_or_infinity_from` / `to_length_from` 与全函数版共用，避免两套截断逻辑漂移）。
+2. String 原型（全部 24 个方法）的接收者一律经 `string_receiver`，参数按规范取对应通道：`searchString` → ToString、`position`/`index` → ToInteger/ToNumber、`padEnd` 的 fill 串 → ToString。新增两个私有辅助 `position_arg`（码元位置，`charAt`/`charCodeAt`）、`slice_bound` / `to_substring_bound`（`slice` 负数从尾部算、`substring` 负数按 0）。
+3. Object 侧接收者校验：`hasOwnProperty` / `isPrototypeOf` / `propertyIsEnumerable` / `toLocaleString` / `valueOf` 前置 `RequireObjectCoercible`；`Object.hasOwn` 改为先 `ToObject(O)`（顺带补上符号键走 `ToPropertyKey`）。注意 `Object.prototype.toString` **不**加校验 —— 它按规范对 `undefined`/`null` 返回 `[[object Undefined]]`/`[[object Null]]`，是唯一例外。
+4. Array 侧参数校验：新增 `relative_index`（已存在，改为传播 ToNumber 的中断）、`clamped_index`；`at` / `copyWithin` / `fill` / `slice` / `splice` / `indexOf` / `lastIndexOf` 全部接上。VM 内的 `array_index_of`（`indexOf`/`lastIndexOf` 的类数组版）一并改为 `Result`，用同一套 `to_integer_or_infinity_throwing`。
+5. `ArrayObject::length_is_writable()`（`length_writable && !frozen`）+ `array.rs` 的 `set_length_throwing`，打在 `push`/`pop`/`shift`/`unshift` 四条快路径的**入口** —— 规范里这四个方法无论如何都会做那次 `Set(O,"length",…,true)`。
+6. `set_member`（G1 strict-only）：非可写属性、只有 getter 的访问器、原始值上的属性都改为抛 TypeError，错误信息带属性名。
+
+**效果**（逐套件实测，无一套件下降）：
+
+| 套件 | 起点（§2.1m 后） | 本批后 | 变化 |
+|------|------------------|--------|------|
+| `built-ins/String` | 564 | **606** | +42 |
+| `built-ins/Object` | 2597 | **2612** | +15 |
+| `built-ins/Array` | 1903 | **1917** | +14 |
+
+**全量复测**：通过 **7677 → 7756**（+79），失败 2875 → 2796，通过率 72.75% → **73.50%**；单元 190 全绿；features 359 → 366 通过（新增 `tests/features/coercion_errors.rs` 7 个用例 / 32 条断言）。失败原因里那条 291 例的 `Expected a TypeError to be thrown` 降到 **244**。
+
+**过程记录**：`Object.freeze(a); a.push()` 的处置比预想细 —— 检查必须落在方法**入口**而不是末尾。`shift/set-length-array-is-frozen.js` 是在 `Array.prototype[0]` 的 getter 里冻结数组的：若把检查放在末尾，那时 `length` 已被改成 0，用例后半段的 `assert.sameValue(array.length, 1)` 就崩了；放在入口则只有"getter 未被调用"这一半失败（`arrayPrototypeGet0Calls` 为 0），状态断言是对的。真正补齐那一半需要让索引读写走原型链，见残留。
+
+**残留**（全部登记进 §2.3）：
+
+- `push`/`pop`/`shift`/`unshift` 的另 8 例（`*-is-frozen` 系列里靠原型链 getter/setter 冻结的那些）仍未解决：它们要求索引的读写经原型链执行访问器，而 builtin 层无法调用用户 getter —— 与 §2.3 的"Array 泛型路径不执行访问器"、"按名派发忽略属性归属"同源，需把这组方法上移到 VM，属跨层改动。
+- ~~`ArraySpeciesCreate` 缺失~~：已在本会话的下一批解决，见 §2.1o。
+- 引擎内部（模板插值、`String(x)` 的隐式转换、`Value::to_js_string` 的其余调用方）仍是全函数语义：`ToString(Symbol)` 的完整修复需要给这些路径也铺 `Result` 通道，留到 M6。
+
+### 2.1o M3-B7 二批：`ArraySpeciesCreate` 与结果对象写入（2026-09-23）
+
+**起点**：通过 7756 / 10552（73.50%）。§2.1n 收尾时列出的残留里，`ArraySpeciesCreate` 缺失是唯一**属于 ES6 核心**、且带 test262 用例簇可测的一项（`Symbol.species` 是 §1.2 "在范围" 清单里的 well-known symbol）。失效规模：`built-ins/Array` 下凡提到 `Symbol.species` 的用例有 **43 例失败**。
+
+**根因**：
+
+1. `Array[Symbol.species]` 这个 well-known 访问器本身没有注册（`built-ins/Array/Symbol.species/{symbol-species,return-value,length,symbol-species-name}.js` 全失败）。它不是装饰品 —— 它决定了"子类默认继承 species"能否被观察到，也决定了引擎能不能把"默认路径"和"有覆写"分开。
+2. `ArraySpeciesCreate(O, len)` 完全没实现。`map`/`filter`/`slice`/`splice`/`concat` 规范上都是以 `A = ? ArraySpeciesCreate(O, len)` 起手的，但本引擎这五个方法都直接返回新建的 `ArrayObject`，于是：物种构造器不被调用（`create-species.js`）、取值不抛错（`create-species-poisoned.js`）、结果对象上的写入失败被吞掉（`target-array-non-extensible.js`）。
+3. 两个 `Get`（`O.constructor`、`C[@@species]`）与最后的 `Construct` 都可能跑用户代码，builtin 层没有 `Construct` 也没有可重入的 `[[Get]]` —— 这决定了这套东西**只能落在 VM 侧**，和当年把回调方法组上移是同一个道理。
+
+**交付**：
+
+1. `register_species_accessor`：`Array` 构造器上注册 `Symbol.species` 访问器（getter 返回接收者，`{enumerable:false, configurable:true}`）；原生名 `__array_species__`，在 `NativeFunctionObject::install_metadata` 里补上展示名映射，所以 `Array[Symbol.species].get.name === "get [Symbol.species]"`。
+2. `VM::array_species_create`（ES 9.4.2.3）：`Get(O,"constructor")` → 仅当是对象才 `Get(C,@@species)`，`null`/`undefined` 回落到普通数组，`? Construct(C, «len»)`，非构造器 → TypeError。返回 `Option<Value>`：`None` = 走原来的 `ArrayCreate` 路径。
+3. **`SameValue(C, %Array%)` 短路**：`Array[Symbol.species]` 返回自身，所以默认情况下 species 会绕回 `Array`；先比较原生名再决定是否 `Construct`，避免每一次 `slice` 都白白穿一次构造流程。
+4. `map`/`filter` 接入（VM 本来就在 VM 侧实现这两个）。`map` 改为先做回调再按 `Some/None` 两路写结果；默认路径的洞保留语义不变 —— 原先靠 `entries` 顺序线性推导，现在改成显式记录缺席索引，两种写法等价。
+5. `slice`/`splice`/`concat` 经新增的 `try_array_species_method` 接入：只在"确实有 species 覆写"时才接管 —— 先用 builtin 算出普通结果（对接收者的副作用与原先逐字一致），再把存在的索引逐个 `CreateDataPropertyOrThrow` 写进目标对象。没有覆写时一律返回 `Ok(None)`，路径完全不变。
+6. `CreateDataPropertyOrThrow` 复用 §2.1n 新修的 `set_member`（strict-only 语义）：目标不可扩展 / 属性不可写 / 不可配置时抛 TypeError。
+
+**效果**（逐套件实测，无一套件下降）：
+
+| 套件 | 起点（§2.1n 后） | 本批后 | 变化 |
+|------|------------------|--------|------|
+| `built-ins/Array` | 1917 | **1946** | +29 |
+
+**全量复测**：通过 **7756 → 7785**（+29），失败 2796 → 2767，通过率 73.50% → **73.78%**；单元 190 全绿；features 366 → 374 通过（新增 `tests/features/array_species.rs` 8 个用例 / 24 条断言）。
+
+**验证方式**：species 语义是"错误时序敏感"的 —— 物种查找必须发生在算法之前（回调一次都不许跑）。写了 8 条 feature 用例专门钉这件事（毒化 getter、`null` 回落、非数组接收者不查 species、非构造器 TypeError、目标不可扩展时四个方法都抛、以及默认路径的洞保留）。
+
+**残留**：
+
+- `flat`/`flatMap`（ES2019）未实现，它们的 species 用例自然也还失败；`findLast`/`findLastIndex`、`toSorted`/`toReversed`/`toSpliced` 同属 ES2023 范围外。
+- `Array/Symbol.species/length.js` 与 `return-value.js` 仍失败：前者要 `get.length === 0` 经 arity 表（部分），后者依赖 §2.3 已登记的 getter 接收者/覆盖语义长尾。
+- `Symbol/species/basic.js` 等三个符号层面用例报"descriptor should not be configurable" —— 是 well-known symbol 的属性描述符（不应可配置）还没纠正。
+
+### 2.1p M4-G1：`function*` / `yield` 子集（2026-09-23）
+
+**起点**：通过 7785 / 10552（73.78%）。按 §2.1k 的顺序，M3 的三步（B2 泛型收尾、JSON、类型校验）与 M3 内部最高 ROI 的 species 都已交付，进入 **M4 生成器** —— 跳过池最大单项（§3.2 记 4061 例，实际两个目录 556 例 + 散落在已启用套件里的 `yield` 用例）。
+
+**为什么这一批能落下来**：§4 把 M4 标成"本项目迄今最大的运行时改动"，但实际上**不需要新的帧表示**。事前摸清的三件事决定了方案：
+
+1. 一个 JS 帧在数据栈上就是一段连续区间：实参在 `[rbp-argc, rbp)`、局部在 `[rbp+0 …]`、`rsp` 之上是表达式临时值（codegen 的 `store_args` → `PushC Rbp` → `CallEx` → 序言 `AddC rsp, stack_size`，收尾 `MovC Rsp, Rbp` + `PopC Rbp` + `SubC Rsp, argc`）。**挂起 = 把 `[rbp-argc, rsp)` 拷出来，恢复 = 拷回去**，函数体怎么编译完全不变。
+2. `invoke_with_new_target` 已经在用 `while self.step(module)? {}` 驱动嵌套帧，并以 `module.instructions.len()` 作哨兵返回地址 —— "跑到这一帧结束"这条缝是现成的。
+3. `step` 在 `pc` 越过指令表末尾时返回 `false`。所以 `Yield` 只要 `jump(instructions.len())`，嵌套循环就停了，与 `Ret` 落到哨兵完全同构。
+
+**交付**：
+
+1. 编译器：`FuncSignature` 增加 `is_generator`（`as_generator()`），`function*` 经 `lower_function_inner` 的新参数一路传到 `Module.generators`；`Expression::YieldExpression`（非 `delegate`）降级为新的 IR `Instruction::Yield { dst, src }`；codegen 发射 `Opcode::Yield`（无操作数时以 `Immd(-1)` 占位）；SSA 重命名补上该指令。
+2. `src/vm/object.rs`：`GeneratorObject`（`ObjectKind::Generator`）+ `SuspendedFrame`。`next` 与 `[Symbol.iterator]` 是 `__gen_next__<id>` / `__gen_iterator__<id>` 两个原生（走 `call_native_by_name`），因为恢复函数体需要 VM。
+3. `src/vm/mod.rs`：
+   - `create_generator`：调用 `function*` 只造对象，不跑函数体（拦截在 `Opcode::CallEx` 的 `Value::Function(id)` 分支）；
+   - `generator_next`：保存调用方上下文 → 装帧（首次推实参 / 之后拷回帧区间，并把 `next(v)` 的 `v` 写进挂起那条 `Yield` 的目的操作数）→ 嵌套循环 → 若挂起则把帧摘出来 → 恢复调用方上下文 → 返回 `{value, done}`；
+   - `Opcode::Yield`：记下产出值、**记下自己的 `pc`**，然后跳到指令表末尾；
+   - `SavedExecutionState` 抽出 `invoke` 的那套保存清单，并**额外保存 19 个寄存器** —— 寄存器文件是全局的，不跟着帧走，嵌套运行会把调用方还在用的值冲掉（`[it.next().done, it.next().done]` 里的数组字面量就是这么丢的）。
+4. runner：`generators` 从 `UNSUPPORTED_FEATURES` 移除，`UNSUPPORTED_PATTERNS` 里的 `"function*"` 与 `"yield "` 一并删除，`SUITES` 新增 `language/statements/generators` 与 `language/expressions/generators`。
+5. 顺带修掉一处既有栈扩容缺陷：`State::push` 只按"翻倍"扩容，而函数序言的 `AddC rsp, stack_size` 可以一步把 `rsp` 推过当前容量（生成器用例触发了 `index out of bounds: len is 1024 but the index is 3605`）；改为同时覆盖 `rsp + 1`。
+
+**效果**：
+
+| 套件 | 之前 | 本批后 |
+|------|------|--------|
+| `language/statements/generators` | 未执行 | **19** 通过 / 13 失败 / 234 跳过 |
+| `language/expressions/generators` | 未执行 | **16** 通过 / 18 失败 / 256 跳过 |
+| 全量 | 7785 / 10552（73.78%） | **7897 / 10768**（73.34%） |
+
+两个生成器目录的通过率 **35/66 ≈ 53%**，达到 §4 的"解锁后 ≥ 40%"标准（不需要动用子集阶段的 25% 放宽）。分母 +216、失败 +104 是解锁的必然代价 —— 通过**绝对数 +112** 才是主指标（§2.1 KPI 约定）。单元 190 全绿；features 374 → 383 通过（新增 `tests/features/generators.rs` 9 个用例 / 30 条断言）。
+
+**踩过的坑（记下来免得重踩）**：
+
+- 一开始把 `save_execution_state()` 放在装帧**之后**，于是 `saved` 里已经含了生成器自己的帧，恢复后那些记录永远留在栈上 → 后续所有表达式读到的都是垃圾（连 `123` 都返回 `[object Object]`）。必须像 `invoke` 那样在推任何东西之前保存。
+- 挂起时 `pc` 已经是哨兵了：先 `jump` 再读 `self.state.pc` 拿到的是指令表末尾，恢复后从错的地方继续。改为在 `Yield` 里先记 `generator_yield_pc`。
+- `yield` 表达式的值属于**下一次** `next(v)`，而 `Yield` 指令恢复后不会再执行，所以写值只能放在恢复路径（从 `instructions[frame.pc]` 读出目的操作数，用恢复后的 `rbp` 定位）。
+
+**本子集不覆盖（M4 后续）**：`yield*`；`gen.return()` / `gen.throw()`；`try` 内的 `yield`（`SuspendedFrame` 故意不带 SEH 记录，带异常处理器的生成器体跨挂起不可靠）；生成器作为构造器；`Generator.prototype` / `%IteratorPrototype%` 原型链与 `next.length`/`name` 元数据。
+
+### 2.1q M4-G2/G3：`yield*`、生成器函数对象、迭代完成值（2026-09-23）
+
+**起点**：通过 7897 / 10768（73.34%），两个生成器目录 35 通过 / 27 失败。§2.1p 交付后剩下的失败**基本不是恢复机制的问题** —— 把它们按名字摊开看，是三件独立的事：
+
+1. 生成器**函数对象**的表面：`prototype` / `instanceof` / 不可 `new` / `arguments`（`default-proto.js`、`prototype-value.js`、`has-instance.js`、`invoke-as-constructor.js`、`arguments-*`）。
+2. **`yield*`**（G2）完全没做 —— 而 §2.1p 里它连降级都没接（只处理了 `delegate: false`）。
+3. 迭代器的**完成值**在 `done` 时被丢掉，于是 `yield*` 拿不到委托方的 `return` 值。
+
+**交付**：
+
+1. 生成器实例继承 `g.prototype`（ES 14.4.11 / 9.1.13 的 `GetPrototypeFromConstructor`）：`create_generator` 读函数对象的 `prototype` 属性，是对象就设为实例的原型。`instanceof` 与挂在 `g.prototype` 上的方法随之可用。
+2. `function*` 不可构造：`Opcode::New` 在解析出 `func_id` 后先查 `Module.generators`，命中即抛 TypeError。
+3. **`yield*` 用脱糖实现，而不是新增指令**。规范里 `yield*` 不是单条指令能表达的：下一次 `next(v)` 的 `v` 要送进**委托迭代器**的 `next`，这本身是个循环。降级成
+   ```text
+   iter = GetIterator(expr); sent = undefined
+   cond: step = iter.next(sent); if (step.done) → done
+   body: sent = yield step.value → cond
+   done: result = step.value; IteratorClose(iter) → after
+   ```
+   全程只用既有的 `MakeIterator` / `CallMethod` / `GetProperty` / `Yield` / `IteratorClose`。`sent = yield …` 这一句正是"送进去"的通道：外层 `next(v)` 给的就是委托方 `next` 该看到的实参。
+4. `iterator_next` 不再把 `done` 时的 `value` 丢掉。原先 `if done { return Ok((Undefined, true)) }`，于是 `function* i(){ return "R" }` 的 `yield* i()` 只能拿到 `undefined`。`IterateNext` 的调用方只在 `has_next` 为真时用 `item`，不受影响。
+5. 原生迭代器的 `next(v)` 转发实参 —— 原来 `iterator_next` 内部是 `invoke(&next, iterator, &[])`，实参被吞掉，这是第 3 条能真正生效的前提。
+6. `SuspendedFrame` 带上 19 个寄存器槽。§2.1p 只围绕嵌套循环保存/恢复了**调用方**的寄存器，但生成器**自己**在 `yield` 时握在寄存器里的值同样会被下一次嵌套运行冲掉 —— 有了它，"寄存器里的值跨 `yield`"这一整类隐患才真正关掉。
+
+**效果**：
+
+| 套件 | §2.1p 后 | 本批后 | 变化 |
+|------|----------|--------|------|
+| `language/expressions/yield` | 未启用 | **28** 通过 / 29 失败 | +28 |
+| `language/statements/for-of` | 24 | **50** | +26 |
+| `language/statements/generators` | 19 | **21** | +2 |
+| `language/expressions/generators` | 16 | **18** | +2 |
+| 全量 | 7897 / 10768（73.34%） | **7933 / 10825**（73.28%） | +36 |
+
+单元 190 全绿；features 383 → 389 通过（新增 6 个生成器用例 / 15 条断言，`tests/features/generators.rs` 合计 15 个用例）。
+
+**过程记录**：`yield*` 打通后 `sent` 仍然传不过去，先怀疑 SSA 的跨块 phi，导出字节码看才发现脱糖的 CFG 是对的 —— 真正断在原生 `next` 的 `&[]`。**先导出字节码再猜**，比反过来省事得多（§6.1 的三级验证又一次成立）。
+
+**残留**：`gen.return()` / `gen.throw()`；`try` 内的 `yield`（`SuspendedFrame` 仍不带 SEH 记录）；`default-proto.js` 一类需要 `%GeneratorFunction.prototype%` / `%GeneratorPrototype%` 真实原型链的用例；`arguments`、`restricted-properties`、`scope-*` 等与生成器无关的长尾。
+
+### 2.1r 派生构造器的 `this` 绑定（`class C extends P`）（2026-09-23）
+
+**起点**：通过 7933 / 10825（73.28%）。生成器告一段落后回到失败池里最大的一簇：`language/statements/class` 147 例失败，其中 `subclass/builtin-objects/*/super-must-be-called.js` 是整齐的一家人（12 例，覆盖 Array/Boolean/Error/Function/GeneratorFunction/Number/String 等）。它们长这样：
+
+```js
+class CustomError extends Error { constructor() {} }
+assert.throws(ReferenceError, function() { new CustomError('foo'); });
+```
+
+也就是 ES 9.2.2 的 `[[ConstructorKind]] = derived`：派生构造器的 `this` 绑定存在但**未初始化**，只有 `super()` 能绑定它（`BindThisValue`）；在此之前读 `this`、或从构造器返回（隐式返回 `this`）都要抛 ReferenceError。本引擎原先直接把 `Opcode::New` 预先造好的对象当 `this`，从未区分过。
+
+**交付**：
+
+1. 编译器：新增 `FuncSignature::is_derived_ctor`（`as_derived_ctor()`），由 `lower_class` 在 `class.super_class.is_some()` 时打标；`Module.derived_ctors` 随模块下发（与 `generators` 同一套机制）。
+2. VM：`State::this_uninitialized` —— 与 `this_stack` 平行的布尔栈，`enter_frame` 压 `false`，未被 `super()` 绑定的派生构造器帧压 `true`。
+   - `Opcode::New` 建帧后按 `Module.derived_ctors` 调 `mark_this_uninitialized()`；
+   - `Opcode::CallSuperSpread`（全部 `super(...)` 都走这一条）**在调用之前**清除最内层那个 `true`；
+   - `Opcode::LoadThis` 命中未初始化即抛；
+   - `Opcode::Ret` 在构造帧返回时若仍是未初始化则抛，且**经 `as_js_exception` + `handle_throw`** 走 SEH —— 否则 `assert.throws(ReferenceError, …)` 看不到它，只会让整个程序中断。
+3. `super()` 的接收者改为取**当前帧的 `this`**，不再由降级 emit 一条 `load_this`。原因很实际：派生构造器里 `load_this` 会在 `super()` 之前执行（那条值只是喂给 `super` 的接收者），一读就抛。箭头函数捕获 `this` 同理 —— `MakeArrowFuncObj` 改为从帧取，于是 `constructor() { (() => super())(); }` 这种（test262 的 `derived-class-return-override-catch-super-arrow.js` 形态）不再被迫提前读 `this`。
+4. 顺带修掉一个既有缺陷：**默认派生构造器什么都不做**。原来是 `constructor() { return; }`，`class C extends P {}` 根本不会调用父类；现在是 `constructor(...args) { super(...args); }`（ES 14.5.15）。
+
+**踩到的两个坑**（都在"栈要配套"上，值得单列）：
+
+- `unwind_frames_to` 截断了 `this_stack` / `frame_argc` 却没有截断新加的 `this_uninitialized`。结果是异常展开后残留一个 `true`，**后面任意一个 `Ret`** 都会再抛一次 —— 表现为"错误在顶层 try 里能抓到，一旦 try 在被调用的函数里就逃逸"。同类问题在 §2.1p 已经出现过一次（那时是控制栈没配对）。
+- `Ret` 分支里直接 `return Err(...)` 不会经过 SEH 路由（`step` 只对 `run_instruction` 的返回做 `as_js_exception`），异常因此不可捕获。任何"以 JS 异常形式暴露"的规范错误都必须过 `handle_throw`。
+
+**效果**：
+
+| 套件 | §2.1q 后 | 本批后 | 变化 |
+|------|----------|--------|------|
+| `language/statements/class` | 80 | **92** | +12 |
+| 全量 | 7933 / 10825（73.28%） | **7949 / 10825**（73.43%） | +16 |
+
+单元 190 全绿；features 389 → 392 通过（新增 3 个用例 / 8 条断言，挂在 `tests/features/class_super.rs`）。
+
+**提交说明（偏离记录）**：§2.1n ~ §2.1r 这五批落在同一批文件里（`src/vm/mod.rs`、`src/compiler/lowering/mod.rs`、`src/builtins/mod.rs` 每批都改，且彼此不构成可独立编译的切片），因此合并为**一个提交**（见 `git log`），而不是 §4 完成标准里的"每个 B 任务独立提交"。五批的起止数据仍按批分别记录在上面各自的小节里。
+
+**残留**：`super-must-be-called` 里 ArrayBuffer / DataView / Map / Promise / Set 那几例是"父类本身未实现"，不是这条语义的问题。`class C extends Error {}` 仍拿不到 `message`/`name`，`class C extends Array` 也仍不会把元素装进派生实例 —— 那是下一块：**内置构造器作父类时，`super()` 要用 `new.target.prototype` 建对象并把初始化写到派生 `this` 上**（`regular-subclassing.js`、`message-property-assignment.js` 等约 20 例）。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -509,8 +707,8 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 | Tagged template 未实现（tag 不调用） | `tag\`\`` 用例 | 计划 M2' 补：strings 数组 + tag 调用 |
 | 慢：内置方法多经 `invoke` 派发 | 全量 ~数分钟（高负载机器上更久） | 建性能护栏 |
 | **按名派发忽略属性归属** | `call_prototype_method(this, name)` 只按方法名分派、不看该方法实际来自哪个原型：`var f = Error.prototype.toString; f()` 走通用 `toString`（返回 `"[object Undefined]"`）而非 `Error.prototype.toString` 应抛的 TypeError；`at`/`toString` 的接收者判定只能靠"是不是字符串/有没有 length"这类启发式 | 2026-09-22 登记（§2.1h/§2.1i 两处被迫使用启发式）：少量用例；根治需在派发时携带 [[HomeObject]]，归 M6 |
-| `ToString(Symbol)` 不抛 TypeError | `to_js_string` 返回 `String`、无 `Result` 通道，于是 `String.prototype.trim.call(Symbol())`、模板插值里的 Symbol、`Array/String` 方法的参数 Symbol 校验用例失败 | 2026-09-22 登记：需给 ToString 增加会抛错的入口，影响面较大，归 M6 |
-| 严格模式下对只读属性的赋值不抛 TypeError | `set_member` 对非可写属性静默 no-op（注释称"引擎不追踪 strict 来源"），`*-gs.js` 生成用例（约 33 例）失败 | 2026-09-22 登记：引擎本就是 strict-only，改抛错方向正确但需先确认不会影响既有通过用例 |
+| `ToString(Symbol)` 不抛 TypeError | `to_js_string` 返回 `String`、无 `Result` 通道，于是 `String.prototype.trim.call(Symbol())`、模板插值里的 Symbol、`Array/String` 方法的参数 Symbol 校验用例失败 | ✅ **部分消除**（2026-09-23，§2.1n）：builtin 层新增 `to_string_throwing` / `to_number_throwing` / `to_integer_or_infinity_throwing`，String/Array/Object 内置方法的参数与接收者已走抛错通道。**残留**：`Value::to_js_string` 本身仍是全函数，模板插值、`String(x)` 隐式转换等引擎内部路径对 Symbol 仍不抛错；把这些路径也铺上 `Result` 通道属跨层改动，归 M6 |
+| ~~严格模式下对只读属性的赋值不抛 TypeError~~ | `set_member` 对非可写属性静默 no-op（注释称"引擎不追踪 strict 来源"），`*-gs.js` 生成用例（约 33 例）失败 | ✅ **2026-09-23 修复**（§2.1n）：G1 已确定引擎是 strict-only，改为抛 TypeError（非可写属性 / 只有 getter 的访问器 / 原始值上的属性）；逐套件比对确认无回退（`built-ins/Object` 反 +1），仅 1 条 feature 断言按新语义更新 |
 | `String.prototype.length` 与索引按**码点**而非**码元** | Rust `String`（UTF-8）无法表示孤立代理：`"\u{1F600}".length` 为 1（应为 2）、`at`/`codePointAt` 落在代理对中间只能用 U+FFFD 代替 | 2026-09-22 登记（§2.1h）：需换成 WTF-8/`Vec<u16>` 表示，属架构级改动，归 M6 |
 | `normalize` 无 Unicode 规范化数据 | 只做 form 校验（非法抛 RangeError），合法 form 原样返回 | 2026-09-22 登记：需引入规范化表（新依赖），归 M6 |
 | class 方法带 `prototype`、缺 `name` 推导 | 方法按规范不应有 `prototype`；`var f = function () {}` 的 `name` 应为 `"f"` | 2026-09-22 登记：需 `SetFunctionName`，归 M6 |
@@ -518,6 +716,10 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 | **嵌套函数捕获外层局部变量不可靠** | 非箭头闭包读/写外层函数的局部变量（含对象）可能得到 `undefined` 或抛 `ReferenceError: undefined variable: X`，且同一段代码在不同嵌套上下文里表现不同。最小复现（在 HEAD 上同样存在，非本轮引入）：`function outer(){ var o = {n:1}; function inner(){ return o.n; } return inner(); }` → 期望 1，实测 ReferenceError；`var inner = function(){ return o.n; }` 形态则静默返回 undefined。箭头函数（`var f = () => o.n`）与"把闭包作为实参传给别的函数"两种形态正常 | 2026-09-22 登记（§2.1m 由 JSON reviver 用例暴露）：与 §5 的"创建时值快照"决定同源，根治要把捕获改成引用绑定（或按调用读取），归 M6；在此之前用例应避免依赖该形态 |
 | **Array 泛型路径不执行访问器** | 泛型（类数组）路径的 `[[Get]]` 直接读属性表，索引上的 getter 不会被调用：`Array/prototype/reverse/length-exceeding-integer-limit-with-object.js`（靠 getter 抛错提前中止）等用例失败 | 2026-09-22 登记（§2.1l）：需要把泛型路径改为经 VM 的 `[[Get]]`，属跨层改动，归 M6 |
 | 泛型路径的物化上限（`MAX_GENERIC_ELEMENTS = 2^22`） | `length` 超过上限的逐元素操作（`fill`/`copyWithin`/`splice` 结果）抛 RangeError，而参考引擎会做稀疏写 | 2026-09-22 登记（§2.1l）：有意为之——本引擎数组是 `Vec` 支撑，无法表示 2^53 长度；先保证不 OOM |
+| **内置构造器作父类时的 `super()`** | `class C extends Error/Array/Boolean/Function/NativeError` 拿不到父类初始化：`new.target.prototype` 没被用来建对象，`message`/`length`/`name`/元素也没写到派生 `this` 上（`regular-subclassing.js`、`message-property-assignment.js`、`instance-length.js` 等约 20 例） | 2026-09-23 登记（§2.1r）：需让原生构造路径接受 `new.target` 并把初始化作用于派生实例 |
+| **生成器子集未覆盖的语义** | 生成器的 `return()` / `throw()`、`try` 内的 `yield`（`SuspendedFrame` 故意不带 SEH 记录，带异常处理器的生成器体跨挂起不可靠）、生成器作构造器、`Generator.prototype` / `%IteratorPrototype%` 原型链与 `next.name`/`length` 元数据 | 2026-09-23 登记（§2.1p）：按 M4 计划"先做仅 `next()`、无 `try` 内 yield 的子集"，逐个补齐 |
+| **Array 快路径绕过原型链上的索引访问器** | `push`/`pop`/`shift`/`unshift` 的 `*-is-frozen` 系列（8 例）在 `Array.prototype[0]` 的 getter/setter 里冻结数组，要求错误在那次访问时抛出；快路径直接改 `Vec`，访问器不执行也没有受限副作用 | 2026-09-23 登记（§2.1n）：`length` 可写性已按 `Set(…,throw)` 处理（同批 +8），剩下的一半要索引读写经原型链、且 getter 可被调用 —— 需把这四个方法上移到 VM，与"Array 泛型路径不执行访问器"同源，归 M6 |
+| ~~缺 `ArraySpeciesCreate` / `CreateDataPropertyOrThrow`~~ | `map`/`filter`/`slice`/`splice`/`concat` 的 species 与目标对象写入用例全部失败 | 2026-09-23 登记（§2.1n）→ ✅ **本轮已交付**（§2.1o）：`Array[Symbol.species]` 访问器、`VM::array_species_create`（含 `SameValue(C,%Array%)` 短路）、五个方法接入；`CreateDataPropertyOrThrow` 复用 strict-only 的 `set_member`。残留仅 ES2019+ 的 `flat`/`flatMap`（未实现）与 well-known symbol 描述符的 `configurable` 细节 |
 
 ### 2.4 跨块活跃性修复（2026-09-20）
 
@@ -548,11 +750,11 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数（§2.1m 后） | 主要缺口 |
+| 套件 | 失败数（§2.1r 后） | 主要缺口 |
 |------|--------------------|----------|
-| `built-ins/Array` | 900 | 泛型路径的长尾（`Symbol.species`、`@@isConcatSpreadable` 与 species 交互）、`resizable-arraybuffer` 类用例、sloppy-mode 依赖的 ES5 用例 |
-| `built-ins/Object` | 514 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |
-| `built-ins/String` | 441 | 主要被 `replace`/`match`/`search`/`split`（RegExp，范围外）占据；其余是 `String.prototype.X.call(obj)` 的接收者 ToString（需要 VM 参与） |
+| `built-ins/Array` | 857 | `flat`/`flatMap`（ES2019）、`findLast*` 与 change-array-by-copy（ES2023）整体缺失；`resizable-arraybuffer` 类用例；sloppy-mode 依赖的 ES5 用例 |
+| `built-ins/Object` | 499 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |
+| `built-ins/String` | 399 | 主要被 `replace`/`match`/`search`/`split`（RegExp，范围外）占据；其余是 `String.prototype.X.call(obj)` 的接收者 ToString（对象经 ToPrimitive 的路径仍需 VM 参与） |
 | `built-ins/Function` | 131 | `prototype/toString`（36，需源码文本）、`bind` 细节、`Symbol.hasInstance` |
 | `language/statements/class` | 124 | 字段初始化次序、私有字段（范围外）、`Symbol` 交互 |
 | `built-ins/Number` | 104 | `toString(radix)`/`toFixed`/`toExponential`/`toPrecision` 的精确格式化、`toLocaleString` |
@@ -567,7 +769,7 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 | 特性 | 规模 | 归属 |
 |------|------|------|
-| `generators` | 4061 | M4（ES6 核心，最大单项） |
+| ~~`generators`~~ | ~~4061~~ | ✅ **2026-09-23 解锁**（§2.1p）：两个目录共 556 例进入分母，35 通过 / 31 失败（53%），达到 §4 的 ≥ 40% 标准 |
 | `Symbol.iterator` / `Symbol` | 1829 / 1452 | M2 收尾 + M4 |
 | `class` | 4734 | 已在执行；剩余失败见 3.1 |
 | `computed-property-names` | 478 | M2 收尾 |
@@ -621,8 +823,8 @@ f(function () { Symbol.keyFor({}); });   // 期望 'caught'，实为错误逃逸
 
 | 任务 | 内容 |
 |------|------|
-| G1 生成器运行时 | 调用帧挂起/恢复（`Yield`/`Resume`）、`yield` 表达式值双向传递、`return()` 提前终止 |
-| G2 `function*` / `yield` / `yield*` 降级 | 函数体编译为可恢复的帧；委托迭代复用 `Symbol.iterator` |
+| G1 生成器运行时 | 调用帧挂起/恢复（`Yield`/`Resume`）、`yield` 表达式值双向传递、`return()` 提前终止 | **首批已交付（§2.1p）**：`next()` 子集（挂起/恢复、双向传值、`{value,done}`、自反 `[Symbol.iterator]`），两个生成器目录 53% 通过；`yield*` / `return()` / `throw()` / `try` 内 yield 待补 |
+| G2 `function*` / `yield` / `yield*` 降级 | **已交付**（§2.1p + §2.1q）：`yield*` 走"next() + yield"脱糖，委托值双向传递 | 函数体编译为可恢复的帧；委托迭代复用 `Symbol.iterator` |
 | G3 IteratorClose 完整化 | `return()` 调用与异常吞除；break/异常/正常结束三条路径 |
 | G4 与 `for-of`、解构、展开的联调 | 复用既有双路径；生成器对象作为慢路径迭代器 |
 

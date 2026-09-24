@@ -70,6 +70,20 @@ pub struct VM {
     /// user-facing `next()`/`return()` natives look iterators up here.
     iterator_registry: HashMap<u64, Value>,
     next_iterator_id: u64,
+    /// Live generator objects, keyed by registry id. `gen.next()` is a native
+    /// (`__gen_next__<id>`), so the resume path has to find the object here.
+    generator_registry: HashMap<u64, Value>,
+    next_generator_id: u64,
+    /// The value the *current* resume supplied (`next(v)`), consumed by
+    /// `Opcode::Yield` as the value of the `yield` expression.
+    generator_send: Value,
+    /// Set while a nested generator loop runs: `None` until the body suspends,
+    /// then `Some(yielded value)`.
+    generator_yielded: Option<Value>,
+    /// Index of the `Yield` instruction that suspended the frame. Captured
+    /// before the handler jumps past the last instruction, so the resume path
+    /// can continue at `pc + 1`.
+    generator_yield_pc: usize,
     /// Function metadata (`name`, parameter count) of the module being run.
     /// Kept here so `materialize_function` can set `fn.name` / `fn.length`
     /// without threading the module through every call site.
@@ -144,6 +158,11 @@ impl VM {
             builtins,
             iterator_registry: HashMap::new(),
             next_iterator_id: 0,
+            generator_registry: HashMap::new(),
+            next_generator_id: 0,
+            generator_send: Value::Undefined,
+            generator_yielded: None,
+            generator_yield_pc: 0,
             current_module_info: None,
             func_objs: HashMap::new(),
             step_limit: Some(DEFAULT_STEP_LIMIT),
@@ -274,6 +293,18 @@ impl VM {
                         // caller can read it.
                         return Ok(false);
                     }
+                    // A derived constructor that returns without `super()` —
+                    // implicitly or via `return this` — has no `this` to return.
+                    // Raised through the SEH machinery: `assert.throws(
+                    // ReferenceError, () => new C())` has to see it.
+                    if self.state.this_uninitialized.last() == Some(&true) {
+                        let err = self.this_not_initialized();
+                        if let Some(exc) = self.as_js_exception(&err) {
+                            self.handle_throw(exc)?;
+                            return Ok(true);
+                        }
+                        return Err(err);
+                    }
                     let return_pc = self.state.popc()?;
                     let saved_seh_depth = self.state.popc()?;
                     let saved_closure_depth = self.state.popc()?;
@@ -286,6 +317,7 @@ impl VM {
                     if let Some(saved_this) = self.state.this_stack.pop() {
                         self.state.this_val = saved_this;
                     }
+                    self.state.this_uninitialized.pop();
                     if let Some(saved_function) = self.state.function_stack.pop() {
                         self.state.function_val = saved_function;
                     }
@@ -636,6 +668,7 @@ impl VM {
         self.state.closure_var_stack.truncate(saved_closure);
         self.state.seh_stack.truncate(saved_seh);
         self.state.this_stack.truncate(saved_this_depth);
+        self.state.this_uninitialized.truncate(saved_this_depth);
         self.state.frame_argc.truncate(saved_this_depth);
         self.state.this_val = saved_this;
         self.state.function_val = saved_function;
@@ -1192,6 +1225,25 @@ impl VM {
         if name == crate::builtins::SYMBOL_DESCRIPTION_NATIVE {
             return crate::builtins::symbol_description(&this);
         }
+        // Generator methods: `gen.next(v)` resumes the body, and
+        // `gen[Symbol.iterator]()` hands the generator itself back.
+        if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_NEXT_PREFIX) {
+            let id: u64 = id.parse().map_err(|_| {
+                RuntimeError::InternalError("malformed generator id".to_string())
+            })?;
+            let send = args.first().cloned().unwrap_or(Value::Undefined);
+            return self.generator_next(id, send, module);
+        }
+        if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_ITERATOR_PREFIX) {
+            let _id: u64 = id.parse().map_err(|_| {
+                RuntimeError::InternalError("malformed generator id".to_string())
+            })?;
+            return Ok(this);
+        }
+        // `get Array[Symbol.species]` returns its receiver (ES 22.1.2.5).
+        if name == crate::builtins::ARRAY_SPECIES_NATIVE {
+            return Ok(this);
+        }
         // `Symbol.iterator` factory: returns an internal iterator over `this`.
         if name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
             return self.make_iterator(this, module);
@@ -1213,11 +1265,11 @@ impl VM {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| RuntimeError::TypeError("iterator is no longer alive".to_string()))?;
-            let (item, done) = self.iterator_next(iter_val, module)?;
-            let mut result = crate::vm::object::OrdinaryObject::new();
-            let _ = result.property_set(PropertyKey::from_str("value"), item);
-            let _ = result.property_set(PropertyKey::from_str("done"), Value::Bool(done));
-            return Ok(Value::Object(Rc::new(RefCell::new(result))));
+            // `next(v)` forwards `v` to a JS iterator: that is how `yield*` gets
+            // the value the outer `next(v)` supplied into the delegate.
+            let send = args.first().cloned();
+            let (item, done) = self.iterator_next(iter_val, send, module)?;
+            return Ok(Self::iterator_result(item, done));
         }
         if let Some(id) = name.strip_prefix(crate::vm::iterator::ITERATOR_RETURN_PREFIX) {
             let id: u64 = id
@@ -1355,6 +1407,24 @@ impl VM {
         let Bytecode { opcode, operands } = inst;
 
         match opcode {
+            // `yield expr`: suspend the enclosing generator. The frame stays on
+            // the value stack; `generator_next` lifts it out before rewinding
+            // `rsp`. Jumping past the last instruction ends the nested `step`
+            // loop the resumer is driving, exactly as a `Ret` to the sentinel
+            // return address would.
+            Opcode::Yield => {
+                // `-1` is the "no operand" marker emitted for a bare `yield`
+                // (codegen cannot leave an operand slot empty).
+                let value = match operands.get(1) {
+                    Some(Operand::Immd(-1)) => Value::Undefined,
+                    Some(src) => self.get_value(*src)?,
+                    None => Value::Undefined,
+                };
+                // `yield expr` evaluates to the value the resumer supplied.
+                self.generator_yielded = Some(value);
+                self.generator_yield_pc = self.state.pc;
+                self.state.jump(module.instructions.len());
+            }
             // ===== Control Flow =====
             Opcode::Call => {
                 let func_id = operands[0].as_immd();
@@ -1402,6 +1472,20 @@ impl VM {
 
                 match callee {
                     Value::Function(id) => {
+                        // `function*`: calling it only builds the generator;
+                        // the body starts at the first `next()`.
+                        if module.generators.contains(&id) {
+                            let args = self.collect_call_args(arg_count)?;
+                            let gobj = self.create_generator(
+                                id,
+                                Value::Undefined,
+                                args,
+                                Vec::new(),
+                            );
+                            self.state.set_register(Register::Rv, gobj)?;
+                            self.state.jump_offset(1);
+                            return Ok(());
+                        }
                         self.state.enter_frame(arg_count)?;
                         // Strict mode: this = undefined for regular calls
                         self.state.this_val = Value::Undefined;
@@ -1932,7 +2016,7 @@ impl VM {
             Opcode::IterNext => {
                 // Operand order comes from codegen: (item, has_next, src).
                 let iter_val = self.get_value(operands[2])?;
-                let (item, done) = self.iterator_next(iter_val, module)?;
+                let (item, done) = self.iterator_next(iter_val, None, module)?;
                 self.set_value(operands[0], item)?;
                 self.set_value(operands[1], Value::Bool(!done))?;
             }
@@ -1981,7 +2065,16 @@ impl VM {
                 // `super(...)`: same shape as CallSpread, but the parent
                 // constructor inherits this frame's `new.target`.
                 let callee = self.get_value(operands[0])?;
-                let this = self.get_value(operands[1])?;
+                // The receiver is normally the *frame's* `this`, not an operand
+                // (lowering a `load_this` would raise in a derived constructor,
+                // whose `this` is still uninitialized here). An arrow body that
+                // calls `super()` still carries it as an operand, though.
+                let operand_this = self.get_value(operands[1])?;
+                let this = if operand_this.is_undefined() {
+                    self.state.this_val.clone()
+                } else {
+                    operand_this
+                };
                 let args_val = self.get_value(operands[2])?;
                 let args = self
                     .array_like_elements(&args_val)
@@ -1996,6 +2089,22 @@ impl VM {
                     .last()
                     .cloned()
                     .unwrap_or(Value::Undefined);
+                // ES 12.3.5.1: `super()` binds the derived constructor's `this`.
+                // Cleared *before* the call runs, because the parent's own frame
+                // pushes an entry onto the same stack.
+                // The innermost frame with an unbound `this` is the one being
+                // bound — an arrow body can run the `super()` on its enclosing
+                // constructor's behalf, and only derived constructors ever set
+                // the flag at all.
+                if let Some(slot) = self
+                    .state
+                    .this_uninitialized
+                    .iter_mut()
+                    .rev()
+                    .find(|flag| **flag)
+                {
+                    *slot = false;
+                }
                 let result =
                     self.invoke_with_new_target(&callee, this, &args, Some(new_target), module)?;
                 self.state.set_register(Register::Rv, result)?;
@@ -2316,6 +2425,17 @@ impl VM {
                     }
                 }
 
+                // `slice` / `splice` / `concat` are pure enough for the builtin
+                // layer, but their result array comes from `ArraySpeciesCreate`,
+                // whose `Get`s and `Construct` can run user code.
+                if let Some(result) =
+                    self.try_array_species_method(&obj_val, &method_name, &args, module)?
+                {
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
+
                 // Try built-in prototype method dispatch. As above: only
                 // "no such method" may fall through.
                 match crate::builtins::call_prototype_method(&obj_val, &method_name, &args) {
@@ -2495,6 +2615,16 @@ impl VM {
 
                 // 1. Determine the function ID and prototype
                 let (func_id, prototype) = match constructor_val {
+                    Value::Function(id) if module.generators.contains(&id) => {
+                        return Err(RuntimeError::TypeError(format!(
+                            "{} is not a constructor",
+                            self.current_module_info
+                                .as_ref()
+                                .and_then(|info| info.get(&id))
+                                .map(|(name, _)| name.as_str())
+                                .unwrap_or("Generator")
+                        )));
+                    }
                     Value::Function(id) => {
                         // Box the bare function reference into its (memoized) object
                         // so `F.prototype` identity is stable across `new` calls.
@@ -2510,6 +2640,7 @@ impl VM {
                             (id, None)
                         }
                     }
+
                     Value::Object(obj_ref) => {
                         let borrowed = obj_ref.borrow();
                         if borrowed.kind() == ObjectKind::Function {
@@ -2581,6 +2712,9 @@ impl VM {
                 match module.symtab.get(&FunctionId::new(func_id)) {
                     Some(location) => {
                         self.state.enter_frame(arg_count)?;
+                        if module.derived_ctors.contains(&func_id) {
+                            self.mark_this_uninitialized();
+                        }
                         // Reset Rv before invoking the constructor so that a constructor
                         // with no explicit `return` (Rv stays undefined) yields `this`
                         // via the [[Construct]] logic in `Ret`. This also avoids leaking a
@@ -2602,6 +2736,9 @@ impl VM {
                 }
             }
             Opcode::LoadThis => {
+                if self.state.this_uninitialized.last() == Some(&true) {
+                    return Err(self.this_not_initialized());
+                }
                 let value = self.state.this_val.clone();
                 self.set_value(operands[0], value)?;
             }
@@ -2644,7 +2781,12 @@ impl VM {
                         ));
                     }
                 };
-                let captured_this = self.get_value(operands[2])?;
+                let captured_this = match self.get_value(operands[2])? {
+                    // Lowering leaves the operand empty (see `lower_arrow_function`);
+                    // the arrow captures whatever the frame's `this` is.
+                    v if v.is_undefined() => self.state.this_val.clone(),
+                    v => v,
+                };
                 // Collect all pending captured variables from closure_var_stack
                 // The variables were pushed by ClosureVar instructions in order
                 let mut captured_vars: Vec<(String, Value)> = Vec::new();
@@ -2948,25 +3090,140 @@ impl VM {
         Ok(entries)
     }
 
+    /// Species-aware wrapper for `slice` / `splice` / `concat`.
+    ///
+    /// Returns `Ok(None)` when the method is not one of them, when the receiver
+    /// is not an Array, or when there is no species override — the ordinary
+    /// builtin dispatch then runs unchanged. Otherwise the builtin computes the
+    /// plain result (its side effects on the receiver are exactly as before)
+    /// and the elements are copied into the species-constructed target, where a
+    /// blocked write is abrupt (`CreateDataPropertyOrThrow`).
+    fn try_array_species_method(
+        &mut self,
+        receiver: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if !matches!(method, "slice" | "splice" | "concat") {
+            return Ok(None);
+        }
+        // `ArraySpeciesCreate(O, 0)`: all three start from an empty result and
+        // grow it index by index.
+        let Some(target) = self.array_species_create(receiver, 0, module)? else {
+            return Ok(None);
+        };
+        let plain = crate::builtins::call_prototype_method(receiver, method, args)?;
+        // Snapshot the present indices first: writing into `target` can run
+        // user code (accessors, proxies once they land), and `plain` is a
+        // RefCell that must not stay borrowed across that call.
+        let elements: Vec<(usize, Value)> = match &plain {
+            Value::Object(result_ref) => {
+                let borrowed = result_ref.borrow();
+                let len = borrowed
+                    .property_get(&PropertyKey::from_str("length"))
+                    .map(|d| d.value.to_number() as usize)
+                    .unwrap_or(0);
+                (0..len)
+                    .filter_map(|i| {
+                        borrowed
+                            .property_get(&PropertyKey::from_str(&i.to_string()))
+                            .map(|d| (i, d.value))
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        for (i, value) in elements {
+            self.set_member(&target, PropertyKey::from_str(&i.to_string()), value, module)?;
+        }
+        Ok(Some(target))
+    }
+
+    /// Mark the frame that is about to run as having an unbound `this`.
+    ///
+    /// Must be called right after `enter_frame`, before the frame's body starts,
+    /// and only for derived-class constructors.
+    fn mark_this_uninitialized(&mut self) {
+        let state = &mut self.state;
+        while state.this_uninitialized.len() < state.this_stack.len() {
+            state.this_uninitialized.push(false);
+        }
+        if let Some(slot) = state.this_uninitialized.last_mut() {
+            *slot = true;
+        }
+    }
+
+    /// The ReferenceError ES raises when a derived constructor touches `this`
+    /// before `super()` (ES 12.3.5.1 BindThisValue / 9.2.2).
+    fn this_not_initialized(&self) -> RuntimeError {
+        RuntimeError::ReferenceError(
+            "Must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string(),
+        )
+    }
+
+    /// ES 9.4.2.3 `ArraySpeciesCreate(O, len)`.
+    ///
+    /// Only the VM can run this one: both `Get`s go through `[[Get]]` (a
+    /// poisoned `@@species` getter must be observable and abrupt — see
+    /// `create-species-poisoned.js`) and `Construct` may re-enter user code.
+    ///
+    /// Returns `Ok(None)` for "build an ordinary array of `len`", which is what
+    /// the spec does for a non-array receiver, an absent `constructor`, and a
+    /// nullish `@@species`. Everything else is the object the species
+    /// constructor produced (or a TypeError when it is not constructible).
+    fn array_species_create(
+        &mut self,
+        receiver: &Value,
+        len: usize,
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        // Step 2-3: a receiver that is not an Array never consults species.
+        let is_array = match receiver {
+            Value::Object(obj_ref) => {
+                obj_ref.borrow().kind() == crate::vm::ObjectKind::Array
+            }
+            _ => false,
+        };
+        if !is_array {
+            return Ok(None);
+        }
+
+        // Step 5: `? Get(O, "constructor")` — abrupt completions propagate.
+        let mut species =
+            self.get_member(receiver, &PropertyKey::from_str("constructor"), module)?;
+        // Step 7: only an *object* `constructor` is asked for `@@species`, and
+        // a nullish result falls back to an ordinary array.
+        if species.is_object() {
+            species = self.get_member(&species, &crate::builtins::species_symbol_key(), module)?;
+            if species.is_null() {
+                return Ok(None);
+            }
+        }
+        if species.is_undefined() {
+            return Ok(None);
+        }
+        // `Array[Symbol.species]` returns its receiver, so the common case
+        // resolves back to `Array`: build it directly instead of routing every
+        // `slice` through Construct.
+        if crate::builtins::native_function_name(&species).as_deref() == Some("Array") {
+            return Ok(None);
+        }
+        // Step 10: `? Construct(C, «len»)` — a non-constructible species is the
+        // TypeError `create-ctor-non-object.js` expects.
+        let target = self.construct(&species, &[Value::Number(len as f64)], module)?;
+        Ok(Some(target))
+    }
+
     /// ES `Array.prototype.indexOf` / `lastIndexOf` over the hole-aware element
     /// list, so generic array-likes (`indexOf.call({length: 2, 0: 'a'}, 'a')`)
     /// and primitives work the same way as real arrays.
-    fn array_index_of(&self, entries: &[Option<Value>], method: &str, args: &[Value]) -> Value {
-        /// ToInteger: truncate towards zero, `NaN` → 0, infinities saturate.
-        fn to_integer(n: f64) -> i64 {
-            if n.is_nan() {
-                0
-            } else if n.is_infinite() {
-                if n.is_sign_positive() {
-                    i64::MAX
-                } else {
-                    i64::MIN
-                }
-            } else {
-                n.trunc() as i64
-            }
-        }
-
+    fn array_index_of(
+        &self,
+        entries: &[Option<Value>],
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
         /// SameValueZero: like `===`, but `NaN` matches itself.
         fn same_value_zero(a: &Value, b: &Value) -> bool {
             if let (Value::Number(x), Value::Number(y)) = (a, b) {
@@ -2979,8 +3236,12 @@ impl VM {
 
         let search = args.first().cloned().unwrap_or(Value::Undefined);
         let len = entries.len() as i64;
+        // `? ToIntegerOrInfinity(fromIndex)`: ToNumber(Symbol) is abrupt, while
+        // an absent argument reads as ToIntegerOf(undefined) = 0.
         let from = match args.get(1) {
-            Some(v) if !v.is_undefined() => to_integer(v.to_number()),
+            Some(v) if !v.is_undefined() => {
+                crate::builtins::to_integer_or_infinity_throwing(Some(v))?
+            }
             _ => {
                 if method == "indexOf" {
                     0
@@ -2993,12 +3254,12 @@ impl VM {
         if method == "indexOf" {
             let start = from.max(0);
             if start >= len {
-                return Value::Number(-1.0);
+                return Ok(Value::Number(-1.0));
             }
             for i in start..len {
                 if let Some(element) = &entries[i as usize] {
                     if same_value_zero(element, &search) {
-                        return Value::Number(i as f64);
+                        return Ok(Value::Number(i as f64));
                     }
                 }
             }
@@ -3007,13 +3268,13 @@ impl VM {
             while i >= 0 {
                 if let Some(element) = &entries[i as usize] {
                     if same_value_zero(element, &search) {
-                        return Value::Number(i as f64);
+                        return Ok(Value::Number(i as f64));
                     }
                 }
                 i -= 1;
             }
         }
-        Value::Number(-1.0)
+        Ok(Value::Number(-1.0))
     }
 
     /// Run an `Array.prototype` method that has to call back into user code.
@@ -3074,7 +3335,7 @@ impl VM {
             if !self.receiver_is_array_like(receiver) {
                 return Ok(None);
             }
-            return Ok(Some(self.array_index_of(&entries, method, args)));
+            return self.array_index_of(&entries, method, args).map(Some);
         }
 
         let callback = args.first().cloned().unwrap_or(Value::Undefined);
@@ -3156,34 +3417,63 @@ impl VM {
                 Ok(Some(Value::Undefined))
             }
             "map" => {
-                // The result keeps the receiver's length *and* its holes.
-                let mut out = Vec::with_capacity(entries.len());
-                let mut holes: Vec<usize> = Vec::new();
+                // Step 5: `A = ? ArraySpeciesCreate(O, len)`. When the default
+                // array is used the result keeps the receiver's length *and*
+                // its holes; with a species constructor only the present
+                // indices are written, and a blocked write is abrupt
+                // (CreateDataPropertyOrThrow).
+                let species = self.array_species_create(receiver, entries.len(), module)?;
+                let mut values: Vec<(usize, Value)> = Vec::with_capacity(entries.len());
                 for (i, e) in entries.iter().enumerate() {
-                    match e {
-                        Some(e) => out.push(call(self, &callback, e, i)?),
-                        None => {
-                            out.push(Value::Undefined);
-                            holes.push(i);
-                        }
+                    if let Some(e) = e {
+                        values.push((i, call(self, &callback, e, i)?));
                     }
                 }
-                let result = crate::vm::object::new_array_object_from_vec(out);
-                if let Value::Object(result_ref) = &result {
-                    if let Some(arr) = result_ref
-                        .borrow_mut()
-                        .as_any_mut()
-                        .downcast_mut::<crate::vm::object::ArrayObject>()
-                    {
-                        for i in holes {
-                            arr.mark_hole(i);
+                Ok(Some(match species {
+                    None => {
+                        let mut out: Vec<Value> = vec![Value::Undefined; entries.len()];
+                        let mut holes: Vec<usize> = Vec::new();
+                        let mut next = 0usize;
+                        for (i, v) in values {
+                            out[i] = v;
+                            for h in next..i {
+                                holes.push(h);
+                            }
+                            next = i + 1;
                         }
+                        for h in next..entries.len() {
+                            holes.push(h);
+                        }
+                        let result = crate::vm::object::new_array_object_from_vec(out);
+                        if let Value::Object(result_ref) = &result {
+                            if let Some(arr) = result_ref
+                                .borrow_mut()
+                                .as_any_mut()
+                                .downcast_mut::<crate::vm::object::ArrayObject>()
+                            {
+                                for i in holes {
+                                    arr.mark_hole(i);
+                                }
+                            }
+                        }
+                        result
                     }
-                }
-                Ok(Some(result))
+                    Some(target) => {
+                        for (i, v) in values {
+                            self.set_member(
+                                &target,
+                                PropertyKey::from_str(&i.to_string()),
+                                v,
+                                module,
+                            )?;
+                        }
+                        target
+                    }
+                }))
             }
             "filter" => {
-                let mut out = Vec::new();
+                let species = self.array_species_create(receiver, 0, module)?;
+                let mut out: Vec<Value> = Vec::new();
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
                         if call(self, &callback, e, i)?.to_boolean() {
@@ -3191,7 +3481,20 @@ impl VM {
                         }
                     }
                 }
-                Ok(Some(crate::vm::object::new_array_object_from_vec(out)))
+                Ok(Some(match species {
+                    None => crate::vm::object::new_array_object_from_vec(out),
+                    Some(target) => {
+                        for (i, v) in out.iter().enumerate() {
+                            self.set_member(
+                                &target,
+                                PropertyKey::from_str(&i.to_string()),
+                                v.clone(),
+                                module,
+                            )?;
+                        }
+                        target
+                    }
+                }))
             }
             "some" => {
                 for (i, e) in entries.iter().enumerate() {
@@ -3343,6 +3646,9 @@ impl VM {
             }
         }
         self.state.frame_argc.truncate(this_depth);
+        // Parallel to `this_stack`: a frame whose `this` was never bound must
+        // not leave its flag behind, or a later `Ret` would raise again.
+        self.state.this_uninitialized.truncate(this_depth);
         self.state.construct_stack.truncate(construct_depth);
         self.state.new_target_stack.truncate(new_target_depth);
         self.state.closure_var_stack.truncate(closure_depth);
@@ -3645,13 +3951,19 @@ impl VM {
                                 self.invoke(&setter, receiver, &[value], module)?;
                                 Ok(())
                             }
-                            // Setter-less accessor: silently ignored (sloppy mode).
-                            None => Ok(()),
+                            // G1 (README target): the engine has no sloppy
+                            // mode, so an assignment that nothing can satisfy
+                            // is a TypeError rather than a silent no-op.
+                            None => Err(RuntimeError::TypeError(
+                                "Cannot set property which has only a getter".to_string(),
+                            )),
                         };
                     }
                     if !desc.writable {
-                        // Sloppy mode: read-only assignment is a silent no-op.
-                        return Ok(());
+                        return Err(RuntimeError::TypeError(format!(
+                            "Cannot assign to read-only property '{}'",
+                            key.display()
+                        )));
                     }
                     let mut borrowed = obj_ref.borrow_mut();
                     borrowed
@@ -3669,11 +3981,20 @@ impl VM {
                 let boxed = self.materialize_function(*id);
                 self.set_member(&boxed, key, value, module)
             }
-            // Assigning to a property of a primitive is a silent no-op in
-            // sloppy mode (the wrapper object is discarded). The engine does
-            // not track strict-mode source, so the spec's TypeError case is
-            // not reachable here.
-            _ => Ok(()),
+            // Assigning to a property of a primitive has no receiver to hold
+            // the property, which strict mode reports as a TypeError (the
+            // sloppy-mode silence is not reachable: cf. G1 in the README).
+            _ => Err(RuntimeError::TypeError(format!(
+                "Cannot create property '{}' on {}",
+                key.display(),
+                match obj {
+                    Value::String(_) => "string",
+                    Value::Number(_) => "number",
+                    Value::Bool(_) => "boolean",
+                    Value::Symbol(_) => "symbol",
+                    _ => "null or undefined",
+                }
+            ))),
         }
     }
 
@@ -3715,6 +4036,312 @@ impl VM {
     ///
     /// Looks up the method through the prototype chain and executes
     /// known methods (toString, valueOf, etc.) directly.
+    // ─────────────────────────────────────────────────────
+    // Generators (ES 25.4) — M4-G1 subset
+    // ─────────────────────────────────────────────────────
+    //
+    // A generator body runs on the ordinary value stack, so suspending it means
+    // copying its frame slice out and resuming means copying it back: no second
+    // frame representation, and no change to how the body is compiled. The
+    // nested `while self.step(module)?` loop already used by `invoke` provides
+    // the "run until this frame finishes" seam; `Opcode::Yield` stops it by
+    // jumping past the last instruction, exactly like a `Ret` to the sentinel
+    // return address does.
+
+    /// Build the generator object a call to `function*` produces.
+    ///
+    /// The body does not run yet: it starts on the first `next()`.
+    pub fn create_generator(
+        &mut self,
+        func_id: u32,
+        this: Value,
+        args: Vec<Value>,
+        captured_vars: Vec<(String, Value)>,
+    ) -> Value {
+        let id = self.next_generator_id;
+        self.next_generator_id += 1;
+        let mut gobj = crate::vm::object::GeneratorObject::new(id, func_id, args, this);
+        gobj.captured_vars = captured_vars;
+        // ES 14.4.11 / 9.1.13: the instance's prototype comes from
+        // `GetPrototypeFromConstructor(functionObject, "%GeneratorPrototype%")`,
+        // i.e. the constructor's own `prototype` property when it is an object.
+        let func_obj = self.materialize_function(func_id);
+        if let Value::Object(func_ref) = &func_obj {
+            if let Some(desc) = func_ref.borrow().property_get(&PropertyKey::from_str("prototype")) {
+                if let Value::Object(proto) = desc.value {
+                    gobj.set_prototype(Some(proto));
+                }
+            }
+        }
+        let value = Value::Object(Rc::new(RefCell::new(gobj)));
+        self.generator_registry.insert(id, value.clone());
+        value
+    }
+
+    /// `gen.next([v])`: resume the body until the next `yield` or the return,
+    /// and report `{ value, done }`.
+    pub fn generator_next(
+        &mut self,
+        id: u64,
+        send: Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        // Saved before anything is pushed, exactly as `invoke` does: the
+        // generator frame must not survive the resume.
+        let saved = self.save_execution_state();
+        let gen_value = match self.generator_registry.get(&id).cloned() {
+            Some(v) => v,
+            None => {
+                return Err(RuntimeError::TypeError(
+                    "generator is no longer alive".to_string(),
+                ))
+            }
+        };
+        let state = {
+            let Value::Object(obj_ref) = &gen_value else {
+                return Err(RuntimeError::TypeError("not a generator".to_string()));
+            };
+            let borrowed = obj_ref.borrow();
+            let Some(gobj) = borrowed
+                .as_any()
+                .downcast_ref::<crate::vm::object::GeneratorObject>()
+            else {
+                return Err(RuntimeError::TypeError("not a generator".to_string()));
+            };
+            gobj.state
+        };
+        if state == crate::vm::object::GeneratorState::Completed {
+            return Ok(Self::iterator_result(Value::Undefined, true));
+        }
+
+        if state == crate::vm::object::GeneratorState::SuspendedStart {
+            // First resume: open a frame exactly like `invoke` does.
+            let (func_id, args, this, captured_vars) = {
+                let Value::Object(obj_ref) = &gen_value else {
+                    return Err(RuntimeError::TypeError("not a generator".to_string()));
+                };
+                let gobj = obj_ref.borrow();
+                let gobj = gobj
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::GeneratorObject>()
+                    .unwrap();
+                match module.symtab.get(&FunctionId::new(gobj.func_id)) {
+                    Some(_) => (gobj.func_id, gobj.args.clone(), gobj.this.clone(), gobj.captured_vars.clone()),
+                    None => {
+                        return Err(RuntimeError::ReferenceError(format!(
+                            "undefined function: {}",
+                            gobj.func_id
+                        )))
+                    }
+                }
+            };
+            let location = *module.symtab.get(&FunctionId::new(func_id)).unwrap();
+            let argc = args.len();
+            for arg in args.iter().rev() {
+                self.state.push(arg.clone())?;
+            }
+            self.state.rbp = self.state.rsp;
+            self.state.enter_frame(argc)?;
+            self.state.this_val = this;
+            self.state.function_val = self.materialize_function(func_id);
+            for (name, value) in &captured_vars {
+                let mut map = std::collections::HashMap::new();
+                map.insert(name.clone(), value.clone());
+                self.state.closure_var_stack.push(map);
+            }
+            self.state.pushc(self.state.closure_var_stack.len())?;
+            self.state.pushc(self.state.seh_stack.len())?;
+            self.state.pushc(self.resume_sentinel(module))?;
+            self.state.construct_stack.push(false);
+            self.state.new_target_stack.push(Value::Undefined);
+            self.state.jump(location);
+        } else {
+            // Resuming at a `yield`: put the frame slice back and hand the
+            // sent value to the `Yield` that is waiting for it.
+            let frame = {
+                let Value::Object(obj_ref) = &gen_value else {
+                    return Err(RuntimeError::TypeError("not a generator".to_string()));
+                };
+                let mut gobj = obj_ref.borrow_mut();
+                let gobj = gobj
+                    .as_any_mut()
+                    .downcast_mut::<crate::vm::object::GeneratorObject>()
+                    .unwrap();
+                gobj.state = crate::vm::object::GeneratorState::Executing;
+                gobj.suspended
+                    .take()
+                    .expect("SuspendedYield without a frame")
+            };
+            let base = self.state.data_stack.len();
+            self.state.data_stack.extend(frame.data.iter().cloned());
+            self.state.rbp = base + frame.argc;
+            self.state.rsp = self.state.rbp + frame.bp_offset;
+            self.state.this_val = frame.this.clone();
+            self.state.function_val = frame.function_val.clone();
+            self.state.enter_frame(frame.argc)?;
+            for map in &frame.closure_maps {
+                self.state.closure_var_stack.push(map.clone());
+            }
+            self.state.pushc(self.state.closure_var_stack.len())?;
+            self.state.pushc(self.state.seh_stack.len())?;
+            self.state.pushc(self.resume_sentinel(module))?;
+            self.state.construct_stack.push(false);
+            self.state.new_target_stack.push(Value::Undefined);
+            // `yield expr` evaluates to the value the resumer supplied. The
+            // instruction itself does not run again, so the destination is read
+            // from the bytecode and written here, with the restored `rbp`.
+            // The register file is global, so the body's in-flight values have
+            // to come back before anything else runs.
+            for (slot, value) in self
+                .state
+                .registers
+                .iter_mut()
+                .zip(frame.registers.iter())
+            {
+                *slot = value.clone();
+            }
+            if let Some(inst) = module.instructions.get(frame.pc) {
+                if matches!(inst.opcode, Opcode::Yield) {
+                    let dst = inst.operands[0];
+                    self.set_value(dst, send)?;
+                }
+            }
+            self.state.jump(frame.pc + 1);
+        }
+
+        let closure_depth = self.state.closure_var_stack.len();
+        self.generator_yielded = None;
+        let outcome = (|| -> Result<(), RuntimeError> {
+            while self.step(module)? {}
+            Ok(())
+        })();
+
+        // A `yield` left the frame on the value stack: lift it out before the
+        // caller's context is restored (which would rewind `rsp` below it).
+        let yielded = self.generator_yielded.take();
+        let suspended = if yielded.is_some() {
+            Some(self.extract_generator_frame(closure_depth))
+        } else {
+            None
+        };
+        let rv = self.state.get_register(Register::Rv)?;
+        if suspended.is_some() {
+            // The body suspended rather than returned, so `Ret` never ran and
+            // the frame's bookkeeping is still on the stacks. Unwind it before
+            // the resumer's context is restored (which only truncates the
+            // stacks it saved — the control stack is not among them).
+            let _ = self.state.popc();
+            let _ = self.state.popc();
+            let _ = self.state.popc();
+            self.state.function_stack.pop();
+        }
+        self.restore_execution_state(&saved);
+        outcome?;
+
+        let Value::Object(obj_ref) = &gen_value else {
+            return Err(RuntimeError::TypeError("not a generator".to_string()));
+        };
+        let mut gobj = obj_ref.borrow_mut();
+        let Some(gobj) = gobj
+            .as_any_mut()
+            .downcast_mut::<crate::vm::object::GeneratorObject>()
+        else {
+            return Err(RuntimeError::TypeError("not a generator".to_string()));
+        };
+        match (yielded, suspended) {
+            (Some(value), Some(frame)) => {
+                gobj.state = crate::vm::object::GeneratorState::SuspendedYield;
+                gobj.suspended = Some(frame);
+                Ok(Self::iterator_result(value, false))
+            }
+            _ => {
+                gobj.state = crate::vm::object::GeneratorState::Completed;
+                gobj.suspended = None;
+                Ok(Self::iterator_result(rv, true))
+            }
+        }
+    }
+
+    /// One past the last instruction: `Ret` (and `Yield`) land here, which is
+    /// what terminates the nested `step` loop.
+    fn resume_sentinel(&self, module: &Module) -> usize {
+        module.instructions.len()
+    }
+
+    /// `{ value, done }` — the shape every iterator result has.
+    fn iterator_result(value: Value, done: bool) -> Value {
+        let mut result = crate::vm::object::OrdinaryObject::new();
+        let _ = result.property_set(PropertyKey::from_str("value"), value);
+        let _ = result.property_set(PropertyKey::from_str("done"), Value::Bool(done));
+        Value::Object(Rc::new(RefCell::new(result)))
+    }
+
+    /// Snapshot of everything a nested call must restore afterwards — the same
+    /// inventory `invoke_with_new_target` saves.
+    fn save_execution_state(&self) -> SavedExecutionState {
+        SavedExecutionState {
+            pc: self.state.pc,
+            rsp: self.state.rsp,
+            rbp: self.state.rbp,
+            closure: self.state.closure_var_stack.len(),
+            seh: self.state.seh_stack.len(),
+            this: self.state.this_val.clone(),
+            this_depth: self.state.this_stack.len(),
+            construct: self.state.construct_stack.len(),
+            new_target: self.state.new_target_stack.len(),
+            function: self.state.function_val.clone(),
+            registers: std::array::from_fn(|i| self.state.registers[i].clone()),
+        }
+    }
+
+    fn restore_execution_state(&mut self, saved: &SavedExecutionState) {
+        self.state.pc = saved.pc;
+        self.state.rsp = saved.rsp;
+        self.state.rbp = saved.rbp;
+        self.state.closure_var_stack.truncate(saved.closure);
+        self.state.seh_stack.truncate(saved.seh);
+        self.state.this_stack.truncate(saved.this_depth);
+        self.state.this_uninitialized.truncate(saved.this_depth);
+        self.state.frame_argc.truncate(saved.this_depth);
+        self.state.this_val = saved.this.clone();
+        self.state.function_val = saved.function.clone();
+        self.state.construct_stack.truncate(saved.construct);
+        self.state.new_target_stack.truncate(saved.new_target);
+        // The register file is *global*, not per frame: a nested run (a
+        // generator body, an `invoke`) overwrites values the caller still has
+        // in registers — an array literal built around `it.next()` is the
+        // common victim.
+        for (slot, value) in self.state.registers.iter_mut().zip(saved.registers.iter()) {
+            *slot = value.clone();
+        }
+    }
+
+    /// Lift the frame currently on top of the value stack out of it, so the
+    /// stack can be rewound to the resumer's position.
+    fn extract_generator_frame(
+        &mut self,
+        closure_depth: usize,
+    ) -> crate::vm::object::SuspendedFrame {
+        let argc = self.state.frame_argc.last().copied().unwrap_or(0);
+        let start = self.state.rbp.saturating_sub(argc);
+        let end = self.state.rsp.min(self.state.data_stack.len());
+        let data = if end > start {
+            self.state.data_stack[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        crate::vm::object::SuspendedFrame {
+            data,
+            argc,
+            bp_offset: self.state.rsp.saturating_sub(self.state.rbp),
+            pc: self.generator_yield_pc,
+            this: self.state.this_val.clone(),
+            function_val: self.state.function_val.clone(),
+            closure_maps: self.state.closure_var_stack[closure_depth..].to_vec(),
+            registers: std::array::from_fn(|i| self.state.registers[i].clone()),
+        }
+    }
+
     /// `GetIterator` (ES6 §7.4.1): produce the internal iterator for `src`.
     ///
     /// Fast path for arrays/strings/`arguments`; otherwise call
@@ -3795,6 +4422,7 @@ impl VM {
     fn iterator_next(
         &mut self,
         iter_val: Value,
+        send: Option<Value>,
         module: &Module,
     ) -> Result<(Value, bool), RuntimeError> {
         use crate::vm::iterator::{native_next, NativeIteratorState};
@@ -3832,16 +4460,20 @@ impl VM {
                 }
             };
             let next = self.get_member(&iterator, &PropertyKey::from_str("next"), module)?;
-            let result = self.invoke(&next, iterator.clone(), &[], module)?;
+            let args = match &send {
+                Some(v) => vec![v.clone()],
+                None => Vec::new(),
+            };
+            let result = self.invoke(&next, iterator.clone(), &args, module)?;
             let done = match self.get_member(&result, &PropertyKey::from_str("done"), module)? {
                 Value::Undefined => false,
                 v => v.to_boolean(),
             };
-            if done {
-                return Ok((Value::Undefined, true));
-            }
+            // The completion value is part of the result even when `done` is
+            // true — `yield*` returns it (`function* i(){ return "R" }` gives
+            // `yield* i()` the value `"R"`), and `IteratorResult` exposes it.
             let item = self.get_member(&result, &PropertyKey::from_str("value"), module)?;
-            Ok((item, false))
+            Ok((item, done))
         } else {
             let mut borrowed = iter_obj.borrow_mut();
             let it = borrowed
@@ -3985,6 +4617,7 @@ impl VM {
         self.state.closure_var_stack.truncate(saved_closure);
         self.state.seh_stack.truncate(saved_seh);
         self.state.this_stack.truncate(saved_this_depth);
+        self.state.this_uninitialized.truncate(saved_this_depth);
         self.state.frame_argc.truncate(saved_this_depth);
         self.state.this_val = saved_this;
         self.state.function_val = saved_function;
@@ -4226,6 +4859,11 @@ struct State {
     /// Saved `this` binding of the caller frame, restored on `Ret`.
     /// Keeping `this` per-frame prevents a nested call from clobbering it.
     this_stack: Vec<Value>,
+    /// Per frame: `this` has not been bound yet. Only ever true for a
+    /// derived-class constructor (`class C extends P`), whose `this` exists as
+    /// a binding but whose value is the *uninitialized* TDZ-like state until
+    /// `super()` supplies it (ES 9.2.2 / 12.3.5.1).
+    this_uninitialized: Vec<bool>,
     /// Number of arguments passed to each active frame, parallel to
     /// `this_stack`. This is what `Opcode::Arguments` reads to build the
     /// `arguments` object: the callee has no other way to learn its arity.
@@ -4250,6 +4888,7 @@ impl State {
             function_val: Value::Undefined,
             function_stack: Vec::new(),
             this_stack: Vec::new(),
+            this_uninitialized: Vec::new(),
             frame_argc: Vec::new(),
             rsp: 0,
             rbp: 0,
@@ -4298,7 +4937,13 @@ impl State {
             return Err(RuntimeError::RangeError("stack overflow".to_string()));
         }
         if self.rsp >= self.data_stack.len() {
-            let grow_to = (self.data_stack.len() * 2).max(1024).min(STACK_MAX);
+            // Doubling alone is not enough when a frame's prologue (`AddC rsp,
+            // stack_size`) jumps `rsp` past the current capacity in one step:
+            // cover the requested index as well.
+            let grow_to = (self.data_stack.len() * 2)
+                .max(self.rsp + 1)
+                .max(1024)
+                .min(STACK_MAX);
             self.data_stack.resize(grow_to, Value::Undefined);
         }
         self.data_stack[self.rsp] = value;
@@ -4400,6 +5045,7 @@ impl State {
             ));
         }
         self.this_stack.push(self.this_val.clone());
+        self.this_uninitialized.push(false);
         self.function_stack.push(self.function_val.clone());
         self.frame_argc.push(argc);
         Ok(())
@@ -4462,6 +5108,23 @@ struct SehRecord {
     saved_this_depth: usize,
     saved_construct_depth: usize,
     saved_new_target_depth: usize,
+}
+
+/// Per-frame execution context saved across a nested (`invoke`-style or
+/// generator-resume) execution loop.
+#[derive(Debug, Clone)]
+struct SavedExecutionState {
+    pc: usize,
+    rsp: usize,
+    rbp: usize,
+    closure: usize,
+    seh: usize,
+    this: Value,
+    this_depth: usize,
+    construct: usize,
+    new_target: usize,
+    function: Value,
+    registers: [Value; 19],
 }
 
 #[derive(Debug)]
@@ -4806,6 +5469,8 @@ mod tests {
             constants,
             HashMap::new(),
             HashMap::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
             instructions,
         )
     }

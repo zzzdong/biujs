@@ -230,15 +230,18 @@ fn array_element_accessors_and_attributes() {
         ),
         "42,42,3"
     );
-    // A non-writable element stays read-only through the descriptor.
+    // A non-writable element stays read-only through the descriptor — and
+    // because the engine is strict-only, the blocked assignment surfaces as a
+    // TypeError instead of a silent no-op.
     assert_eq!(
         eval_string(
             "var a = [1, 2];
              Object.defineProperty(a, 0, { value: 9, writable: false });
-             a[0] = 99;
-             a[0] + ',' + Object.getOwnPropertyDescriptor(a, 0).writable"
+             var thrown = 'none';
+             try { a[0] = 99; } catch (e) { thrown = e.name; }
+             a[0] + ',' + thrown + ',' + Object.getOwnPropertyDescriptor(a, 0).writable"
         ),
-        "9,false"
+        "9,TypeError,false"
     );
     // A non-enumerable element is hidden from Object.keys but keeps its value.
     assert_eq!(

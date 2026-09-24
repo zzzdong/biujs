@@ -35,6 +35,14 @@ pub const ITERATOR_NEXT_PREFIX: &str = "__iter_next__";
 /// Prefix for the per-iterator `return` method (`__iter_return__<id>`).
 pub const ITERATOR_RETURN_PREFIX: &str = "__iter_return__";
 
+/// Prefix for a generator's `next` method (`__gen_next__<id>`) — the method is
+/// a native because resuming the body needs the VM.
+pub const GENERATOR_NEXT_PREFIX: &str = "__gen_next__";
+
+/// Prefix for a generator's `[Symbol.iterator]` factory (`__gen_iterator__<id>`),
+/// which hands the generator itself back.
+pub const GENERATOR_ITERATOR_PREFIX: &str = "__gen_iterator__";
+
 /// `PropertyKey` for the well-known `Symbol.iterator`.
 pub fn iterator_symbol_key() -> PropertyKey {
     PropertyKey::Symbol(ITERATOR_SYMBOL_ID)

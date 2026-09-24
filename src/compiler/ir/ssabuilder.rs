@@ -647,6 +647,12 @@ impl<'a> SSABuilder<'a> {
             Instruction::LoadCurrentFunction { dst } => {
                 SSABuilder::rename_definition(dst, new_versions);
             }
+            Instruction::Yield { dst, src } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                if let Some(src) = src {
+                    SSABuilder::rename_use(src, stacks);
+                }
+            }
             Instruction::IteratorClose { iter } => {
                 SSABuilder::rename_use(iter, stacks);
             }

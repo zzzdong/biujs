@@ -14,6 +14,12 @@ pub struct Module {
     /// Declared name and parameter count of every bytecode function, keyed by
     /// function id. Function objects expose these as `name` / `length`.
     pub func_info: HashMap<u32, (String, usize)>,
+    /// Ids of the functions declared as `function*`. A call to one of these
+    /// creates a generator object instead of pushing a frame.
+    pub generators: std::collections::HashSet<u32>,
+    /// Ids of constructors declared in a class with an `extends` clause. Their
+    /// `this` is uninitialized until `super()` runs.
+    pub derived_ctors: std::collections::HashSet<u32>,
     pub instructions: Vec<Bytecode>,
     pub debug_instructions: BTreeMap<usize, crate::compiler::ir::Instruction>,
 }
@@ -24,6 +30,8 @@ impl Module {
         constants: Vec<Constant>,
         symtab: HashMap<FunctionId, usize>,
         func_info: HashMap<u32, (String, usize)>,
+        generators: std::collections::HashSet<u32>,
+        derived_ctors: std::collections::HashSet<u32>,
         instructions: Vec<Bytecode>,
     ) -> Self {
         Self {
@@ -31,6 +39,8 @@ impl Module {
             constants,
             symtab,
             func_info,
+            generators,
+            derived_ctors,
             instructions,
             debug_instructions: BTreeMap::new(),
         }
@@ -274,6 +284,11 @@ pub enum Opcode {
     Arguments,
     /// iter_close iter — signal early exit to a protocol iterator
     IterClose,
+    /// Suspend the enclosing generator: record the yielded value, hand the
+    /// current frame to [`crate::vm::VM::generator_resume`] and stop the
+    /// nested execution loop (the VM jumps past the last instruction, which is
+    /// what terminates a nested `step` loop).
+    Yield,
     /// to_string dst, src — ES ToString (objects via ToPrimitive("string"))
     ToString,
     /// to_number dst, src — ES ToNumber (objects via ToPrimitive("number"))
@@ -368,6 +383,7 @@ impl fmt::Display for Opcode {
             Opcode::ClosureVar => write!(f, "closure_var"),
             Opcode::Arguments => write!(f, "arguments"),
             Opcode::IterClose => write!(f, "iter_close"),
+            Opcode::Yield => write!(f, "yield"),
             Opcode::ToString => write!(f, "to_string"),
             Opcode::ToNumber => write!(f, "to_number"),
             Opcode::MakeRest => write!(f, "make_rest"),
@@ -883,7 +899,15 @@ mod tests {
 
     #[test]
     fn test_module_new() {
-        let module = Module::new(Some("test".to_string()), vec![], HashMap::new(), HashMap::new(), vec![]);
+        let module = Module::new(
+            Some("test".to_string()),
+            vec![],
+            HashMap::new(),
+            HashMap::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            vec![],
+        );
         assert_eq!(module.name, Some("test".to_string()));
         assert!(module.constants.is_empty());
         assert!(module.symtab.is_empty());
@@ -897,6 +921,8 @@ mod tests {
             vec![Constant::from("hello")],
             HashMap::new(),
             HashMap::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
             vec![Bytecode::empty(Opcode::Halt)],
         );
         let display = format!("{}", module);
