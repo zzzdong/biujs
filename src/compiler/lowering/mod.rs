@@ -723,6 +723,9 @@ impl<'a> JSASTLower<'a> {
     fn lower_yield_delegate(&mut self, expr: &Expression<'_>) -> Value {
         let src = self.lower_expression(expr);
         let iter = self.builder.make_iterator(src);
+        // The iterator is pending until the delegation finishes: a `return()`
+        // or `throw()` on the generator has to close it.
+        self.builder.delegate_open(iter);
 
         let sent = self.builder.alloc();
         self.builder
@@ -751,6 +754,7 @@ impl<'a> JSASTLower<'a> {
         self.builder.switch_to_block(done_blk);
         let returned = self.builder.get_property(step, "value");
         self.builder.assign(result, returned);
+        self.builder.delegate_close(iter);
         self.builder.iterator_close(iter);
         self.builder.jump(after_blk);
 

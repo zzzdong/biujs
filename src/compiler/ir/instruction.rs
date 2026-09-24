@@ -300,6 +300,14 @@ pub enum Instruction {
     },
 
     // Iteration Instructions
+    /// `yield*`: record the delegate so an abrupt completion can close it.
+    DelegateOpen {
+        iter: Value,
+    },
+    /// `yield*` finished; drop the record.
+    DelegateClose {
+        iter: Value,
+    },
     MakeIterator {
         dst: Value,
         src: Value,
@@ -556,6 +564,8 @@ impl Instruction {
                 src: iter,
                 dst: result,
             } => (vec![*result], vec![*iter]),
+            Instruction::DelegateOpen { iter } => (vec![], vec![*iter]),
+            Instruction::DelegateClose { iter } => (vec![], vec![*iter]),
             Instruction::IterateNext {
                 iter,
                 item,
@@ -780,6 +790,8 @@ impl std::fmt::Display for Instruction {
             Instruction::MakeIterator { src, dst } => {
                 write!(f, "{dst} = make_iterator {src}")
             }
+            Instruction::DelegateOpen { iter } => write!(f, "delegate_open {iter}"),
+            Instruction::DelegateClose { iter } => write!(f, "delegate_close {iter}"),
             Instruction::IteratorClose { iter } => {
                 write!(f, "iterator_close {iter}")
             }

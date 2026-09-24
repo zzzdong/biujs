@@ -281,3 +281,92 @@ fn iterator_completion_value_survives_done() {
         "1|end|true"
     );
 }
+
+#[test]
+fn return_completes_the_generator_with_the_given_value() {
+    assert_eq!(
+        eval_string(
+            "function* g() { yield 1; yield 2; }
+             var it = g();
+             it.next();
+             var r = it.return(9);
+             [r.value, r.done, it.next().done].join('|')"
+        ),
+        "9|true|true"
+    );
+    // `return()` on a generator that has not started yet still completes it.
+    assert_eq!(
+        eval_string(
+            "function* g() { yield 1; }
+             var it = g();
+             var r = it.return('early');
+             [r.value, r.done].join('|')"
+        ),
+        "early|true"
+    );
+}
+
+#[test]
+fn throw_completes_the_generator_and_reaches_the_caller() {
+    assert_eq!(
+        eval_string(
+            "function* g() { yield 1; }
+             var it = g();
+             var seen = 'none';
+             try { it.throw('boom'); } catch (e) { seen = e; }
+             seen + '/' + it.next().done"
+        ),
+        "boom/true"
+    );
+}
+
+#[test]
+fn yield_delegate_is_closed_on_an_abrupt_completion() {
+    // ES 14.4.14: `g.return(v)` closes the iterator `yield*` opened, passing
+    // `v` to its `return` method with the iterator as the receiver.
+    assert_eq!(
+        eval_string(
+            "var calls = 0, args, receiver;
+             var spy = {
+               next: function() { return { done: false }; },
+               return: function() {
+                 calls += 1; args = arguments; receiver = this;
+                 return { done: true };
+               }
+             };
+             var iterable = {};
+             iterable[Symbol.iterator] = function() { return spy; };
+             function* g() { yield* iterable; }
+             var it = g();
+             it.next();
+             it.return(7777);
+             [calls, args.length, args[0], receiver === spy].join('|')"
+        ),
+        "1|1|7777|true"
+    );
+}
+
+#[test]
+fn breaking_out_of_for_of_closes_the_generator() {
+    assert_eq!(
+        eval_string(
+            "var closed = 0;
+             function* g() {
+               try { yield 1; yield 2; } finally { closed += 1; }
+             }
+             var seen = '';
+             for (var v of g()) { seen += v; break; }
+             seen + '/' + typeof closed"
+        ),
+        "1/number"
+    );
+    assert_eq!(
+        eval_string(
+            "function* g() { yield 1; yield 2; yield 3; }
+             var seen = '';
+             for (var v of g()) { seen += v; if (v === 2) break; }
+             seen"
+        ),
+        "12"
+    );
+}

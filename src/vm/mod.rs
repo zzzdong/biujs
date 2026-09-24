@@ -84,6 +84,9 @@ pub struct VM {
     /// before the handler jumps past the last instruction, so the resume path
     /// can continue at `pc + 1`.
     generator_yield_pc: usize,
+    /// Iterators opened by `yield*` in the frames currently running, innermost
+    /// last. An abrupt completion of a generator closes everything it opened.
+    delegate_stack: Vec<Value>,
     /// Function metadata (`name`, parameter count) of the module being run.
     /// Kept here so `materialize_function` can set `fn.name` / `fn.length`
     /// without threading the module through every call site.
@@ -163,6 +166,7 @@ impl VM {
             generator_send: Value::Undefined,
             generator_yielded: None,
             generator_yield_pc: 0,
+            delegate_stack: Vec::new(),
             current_module_info: None,
             func_objs: HashMap::new(),
             step_limit: Some(DEFAULT_STEP_LIMIT),
@@ -1267,14 +1271,29 @@ impl VM {
         if name == crate::builtins::SYMBOL_DESCRIPTION_NATIVE {
             return crate::builtins::symbol_description(&this);
         }
-        // Generator methods: `gen.next(v)` resumes the body, and
-        // `gen[Symbol.iterator]()` hands the generator itself back.
+        // Generator methods: `gen.next(v)` resumes the body, `gen.return(v)` /
+        // `gen.throw(e)` complete it, and `gen[Symbol.iterator]()` hands the
+        // generator itself back.
         if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_NEXT_PREFIX) {
             let id: u64 = id.parse().map_err(|_| {
                 RuntimeError::InternalError("malformed generator id".to_string())
             })?;
             let send = args.first().cloned().unwrap_or(Value::Undefined);
             return self.generator_next(id, send, module);
+        }
+        if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_RETURN_PREFIX) {
+            let id: u64 = id.parse().map_err(|_| {
+                RuntimeError::InternalError("malformed generator id".to_string())
+            })?;
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            return self.generator_abrupt(id, Ok(value), module);
+        }
+        if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_THROW_PREFIX) {
+            let id: u64 = id.parse().map_err(|_| {
+                RuntimeError::InternalError("malformed generator id".to_string())
+            })?;
+            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+            return self.generator_abrupt(id, Err(RuntimeError::Thrown(reason)), module);
         }
         if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_ITERATOR_PREFIX) {
             let _id: u64 = id.parse().map_err(|_| {
@@ -1318,9 +1337,12 @@ impl VM {
                 .parse()
                 .map_err(|_| RuntimeError::InternalError("malformed iterator id".to_string()))?;
             if let Some(iter_val) = self.iterator_registry.get(&id).cloned() {
-                self.iterator_close(iter_val, module)?;
+                self.iterator_close(iter_val, args.first(), module)?;
             }
-            return Ok(Value::Undefined);
+            // `return()` is an iterator method, so it answers with an iterator
+            // result — `yield*` checks that the value is an object
+            // (ES 14.4.14 step 5.c.vi).
+            return Ok(Self::iterator_result(Value::Undefined, true));
         }
         // `Function.prototype` registers `call` / `apply` / `bind` under their
         // plain names, so handle them before the static-method lookup.
@@ -2050,6 +2072,13 @@ impl VM {
             }
 
             // ===== Iteration =====
+            Opcode::DelegateOpen => {
+                let iter = self.get_value(operands[0])?;
+                self.delegate_stack.push(iter);
+            }
+            Opcode::DelegateClose => {
+                self.delegate_stack.pop();
+            }
             Opcode::MakeIter => {
                 let src = self.get_value(operands[1])?;
                 let iter_val = self.make_iterator(src, module)?;
@@ -2064,7 +2093,7 @@ impl VM {
             }
             Opcode::IterClose => {
                 let iter_val = self.get_value(operands[0])?;
-                self.iterator_close(iter_val, module)?;
+                self.iterator_close(iter_val, None, module)?;
             }
             Opcode::MakeRest => {
                 // Collect the tail of the incoming arguments into a fresh
@@ -4138,6 +4167,10 @@ impl VM {
         // Saved before anything is pushed, exactly as `invoke` does: the
         // generator frame must not survive the resume.
         let saved = self.save_execution_state();
+        // Captured before the frame is set up: the resume path puts the frame's
+        // own open delegates back, and those are *this* frame's, not the
+        // resumer's.
+        let delegate_depth = self.delegate_stack.len();
         let gen_value = match self.generator_registry.get(&id).cloned() {
             Some(v) => v,
             None => {
@@ -4222,6 +4255,7 @@ impl VM {
                     .expect("SuspendedYield without a frame")
             };
             let base = self.state.data_stack.len();
+            self.delegate_stack.extend(frame.delegates.iter().cloned());
             self.state.data_stack.extend(frame.data.iter().cloned());
             self.state.rbp = base + frame.argc;
             self.state.rsp = self.state.rbp + frame.bp_offset;
@@ -4269,7 +4303,7 @@ impl VM {
         // caller's context is restored (which would rewind `rsp` below it).
         let yielded = self.generator_yielded.take();
         let suspended = if yielded.is_some() {
-            Some(self.extract_generator_frame(closure_depth))
+            Some(self.extract_generator_frame(closure_depth, delegate_depth))
         } else {
             None
         };
@@ -4311,6 +4345,83 @@ impl VM {
         }
     }
 
+    /// `gen.return(v)` / `gen.throw(e)`: complete the generator with the given
+    /// completion instead of resuming the body.
+    ///
+    /// `Ok(value)` is a return completion and reports `{ value, done: true }`;
+    /// `Err(Thrown(reason))` completes the generator and re-raises `reason` to
+    /// the caller, which is what `throw()` does (ES 25.4.3.4 / 25.4.3.5).
+    ///
+    /// The body is *not* resumed: the full specification resumes it so that
+    /// `finally` blocks run, and a `yield*` closes its delegate iterator. Both
+    /// need the SEH records and the delegate stack that this subset does not
+    /// carry yet — see §2.1u of the conformance plan.
+    fn generator_abrupt(
+        &mut self,
+        id: u64,
+        completion: Result<Value, RuntimeError>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let gen_value = match self.generator_registry.get(&id).cloned() {
+            Some(v) => v,
+            None => {
+                return Err(RuntimeError::TypeError(
+                    "generator is no longer alive".to_string(),
+                ))
+            }
+        };
+        let Value::Object(obj_ref) = &gen_value else {
+            return Err(RuntimeError::TypeError("not a generator".to_string()));
+        };
+        let mut gobj = obj_ref.borrow_mut();
+        let Some(gobj) = gobj
+            .as_any_mut()
+            .downcast_mut::<crate::vm::object::GeneratorObject>()
+        else {
+            return Err(RuntimeError::TypeError("not a generator".to_string()));
+        };
+        // A generator that has not started yet still becomes completed, and the
+        // completion is what the caller sees.
+        gobj.state = crate::vm::object::GeneratorState::Completed;
+        let delegates = gobj.suspended.take().map(|f| f.delegates).unwrap_or_default();
+        drop(gobj);
+        // ES 14.4.14 step 5.c: `yield*` closes its delegate with the abrupt
+        // completion before the generator finishes.
+        let value = completion?;
+        self.close_delegates(&delegates, &value, module)?;
+        Ok(Self::iterator_result(value, true))
+    }
+
+    /// `IteratorClose` for every iterator a `yield*` left open, innermost first.
+    ///
+    /// `GetMethod(iterator, "return")` — absent means nothing to do — then the
+    /// call, then the "result must be an object" check (ES 7.4.6).
+    fn close_delegates(
+        &mut self,
+        delegates: &[Value],
+        value: &Value,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        for iter in delegates.iter().rev() {
+            let return_method = self.get_member(iter, &PropertyKey::from_str("return"), module)?;
+            if return_method.is_undefined() || return_method.is_null() {
+                continue;
+            }
+            if !return_method.is_callable() {
+                return Err(RuntimeError::TypeError(
+                    "iterator.return is not a function".to_string(),
+                ));
+            }
+            let result = self.invoke(&return_method, iter.clone(), &[value.clone()], module)?;
+            if !result.is_object() {
+                return Err(RuntimeError::TypeError(
+                    "iterator.return() returned a non-object value".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// One past the last instruction: `Ret` (and `Yield`) land here, which is
     /// what terminates the nested `step` loop.
     fn resume_sentinel(&self, module: &Module) -> usize {
@@ -4339,6 +4450,7 @@ impl VM {
             construct: self.state.construct_stack.len(),
             new_target: self.state.new_target_stack.len(),
             function: self.state.function_val.clone(),
+            delegate: self.delegate_stack.len(),
             registers: std::array::from_fn(|i| self.state.registers[i].clone()),
         }
     }
@@ -4356,6 +4468,7 @@ impl VM {
         self.state.function_val = saved.function.clone();
         self.state.construct_stack.truncate(saved.construct);
         self.state.new_target_stack.truncate(saved.new_target);
+        self.delegate_stack.truncate(saved.delegate);
         // The register file is *global*, not per frame: a nested run (a
         // generator body, an `invoke`) overwrites values the caller still has
         // in registers — an array literal built around `it.next()` is the
@@ -4392,6 +4505,7 @@ impl VM {
     fn extract_generator_frame(
         &mut self,
         closure_depth: usize,
+        delegate_depth: usize,
     ) -> crate::vm::object::SuspendedFrame {
         let argc = self.state.frame_argc.last().copied().unwrap_or(0);
         let start = self.state.rbp.saturating_sub(argc);
@@ -4408,8 +4522,18 @@ impl VM {
             pc: self.generator_yield_pc,
             this: self.state.this_val.clone(),
             function_val: self.state.function_val.clone(),
-            closure_maps: self.state.closure_var_stack[closure_depth..].to_vec(),
+            closure_maps: self
+                .state
+                .closure_var_stack
+                .get(closure_depth..)
+                .unwrap_or_default()
+                .to_vec(),
             registers: std::array::from_fn(|i| self.state.registers[i].clone()),
+            delegates: self
+                .delegate_stack
+                .get(delegate_depth..)
+                .unwrap_or_default()
+                .to_vec(),
         }
     }
 
@@ -4563,7 +4687,15 @@ impl VM {
     /// Only meaningful on the slow path (calls `iterator.return()`); native
     /// iterators are stateless no-ops. Errors from `return()` are swallowed,
     /// as the spec requires for abrupt completions that already have a reason.
-    fn iterator_close(&mut self, iter_val: Value, module: &Module) -> Result<(), RuntimeError> {
+    /// `value` is the completion value `yield*` forwards to the iterator's
+    /// `return` method (ES 14.4.14 step 5.c.iv); a plain `IteratorClose` passes
+    /// none (ES 7.4.6).
+    fn iterator_close(
+        &mut self,
+        iter_val: Value,
+        value: Option<&Value>,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
         use crate::vm::iterator::NativeIteratorState;
 
         let Value::Object(iter_obj) = &iter_val else {
@@ -4586,8 +4718,12 @@ impl VM {
             .get_member(&iterator, &PropertyKey::from_str("return"), module)
             .unwrap_or(Value::Undefined);
         if return_fn.is_callable() {
+            let args = match value {
+                Some(v) => vec![v.clone()],
+                None => Vec::new(),
+            };
             // Swallow errors from `return()` — the original completion wins.
-            let _ = self.invoke(&return_fn, iterator, &[], module);
+            let _ = self.invoke(&return_fn, iterator, &args, module);
         }
         Ok(())
     }
@@ -5212,6 +5348,7 @@ struct SavedExecutionState {
     construct: usize,
     new_target: usize,
     function: Value,
+    delegate: usize,
     registers: [Value; 19],
 }
 

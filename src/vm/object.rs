@@ -1863,6 +1863,9 @@ pub struct SuspendedFrame {
     /// The 19-slot register file. It is **global**, not per frame, so a value
     /// held in a register across a `yield` has to travel with the frame.
     pub registers: [Value; 19],
+    /// Iterators this frame's `yield*` left open. An abrupt completion has to
+    /// close them (ES 14.4.14 step 5.c).
+    pub delegates: Vec<Value>,
     // NOTE: no SEH records here — a `try` around a `yield` is out of scope for
     // the first generator increment (M4 follow-up), so a generator body with an
     // exception handler is simply not resumable across it.
@@ -1934,6 +1937,16 @@ impl JSObject for GeneratorObject {
                 crate::vm::iterator::GENERATOR_NEXT_PREFIX,
                 self.id
             ),
+            Some("return") => format!(
+                "{}{}",
+                crate::vm::iterator::GENERATOR_RETURN_PREFIX,
+                self.id
+            ),
+            Some("throw") => format!(
+                "{}{}",
+                crate::vm::iterator::GENERATOR_THROW_PREFIX,
+                self.id
+            ),
             _ => return None,
         };
         Some(PropertyDescriptor::data_descriptor(Value::Object(
@@ -1959,11 +1972,15 @@ impl JSObject for GeneratorObject {
 
     fn has_property(&self, key: &PropertyKey) -> bool {
         *key == crate::vm::iterator::iterator_symbol_key()
-            || matches!(key.as_str(), Some("next"))
+            || matches!(key.as_str(), Some("next") | Some("return") | Some("throw"))
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        vec![PropertyKey::from_str("next")]
+        vec![
+            PropertyKey::from_str("next"),
+            PropertyKey::from_str("return"),
+            PropertyKey::from_str("throw"),
+        ]
     }
 
     fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {

@@ -39,6 +39,12 @@ pub const ITERATOR_RETURN_PREFIX: &str = "__iter_return__";
 /// a native because resuming the body needs the VM.
 pub const GENERATOR_NEXT_PREFIX: &str = "__gen_next__";
 
+/// Prefix for a generator's `return` method (`__gen_return__<id>`).
+pub const GENERATOR_RETURN_PREFIX: &str = "__gen_return__";
+
+/// Prefix for a generator's `throw` method (`__gen_throw__<id>`).
+pub const GENERATOR_THROW_PREFIX: &str = "__gen_throw__";
+
 /// Prefix for a generator's `[Symbol.iterator]` factory (`__gen_iterator__<id>`),
 /// which hands the generator itself back.
 pub const GENERATOR_ITERATOR_PREFIX: &str = "__gen_iterator__";

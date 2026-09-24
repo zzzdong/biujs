@@ -653,6 +653,9 @@ impl<'a> SSABuilder<'a> {
                     SSABuilder::rename_use(src, stacks);
                 }
             }
+            Instruction::DelegateOpen { iter } | Instruction::DelegateClose { iter } => {
+                SSABuilder::rename_use(iter, stacks);
+            }
             Instruction::IteratorClose { iter } => {
                 SSABuilder::rename_use(iter, stacks);
             }

@@ -289,6 +289,16 @@ impl Codegen {
                     }
 
                     // Iteration Instructions
+                    Instruction::DelegateOpen { iter } => {
+                        let iter = self.gen_operand(iter);
+                        self.codes
+                            .push(Bytecode::single(Opcode::DelegateOpen, iter));
+                    }
+                    Instruction::DelegateClose { iter } => {
+                        let iter = self.gen_operand(iter);
+                        self.codes
+                            .push(Bytecode::single(Opcode::DelegateClose, iter));
+                    }
                     Instruction::MakeIterator {
                         src: iter,
                         dst: result,

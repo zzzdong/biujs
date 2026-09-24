@@ -223,6 +223,11 @@ pub enum Opcode {
     /// in dst, src1, src2
     In,
     /// make_iter dst, src
+    /// Remember an iterator opened by `yield*`: an abrupt completion of the
+    /// enclosing generator has to close it (ES 14.4.14).
+    DelegateOpen,
+    /// The `yield*` finished normally; its iterator is no longer pending.
+    DelegateClose,
     MakeIter,
     /// iter_next dst, has_next, src
     IterNext,
@@ -353,6 +358,8 @@ impl fmt::Display for Opcode {
             Opcode::TypeOfEnv => write!(f, "typeof_env"),
             Opcode::InstanceOf => write!(f, "instanceof"),
             Opcode::In => write!(f, "in"),
+            Opcode::DelegateOpen => write!(f, "delegate_open"),
+            Opcode::DelegateClose => write!(f, "delegate_close"),
             Opcode::MakeIter => write!(f, "make_iter"),
             Opcode::IterNext => write!(f, "iter_next"),
             Opcode::MakeArray => write!(f, "make_array"),

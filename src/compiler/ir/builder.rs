@@ -296,6 +296,16 @@ pub trait InstBuilder {
     }
 
     /// Signal early exit to a protocol iterator (`IteratorClose`).
+    /// `yield*`: the iterator is now pending on this frame.
+    fn delegate_open(&mut self, iter: Value) {
+        self.emit(Instruction::DelegateOpen { iter });
+    }
+
+    /// `yield*`: the iterator is done.
+    fn delegate_close(&mut self, iter: Value) {
+        self.emit(Instruction::DelegateClose { iter });
+    }
+
     fn iterator_close(&mut self, iter: Value) {
         self.emit(Instruction::IteratorClose { iter });
     }

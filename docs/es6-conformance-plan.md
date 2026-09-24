@@ -726,6 +726,39 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 
 **残留**：`derived-class-return-override-*` 里 `-catch-super` / `-catch-super-arrow` / `-for-of` 三例仍未过（都还需要 `try`/`finally` 与 `super()` 的组合语义，与 §2.3 里"finally 块执行两次"的老债同源，归 M6）；`superclass-bound-function.js`、`class-definition-null-proto-*` 是另外的小簇。
 
+### 2.1u M4-G3：`gen.return()` / `gen.throw()` 与 `yield*` 的委托关闭（2026-09-24）
+
+**起点**：通过 7974 / 10825（73.66%）。M4 只剩 G3（IteratorClose 完整化）与 G4（联调）。`language/expressions/yield` 的 29 例失败里，`star-rhs-iter-rtrn-*`（11）是"生成器被 `return()` 中断时要关闭 `yield*` 打开的迭代器"，`star-rhs-iter-thrw-*`（12）是同一件事的 throw 版本。
+
+**交付**：
+
+1. 生成器对象补上 `return` / `throw` 两个原生方法（`__gen_return__<id>` / `__gen_throw__<id>`），与 `next` 同构。
+2. `VM::generator_abrupt`：`return(v)` 以 `{ value: v, done: true }` 完成生成器；`throw(e)` 完成生成器并把 `e` 抛给调用方（ES 25.4.3.4 / 25.4.3.5）。尚未启动的生成器同样直接完成。
+3. **委托追踪**：`yield*` 的迭代器现在是"挂起的"，会被 abrupt completion 关闭。
+   - 新增 `Opcode::DelegateOpen` / `DelegateClose`（IR 层 `Instruction::DelegateOpen/Close`），脱糖在 `make_iterator` 之后 open、在 done 分支 close；
+   - VM 用 `delegate_stack` 记着；`SuspendedFrame` 带上属于本帧的那一段（挂起时摘出、恢复时放回）；
+   - `generator_abrupt` 在返回之前按" innermost first"逐个 `GetMethod(iter, "return")` → 调用 → 校验结果是对象（ES 14.4.14 step 5.c）。
+4. `iterator_close` 增加"完成值"参数：`yield*` 那条路要把 `received.[[Value]]` 传给 `return()`，而普通 `IteratorClose`（ES 7.4.6）不传 —— 同一个函数、两种调用，参数区分。
+5. 顺带修掉：原生迭代器的 `return()` 原先返回 `undefined`，而它是迭代器方法、必须返回 iterator result；`yield*` 的"结果必须是对象"检查因此一直失败。
+
+**踩到的坑**（都是"栈/深度要在装帧之前取"）：
+
+- `delegate_depth` 一开始放在帧装好之后取，于是恢复路径刚把本帧的委托放回去就被算成了"resumer 的深度"，下一次挂起时切片越界（`range start index 1 out of range for slice of length 0`，feature 用例 `yield_delegate_value_is_the_inner_return` 直接崩）。必须和 `save_execution_state()` 一样**在装帧之前**取。这是 §2.1p 那次（`save_execution_state` 装帧后取）的同一个教训第三次出现。
+- `close_delegates` 里拿到的 `return` 方法是**包装对象**的原生 `__iter_return__<id>`，不是用户写的那个函数；它替用户迭代器转发调用，所以修它而不是绕过它。
+
+**效果**：
+
+| 套件 | §2.1t 后 | 本批后 | 变化 |
+|------|----------|--------|------|
+| `language/expressions/yield` | 28 | **30** | +2 |
+| 全量 | 7974 / 10825（73.66%） | **7976 / 10825**（73.68%） | +2 |
+
+单元 190 全绿；features 397 → 401 通过（`generators.rs` 新增 4 个用例 / 11 条断言）。
+
+**净收益只有 +2，值得说明**：`return()`/`throw()` 本身在 test262 里几乎没有单独计分的用例，它们的价值是让 `for-of` 里 `break` 真正触发 `IteratorClose`、以及让 `yield*` 在中断时关闭委托 —— 这两条都是"别的用例依赖它"的语义，而不是自带一批用例。§2.1q 时 `for-of` 靠完成值涨了 26，这一批是把那条路补完整。
+
+**残留**：`star-rhs-iter-thrw-*`（12 例）仍未过 —— 它们要求 `throw()` **恢复函数体**并把异常抛在 `yield` 的位置上，这样 `try`/`catch` 能接住、`finally` 能跑；这需要 `SuspendedFrame` 带上 SEH 记录（§2.1p 起就明确排除）。同样地，`return()` 也还没跑 `finally`。这两件事归同一个后续任务：**给生成器的挂起帧补上异常处理器**。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -780,7 +813,7 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 | **Array 泛型路径不执行访问器** | 泛型（类数组）路径的 `[[Get]]` 直接读属性表，索引上的 getter 不会被调用：`Array/prototype/reverse/length-exceeding-integer-limit-with-object.js`（靠 getter 抛错提前中止）等用例失败 | 2026-09-22 登记（§2.1l）：需要把泛型路径改为经 VM 的 `[[Get]]`，属跨层改动，归 M6 |
 | 泛型路径的物化上限（`MAX_GENERIC_ELEMENTS = 2^22`） | `length` 超过上限的逐元素操作（`fill`/`copyWithin`/`splice` 结果）抛 RangeError，而参考引擎会做稀疏写 | 2026-09-22 登记（§2.1l）：有意为之——本引擎数组是 `Vec` 支撑，无法表示 2^53 长度；先保证不 OOM |
 | **内置构造器初始化未搬到派生 `this` 上** | `prototype_from_constructor` 与 `BindThisValue` 已到位（§2.1s），但每个内建构造器的初始化仍是"自己 new 一个"：`Array` 子类装不进元素（`regular-subclassing.js`、`length.js`、`contructor-calls-super-*.js`）、`Function` 子类缺 `length`/`name` own 属性（`instance-length.js`、`instance-name.js`）、`message` 不是自有属性（`message-property-assignment.js`） | 2026-09-24 登记（§2.1s）：让 `ArrayCreate`/`Error` 等接受"待初始化的 `this`"，逐个补 |
-| **生成器子集未覆盖的语义** | 生成器的 `return()` / `throw()`、`try` 内的 `yield`（`SuspendedFrame` 故意不带 SEH 记录，带异常处理器的生成器体跨挂起不可靠）、生成器作构造器、`Generator.prototype` / `%IteratorPrototype%` 原型链与 `next.name`/`length` 元数据 | 2026-09-23 登记（§2.1p）：按 M4 计划"先做仅 `next()`、无 `try` 内 yield 的子集"，逐个补齐 |
+| **生成器子集未覆盖的语义** | `return()` / `throw()` 已就位但不恢复函数体（§2.1u）：`try`/`catch` 接不住、`finally` 不跑；根因是 `SuspendedFrame` 不带 SEH 记录（`star-rhs-iter-thrw-*` 12 例）。另有生成器作构造器、`Generator.prototype` / `%IteratorPrototype%` 原型链与 `next.name`/`length` 元数据 | 2026-09-23 登记（§2.1p）、2026-09-24 更新（§2.1u）：后续任务是"给生成器的挂起帧补上异常处理器" |
 | **Array 快路径绕过原型链上的索引访问器** | `push`/`pop`/`shift`/`unshift` 的 `*-is-frozen` 系列（8 例）在 `Array.prototype[0]` 的 getter/setter 里冻结数组，要求错误在那次访问时抛出；快路径直接改 `Vec`，访问器不执行也没有受限副作用 | 2026-09-23 登记（§2.1n）：`length` 可写性已按 `Set(…,throw)` 处理（同批 +8），剩下的一半要索引读写经原型链、且 getter 可被调用 —— 需把这四个方法上移到 VM，与"Array 泛型路径不执行访问器"同源，归 M6 |
 | ~~缺 `ArraySpeciesCreate` / `CreateDataPropertyOrThrow`~~ | `map`/`filter`/`slice`/`splice`/`concat` 的 species 与目标对象写入用例全部失败 | 2026-09-23 登记（§2.1n）→ ✅ **本轮已交付**（§2.1o）：`Array[Symbol.species]` 访问器、`VM::array_species_create`（含 `SameValue(C,%Array%)` 短路）、五个方法接入；`CreateDataPropertyOrThrow` 复用 strict-only 的 `set_member`。残留仅 ES2019+ 的 `flat`/`flatMap`（未实现）与 well-known symbol 描述符的 `configurable` 细节 |
 
@@ -813,7 +846,7 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数（§2.1t 后） | 主要缺口 |
+| 套件 | 失败数（§2.1u 后） | 主要缺口 |
 |------|--------------------|----------|
 | `built-ins/Array` | 857 | `flat`/`flatMap`（ES2019）、`findLast*` 与 change-array-by-copy（ES2023）整体缺失；`resizable-arraybuffer` 类用例；sloppy-mode 依赖的 ES5 用例 |
 | `built-ins/Object` | 499 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |
