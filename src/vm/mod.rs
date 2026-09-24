@@ -558,8 +558,23 @@ impl VM {
         new_target_override: Option<Value>,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
-        // Native built-ins never need a bytecode frame.
+        // Native built-ins never need a bytecode frame — except when a
+        // `super(...)` supplies a `new.target`: then the built-in has to build
+        // the instance with `newTarget.prototype` (ES 9.1.14
+        // GetPrototypeFromConstructor), which is what makes
+        // `class C extends Error {}` produce a real error object.
         if let Some(name) = crate::builtins::native_function_name(callee) {
+            if let Some(new_target) = &new_target_override {
+                if new_target.is_object() {
+                    return self.native_construct(
+                        &name,
+                        callee,
+                        args,
+                        Some(new_target),
+                        module,
+                    );
+                }
+            }
             return self.call_native_by_name(&name, this, args, module);
         }
 
@@ -2107,6 +2122,13 @@ impl VM {
                 }
                 let result =
                     self.invoke_with_new_target(&callee, this, &args, Some(new_target), module)?;
+                // ES 12.3.5.1 `BindThisValue`: whatever `super()` produced *is*
+                // the derived `this`. A built-in parent builds its own instance
+                // (`Error` sets `message`), so the pre-created object has to be
+                // replaced by it; a bytecode parent hands the same one back.
+                if result.is_object() {
+                    self.state.this_val = result.clone();
+                }
                 self.state.set_register(Register::Rv, result)?;
             }
             Opcode::NewSpread => {
@@ -2669,7 +2691,7 @@ impl VM {
 
                             let ctor = Value::Object(Rc::clone(&obj_ref));
                             let args = self.collect_call_args(arg_count)?;
-                            let rv = self.native_construct(&name, &ctor, &args, module)?;
+                            let rv = self.native_construct(&name, &ctor, &args, None, module)?;
                             self.state.set_register(Register::Rv, rv)?;
                             self.state.jump_offset(1);
                             return Ok(());
@@ -4316,6 +4338,28 @@ impl VM {
         }
     }
 
+    /// The prototype a `[[Construct]]` should give the new instance.
+    fn prototype_from_constructor(
+        &self,
+        constructor_val: &Value,
+        new_target: Option<&Value>,
+    ) -> Option<Value> {
+        if let Some(Value::Object(nt)) = new_target {
+            if let Some(desc) = nt.borrow().property_get(&PropertyKey::from_str("prototype")) {
+                if desc.value.is_object() {
+                    return Some(desc.value);
+                }
+            }
+        }
+        match constructor_val {
+            Value::Object(obj_ref) => obj_ref
+                .borrow()
+                .property_get(&PropertyKey::from_str("prototype"))
+                .map(|d| d.value),
+            _ => None,
+        }
+    }
+
     /// Lift the frame currently on top of the value stack out of it, so the
     /// stack can be rewound to the resumer's position.
     fn extract_generator_frame(
@@ -4640,7 +4684,7 @@ impl VM {
         // Built-in constructors (Object, Array, Error, `f.bind(…)`, …) share
         // their `[[Construct]]` with the `New` opcode.
         if let Some(name) = crate::builtins::native_function_name(constructor_val) {
-            return self.native_construct(&name, constructor_val, args, module);
+            return self.native_construct(&name, constructor_val, args, None, module);
         }
 
         // Bytecode constructor: resolve the prototype from the (boxed)
@@ -4682,6 +4726,7 @@ impl VM {
         name: &str,
         constructor_val: &Value,
         args: &[Value],
+        new_target: Option<&Value>,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         // A bound function constructs its target with the bound arguments
@@ -4713,15 +4758,14 @@ impl VM {
             return Err(RuntimeError::TypeError("not a constructor".to_string()));
         }
 
-        // The instance prototype is `C.prototype`, *not* the constructor's own
-        // `[[Prototype]]` (which is `Function.prototype`).
-        let proto = match constructor_val {
-            Value::Object(obj_ref) => obj_ref
-                .borrow()
-                .property_get(&PropertyKey::from_str("prototype"))
-                .map(|d| d.value),
-            _ => None,
-        };
+        // ES 9.1.14 `GetPrototypeFromConstructor`: `newTarget.prototype` when
+        // it is an object, otherwise the constructor's own `prototype` — which
+        // for a plain `new Error(...)` is the same object anyway.
+        let proto = self.prototype_from_constructor(constructor_val, new_target);
+        // True when the prototype came from a *different* function than the
+        // constructor being run: the instance the built-in just made carries
+        // the intrinsic prototype and has to be re-parented.
+        let reparent = new_target.is_some_and(|nt| !nt.strict_eq_obj(constructor_val));
         let mut this_obj = crate::vm::object::OrdinaryObject::new();
         match &proto {
             Some(Value::Object(p)) => this_obj.set_prototype(Some(Rc::clone(p))),
@@ -4730,7 +4774,13 @@ impl VM {
         let this_val = Value::Object(Rc::new(RefCell::new(this_obj)));
 
         let result = crate::builtins::call_native(name, args)?;
-        Ok(self.finish_native_construct(result, &proto, this_val))
+        let result = self.finish_native_construct(result, &proto, this_val);
+        if reparent {
+            if let (Value::Object(obj_ref), Some(Value::Object(p))) = (&result, &proto) {
+                obj_ref.borrow_mut().set_prototype(Some(Rc::clone(p)));
+            }
+        }
+        Ok(result)
     }
 
     /// Result value of `new C(…)` for a built-in constructor `C`.

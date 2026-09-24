@@ -310,6 +310,17 @@ impl Value {
         }
     }
 
+    /// Object identity: true only when both values are the *same* object.
+    ///
+    /// Used where `SameValue` on objects is meant (comparing a `new.target`
+    /// with the constructor being run), without the coercion `===` implies.
+    pub fn strict_eq_obj(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     /// JS strict equality (===)
     pub fn strict_eq(&self, other: &Value) -> bool {
         match (self, other) {

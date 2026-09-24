@@ -663,6 +663,34 @@ assert.throws(ReferenceError, function() { new CustomError('foo'); });
 
 **残留**：`super-must-be-called` 里 ArrayBuffer / DataView / Map / Promise / Set 那几例是"父类本身未实现"，不是这条语义的问题。`class C extends Error {}` 仍拿不到 `message`/`name`，`class C extends Array` 也仍不会把元素装进派生实例 —— 那是下一块：**内置构造器作父类时，`super()` 要用 `new.target.prototype` 建对象并把初始化写到派生 `this` 上**（`regular-subclassing.js`、`message-property-assignment.js` 等约 20 例）。
 
+### 2.1s 内置构造器作父类：`super()` 的 `new.target` 与 `BindThisValue`（2026-09-24）
+
+**起点**：通过 7949 / 10825（73.43%）。§2.1r 收尾时新登记的那条债 —— `class C extends Error/Array/Boolean/…` 拿不到父类的初始化。这是 `super-must-be-called` 之后顺理成章的下一步：同一种形态（`subclass/builtin-objects/*`）的另一半。
+
+把失败摊开看，是两件事叠加，缺一不可：
+
+1. **原型不对**：`super()` 调用原生父类时走的是 `invoke_with_new_target` 的"原生分支"，而那条分支**完全忽略了 new.target** —— 实例拿到的永远是父类内建的原型（`Error.prototype`），而不是 `C.prototype`。
+2. **初始化没落到 `this` 上**：原生构造器（`error_constructor` 等）自己 new 一个对象返回；而派生帧里的 `this_val` 仍是 `Opcode::New` 预先造的那个空对象。于是 `new C('m').message` 是空的。
+
+**交付**：
+
+1. `Value::strict_eq_obj` —— 只在两侧是同一个对象时为真。用来判断 `newTarget` 与正在执行的构造器是否同一个函数，避免 `===` 的强制转换语义混进来。
+2. `VM::prototype_from_constructor`（ES 9.1.14 `GetPrototypeFromConstructor`）：`newTarget.prototype` 是对象就用它，否则回退到构造器自己的 `prototype`。`native_construct` 改用它，并新增 `new_target` 参数；`reparent` 标志在 `newTarget !== 构造器` 时把新造出来的实例**重新挂到** `newTarget.prototype` 上 —— 注意 `finish_native_construct` 只在实例"还没有原型"时才挂，而内建构造器造出来的实例是带着内建原型的，所以这一步必须单独做。
+3. `super()` 的结果绑定为 `this`（ES 12.3.5.1 `BindThisValue`）：`CallSuperSpread` 在结果是对象时把 `this_val` 换成它。字节码父类返回的本来就是同一个对象，所以这条只影响内置父类 —— 正好是需要的那一半。
+
+**效果**：
+
+| 套件 | §2.1r 后 | 本批后 | 变化 |
+|------|----------|--------|------|
+| `language/statements/class` | 92 | **109** | +17 |
+| `language/expressions/class` | 14 | **15** | +1 |
+| `built-ins/Error` | 35 | **36** | +1 |
+| 全量 | 7949 / 10825（73.43%） | **7968 / 10825**（73.61%） | +19 |
+
+单元 190 全绿；features 392 → 395 通过（`class_super.rs` 新增 3 个用例 / 12 条断言）。
+
+**残留**：`Array` 的子类化仍不完整（`super-must-be-called` 之外的 `regular-subclassing.js`、`length.js`、`contructor-calls-super-*.js` 要的是"元素装进派生实例"，即 `ArrayCreate` 也要走 `newTarget`）；`Function` 子类的 `length`/`name` own 属性（`instance-length.js`、`instance-name.js`）；`message should be an own property` 一类要求 `message` 是**自有**属性（现在多半落在 `Error.prototype` 上）。这三处都属于同一条主线：**每个内建构造器的初始化都得搬到"作用于传入的 `this`"这条路上**，逐个补。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -716,7 +744,7 @@ assert.throws(ReferenceError, function() { new CustomError('foo'); });
 | **嵌套函数捕获外层局部变量不可靠** | 非箭头闭包读/写外层函数的局部变量（含对象）可能得到 `undefined` 或抛 `ReferenceError: undefined variable: X`，且同一段代码在不同嵌套上下文里表现不同。最小复现（在 HEAD 上同样存在，非本轮引入）：`function outer(){ var o = {n:1}; function inner(){ return o.n; } return inner(); }` → 期望 1，实测 ReferenceError；`var inner = function(){ return o.n; }` 形态则静默返回 undefined。箭头函数（`var f = () => o.n`）与"把闭包作为实参传给别的函数"两种形态正常 | 2026-09-22 登记（§2.1m 由 JSON reviver 用例暴露）：与 §5 的"创建时值快照"决定同源，根治要把捕获改成引用绑定（或按调用读取），归 M6；在此之前用例应避免依赖该形态 |
 | **Array 泛型路径不执行访问器** | 泛型（类数组）路径的 `[[Get]]` 直接读属性表，索引上的 getter 不会被调用：`Array/prototype/reverse/length-exceeding-integer-limit-with-object.js`（靠 getter 抛错提前中止）等用例失败 | 2026-09-22 登记（§2.1l）：需要把泛型路径改为经 VM 的 `[[Get]]`，属跨层改动，归 M6 |
 | 泛型路径的物化上限（`MAX_GENERIC_ELEMENTS = 2^22`） | `length` 超过上限的逐元素操作（`fill`/`copyWithin`/`splice` 结果）抛 RangeError，而参考引擎会做稀疏写 | 2026-09-22 登记（§2.1l）：有意为之——本引擎数组是 `Vec` 支撑，无法表示 2^53 长度；先保证不 OOM |
-| **内置构造器作父类时的 `super()`** | `class C extends Error/Array/Boolean/Function/NativeError` 拿不到父类初始化：`new.target.prototype` 没被用来建对象，`message`/`length`/`name`/元素也没写到派生 `this` 上（`regular-subclassing.js`、`message-property-assignment.js`、`instance-length.js` 等约 20 例） | 2026-09-23 登记（§2.1r）：需让原生构造路径接受 `new.target` 并把初始化作用于派生实例 |
+| **内置构造器初始化未搬到派生 `this` 上** | `prototype_from_constructor` 与 `BindThisValue` 已到位（§2.1s），但每个内建构造器的初始化仍是"自己 new 一个"：`Array` 子类装不进元素（`regular-subclassing.js`、`length.js`、`contructor-calls-super-*.js`）、`Function` 子类缺 `length`/`name` own 属性（`instance-length.js`、`instance-name.js`）、`message` 不是自有属性（`message-property-assignment.js`） | 2026-09-24 登记（§2.1s）：让 `ArrayCreate`/`Error` 等接受"待初始化的 `this`"，逐个补 |
 | **生成器子集未覆盖的语义** | 生成器的 `return()` / `throw()`、`try` 内的 `yield`（`SuspendedFrame` 故意不带 SEH 记录，带异常处理器的生成器体跨挂起不可靠）、生成器作构造器、`Generator.prototype` / `%IteratorPrototype%` 原型链与 `next.name`/`length` 元数据 | 2026-09-23 登记（§2.1p）：按 M4 计划"先做仅 `next()`、无 `try` 内 yield 的子集"，逐个补齐 |
 | **Array 快路径绕过原型链上的索引访问器** | `push`/`pop`/`shift`/`unshift` 的 `*-is-frozen` 系列（8 例）在 `Array.prototype[0]` 的 getter/setter 里冻结数组，要求错误在那次访问时抛出；快路径直接改 `Vec`，访问器不执行也没有受限副作用 | 2026-09-23 登记（§2.1n）：`length` 可写性已按 `Set(…,throw)` 处理（同批 +8），剩下的一半要索引读写经原型链、且 getter 可被调用 —— 需把这四个方法上移到 VM，与"Array 泛型路径不执行访问器"同源，归 M6 |
 | ~~缺 `ArraySpeciesCreate` / `CreateDataPropertyOrThrow`~~ | `map`/`filter`/`slice`/`splice`/`concat` 的 species 与目标对象写入用例全部失败 | 2026-09-23 登记（§2.1n）→ ✅ **本轮已交付**（§2.1o）：`Array[Symbol.species]` 访问器、`VM::array_species_create`（含 `SameValue(C,%Array%)` 短路）、五个方法接入；`CreateDataPropertyOrThrow` 复用 strict-only 的 `set_member`。残留仅 ES2019+ 的 `flat`/`flatMap`（未实现）与 well-known symbol 描述符的 `configurable` 细节 |
@@ -750,7 +778,7 @@ assert.throws(ReferenceError, function() { new CustomError('foo'); });
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数（§2.1r 后） | 主要缺口 |
+| 套件 | 失败数（§2.1s 后） | 主要缺口 |
 |------|--------------------|----------|
 | `built-ins/Array` | 857 | `flat`/`flatMap`（ES2019）、`findLast*` 与 change-array-by-copy（ES2023）整体缺失；`resizable-arraybuffer` 类用例；sloppy-mode 依赖的 ES5 用例 |
 | `built-ins/Object` | 499 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |

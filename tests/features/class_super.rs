@@ -185,3 +185,66 @@ fn super_call_binds_this_in_arrow_bodies() {
         "q>p"
     );
 }
+
+#[test]
+fn subclassing_builtins_uses_new_target_prototype() {
+    // ES 9.1.14 GetPrototypeFromConstructor: the instance comes from
+    // `newTarget.prototype`, not from the parent's intrinsic prototype.
+    assert!(eval_bool(
+        "class C extends Error {}
+         Object.getPrototypeOf(new C()) === C.prototype"
+    ));
+    assert!(eval_bool("class C extends Error {} new C() instanceof C"));
+    assert!(eval_bool(
+        "class C extends Boolean {}
+         Object.getPrototypeOf(new C(true)) === C.prototype"
+    ));
+    assert!(eval_bool(
+        "class C extends String {}
+         Object.getPrototypeOf(new C('hi')) === C.prototype"
+    ));
+}
+
+#[test]
+fn builtin_parent_initialises_the_derived_instance() {
+    // `super(m)` puts the parent's own slots on the derived `this`.
+    assert_eq!(
+        eval_string("class C extends Error {} new C('boom').message"),
+        "boom"
+    );
+    assert_eq!(
+        eval_string(
+            "class C extends Error { constructor(m) { super(m); this.tag = 'x'; } }
+             var e = new C('boom');
+             e.message + '/' + e.tag"
+        ),
+        "boom/x"
+    );
+    assert_eq!(
+        eval_string("class C extends TypeError {} new C('m').name"),
+        "TypeError"
+    );
+    // A plain `new Error(...)` is untouched by all of this.
+    assert_eq!(
+        eval_string(
+            "var e = new Error('plain');
+             [e.message, Object.getPrototypeOf(e) === Error.prototype].join('|')"
+        ),
+        "plain|true"
+    );
+}
+
+#[test]
+fn super_result_becomes_this() {
+    // ES 12.3.5.1: whatever `super()` produced is the derived `this`, so a
+    // parent that returns a different object replaces the pre-created one.
+    assert_eq!(
+        eval_string(
+            "var owned = { tag: 'owned' };
+             class P { constructor() { return owned; } }
+             class C extends P { constructor() { super(); } }
+             new C().tag"
+        ),
+        "owned"
+    );
+}
