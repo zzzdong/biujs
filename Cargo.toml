@@ -7,8 +7,14 @@ description = "A lightweight, embeddable JavaScript engine with ES6 support"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zzzdong/biujs"
 homepage = "https://github.com/zzzdong/biujs"
+documentation = "https://docs.rs/biujs"
+readme = "README.md"
 keywords = ["javascript", "es6", "engine", "embedded", "vm"]
 categories = ["embedded", "compilers"]
+# The conformance suite is a 245 MB git submodule; it must never land in the
+# published tarball (crates.io caps package size at 10 MB). The runner degrades
+# gracefully when the submodule is absent, so the rest of `tests/` ships.
+exclude = ["tests/test262"]
 
 [dependencies]
 # OXC parser - JavaScript/TypeScript parser
