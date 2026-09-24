@@ -691,6 +691,41 @@ assert.throws(ReferenceError, function() { new CustomError('foo'); });
 
 **残留**：`Array` 的子类化仍不完整（`super-must-be-called` 之外的 `regular-subclassing.js`、`length.js`、`contructor-calls-super-*.js` 要的是"元素装进派生实例"，即 `ArrayCreate` 也要走 `newTarget`）；`Function` 子类的 `length`/`name` own 属性（`instance-length.js`、`instance-name.js`）；`message should be an own property` 一类要求 `message` 是**自有**属性（现在多半落在 `Error.prototype` 上）。这三处都属于同一条主线：**每个内建构造器的初始化都得搬到"作用于传入的 `this`"这条路上**，逐个补。
 
+### 2.1t 派生构造器只能返回对象（ES 9.2.2 step 13c）（2026-09-24）
+
+**起点**：通过 7968 / 10825（73.61%）。§2.1s 之后 `language/statements/class` 还剩 115 例失败，其中 `derived-class-return-override-*` 是一整家人（10 例）：
+
+```js
+class Base { constructor() {} }
+class Derived extends Base { constructor() { super(); return 0; } }
+assert.throws(TypeError, function() { new Derived(); });
+```
+
+ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`；**派生**构造器返回非 `undefined` 的原始值 → **TypeError**。
+
+**交付**：
+
+1. `State::this_uninitialized` 改名为 `this_state`，从 `Vec<bool>` 变成 `Vec<u8>` 的**三态**：`THIS_NONE`（普通帧）/ `THIS_DERIVED_UNBOUND`（派生构造器、`super()` 之前）/ `THIS_DERIVED_BOUND`（`super()` 之后）。
+   为什么要合并成一条栈：判断"这一帧是不是派生构造器"本来需要**再加一条**与 `this_stack` 平行的栈，而 §2.1r 已经踩过一次"平行栈没同步"的坑（`unwind_frames_to` 漏截断）。两个事实用一条栈表达，就少一处必须同步的地方。
+2. `Opcode::Ret` 在派生构造器帧且返回值为"非 undefined 且非对象"时抛 TypeError。
+
+**这一条的难点全在抛错的时机上**，值得单独记：
+
+- 必须在 `[[Construct]]` 把原始值替换成 `this` **之前**判断 —— 否则 Rv 已经变成对象，永远触发不了。所以返回值要在帧展开前抓下来（`returned`）。
+- 必须在帧**完全展开之后**才抛 —— 也就是 `seh_stack.truncate(saved_seh_depth)` 之后。我第一版放在 `frame_argc.pop()` 之后、`seh_stack` 截断之前，结果派生构造器**自己**的 `catch` 把错误吞了，紧接着第二次 `Ret` 又把控制栈弹空，报 `RangeError: control stack underflow`。
+- 前一点正是 `derived-class-return-override-catch.js` 的考点：**这个 TypeError 属于 `[[Construct]]`，不属于构造器函数体**，所以构造器内的 `try` 抓不到，而调用方的 `assert.throws(TypeError, () => new C())` 抓得到。抛错位置就落在这一线之间。
+
+**效果**：
+
+| 套件 | §2.1s 后 | 本批后 | 变化 |
+|------|----------|--------|------|
+| `language/statements/class` | 109 | **115** | +6 |
+| 全量 | 7968 / 10825（73.61%） | **7974 / 10825**（73.66%） | +6 |
+
+单元 190 全绿；features 395 → 397 通过（`class_super.rs` 新增 2 个用例 / 8 条断言）。
+
+**残留**：`derived-class-return-override-*` 里 `-catch-super` / `-catch-super-arrow` / `-for-of` 三例仍未过（都还需要 `try`/`finally` 与 `super()` 的组合语义，与 §2.3 里"finally 块执行两次"的老债同源，归 M6）；`superclass-bound-function.js`、`class-definition-null-proto-*` 是另外的小簇。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -778,7 +813,7 @@ assert.throws(ReferenceError, function() { new CustomError('foo'); });
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数（§2.1s 后） | 主要缺口 |
+| 套件 | 失败数（§2.1t 后） | 主要缺口 |
 |------|--------------------|----------|
 | `built-ins/Array` | 857 | `flat`/`flatMap`（ES2019）、`findLast*` 与 change-array-by-copy（ES2023）整体缺失；`resizable-arraybuffer` 类用例；sloppy-mode 依赖的 ES5 用例 |
 | `built-ins/Object` | 499 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |

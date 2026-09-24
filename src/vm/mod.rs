@@ -297,7 +297,7 @@ impl VM {
                     // implicitly or via `return this` — has no `this` to return.
                     // Raised through the SEH machinery: `assert.throws(
                     // ReferenceError, () => new C())` has to see it.
-                    if self.state.this_uninitialized.last() == Some(&true) {
+                    if self.state.this_state.last() == Some(&THIS_DERIVED_UNBOUND) {
                         let err = self.this_not_initialized();
                         if let Some(exc) = self.as_js_exception(&err) {
                             self.handle_throw(exc)?;
@@ -305,6 +305,9 @@ impl VM {
                         }
                         return Err(err);
                     }
+                    // The frame's own constructor state, captured before the
+                    // pops below take it off the stack.
+                    let frame_ctor_state = self.state.this_state.last().copied();
                     let return_pc = self.state.popc()?;
                     let saved_seh_depth = self.state.popc()?;
                     let saved_closure_depth = self.state.popc()?;
@@ -313,11 +316,14 @@ impl VM {
                     // restored, otherwise a constructor would return the
                     // caller's `this` instead of the object it just built.
                     let frame_this = self.state.this_val.clone();
+                    // Captured before the [[Construct]] coercion below, which
+                    // would replace a primitive return value with `this`.
+                    let returned = self.state.get_register(Register::Rv)?;
                     // Restore the caller's `this` binding and frame arity.
                     if let Some(saved_this) = self.state.this_stack.pop() {
                         self.state.this_val = saved_this;
                     }
-                    self.state.this_uninitialized.pop();
+                    self.state.this_state.pop();
                     if let Some(saved_function) = self.state.function_stack.pop() {
                         self.state.function_val = saved_function;
                     }
@@ -334,6 +340,27 @@ impl VM {
                     self.state.new_target_stack.pop();
                     self.state.closure_var_stack.truncate(saved_closure_depth);
                     self.state.seh_stack.truncate(saved_seh_depth);
+                    // ES 9.2.2 step 13c: a derived constructor that returns a
+                    // primitive other than `undefined` raises a TypeError. The
+                    // frame is fully unwound by now — its own SEH records in
+                    // particular are gone — so a `try` inside the constructor
+                    // cannot swallow it, while `assert.throws(TypeError, () =>
+                    // new C())` in the caller still can. That asymmetry is what
+                    // `derived-class-return-override-catch.js` checks.
+                    if frame_ctor_state == Some(THIS_DERIVED_BOUND)
+                        && !returned.is_undefined()
+                        && !returned.is_object()
+                    {
+                        let err = RuntimeError::TypeError(
+                            "derived constructor can only return an Object or undefined"
+                                .to_string(),
+                        );
+                        if let Some(exc) = self.as_js_exception(&err) {
+                            self.handle_throw(exc)?;
+                            return Ok(true);
+                        }
+                        return Err(err);
+                    }
                     self.state.jump(return_pc);
                 }
             }
@@ -683,7 +710,7 @@ impl VM {
         self.state.closure_var_stack.truncate(saved_closure);
         self.state.seh_stack.truncate(saved_seh);
         self.state.this_stack.truncate(saved_this_depth);
-        self.state.this_uninitialized.truncate(saved_this_depth);
+        self.state.this_state.truncate(saved_this_depth);
         self.state.frame_argc.truncate(saved_this_depth);
         self.state.this_val = saved_this;
         self.state.function_val = saved_function;
@@ -2113,12 +2140,12 @@ impl VM {
                 // the flag at all.
                 if let Some(slot) = self
                     .state
-                    .this_uninitialized
+                    .this_state
                     .iter_mut()
                     .rev()
-                    .find(|flag| **flag)
+                    .find(|state| **state == THIS_DERIVED_UNBOUND)
                 {
-                    *slot = false;
+                    *slot = THIS_DERIVED_BOUND;
                 }
                 let result =
                     self.invoke_with_new_target(&callee, this, &args, Some(new_target), module)?;
@@ -2758,7 +2785,7 @@ impl VM {
                 }
             }
             Opcode::LoadThis => {
-                if self.state.this_uninitialized.last() == Some(&true) {
+                if self.state.this_state.last() == Some(&THIS_DERIVED_UNBOUND) {
                     return Err(self.this_not_initialized());
                 }
                 let value = self.state.this_val.clone();
@@ -3168,11 +3195,11 @@ impl VM {
     /// and only for derived-class constructors.
     fn mark_this_uninitialized(&mut self) {
         let state = &mut self.state;
-        while state.this_uninitialized.len() < state.this_stack.len() {
-            state.this_uninitialized.push(false);
+        while state.this_state.len() < state.this_stack.len() {
+            state.this_state.push(THIS_NONE);
         }
-        if let Some(slot) = state.this_uninitialized.last_mut() {
-            *slot = true;
+        if let Some(slot) = state.this_state.last_mut() {
+            *slot = THIS_DERIVED_UNBOUND;
         }
     }
 
@@ -3669,8 +3696,8 @@ impl VM {
         }
         self.state.frame_argc.truncate(this_depth);
         // Parallel to `this_stack`: a frame whose `this` was never bound must
-        // not leave its flag behind, or a later `Ret` would raise again.
-        self.state.this_uninitialized.truncate(this_depth);
+        // not leave its state behind, or a later `Ret` would raise again.
+        self.state.this_state.truncate(this_depth);
         self.state.construct_stack.truncate(construct_depth);
         self.state.new_target_stack.truncate(new_target_depth);
         self.state.closure_var_stack.truncate(closure_depth);
@@ -4323,7 +4350,7 @@ impl VM {
         self.state.closure_var_stack.truncate(saved.closure);
         self.state.seh_stack.truncate(saved.seh);
         self.state.this_stack.truncate(saved.this_depth);
-        self.state.this_uninitialized.truncate(saved.this_depth);
+        self.state.this_state.truncate(saved.this_depth);
         self.state.frame_argc.truncate(saved.this_depth);
         self.state.this_val = saved.this.clone();
         self.state.function_val = saved.function.clone();
@@ -4661,7 +4688,7 @@ impl VM {
         self.state.closure_var_stack.truncate(saved_closure);
         self.state.seh_stack.truncate(saved_seh);
         self.state.this_stack.truncate(saved_this_depth);
-        self.state.this_uninitialized.truncate(saved_this_depth);
+        self.state.this_state.truncate(saved_this_depth);
         self.state.frame_argc.truncate(saved_this_depth);
         self.state.this_val = saved_this;
         self.state.function_val = saved_function;
@@ -4909,11 +4936,13 @@ struct State {
     /// Saved `this` binding of the caller frame, restored on `Ret`.
     /// Keeping `this` per-frame prevents a nested call from clobbering it.
     this_stack: Vec<Value>,
-    /// Per frame: `this` has not been bound yet. Only ever true for a
-    /// derived-class constructor (`class C extends P`), whose `this` exists as
-    /// a binding but whose value is the *uninitialized* TDZ-like state until
-    /// `super()` supplies it (ES 9.2.2 / 12.3.5.1).
-    this_uninitialized: Vec<bool>,
+    /// Per-frame constructor state — see [`THIS_NONE`]. Only derived-class
+    /// constructors (`class C extends P`) are tracked: their `this` starts
+    /// *unbound* and only `super()` binds it (ES 9.2.2 / 12.3.5.1), and on
+    /// return they may only produce an object or `undefined` (ES 9.2.2 step
+    /// 13c). Two facts, one stack, so there is no second parallel stack to
+    /// keep in sync.
+    this_state: Vec<u8>,
     /// Number of arguments passed to each active frame, parallel to
     /// `this_stack`. This is what `Opcode::Arguments` reads to build the
     /// `arguments` object: the callee has no other way to learn its arity.
@@ -4938,7 +4967,7 @@ impl State {
             function_val: Value::Undefined,
             function_stack: Vec::new(),
             this_stack: Vec::new(),
-            this_uninitialized: Vec::new(),
+            this_state: Vec::new(),
             frame_argc: Vec::new(),
             rsp: 0,
             rbp: 0,
@@ -5095,7 +5124,7 @@ impl State {
             ));
         }
         self.this_stack.push(self.this_val.clone());
-        self.this_uninitialized.push(false);
+        self.this_state.push(THIS_NONE);
         self.function_stack.push(self.function_val.clone());
         self.frame_argc.push(argc);
         Ok(())
@@ -5159,6 +5188,15 @@ struct SehRecord {
     saved_construct_depth: usize,
     saved_new_target_depth: usize,
 }
+
+/// Per-frame constructor states for [`State::this_state`].
+///
+/// * `THIS_NONE` — an ordinary frame.
+/// * `THIS_DERIVED_UNBOUND` — a derived constructor before `super()`.
+/// * `THIS_DERIVED_BOUND` — a derived constructor after `super()`.
+const THIS_NONE: u8 = 0;
+const THIS_DERIVED_UNBOUND: u8 = 1;
+const THIS_DERIVED_BOUND: u8 = 2;
 
 /// Per-frame execution context saved across a nested (`invoke`-style or
 /// generator-resume) execution loop.

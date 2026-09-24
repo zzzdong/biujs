@@ -248,3 +248,56 @@ fn super_result_becomes_this() {
         "owned"
     );
 }
+
+#[test]
+fn derived_constructor_may_only_return_object_or_undefined() {
+    // ES 9.2.2 step 13c.
+    for snippet in [
+        "class B { constructor() {} }
+         class D extends B { constructor() { super(); return 0; } }
+         var n = 'none';
+         try { new D(); } catch (e) { n = e.name; }
+         n",
+        "class B { constructor() {} }
+         class D extends B { constructor() { super(); return 's'; } }
+         var n = 'none';
+         try { new D(); } catch (e) { n = e.name; }
+         n",
+    ] {
+        assert_eq!(eval_string(snippet), "TypeError");
+    }
+    // An object return is fine, and so is an implicit `undefined`.
+    assert_eq!(
+        eval_string(
+            "class B { constructor() {} }
+             class D extends B { constructor() { super(); return { tag: 'r' }; } }
+             new D().tag"
+        ),
+        "r"
+    );
+    // A *base* class may return anything: the primitive is discarded.
+    assert_eq!(
+        eval_string(
+            "class B { constructor() { return 5; } }
+             typeof new B()"
+        ),
+        "object"
+    );
+}
+
+#[test]
+fn return_override_typeerror_is_not_catchable_inside_the_constructor() {
+    // The TypeError belongs to `[[Construct]]`, not to the constructor body:
+    // a `try`/`catch` around the `return` must not swallow it
+    // (`derived-class-return-override-catch.js`).
+    assert_eq!(
+        eval_string(
+            "class B { constructor() {} }
+             class D extends B { constructor() { super(); try { return 0; } catch (e) { return; } } }
+             var n = 'none';
+             try { new D(); } catch (e) { n = e.name; }
+             n"
+        ),
+        "TypeError"
+    );
+}
