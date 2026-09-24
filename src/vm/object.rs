@@ -1866,6 +1866,10 @@ pub struct SuspendedFrame {
     /// Iterators this frame's `yield*` left open. An abrupt completion has to
     /// close them (ES 14.4.14 step 5.c).
     pub delegates: Vec<Value>,
+    /// Exception handlers that were live at the `yield`. Without them a
+    /// `try`/`finally` around the suspension point would be forgotten — the
+    /// `finally` would never run.
+    pub seh: Vec<crate::vm::SehRecord>,
     // NOTE: no SEH records here — a `try` around a `yield` is out of scope for
     // the first generator increment (M4 follow-up), so a generator body with an
     // exception handler is simply not resumable across it.

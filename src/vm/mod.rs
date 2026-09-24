@@ -4265,6 +4265,9 @@ impl VM {
             for map in &frame.closure_maps {
                 self.state.closure_var_stack.push(map.clone());
             }
+            // The body's live exception handlers come back with the frame; a
+            // `finally` that had not run yet must still run.
+            self.state.seh_stack.extend(frame.seh.iter().cloned());
             self.state.pushc(self.state.closure_var_stack.len())?;
             self.state.pushc(self.state.seh_stack.len())?;
             self.state.pushc(self.resume_sentinel(module))?;
@@ -4303,7 +4306,7 @@ impl VM {
         // caller's context is restored (which would rewind `rsp` below it).
         let yielded = self.generator_yielded.take();
         let suspended = if yielded.is_some() {
-            Some(self.extract_generator_frame(closure_depth, delegate_depth))
+            Some(self.extract_generator_frame(closure_depth, delegate_depth, saved.seh))
         } else {
             None
         };
@@ -4581,6 +4584,7 @@ impl VM {
         &mut self,
         closure_depth: usize,
         delegate_depth: usize,
+        seh_depth: usize,
     ) -> crate::vm::object::SuspendedFrame {
         let argc = self.state.frame_argc.last().copied().unwrap_or(0);
         let start = self.state.rbp.saturating_sub(argc);
@@ -4607,6 +4611,12 @@ impl VM {
             delegates: self
                 .delegate_stack
                 .get(delegate_depth..)
+                .unwrap_or_default()
+                .to_vec(),
+            seh: self
+                .state
+                .seh_stack
+                .get(seh_depth..)
                 .unwrap_or_default()
                 .to_vec(),
         }
@@ -5367,6 +5377,11 @@ pub fn to_uint32(n: f64) -> u32 {
 }
 
 /// SEH (Structured Exception Handling) record for try/catch/finally
+///
+/// `Clone` because a generator's suspended frame carries the records that were
+/// live at the `yield`: without them the body's `try`/`finally` would be
+/// forgotten the moment it suspends.
+#[derive(Clone, Debug)]
 struct SehRecord {
     /// catch handler PC (0 if no catch)
     handler_pc: usize,

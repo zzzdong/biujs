@@ -790,6 +790,32 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 
 **下一步（同一个任务）**：给 `SuspendedFrame` 带上 SEH 记录，让 `return()` / `throw()` 真正恢复函数体。这一件事同时解决：`-rtrn-*` 的"执行被恢复"、`-thrw-*` 的异常回到调用方、以及 §2.1p 以来"生成器体不能带 `try`"这条限制。
 
+### 2.1w 挂起帧携带异常处理器（`finally` 不再丢失）（2026-09-25）
+
+**起点**：通过 7977 / 10825（73.69%）。§2.1u / §2.1v 两批都把同一句写进了残留："`return()` / `throw()` 不恢复函数体，根因是 `SuspendedFrame` 不带 SEH 记录"。本批先把这个根因拆掉 —— 它是"恢复函数体"的前置条件，而且它本身已经是一个可观察的 bug。
+
+**先确认 bug 真实存在**：`function* g(){ try { yield 1; yield 2; } finally { log.push('fin') } }` 连调三次 `next()`，`log` 是空的。挂起时 `SuspendedFrame` 有意不带 SEH 记录，于是 `finally` 随帧一起被丢掉 —— 函数自然结束也不会跑它。这不是"没实现"，是**错误的可观察行为**。
+
+**交付**：
+
+1. `SehRecord` 加 `Clone`（它本来就 `Debug`）。字段全是 `usize` / `bool` / `Option<Value>` / `Option<isize>`，克隆即可。
+2. `SuspendedFrame.seh: Vec<SehRecord>`：
+   - 挂起时取 `seh_stack[seh_depth..]`，`seh_depth` 用的正是 `save_execution_state()` 里那个 —— 它同样必须在**装帧之前**捕获（§2.1p / §2.1r / §2.1u 已经因为这件事踩过三次，这次直接复用了 `saved.seh`）。
+   - 恢复时 `seh_stack.extend(frame.seh)`，并且**必须在 `pushc(seh_stack.len())` 之前** —— 那条 ctrl 记录存的是"本帧开始时保存的 SEH 深度"，顺序错了 `Ret` 就会截断过头。
+
+**效果**：
+
+| 指标 | §2.1v 后 | 本批后 |
+|------|----------|--------|
+| `language/expressions/yield` | 31 | 31（±0） |
+| 全量 | 7977 / 10825（73.69%） | **7977 / 10825**（73.69%，±0） |
+
+单元 190 全绿；features 402 → 403 通过（`generators.rs` 新增 1 个用例 / 2 条断言）。
+
+**为什么全量 ±0，如实说明**：test262 里那几个 `try`/`finally` 跨 `yield` 的用例，断言的是 `iter.return()` 之后 `hitFinally === true` —— 也就是"**被中断时**跑 finally"，而不只是"正常结束时跑 finally"。本批修的是后者（当前没有对应用例计分），前者仍要等"恢复函数体"。
+
+**下一步的具体障碍（已经定位到）**：`return(v)` 恢复函数体需要把 `yield` 当作 `return v` 执行，也就是要**触发一次 `Ret`**，好让 `Opcode::Ret` 里既有的 finally 分发逻辑（扫 `seh_stack` 找未执行的 `finally_pc`、标 `in_finally`/`delayed_return`、跳到 finally、finally 末尾再跳回同一条 `Ret`）发挥作用。难点在于：finally 块的**回跳目标在编译期就固定成了某条 `Ret`**，而挂起点在 `yield` 上、那里没有 `Ret` 可跳。可选的三条路：(a) 让降级把每个含 `try` 的函数末尾那条隐式 `Ret` 的 pc 记进 `func_info`，恢复时跳到它；(b) 把 finally 的回跳目标改成动态的（挂起帧里存）；(c) 在 VM 里手写一遍"跑 finally 链"的循环，不依赖回跳。下次开工从这三条里选。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -877,7 +903,7 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数（§2.1v 后） | 主要缺口 |
+| 套件 | 失败数（§2.1w 后） | 主要缺口 |
 |------|--------------------|----------|
 | `built-ins/Array` | 857 | `flat`/`flatMap`（ES2019）、`findLast*` 与 change-array-by-copy（ES2023）整体缺失；`resizable-arraybuffer` 类用例；sloppy-mode 依赖的 ES5 用例 |
 | `built-ins/Object` | 499 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |

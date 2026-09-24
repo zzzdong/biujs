@@ -414,3 +414,33 @@ fn throw_is_forwarded_to_the_delegate() {
         "2222|false"
     );
 }
+
+#[test]
+fn a_try_finally_around_a_yield_survives_suspension() {
+    // The frame's live exception handlers travel with it, so a `finally` that
+    // has not run yet still runs when the body finishes.
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             function* g() { try { yield 1; yield 2; } finally { log.push('fin'); } }
+             var it = g();
+             it.next(); it.next(); it.next();
+             log.join(',')"
+        ),
+        "fin"
+    );
+    // A `catch` around the yield is restored too, and is not entered by a
+    // plain `next()`.
+    assert_eq!(
+        eval_string(
+            "var caught = 'none';
+             function* g() { try { yield 1; } catch (e) { caught = e; } yield 2; }
+             var it = g();
+             var a = it.next();
+             var b = it.next();
+             var c = it.next();
+             [a.value, b.value, c.done, caught].join('|')"
+        ),
+        "1|2|true|none"
+    );
+}
