@@ -839,12 +839,20 @@ impl<'a> JSASTLower<'a> {
         match left {
             ForStatementLeft::VariableDeclaration(decl) => {
                 for declarator in &decl.declarations {
-                    // Destructuring patterns land here in T7; for now bind the
-                    // simple identifier.
-                    let name = self.binding_pattern_name(&declarator.id);
-                    let dst = self.builder.alloc();
-                    self.builder.assign(dst, item);
-                    self.symbols.insert(name, Variable::new(dst));
+                    // A destructuring head (`for (const [x] of …)`) binds every
+                    // leaf through the ordinary pattern machinery. Routing it
+                    // through `binding_pattern_name` instead inserted the
+                    // placeholder `"<destructured>"` as a symbol name and left
+                    // the real bindings undeclared — every leaf read was a
+                    // ReferenceError. The simple identifier keeps its direct
+                    // slot so the hot path is unchanged.
+                    if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+                        let dst = self.builder.alloc();
+                        self.builder.assign(dst, item.clone());
+                        self.symbols.insert(id.name.to_string(), Variable::new(dst));
+                    } else {
+                        self.bind_pattern(&declarator.id, item.clone(), true);
+                    }
                 }
             }
             ForStatementLeft::AssignmentTargetIdentifier(ident) => {
@@ -1199,10 +1207,13 @@ impl<'a> JSASTLower<'a> {
             if let Some(catch_clause) = &try_stmt.handler {
                 self.symbols.enter_scope();
                 self.scope_depth += 1;
-                let name = self.catch_clause_param_name(catch_clause);
-                let dst = self.builder.alloc();
-                self.builder.assign(dst, exc_val);
-                self.symbols.insert(name, Variable::new(dst));
+                // `catch ([a, b])` / `catch ({a})` destructure the thrown
+                // value; `catch_clause_param_name` answered the placeholder
+                // `"<destructured>"` for those and the leaves were never
+                // declared (`catch-ary` / `catch-obj` families).
+                if let Some(param) = &catch_clause.param {
+                    self.bind_pattern(&param.pattern, exc_val, false);
+                }
                 if let Some(v) = self.lower_block_like_with_result(&catch_clause.body.body) {
                     self.builder.assign(result_var, v);
                 }

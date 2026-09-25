@@ -351,3 +351,56 @@ fn runaway_recursion_reports_range_error() {
         Ok(v) => panic!("expected a RangeError, got {v:?}"),
     }
 }
+
+#[test]
+fn destructuring_binds_in_declaration_heads() {
+    // `catch`, `for-in` and `for-of` declare their binding at a site that is not
+    // a `VariableDeclaration` statement. Those three used to route the pattern
+    // through `binding_pattern_name`, which answers the placeholder
+    // `"<destructured>"` for anything that is not a plain identifier — so the
+    // real leaves were never declared and every read was a ReferenceError.
+    assert_eq!(
+        eval_string(
+            "var out = [];
+             for (const [x] of [[1],[2]]) { out.push(x); }
+             for (let {a} of [{a:3}]) { out.push(a); }
+             for (var [y] of [[4]]) { out.push(y); }
+             out.join(',')"
+        ),
+        "1,2,3,4"
+    );
+    // `for-in` iterates the *string* keys, so an array pattern destructures the
+    // key text itself.
+    assert_eq!(
+        eval_string(
+            "var out = [];
+             for (var [first, second] in {ab: 1}) { out.push(first + second); }
+             out.join(',')"
+        ),
+        "ab"
+    );
+    assert_eq!(
+        eval_number(
+            "var r = 0;
+             try { throw [7, 8]; } catch ([a, b]) { r = a + b; }
+             r"
+        ),
+        15.0
+    );
+    // Nested patterns, defaults and rest all go through the same machinery.
+    assert_eq!(
+        eval_string(
+            "var out = [];
+             for (const [[a], [b, c] = [8, 9], ...rest] of [[[1]], [[2, 3], [4, 5], 6, 7]]) {
+               out.push([a, b, c, rest.length].join(':'));
+             }
+             out.join('|')"
+        ),
+        "1:8:9:0|2:4:5:2"
+    );
+    // A plain identifier head still binds normally.
+    assert_eq!(
+        eval_string("var s = ''; for (const x of [1, 2]) { s += x; } s"),
+        "12"
+    );
+}

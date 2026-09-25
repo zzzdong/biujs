@@ -71,12 +71,12 @@
 | 指标 | 数值 |
 |------|------|
 | test262 已执行 | 17477 |
-| 通过 | **12217** |
-| 失败 | 5260 |
+| 通过 | **12480** |
+| 失败 | 4997 |
 | 跳过 | 8109（全部为 §1.2 范围外或 §1.1 G3 排除项，见 §3.2） |
-| 通过率 | 69.90%（参考值，分母见 §2.1y） |
+| 通过率 | 71.41%（参考值，分母见 §2.1y） |
 | 单元测试 | 190（全绿） |
-| feature 集成测试 | 23 个文件 / 411 个用例（全绿） |
+| feature 集成测试 | 23 个文件 / 412 个用例（全绿） |
 | 全量耗时基线 | 2m05s |
 
 > **分母变更提醒（§2.1y）**：2026-09-25 之前，通过率的分母是 10825 —— 跳过表里混着两条与特性无关的规则（`Flag::Generated`、`$DONOTEVALUATE`），把 6652 个可执行测试排除在外。修正后分母是 17477，因此**通过率旧值（73.73%）与新值（69.90%）不可直接比较**；同一批 10825 个测试上的成绩在两个版本里都是 7981 / 10825 = 73.73%，没有变化。
@@ -917,6 +917,46 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 **跳过池 8109 例的构成**（按声明特性归拢）：`Temporal`、`async-iteration` / `async-functions` / `await`、`class-methods-private` / `class-fields-private` 及其 static 变体、`BigInt`、`TypedArray`、`dynamic-import` / `modules`、`Proxy` / `Reflect`、`Atomics` / `SharedArrayBuffer`、`Intl`；源码模式则是 `Date` / `RegExp` / `eval(` / `new Function(` / `with (`（§1.2 范围外，§1.1 的 G3 永久排除）。**跳过表至此可以认为只剩真话了**，§6.2 的治理到此收敛。
 
 **残留**：`$DONOTEVALUATE` 解锁后出现了 153 条 `expected Some("SyntaxError") at Parse phase but compilation succeeded` —— 引擎接受了本应拒绝的语法。这批从"看不见"变成"红着"是好事，属 M6-T2 的一致性收尾。
+### 2.1z 声明位解构：`catch` / `for-in` / `for-of` 的头（2026-09-25）
+
+**起点**：通过 12217 / 17477（69.90%）。§2.1y 解锁后 `language/statements/for-of` 从 121 / 576 变成池里比例最差的套件，顺着 149 条 `Expected SameValue` 和 77 条 `ReferenceError: undefined variable: x` 查下去，是一个**单一缺陷**造成的整片失效。
+
+**根因**：解构在四个"声明位"里的表现不一致 ——
+
+| 位置 | 修复前 |
+|------|--------|
+| `var [x] = …` / `let {a} = …` | ✅ 走 `bind_pattern` |
+| 形参 `function f([x])` / 箭头参数 | ✅ 走 `bind_pattern` |
+| 赋值位 `[x] = …` | ✅ |
+| **`catch ([x])`** | ❌ `ReferenceError` |
+| **`for (var [x] in …)`** | ❌ `ReferenceError` |
+| **`for (const [x] of …)`** | ❌ `ReferenceError` |
+
+后三处调的是 `binding_pattern_name(&pattern)` —— 这个函数对非标识符模式**直接返回占位符 `"<destructured>"`**（并打一条 `log::warn`），于是符号表里插进了一个叫 `"<destructured>"` 的变量，真正的叶子 `x` 从未声明。三处都只有一行，都在"把模式当标识符"：
+
+- `bind_for_of_left`（`for-of`/`for-in` 共用）带一条注释写着 "Destructuring patterns land here in T7; for now bind the simple identifier" —— T7 从没来。
+- `lower_try` 的 catch 参数同样先取名字、再 `alloc` + `assign` + `symbols.insert`。
+
+**改动**：两处都改走既有的 `bind_pattern`（`mod.rs:2595`，`var [x] = …` 用的就是它，含默认值、rest、嵌套、对象/数组两套）。`for-of` 的简单标识符保留原来的直接槽位，热路径不变；catch 无参数时不再插占位符。
+
+**这一处的收益是被 §2.1y 放大的**：`destructuring-binding` 在失败池里出现 1975 次，但绝大多数测试文件里 `dstr` 的位置是解构**赋值**或**语句级声明**（本来就对），真正踩中的是头部绑定。
+
+**效果**：
+
+| 套件 | §2.1y 后 | 本批后 | 变化 |
+|------|----------|--------|------|
+| `language/statements/for-of` | 121 | **318** | +197 |
+| `language/statements/try` | 61 | **125** | +64 |
+| `language/statements/for-in` | 40 | **42** | +2 |
+| 全量 | 12217（69.90%） | **12480**（71.41%） | +263 |
+
+逐套件比对**零回退**；单元 190 全绿；features 411 → 412（新增 `destructuring_binds_in_declaration_heads`，含嵌套模式 + 默认值 + rest + `for-in` 解构键字符串）。失败 5260 → 4997。
+
+**残留**（仍在池中，`for-of`/`try`/`for-in` 合计 484 条）：
+- 77 条 `expected Some("SyntaxError") at Parse phase but compilation succeeded` —— 集中在 `yield` 作标识符（strict / generator 体内）、`labelled-fn-stmt-*`（标签函数的声明位置）、`obj-id-*-strict`。属**解析期校验缺口**，与 §2.1y 暴露的 153 条同类，是同一批工作。
+- 56 条 `Expected a TypeError` / 36 条 `Test262Error` 未抛 —— 迭代协议的异常路径。
+- 5 条 `execution step limit exceeded`（`S12.14_A9_T2` 等 + `for-of/body-dstr-assign-error.js`）—— 被 §6.5 的步数护栏兜住，需要逐条确认是测试自身的循环还是引擎缺陷。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
