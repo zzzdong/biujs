@@ -71,12 +71,12 @@
 | 指标 | 数值 |
 |------|------|
 | test262 已执行 | 17477 |
-| 通过 | **13136** |
-| 失败 | 4341 |
+| 通过 | **13211** |
+| 失败 | 4266 |
 | 跳过 | 8109（全部为 §1.2 范围外或 §1.1 G3 排除项，见 §3.2） |
-| 通过率 | 75.16%（参考值，分母见 §2.1y） |
+| 通过率 | 75.59%（参考值，分母见 §2.1y） |
 | 单元测试 | 190（全绿） |
-| feature 集成测试 | 23 个文件 / 414 个用例（全绿） |
+| feature 集成测试 | 23 个文件 / 417 个用例（全绿） |
 | 全量耗时基线 | 2m05s |
 
 > **分母变更提醒（§2.1y）**：2026-09-25 之前，通过率的分母是 10825 —— 跳过表里混着两条与特性无关的规则（`Flag::Generated`、`$DONOTEVALUATE`），把 6652 个可执行测试排除在外。修正后分母是 17477，因此**通过率旧值（73.73%）与新值（69.90%）不可直接比较**；同一批 10825 个测试上的成绩在两个版本里都是 7981 / 10825 = 73.73%，没有变化。
@@ -978,7 +978,7 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 | 指标 | §2.1z 后 | 本批后 | 变化 |
 |------|----------|--------|------|
 | 全量通过 | 12480（71.41%） | **13003**（74.40%） | **+523** |
-| 失败 | 4341 | **4474** | −523 |
+| 失败 | 4266 | **4474** | −523 |
 | "能编译但应报 SyntaxError" | 533 | **10** | −523 |
 
 即**这一类几乎被一次扫空**（剩下 10 条不是早期错误，是别的 negative 用例）。提升最大的套件：`language/statements/class` 995 → **1066**、`language/expressions/class` 889 → **955**、`for-of` 318 → **357**、`switch` 13 → **49**、`expressions/object` 595 → **631**、`for-in` 42 → **75**、`variable` 87 → **118**、`arrow-function` 137 → **168**、`function` 279 → **307`、`assignment` 348 → **374**。
@@ -1037,6 +1037,53 @@ ES 7.4.6：`return()` 既非 `undefined` 又不可调用 → TypeError（step 4.
 - `*-put-const` 10 条：向 `const` 绑定做解构赋值要在**运行期**抛 TypeError（ES `SetMutableBinding`）。本项目的 const 重赋值检测在 `semantic.rs` 里是**编译期**静态检查，覆盖不到解构这类间接写入；要做需要让降级层知道绑定的可变性并发出运行期抛出。
 - 迭代器剩余簇：`ary-init-iter-get-err` 44 条（数组模式里取 `Symbol.iterator` 抛错要传播）、`-close-non-object` 若干。
 
+### 2.1ac `GetIterator` 必须做那次查询（2026-09-25）
+
+**起点**：通过 13136 / 17477（75.16%）。§2.1ab 收尾时列出的 `ary-init-iter-get-err` 44 条，表面看是"数组模式里取 `Symbol.iterator` 抛错没传播"，实际读用例才发现它测的是整个 `GetIterator` 的第一步：
+
+```js
+delete Array.prototype[Symbol.iterator];
+var f = ([x, y, z]) => {};
+assert.throws(TypeError, () => f([1, 2, 3]));
+```
+
+**根因**：`VM::make_iterator` 对**真数组**和**字符串**直接构造原生迭代器，**完全跳过了 `GetMethod(obj, @@iterator)`**。ES 7.4.2 的这一步是**可观察**的，跳过它让三件事一起失效：
+
+1. `delete Array.prototype[Symbol.iterator]` 之后 `var [x] = [1]` 仍能成功（应为 TypeError）；
+2. 被替换的 `Array.prototype[Symbol.iterator]` 被完全忽略；
+3. 取该属性时抛错的 getter 也被忽略。
+
+**改动**：`make_iterator` 现在先无条件做那次属性查询（含 getter 的副作用与抛错），只有在解析到**内置工厂**（原生名 `__iterator_factory__`）时才走数组/字符串快路径 —— 普通 `for (x of arr)` 的开销只是一次属性读取，不是一次 `invoke`。被替换成 JS 函数时改走通用路径（`invoke` 那个工厂）。
+
+**顺带修掉的两处**：
+
+- **`new String('ab')` 迭代导致栈溢出 → 整个 test262 跑不完**。字符串*包装对象*的 `@@iterator` 与数组是同一个原生工厂，而该工厂的实现是"回到 `make_iterator(this)`"，包装对象既不匹配数组分支也不匹配原始字符串分支 —— 于是无限递归。修前它只是"被快路径掩盖"（数组干脆不查 `@@iterator`），补上查询后立刻变成 `fatal runtime error: stack overflow`，把整轮全量回归打断。现在包装对象走 `ObjectKind::String` 分支读字符。
+- **`invoke` 对生成器函数没有生成器分支**。`Call` opcode 会检查 `module.generators` 并构造生成器对象，`invoke_with_new_target` 不检查 —— 于是经 `invoke` 调用生成器函数会**立刻执行函数体**。函数体的第一步是参数绑定，参数若是解构模式又会进 `make_iterator`，而那时 `Array.prototype[Symbol.iterator]` 可能正是那个生成器函数：无界递归。修法是在 `invoke` 解析出 `func_id` 后补同样的分支。
+
+**排查过程**：这轮踩到一个工具缺口 —— 崩溃发生在测试线程里（Rust 栈比 CLI 主线程小，引擎自身的调用深度护栏还没来得及报 `RangeError`），进程直接 SIGABRT，报告里看不出是哪个用例。为此给 runner 加了 `BIUJS_TEST262_TRACE=1`：逐条打印正在跑的测试路径，崩溃时最后一行就是元凶。这个开关留着。
+
+**效果**：
+
+| 套件 | §2.1ab 后 | 本批后 |
+|------|-----------|--------|
+| `language/statements/class` | 1090 | **1106** |
+| `language/expressions/class` | 979 | **995** |
+| `language/expressions/object` | 643 | **651** |
+| `language/statements/for-of` | 370 | **376** |
+| `language/statements/for` | 308 | **314** |
+| `language/statements/function` | 313 | **317** |
+| `language/expressions/function` | 197 | **201** |
+| 其余 5 套件各 +2 | | |
+| 全量 | 13136（75.16%） | **13211**（75.59%） |
+
+**净增 +75，失败 4341 → 4266，逐套件零回退**；单元 190 全绿；features 414 → 417。
+
+**新登记的技术债**（§2.3）：
+
+- **`[...src]` / `f(...src)` 完全不走迭代协议**。`Opcode::ArrayPushSpread` 用的是 `array_like_elements(&src)`（读 `length` + 整数键的快照），既不查 `@@iterator` 也不执行访问器。`delete Array.prototype[Symbol.iterator]` 之后 `[...[1]]` 仍返回 `[1]`。修它要把它改成 `make_iterator` + 循环，是独立一批。
+- **脚本完成值不可靠**。`vm.run(&module)` 返回的不是"最后一个产生值的语句"的值：`var o = {…}; …; 'ok'` 会返回中间某个表达式的值（实测返回过对象字面量本身、`out.join('')` 的结果）。写 feature 测试因此不能用"末尾表达式"取值，改成在 JS 里 `throw`。
+- **闭包捕获对对象的处理**。§5 已记"按值快照"，但实测 `var box = {i:0}; … function() { box.i += 1 }` 里 `box` 解析成了数字并报 `Cannot create property 'i' on number` —— 比"快照"更糟，快照点像是取错了寄存器。归 M6 一并看。
+
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -1092,6 +1139,9 @@ ES 7.4.6：`return()` 既非 `undefined` 又不可调用 → TypeError（step 4.
 | 泛型路径的物化上限（`MAX_GENERIC_ELEMENTS = 2^22`） | `length` 超过上限的逐元素操作（`fill`/`copyWithin`/`splice` 结果）抛 RangeError，而参考引擎会做稀疏写 | 2026-09-22 登记（§2.1l）：有意为之——本引擎数组是 `Vec` 支撑，无法表示 2^53 长度；先保证不 OOM |
 | **内置构造器初始化未搬到派生 `this` 上** | `prototype_from_constructor` 与 `BindThisValue` 已到位（§2.1s），但每个内建构造器的初始化仍是"自己 new 一个"：`Array` 子类装不进元素（`regular-subclassing.js`、`length.js`、`contructor-calls-super-*.js`）、`Function` 子类缺 `length`/`name` own 属性（`instance-length.js`、`instance-name.js`）、`message` 不是自有属性（`message-property-assignment.js`） | 2026-09-24 登记（§2.1s）：让 `ArrayCreate`/`Error` 等接受"待初始化的 `this`"，逐个补 |
 | **生成器子集未覆盖的语义** | `return()` / `throw()` 现在会恢复函数体（§2.1x）：`finally` 会跑、体内 `try` 接得住 `throw`、委托关闭的异常也进 `catch`。残留：`yield*` 的委托没有 `throw` 方法时需先 `IteratorClose` 再交给函数体（`-thrw-violation-*` 5 例）；`finally { return x }` 的值以请求值为准；生成器作构造器、`Generator.prototype` / `%IteratorPrototype%` 原型链与 `next.name`/`length` 元数据 | 2026-09-23 登记（§2.1p），2026-09-25 更新（§2.1x） |
+| **`[...src]` / `f(...src)` 不走迭代协议** | `Opcode::ArrayPushSpread` 用 `array_like_elements` 读 `length` + 整数键的快照，既不查 `@@iterator` 也不执行访问器；`delete Array.prototype[Symbol.iterator]` 后 `[...[1]]` 仍返回 `[1]` | 2026-09-25 登记（§2.1ac）：修法是把它改成 `make_iterator` + 循环，属独立一批 |
+| 脚本完成值不可靠 | `vm.run(&module)` 返回的不是"最后一个产生值的语句"的值，实测会返回中间表达式（对象字面量本身、某次 `join` 的结果）。feature 测试因此不能用末尾表达式取值，要改成在 JS 里 `throw` | 2026-09-25 登记（§2.1ac）：影响测试写法与 REPL 输出，归 M6 |
+| 闭包捕获对象的快照点错误 | `var box = {i:0}; …; function() { box.i += 1 }` 里 `box` 解析成数字并报 `Cannot create property 'i' on number`，比 §5 记的"按值快照"更糟 | 2026-09-25 登记（§2.1ac）：归 M6，与 §5 的捕获模型一并看 |
 | **Array 快路径绕过原型链上的索引访问器** | `push`/`pop`/`shift`/`unshift` 的 `*-is-frozen` 系列（8 例）在 `Array.prototype[0]` 的 getter/setter 里冻结数组，要求错误在那次访问时抛出；快路径直接改 `Vec`，访问器不执行也没有受限副作用 | 2026-09-23 登记（§2.1n）：`length` 可写性已按 `Set(…,throw)` 处理（同批 +8），剩下的一半要索引读写经原型链、且 getter 可被调用 —— 需把这四个方法上移到 VM，与"Array 泛型路径不执行访问器"同源，归 M6 |
 | ~~缺 `ArraySpeciesCreate` / `CreateDataPropertyOrThrow`~~ | `map`/`filter`/`slice`/`splice`/`concat` 的 species 与目标对象写入用例全部失败 | 2026-09-23 登记（§2.1n）→ ✅ **本轮已交付**（§2.1o）：`Array[Symbol.species]` 访问器、`VM::array_species_create`（含 `SameValue(C,%Array%)` 短路）、五个方法接入；`CreateDataPropertyOrThrow` 复用 strict-only 的 `set_member`。残留仅 ES2019+ 的 `flat`/`flatMap`（未实现）与 well-known symbol 描述符的 `configurable` 细节 |
 

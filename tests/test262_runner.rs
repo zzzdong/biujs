@@ -439,6 +439,13 @@ fn run_suite(subdir: &str) -> SuiteResult {
             continue;
         }
 
+        // `BIUJS_TEST262_TRACE=1` prints each test as it starts. A crash inside
+        // the engine (a Rust stack overflow, say) aborts the process and would
+        // otherwise leave no clue which test did it.
+        if std::env::var("BIUJS_TEST262_TRACE").is_ok() {
+            println!("[run] {}", test.path.display());
+        }
+
         let id = test
             .desc
             .id

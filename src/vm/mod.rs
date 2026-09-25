@@ -645,6 +645,22 @@ impl VM {
             _ => return Err(RuntimeError::TypeError("not a function".to_string())),
         };
 
+        // A generator function reached through `invoke` — the iterator protocol,
+        // `Array.prototype.map`, any builtin that calls back — must build a
+        // generator object exactly like the `Call` opcode does. Running the body
+        // eagerly would execute its *parameter binding* right there, and a
+        // parameter with a destructuring pattern re-enters `make_iterator`,
+        // which reaches this call again: unbounded recursion for a source as
+        // ordinary as `Array.prototype[Symbol.iterator] = function* () {…}`.
+        if module.generators.contains(&func_id) {
+            return Ok(self.create_generator(
+                func_id,
+                effective_this,
+                args.to_vec(),
+                captured_vars,
+            ));
+        }
+
         let saved_pc = self.state.pc;
         let saved_rsp = self.state.rsp;
         let saved_rbp = self.state.rbp;
@@ -4843,17 +4859,44 @@ impl VM {
             }
         }
 
+        // ES 7.4.2 `GetIterator` starts with `GetMethod(obj, @@iterator)`, and
+        // that step is *observable for every source*: a getter can throw, the
+        // method can be replaced, and `delete Array.prototype[Symbol.iterator]`
+        // has to turn `var [x] = [1]` into a TypeError.
+        //
+        // Skipping the lookup for real arrays and strings made all three cases
+        // invisible. The fast path is still taken when the method resolves to
+        // the built-in factory, so an ordinary `for (x of arr)` is unchanged.
+        let factory = self.get_member(&src, &iterator_symbol_key(), module)?;
+        if !factory.is_callable() {
+            return Err(RuntimeError::TypeError(format!(
+                "{} is not iterable",
+                src.type_of()
+            )));
+        }
+        let is_default_factory = crate::builtins::native_function_name(&factory).as_deref()
+            == Some(crate::vm::iterator::ITERATOR_NATIVE_NAME);
+
         let state = match &src {
-            Value::Object(obj_ref) => {
-                let is_array = obj_ref.borrow().kind() == ObjectKind::Array;
-                if is_array {
-                    let items = self.array_like_elements(&src).unwrap_or_default();
-                    Some(NativeIteratorState::Array { items, idx: 0 })
-                } else {
-                    None
+            Value::Object(obj_ref) if is_default_factory => {
+                match obj_ref.borrow().kind() {
+                    ObjectKind::Array => {
+                        let items = self.array_like_elements(&src).unwrap_or_default();
+                        Some(NativeIteratorState::Array { items, idx: 0 })
+                    }
+                    // A String *wrapper* iterates its characters. Its built-in
+                    // `@@iterator` is the same native factory as the array's, so
+                    // without this arm the factory would route straight back
+                    // into `make_iterator` forever — the wrapper matches neither
+                    // the array arm nor the primitive-string one.
+                    ObjectKind::String => Some(NativeIteratorState::String {
+                        chars: self.array_like_elements(&src).unwrap_or_default(),
+                        idx: 0,
+                    }),
+                    _ => None,
                 }
             }
-            Value::String(s) => Some(NativeIteratorState::String {
+            Value::String(s) if is_default_factory => Some(NativeIteratorState::String {
                 chars: s.chars().map(|c| Value::string(&c.to_string())).collect(),
                 idx: 0,
             }),
@@ -4863,14 +4906,7 @@ impl VM {
         let state = match state {
             Some(state) => state,
             None => {
-                // Slow path: `src[Symbol.iterator]()`.
-                let factory = self.get_member(&src, &iterator_symbol_key(), module)?;
-                if !factory.is_callable() {
-                    return Err(RuntimeError::TypeError(format!(
-                        "{} is not iterable",
-                        src.type_of()
-                    )));
-                }
+                // `src[Symbol.iterator]()`.
                 let iterator = self.invoke(&factory, src.clone(), &[], module)?;
                 crate::vm::iterator::NativeIteratorState::Js { iterator }
             }

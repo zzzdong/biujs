@@ -489,3 +489,92 @@ fn array_patterns_close_an_unexhausted_iterator() {
         0.0
     )
 }
+
+#[test]
+fn iterator_lookup_is_observable_for_every_source() {
+    // ES 7.4.2 `GetIterator` starts with `GetMethod(obj, @@iterator)`. Serving
+    // real arrays from a native fast path without doing that lookup made three
+    // things invisible: deleting the method, replacing it, and a getter that
+    // throws.
+    //
+    // The assertions below live *inside* the JS (a throw on mismatch) rather
+    // than in the program's result value — the VM's script completion value is
+    // not a reliable place to read from (see §2.3).
+    eval_js(
+        "delete Array.prototype[Symbol.iterator];
+         delete String.prototype[Symbol.iterator];
+         function t(fn) { try { fn(); } catch (e) { return e.name === 'TypeError'; } return false; }
+         if (!t(function() { var [x] = [1, 2]; })) throw new Error('array pattern');
+         if (!t(function() { for (var x of [1]) {} })) throw new Error('for-of');
+         if (!t(function() { var [x] = 'ab'; })) throw new Error('string pattern');",
+    )
+    .unwrap();
+
+    // A generator function is used as the replacement so the test does not lean
+    // on mutable closure capture, which this engine does not have (§5).
+    eval_js(
+        "Array.prototype[Symbol.iterator] = function* () { yield 'replaced'; };
+         var [x] = [1, 2, 3];
+         if (x !== 'replaced') throw new Error('destructuring ignored the replacement');
+         var seen = [];
+         for (var y of [9]) { seen.push(y); }
+         if (seen.join(',') !== 'replaced') throw new Error('for-of ignored the replacement');",
+    )
+    .unwrap();
+
+    eval_js(
+        "var o = {};
+         Object.defineProperty(o, Symbol.iterator, { get: function() { throw 'boom'; } });
+         var seen = 'none';
+         try { var [x] = o; } catch (e) { seen = e; }
+         if (seen !== 'boom') throw new Error('getter error was swallowed');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn string_wrappers_iterate_their_characters() {
+    // A String *wrapper* resolves `@@iterator` to the same native factory as an
+    // array, and that factory used to route straight back into the iterator
+    // builder — a stack overflow for `for (x of new String('ab'))`.
+    eval_js(
+        "var out = [];
+         for (var c of new String('ab')) { out.push(c); }
+         if (out.join(',') !== 'a,b') throw new Error('wrapper iteration');
+         var [x] = new String('xy');
+         if (x !== 'x') throw new Error('wrapper destructuring');
+         function t(v) { try { for (var c of v) {} } catch (e) { return e.name === 'TypeError'; } return false; }
+         if (!t(new Number(1))) throw new Error('Number wrapper is not iterable');
+         if (!t(new Boolean(true))) throw new Error('Boolean wrapper is not iterable');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn generator_functions_reached_through_invoke_build_a_generator() {
+    // A generator function called through `invoke` (here as an overridden
+    // `@@iterator`) must build a generator object, exactly like the `Call`
+    // opcode. Running the body eagerly executed its parameter binding on the
+    // spot, which re-entered the iterator builder without bound.
+    eval_js(
+        "Array.prototype[Symbol.iterator] = function* () {
+           if (this.length > 0) { yield this[0]; }
+           if (this.length > 1) { yield 42; }
+         };
+         var [x, y] = [1, 2];
+         if (x !== 1 || y !== 42) throw new Error('generator factory');",
+    )
+    .unwrap();
+
+    eval_js(
+        "var o = { v: 5, *m() { yield this.v; } };
+         var called = 0;
+         function* g([a]) { called += 1; yield a; }
+         var out = [];
+         for (var v of g([7])) { out.push(v); }
+         if (out.join('') !== '7') throw new Error('body');
+         if (called !== 1) throw new Error('generator body ran ' + called + ' times');
+         if (o.m().next().value !== 5) throw new Error('method generator this');",
+    )
+    .unwrap();
+}
