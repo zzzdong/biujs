@@ -659,6 +659,9 @@ impl<'a> SSABuilder<'a> {
             Instruction::IteratorClose { iter } => {
                 SSABuilder::rename_use(iter, stacks);
             }
+            Instruction::RequireObjectCoercible { src } => {
+                SSABuilder::rename_use(src, stacks);
+            }
             Instruction::ToString { dst, src } => {
                 SSABuilder::rename_definition(dst, new_versions);
                 SSABuilder::rename_use(src, stacks);

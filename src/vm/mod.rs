@@ -2106,6 +2106,10 @@ impl VM {
                 let iter_val = self.get_value(operands[0])?;
                 self.iterator_close(iter_val, None, module)?;
             }
+            Opcode::RequireObjectCoercible => {
+                let src = self.get_value(operands[0])?;
+                crate::builtins::require_object_coercible(&src)?;
+            }
             Opcode::MakeRest => {
                 // Collect the tail of the incoming arguments into a fresh
                 // array: args[from..] where arg i lives at [rbp - (i + 1)].
@@ -4985,13 +4989,30 @@ impl VM {
         let return_fn = self
             .get_member(&iterator, &PropertyKey::from_str("return"), module)
             .unwrap_or(Value::Undefined);
-        if return_fn.is_callable() {
+        if !return_fn.is_undefined() {
+            // ES 7.4.6 step 4.b: a `return` that is neither `undefined` nor
+            // callable is a TypeError.
+            if !return_fn.is_callable() {
+                return Err(RuntimeError::TypeError(
+                    "iterator.return is not a function".to_string(),
+                ));
+            }
             let args = match value {
                 Some(v) => vec![v.clone()],
                 None => Vec::new(),
             };
-            // Swallow errors from `return()` — the original completion wins.
-            let _ = self.invoke(&return_fn, iterator, &args, module);
+            // Step 5: an error raised by `return()` itself is swallowed — the
+            // completion being closed over wins.
+            if let Ok(result) = self.invoke(&return_fn, iterator, &args, module) {
+                // Step 6: but a *normal* result that is not an object is a
+                // TypeError of its own. Without this an iterator whose `return`
+                // answers `null` closed silently (`*-close-null` families).
+                if !result.is_object() {
+                    return Err(RuntimeError::TypeError(
+                        "iterator.return() returned a non-object value".to_string(),
+                    ));
+                }
+            }
         }
         Ok(())
     }

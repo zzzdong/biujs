@@ -71,12 +71,12 @@
 | 指标 | 数值 |
 |------|------|
 | test262 已执行 | 17477 |
-| 通过 | **13003** |
-| 失败 | 4474 |
+| 通过 | **13136** |
+| 失败 | 4341 |
 | 跳过 | 8109（全部为 §1.2 范围外或 §1.1 G3 排除项，见 §3.2） |
-| 通过率 | 74.40%（参考值，分母见 §2.1y） |
+| 通过率 | 75.16%（参考值，分母见 §2.1y） |
 | 单元测试 | 190（全绿） |
-| feature 集成测试 | 23 个文件 / 412 个用例（全绿） |
+| feature 集成测试 | 23 个文件 / 414 个用例（全绿） |
 | 全量耗时基线 | 2m05s |
 
 > **分母变更提醒（§2.1y）**：2026-09-25 之前，通过率的分母是 10825 —— 跳过表里混着两条与特性无关的规则（`Flag::Generated`、`$DONOTEVALUATE`），把 6652 个可执行测试排除在外。修正后分母是 17477，因此**通过率旧值（73.73%）与新值（69.90%）不可直接比较**；同一批 10825 个测试上的成绩在两个版本里都是 7981 / 10825 = 73.73%，没有变化。
@@ -978,7 +978,7 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 | 指标 | §2.1z 后 | 本批后 | 变化 |
 |------|----------|--------|------|
 | 全量通过 | 12480（71.41%） | **13003**（74.40%） | **+523** |
-| 失败 | 4474 | **4474** | −523 |
+| 失败 | 4341 | **4474** | −523 |
 | "能编译但应报 SyntaxError" | 533 | **10** | −523 |
 
 即**这一类几乎被一次扫空**（剩下 10 条不是早期错误，是别的 negative 用例）。提升最大的套件：`language/statements/class` 995 → **1066**、`language/expressions/class` 889 → **955**、`for-of` 318 → **357**、`switch` 13 → **49**、`expressions/object` 595 → **631**、`for-in` 42 → **75**、`variable` 87 → **118**、`arrow-function` 137 → **168**、`function` 279 → **307`、`assignment` 348 → **374**。
@@ -990,6 +990,52 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 **残留**：剩余 10 条 parse-phase 缺口里已无早期错误；但**引入语义阶段后出现了新的可见簇**（此前被"能编译"掩盖）：92 条 `arrow function invoked exactly once`、42 条 `a should be an own property`、39 条 `Actual argument [undefined] shouldn't be primitive.`，以及 112 条 `Cannot convert undefined or null to object`。这些属实现型工作，按 §3.1 排队。
 
 **一个提醒**：`build_source` 只补了 `onlyStrict`。按 test262 的规范，**既无 `onlyStrict` 也无 `noStrict`** 的用例要跑两遍（sloppy + strict），两边都得过。本引擎本就是 strict-only（§1.1 G1），实际跑的已经是接近 strict 的那一边，所以这一批不追加第二遍；若要完全对齐 test262 的口径，这是个可选项（会引入一批新的失败面）。
+
+### 2.1ab 解构协议的缺口：`RequireObjectCoercible` 与 `IteratorClose`（2026-09-25）
+
+**起点**：通过 13003 / 17477（74.40%）。§2.1aa 扫平早期错误后，失败池里 `Expected a TypeError to be thrown` 还剩 421 条，而它**集中在 `dstr` 目录**（`for-of/dstr` 50、`class/dstr` 24+24、`generators/dstr` 18+18、`assignment/dstr` 15 …）。逐条看是三个独立的规范步骤没做。
+
+**一、对象模式没有 `RequireObjectCoercible`**（84 条）
+
+ES 8.5.2 的 `ObjectAssignmentPattern` 第一步就是 `? RequireObjectCoercible(value)`，**在读取任何属性之前**。这条检查必须无条件执行：空模式 `{} = null` **什么都不读**，所以如果不显式检查，就没有任何东西会注意到源是空值。修前 `(0, {} = null)` 直接得到 `null`。
+
+修法：新增一条 IR 指令 + 字节码 `RequireObjectCoercible`（`instruction.rs` / `builder.rs` / `codegen.rs` / `bytecode.rs` / `vm/mod.rs` 五层，复用既有的 `builtins::require_object_coercible`），在 `bind_pattern` 的 `ObjectPattern` 分支和 `bind_object_assignment_target` 的开头各发一次。这是本项目第一次为"一个规范步骤"新增指令，五层加起来不到 40 行 —— 模板是现成的（`IteratorClose` 的四层写法）。
+
+**二、数组模式不关闭未耗尽的迭代器**（44 条）
+
+ES 8.5.1：模式在源耗尽前停下时，要 `IteratorClose`。原来 `bind_pattern` 的数组分支上有一句注释写着 "The iterator completed normally; no IteratorClose needed." —— 那只在**恰好耗尽**时成立。`[x] = 只生产不结束的迭代器` 一直不关。
+
+修法：新增 `emit_iterator_close_if(cond, it)`，用最后一步 `IterateNext` 的 `has_next` 做条件分支（`br_if` + 新建两个基本块），在 `bind_pattern` 与 `bind_array_assignment_target` 两处、且**只在没有 rest 元素时**发出（rest 会把迭代器抽干）。
+
+**三、`IteratorClose` 不检查 `return()` 的返回值**（18 条）
+
+ES 7.4.6：`return()` 既非 `undefined` 又不可调用 → TypeError（step 4.b）；调用**正常返回**但不是对象 → TypeError（step 6）；调用**自己抛错** → 吞掉（step 5，原完成优先）。`VM::iterator_close` 原来只有"可调用就调、错误全吞"，缺了 4.b 与 6。三个语义差别都在同一个函数里补齐了。
+
+**效果**：
+
+| 套件 | §2.1aa 后 | 本批后 |
+|------|-----------|--------|
+| `language/statements/class` | 1066 | **1090** |
+| `language/expressions/class` | 955 | **979** |
+| `language/expressions/assignment` | 374 | **388** |
+| `language/statements/for-of` | 357 | **370** |
+| `language/statements/for` | 296 | **308** |
+| `language/expressions/object` | 631 | **643** |
+| `language/statements/function` | 307 | **313** |
+| `language/expressions/function` | 191 | **197** |
+| `language/expressions/arrow-function` | 168 | **172** |
+| `language/statements/variable` | 118 | **121** |
+| `language/statements/try` | 130 | **133** |
+| `language/statements/let` | 106 | **109** |
+| 全量 | 13003（74.40%） | **13136**（75.16%） |
+
+**净增 +133，失败 4474 → 4341，逐套件零回退**；单元 190 全绿；features 412 → 414（新增两组：对象模式对空值源的六种位置、数组模式的关闭时机与 `return` 返回值的三种语义）。
+
+**收益为什么分布在 12 个套件而不是 `dstr` 一处**：这三条都是**协议步骤**，凡是用到解构/迭代的地方都要走 —— `class` 的方法参数解构、`for`/`for-of` 的头部、函数形参，所以 `statements/class` 和 `expressions/class` 各 +24。
+
+**残留（更新进 §3.1）**：
+- `*-put-const` 10 条：向 `const` 绑定做解构赋值要在**运行期**抛 TypeError（ES `SetMutableBinding`）。本项目的 const 重赋值检测在 `semantic.rs` 里是**编译期**静态检查，覆盖不到解构这类间接写入；要做需要让降级层知道绑定的可变性并发出运行期抛出。
+- 迭代器剩余簇：`ary-init-iter-get-err` 44 条（数组模式里取 `Symbol.iterator` 抛错要传播）、`-close-non-object` 若干。
 
 ### 2.2 已交付（M0 → M2'）
 

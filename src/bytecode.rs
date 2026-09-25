@@ -302,6 +302,12 @@ pub enum Opcode {
     Arguments,
     /// iter_close iter — signal early exit to a protocol iterator
     IterClose,
+    /// require_object_coercible src — ES 7.2.1, raises a TypeError for
+    /// `undefined` / `null`. Emitted as the first step of an object
+    /// destructuring pattern, which must reject a nullish source even when the
+    /// pattern is empty (`{} = null` reads no property, so there would
+    /// otherwise be nothing to notice).
+    RequireObjectCoercible,
     /// Suspend the enclosing generator: record the yielded value, hand the
     /// current frame to [`crate::vm::VM::generator_resume`] and stop the
     /// nested execution loop (the VM jumps past the last instruction, which is
@@ -403,6 +409,7 @@ impl fmt::Display for Opcode {
             Opcode::ClosureVar => write!(f, "closure_var"),
             Opcode::Arguments => write!(f, "arguments"),
             Opcode::IterClose => write!(f, "iter_close"),
+            Opcode::RequireObjectCoercible => write!(f, "require_object_coercible"),
             Opcode::Yield => write!(f, "yield"),
             Opcode::ToString => write!(f, "to_string"),
             Opcode::ToNumber => write!(f, "to_number"),

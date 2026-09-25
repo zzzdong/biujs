@@ -322,6 +322,11 @@ pub enum Instruction {
     IteratorClose {
         iter: Value,
     },
+    /// ES `RequireObjectCoercible(src)`: reject `undefined` / `null` before an
+    /// object destructuring pattern reads anything.
+    RequireObjectCoercible {
+        src: Value,
+    },
     /// `yield expr` / `yield`: suspend the enclosing generator.
     ///
     /// `src` is the yielded value (absent means `undefined`). `dst` receives
@@ -572,6 +577,7 @@ impl Instruction {
                 has_next,
             } => (vec![*item, *has_next], vec![*iter]),
             Instruction::IteratorClose { iter } => (vec![], vec![*iter]),
+            Instruction::RequireObjectCoercible { src } => (vec![], vec![*src]),
             Instruction::Yield { dst, src } => (vec![*dst], src.iter().copied().collect()),
             Instruction::ToString { dst, src } => (vec![*dst], vec![*src]),
             Instruction::MakeRest { dst, .. } => (vec![*dst], vec![]),
@@ -794,6 +800,9 @@ impl std::fmt::Display for Instruction {
             Instruction::DelegateClose { iter } => write!(f, "delegate_close {iter}"),
             Instruction::IteratorClose { iter } => {
                 write!(f, "iterator_close {iter}")
+            }
+            Instruction::RequireObjectCoercible { src } => {
+                write!(f, "require_object_coercible {src}")
             }
             Instruction::Yield { dst, src } => match src {
                 Some(src) => write!(f, "{dst} = yield {src}"),

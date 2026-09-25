@@ -404,3 +404,88 @@ fn destructuring_binds_in_declaration_heads() {
         "12"
     );
 }
+
+#[test]
+fn object_patterns_reject_a_nullish_source() {
+    // ES 8.5.2: `? RequireObjectCoercible(value)` is the first step of an object
+    // destructuring, so even an *empty* pattern (which reads no property) has to
+    // reject `null` / `undefined`.
+    assert_eq!(
+        eval_string(
+            "function t(src) { try { (0, {} = src); return 'no-throw'; } catch (e) { return e.name; } }
+             [t(null), t(undefined), t({}), t(5)].join(',')"
+        ),
+        "TypeError,TypeError,no-throw,no-throw"
+    );
+    // Same for the binding forms.
+    assert_eq!(
+        eval_string(
+            "function t(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+             [
+               t(function() { var {} = null; }),
+               t(function() { var {a} = undefined; }),
+               t(function() { function f({}) {} f(null); }),
+               t(function() { var {a: {}} = {a: null}; })
+             ].join(',')"
+        ),
+        "TypeError,TypeError,TypeError,TypeError"
+    );
+}
+
+#[test]
+fn array_patterns_close_an_unexhausted_iterator() {
+    // ES 8.5.1: the iterator is closed when the pattern stops before the source
+    // is exhausted. `IteratorClose` then validates what `return()` answered
+    // (ES 7.4.6 step 4.b and step 6).
+    let probe = |ret_body: &str| {
+        format!(
+            "var log = [];
+             var iterator = {{
+               next: function() {{ return {{ done: false, value: 1 }}; }},
+               return: function() {{ log.push('ret'); {ret_body} }}
+             }};
+             var iterable = {{}};
+             iterable[Symbol.iterator] = function() {{ return iterator; }};
+             var thrown = 'none', out;
+             try {{ var [x] = iterable; out = x; }} catch (e) {{ thrown = e.name; }}
+             [out, thrown, log.join(',')].join('|')"
+        )
+    };
+    // `return` answering an object: the close is invisible.
+    assert_eq!(eval_string(&probe("return {};")), "1|none|ret");
+    // `return` answering a primitive: TypeError (step 6).
+    assert_eq!(eval_string(&probe("return null;")), "|TypeError|ret");
+    assert_eq!(eval_string(&probe("return 1;")), "|TypeError|ret");
+    // A `return` that is neither undefined nor callable: TypeError (step 4.b).
+    assert_eq!(
+        eval_string(
+            "var iterator = {
+               next: function() { return { done: false, value: 1 }; },
+               return: 7
+             };
+             var iterable = {};
+             iterable[Symbol.iterator] = function() { return iterator; };
+             var thrown = 'none';
+             try { var [x] = iterable; } catch (e) { thrown = e.name; }
+             thrown"
+        ),
+        "TypeError"
+    );
+    // An already-exhausted source is not closed at all.
+    assert_eq!(
+        eval_number(
+            "var log = [];
+             var iterable = {};
+             iterable[Symbol.iterator] = function() {
+               return {
+                 next: function() { return { done: true, value: undefined }; },
+                 return: function() { log.push('ret'); return {}; }
+               };
+             };
+             var x;
+             [x] = iterable;
+             log.length"
+        ),
+        0.0
+    )
+}

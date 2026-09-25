@@ -312,6 +312,11 @@ impl Codegen {
                         let iter = self.gen_operand(iter);
                         self.codes.push(Bytecode::single(Opcode::IterClose, iter));
                     }
+                    Instruction::RequireObjectCoercible { src } => {
+                        let src = self.gen_operand(src);
+                        self.codes
+                            .push(Bytecode::single(Opcode::RequireObjectCoercible, src));
+                    }
                     Instruction::Yield { dst, src } => {
                         let dst = self.gen_operand(dst);
                         let src = match src {

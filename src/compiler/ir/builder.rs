@@ -235,6 +235,12 @@ pub trait InstBuilder {
         self.emit(Instruction::Return { value });
     }
 
+    /// ES `RequireObjectCoercible(src)` — throws at run time for a nullish
+    /// value. Emitted as the prologue of an object destructuring pattern.
+    fn require_object_coercible(&mut self, src: Value) {
+        self.emit(Instruction::RequireObjectCoercible { src });
+    }
+
     fn make_iterator(&mut self, iter: Value) -> Value {
         let result = self.alloc();
 

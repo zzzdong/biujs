@@ -2624,6 +2624,13 @@ impl<'a> JSASTLower<'a> {
                 self.bind_pattern(&ap.left, default_val, publish_global);
             }
             BindingPattern::ObjectPattern(op) => {
+                // ES 8.5.2 `DestructuringAssignmentEvaluation` for
+                // `ObjectAssignmentPattern` starts with
+                // `? RequireObjectCoercible(value)`, before any property is
+                // read. The check has to be unconditional: an *empty* pattern
+                // (`{} = null`) reads nothing, so without it there is nothing
+                // left to notice the nullish source.
+                self.builder.require_object_coercible(value.clone());
                 let mut consumed: Vec<Value> = Vec::new();
                 for prop in &op.properties {
                     let (key_value, key_name, computed) =
@@ -2648,30 +2655,52 @@ impl<'a> JSASTLower<'a> {
             BindingPattern::ArrayPattern(ap) => {
                 let it = self.builder.make_iterator(value);
 
+                // `has_next` of the last element stepped. ES 8.5.1 closes the
+                // iterator when the pattern stops before the source is
+                // exhausted, and `IteratorClose` itself validates what
+                // `return()` answers.
+                let mut last_has_next: Option<Value> = None;
                 for element in &ap.elements {
                     match element {
                         // Elision hole: step the iterator, discard the value.
                         None => {
-                            self.builder.iterate_next(it);
+                            let (_, has_next) = self.builder.iterate_next(it);
+                            last_has_next = Some(has_next);
                         }
                         Some(pat) => {
                             let (item, has_next) = self.builder.iterate_next(it);
+                            last_has_next = Some(has_next.clone());
                             self.bind_array_element_pattern(pat, item, has_next, publish_global);
                         }
                     }
                 }
 
                 if let Some(rest) = &ap.rest {
+                    // The rest element drains the iterator, so there is nothing
+                    // left to close.
                     let rest_arr = self.builder.make_array();
                     self.emit_rest_collect(rest_arr, it);
                     self.bind_pattern(&rest.argument, rest_arr, publish_global);
+                } else if let Some(has_next) = last_has_next {
+                    self.emit_iterator_close_if(has_next, it);
                 }
-                // The iterator completed normally; no IteratorClose needed.
             }
             _ => {
                 log::warn!("unsupported binding pattern in destructuring");
             }
         }
+    }
+
+    /// `if (cond) IteratorClose(it)` — an array pattern that stops early owes
+    /// the source an `IteratorClose` (ES 8.5.1), but only then.
+    fn emit_iterator_close_if(&mut self, cond: Value, it: Value) {
+        let close_blk = self.create_block("dstr_close");
+        let after_blk = self.create_block("dstr_close_after");
+        self.builder.br_if(cond, close_blk, after_blk);
+        self.builder.switch_to_block(close_blk);
+        self.builder.iterator_close(it);
+        self.builder.jump(after_blk);
+        self.builder.switch_to_block(after_blk);
     }
 
     /// Bind one element of an array pattern, honouring defaults.
@@ -2876,14 +2905,19 @@ impl<'a> JSASTLower<'a> {
         value: Value,
     ) {
         let it = self.builder.make_iterator(value);
+        // Same obligation as the binding form: an `ArrayAssignmentPattern` that
+        // stops before the source is exhausted closes the iterator.
+        let mut last_has_next: Option<Value> = None;
         for element in &target.elements {
             match element {
                 // Elision hole: step the iterator, discard the value.
                 None => {
-                    self.builder.iterate_next(it);
+                    let (_, has_next) = self.builder.iterate_next(it);
+                    last_has_next = Some(has_next);
                 }
                 Some(element) => {
                     let (item, has_next) = self.builder.iterate_next(it);
+                    last_has_next = Some(has_next.clone());
                     self.bind_element_maybe_default(element, item, has_next);
                 }
             }
@@ -2892,6 +2926,8 @@ impl<'a> JSASTLower<'a> {
             let rest_arr = self.builder.make_array();
             self.emit_rest_collect(rest_arr, it);
             self.bind_assignment_target(&rest.target, rest_arr);
+        } else if let Some(has_next) = last_has_next {
+            self.emit_iterator_close_if(has_next, it);
         }
     }
 
@@ -2901,6 +2937,10 @@ impl<'a> JSASTLower<'a> {
         target: &ObjectAssignmentTarget<'_>,
         value: Value,
     ) {
+        // `? RequireObjectCoercible(value)` comes before any property access,
+        // and an empty pattern (`{} = null`) accesses none — so the check has to
+        // be here rather than implied by the reads.
+        self.builder.require_object_coercible(value.clone());
         let mut consumed: Vec<Value> = Vec::new();
         for prop in &target.properties {
             match prop {
