@@ -31,6 +31,9 @@ done
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# 快照里的 `#` 注释行不能参与 join（否则会被当成"消失的套件"）
+strip_comments() { grep -v '^[[:space:]]*#' "$1"; }
+
 hr() { printf '%s\n' "────────────────────────────────────────────────────────"; }
 
 # ── 1. 构建 ────────────────────────────────────────────────────────────────
@@ -127,10 +130,8 @@ fi
 
 echo
 echo "== 与基线 $SNAP 对比 =="
-join -t$'\t' -j 1 \
-  <(sort "$SNAP") \
-  <(sort "$TMP/new.tsv") \
-  > "$TMP/joined.tsv"
+strip_comments "$SNAP" | sort > "$TMP/old.tsv"
+join -t$'\t' -j 1 "$TMP/old.tsv" <(sort "$TMP/new.tsv") > "$TMP/joined.tsv"
 
 REGRESSED=0
 : > "$TMP/regress.txt"
@@ -145,9 +146,9 @@ while IFS=$'\t' read -r suite old_p old_s old_f new_p new_s new_f; do
 done < "$TMP/joined.tsv"
 
 # 基线里有、新表里没有的套件（套件被移除或改名）
-join -t$'\t' -j 1 -v 1 <(sort "$SNAP") <(sort "$TMP/new.tsv") > "$TMP/missing.txt"
+join -t$'\t' -j 1 -v 1 "$TMP/old.tsv" <(sort "$TMP/new.tsv") > "$TMP/missing.txt"
 # 新表里有、基线里没有的（新增套件）
-join -t$'\t' -j 1 -v 2 <(sort "$SNAP") <(sort "$TMP/new.tsv") > "$TMP/added.txt"
+join -t$'\t' -j 1 -v 2 "$TMP/old.tsv" <(sort "$TMP/new.tsv") > "$TMP/added.txt"
 
 if [ -s "$TMP/gain.txt" ]; then
   echo
