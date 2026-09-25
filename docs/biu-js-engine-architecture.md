@@ -1,4 +1,9 @@
-# Biu — 嵌入式 JavaScript 引擎架构方案
+# Biu — 嵌入式 JavaScript 引擎架构方案（早期设计蓝图）
+
+> **这是设计蓝图，不是当前实现地图。** 它写于 2026-09-21、早于 M3/M4 与迭代协议/生成器/严格模式早期错误
+> 这几批工作，其中若干"排除/远期"的判断已经过时。
+> **实现问题请以 `docs/architecture.md` 为准**；当前计划见 `docs/es6-conformance-phase2.md`；接手入口见 `docs/handover.md`。
+> 已知过时处（保留原文以便追溯设计意图，但不要照着做）：§一.1 声称排除 `var`/`arguments` —— **两者都已支持**（见 `es6-conformance-plan.md` §1.2）；§九.3"延期特性"与 §十一 的 M3"规划中"/M4"远期"均已完成；生成器、SEH 跨帧展开、迭代协议、strict 早期错误层当时都还不存在。
 
 > 基于 evalit (IR + Bytecode + VM) 架构蓝图，使用 oxc 解析器
 > 定位：轻量级、嵌入式、ES6 兼容、Rust 实现
