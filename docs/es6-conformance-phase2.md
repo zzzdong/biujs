@@ -10,13 +10,13 @@
 
 | 指标 | 数值 | 说明 |
 |------|------|------|
-| test262 执行 | 17477 | runner 实际跑的数 |
-| 通过 | **13382** | 主指标（B5b 后） |
-| 失败 | 4095 | 其中约 3460 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
-| 跳过 | 8109 | 全部为范围外或 G3 排除项 |
-| 通过率 | 76.57% | 参考值 |
+| test262 执行 | 17647 | runner 实际跑的数（B2a 起含 `built-ins/Map`） |
+| 通过 | **13584** | 主指标（B2a 后） |
+| 失败 | 4063 | 其中约 3430 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
+| 跳过 | 8143 | 范围外 / G3 排除项 + 已入册套件自己的 feature 门控（`built-ins/Map` 42 条） |
+| 通过率 | 76.98% | 参考值 |
 | 单元测试 | 190 全绿 | |
-| feature 集成测试 | 24 个文件 / 429 用例全绿 | |
+| feature 集成测试 | 31 个文件 / 436 用例全绿 | |
 | 全量耗时 | 2m50s | B1 的协议化 spread 带来的上升，见 §6.1 |
 | runner 覆盖面 | 25586 / 53568 个测试文件（**47%**） | 见 §2.3 |
 
@@ -151,7 +151,8 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 |------|------|------|------|
 | **B0** ✅ | 度量铺底：§2.3 清单入文档；把"入册+解锁联动"写进 runner 的注释与 §6.2 | — | **已完成**，见 §6.1 |
 | **B1** ✅ | M7-P3 的 spread 走 `GetIterator`（含 `ArrayPushSpread` 重写） | +21 | **已完成**，见 §6.1；顺带修好 `@@iterator === values` 与 `values/keys/entries` 的接收者校验 |
-| **B2** | M5-C1 `Map`/`Set`（含入册解锁） | 587 | ES6 承诺内最早能整体交付、不依赖新机制 |
+| **B2a** ✅ | M5-C1 前半：`Map`（含入册解锁） | 204（入册后执行 162） | **已完成**，见 §6.1；套件通过率 95.68%，A3 的 ≥80% 达标 |
+| **B2b** | M5-C1 后半：`Set`（与 `Map` 同构，可顺带做 `WeakMap`/`WeakSet`） | 383 | 复用 B2a 的迭代器与接收者检查套路 |
 | **B3** | M5-C2 `WeakMap`/`WeakSet` | 226 | 与 B2 同构，可顺带 |
 | **B4** | M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策 | — | 把 KPI 的杂音清掉，再动大件 |
 | **B5a** ✅ | M7-P4 前半：数组 `length` 的错误种类（应为 RangeError） | +32 | **已完成**，见 §6.1 |
@@ -296,6 +297,61 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 - **严格模式下删除不可配置属性不抛 TypeError**：`obj[sym] = ...` 之后再 `delete obj[sym]` 应抛（`symbol-data-property-default-strict`）。
 - **Annex B 遗留访问器**：`prototype/__proto__`（13）、`__defineGetter__`/`__defineSetter__`（各 10）、`__lookupGetter__`/`__lookupSetter__`（各 7）合计约 47 条，都要按 `[[Get]]`/`[[Set]]` 走接收者，必须在 VM 侧实现。
 - **范围外杂音**（M8-V3 处理，本批不动）：`Object.fromEntries` 24（ES2019）、`Object.groupBy` 14（ES2024）、`Object.getOwnPropertyDescriptors` 13（ES2017）—— 它们已在执行、计入失败，但不在 ES6 目标集里。
+
+#### B2a `Map` —— 已完成（2026-09-26）
+
+**起点**：通过 13382 / 17477（76.57%）。
+
+**交付**：`Map` 从 `IN_SCOPE_PENDING` 摘掉，`built-ins/Map` 加进 `SUITES`（§2.2 的"实现 + 解锁 + 入册"三件事同批）。入册后 `built-ins/Map` **155 / 162 = 95.68%**，A3 的"≥ 80%"达标。
+
+**改动**（按 `architecture.md` §3.1 的清单，实际落点）
+
+| 层 | 内容 |
+|----|------|
+| `vm/object.rs` | `MapObject`：`Vec<Option<(K,V)>>` 保插入序、`SameValueZero` 查键（`set` 时把 `-0` 归一成 `+0`）、`size`/`get`/`set`/`has`/`delete`/`clear`/`entry_from`；`impl JSObject`（含 `[[Freeze]]`/`[[Seal]]`/`[[DefineOwnProperty]]`，`class_name` = `"Map"`）。**删除用墓碑（`None`）而不是 `Vec::remove`** —— 迭代器是"活"的，按下标前进，一旦前面的条目被删掉、后面的元素左移，下标就会跳读 |
+| `vm/iterator.rs` | `NativeIteratorState::Map { map, kind, idx }` + `MapIterKind{Key,Value,Entry}`；`native_next` 每一步重新借一次 map（回调可能在两步之间改它） |
+| `builtins/map.rs`（新） | `get`/`set`/`has`/`delete`/`clear`、`size` 访问器、`Symbol.toStringTag`、`Symbol.species` 访问器；`as_map()` 提供"接收者必须是 `[[MapData]]`"的检查 |
+| `builtins/mod.rs` | `map_prototype` 字段 + `register()` 里装配构造器/原型/`@@iterator === entries`；新增 `MAP_METHOD_PREFIX` 与 `set_map_method`（见下）；arity 表加 `Map`/`get`/`has`/`delete`/`set`/`getOrInsert*`/`Map.groupBy` |
+| `vm/mod.rs` | 构造器 `map_construct`（`GetIterator` + 逐条 `Get(item,"0")`/`Get(item,"1")` + `Get(map,"set")` 后 `Call`，任一步骤 abrupt 都先 `IteratorClose`）、`map_for_each`、`map_iterator`、`Map.groupBy`、`size`/`species` 访问器派发 |
+| `tests/` | `tests/features/map.rs`（7 组断言）+ runner 的解锁/入册 |
+
+**三个必须记下来的坑**
+
+1. **`keys`/`values`/`entries`/`forEach` 不能和 `Array.prototype` 同一套前缀**。它们名字一样，但接收者规则相反：`Array.prototype.keys.call(1)` 规范要求返回空迭代器，`Map.prototype.keys.call(1)` 必须是 TypeError。按名字派发区分不开，于是给 Map 的四个方法单独一个 `__map_method__` 前缀，并在 `NativeFunctionObject::install_metadata` / arity 表里同步剥掉。
+2. **`get`/`set`/`has`/`delete`/`clear` 的派发必须带"接收者真是 Map"的守卫**。把它们直接加进 `call_prototype_method` 的名字表会劫持**任何**对象上的同名数据属性 —— 实测 `var obj = { get: function () { return this.value; } }; obj.get()` 立刻变成 `Map.prototype.get called on an incompatible receiver`（新的 feature 用例 `this_survives_nested_call` 抓到的）。
+3. **`CallMethod` 的数组回调拦截跑在原生派发之前**。`m.forEach(cb)` 会先被 `try_array_callback_method` 当成"没有 `length` 的类数组"吞掉（回调一次都不执行）。修法是让 Map 接收者在那里提前 `return Ok(None)`；注意**只能对 Map 生效** —— 我第一版写成"不是类数组就退出"，把 `Array.prototype.forEach.call(true, cb)`（应静默迭代 0 次）等 20 条打挂了。
+
+**顺带修掉的两条既有问题**
+
+- `iterator_close` 新增"外层完成是 throw"的分支（ES 7.4.6 step 7）：此前无论外层是不是抛出，`return()` 返回非对象都会变成 TypeError，把真正的 `Test262Error` 盖掉。
+- `NativeFunctionObject::define_property` / `property_delete` 补上可扩展性与重定义校验（`C.prototype` 是非可配置的，重新定义应当抛）。
+
+**一次"解锁即倒垃圾"的事故（已修，必须记住）**
+
+`is_unsupported` 的匹配是 `starts_with || contains`。`"Array.prototype.flatMap".contains("Map")` 为真 —— 也就是说 `Map` 一直"顺带"把 `Array.prototype.flatMap` 的 20 条用例锁着。把 `Map` 从 `IN_SCOPE_PENDING` 摘掉的瞬间，这 20 条（ES2019，未实现）涌进执行池，`built-ins/Array` 掉了 20 条通过。修法：在 `OUT_OF_SCOPE_FEATURES` 里**显式**登记 `Array.prototype.flatMap`（范围外 + 未实现，与"跳过表只剩范围外/G3"的定义一致），并在 `is_unsupported` 上写明这个匹配的锋利边缘。修完 `built-ins/Array` 回到 1941（比起点 1940 多 1），跳过数从 8109 变成 **8143**（Map 套件自带的 42 条门控用例进表，另有 8 条曾被 `Map` 顺带跳过、现在真正执行）。
+
+**效果**
+
+| 指标 | 起点 | 本批后 |
+|------|------|--------|
+| 全量通过 | 13382（76.57%） | **13584**（76.98%） |
+| 失败 | 4095 | **4063** |
+| 执行 / 跳过 | 17477 / 8109 | 17647 / 8143 |
+| `built-ins/Map` | 未入册 | **155 / 162 = 95.68%** |
+| `built-ins/Symbol` | 39 | **54** |
+| `built-ins/Number` | 180 | **189** |
+| `language/statements/for-of` | 376 | **381** |
+| `language/statements/class` | 1110 | **1113** |
+| `built-ins/NativeErrors` / `Error` | 62 / 36 | **68 / 38** |
+| 其余 | — | `String`+1、`Object`+2、`Function`+1、`Array`+1、`types`+1、`expressions/class`+1 |
+
+净 **+202**，**逐套件零回退**（`scripts/phase2-status.sh` 判定"无逐套件回退"）。单元 190 全绿；features 429 → **436**（新增 `tests/features/map.rs`，7 组）。
+
+**残留**
+
+- `built-ins/Map` 剩 7 条：4 条是 `Map.groupBy` 之后用 `Array.from(map.keys())` 取结果 —— **`Array.from` 根本不走迭代协议**（`builtins/array.rs::array_from` 只按 `length` + 索引取快照），这是 ES6 范围内的独立缺口，`built-ins/Array/from` 里还有 30 条同源失败；1 条 `map.js` 等全局对象（顶层 `this`）；2 条需要"闭包内可写外部变量"（M7-P5 数据模型债）。
+- **`Set` / `WeakMap` / `WeakSet` 仍未开工**（B2b），`Map` 的迭代器状态与接收者检查可以直接复用。
+- `Map.groupBy`（ES2024）与 `getOrInsert`/`getOrInsertComputed`（ES2026 提案）**不在 ES6 承诺面内**，但已在钉住的 test262 里、且和 `Map` 同一套迭代/回调机制，所以随本批实现了（38 条）。M8-V3 若要按"范围外"把它们从 KPI 里摘掉，可以再讨论 —— 它们不是 M7 的承诺。
 
 ---
 

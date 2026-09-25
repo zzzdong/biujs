@@ -106,9 +106,10 @@
 | `FunctionObject`（`:1271`） | `func_id`、`name`、`captured_this` / `captured_new_target` / `captured_vars` |
 | `NativeFunctionObject`（`:1476`） | `name`（**派发就靠它**）、`properties`（`length`/`name` 元数据，`install_metadata:1510`） |
 | `GeneratorObject`（`:1890`） | `state`、`args`、`this`、`suspended: Option<SuspendedFrame>` |
-| `NativeIteratorObject`（`iterator.rs:100`） | 迭代器状态 |
+| `MapObject`（B2a） | `entries: Vec<Option<(Value, Value)>>`（插入序；`None` 是删除留下的墓碑）、`properties`、`prototype` |
+| `NativeIteratorObject`（`iterator.rs:100`） | 迭代器状态（`Map` 变体见 `NativeIteratorState`） |
 
-- `PropertyKey`（`property.rs:5`）= `Str(Rc<String>) | Symbol(u64)`；`PropertyDescriptor:45`；`ObjectKind:99`（20 个变体，`Map`/`Set` 等**目前只是占位**，无实现）。
+- `PropertyKey`（`property.rs:5`）= `Str(Rc<String>) | Symbol(u64)`；`PropertyDescriptor:45`；`ObjectKind:99`（20 个变体，`Set`/`WeakMap` 等**目前只是占位**，无实现）。
 - `prototype.rs`：`find_descriptor:83` / `internal_get:36` / `internal_set:110` / `internal_has_property:183` / `internal_delete:212`。**错误类型是 `String`**（见地雷 5）。
 
 ### 2.7 内置对象层
@@ -135,20 +136,24 @@
 | 严格模式早期错误 | 已由 oxc 语义构建器承担（`parse_js`） | runner 侧的 `onlyStrict` 前置 |
 | 测试与度量 | `tests/test262_runner.rs`（`SUITES:500`、两套特性表 `:171`/`:206`、`should_skip:256`、`build_source:117`） | 计划书 §2.2 的"入册 + 解锁"联动纪律 |
 
-### 3.1 示例：新增一个集合类型（Map / Set / TypedArray）的改动清单
+### 3.1 新增一个集合类型（Map / Set / WeakMap / TypedArray）的改动清单
 
-`Map` / `Set` 目前**零脚手架** —— `ObjectKind` 里那两个变体只是占位，没有任何实现。按顺序动这些地方：
+`Map` 已在 B2a 落地，下面是"照着做 `Set`/`WeakMap`"时的落点，**以及 B2a 实际踩到的三个坑**（比清单本身值钱）：
 
-1. `vm/object.rs`：新增 `MapObject { entries: Vec<(Value, Value)>, prototype, properties, ... }`，`impl JSObject`。
-   - 插入序用 `Vec` 保序（`Map` 规范要求插入序），查找走 `SameValueZero`。**别用 `HashMap` 直接当存储**：`SameValueZero` 与 `Hash` 语义不同（`-0`/`+0`、`NaN`），且要保序。
-   - `get_prototype`/`set_prototype`/`property_get`/`property_set` 转发到内部的 `properties` + `prototype`（照抄 `OrdinaryObject` 的那几段）。
-   - `kind()` 返回 `ObjectKind::Map`（那就得把 `property.rs` 里现有的占位变体用起来）。
-2. `vm/iterator.rs`：`NativeIteratorState` 加变体（如 `MapEntries { items: Vec<Value>, idx }`），并在 `native_next` 里实现推进。若迭代器要"活"（规范要求 Map/Set 迭代器观察迭代期间的增删），就不能用快照，需要在状态里持有对象引用 + 索引 —— **这是本任务里最容易做错的一点**。
-3. `builtins/map.rs`：`register_map_prototype(&proto)`（用 `set_prototype_method` / `set_prototype_method_arity`）+ `size` 的 getter（用 `define_property` 装访问器）。
-4. `builtins/mod.rs`：`Builtins` 加 `map_prototype` 字段；`register()` 里建构造器、`link_constructor_prototype`、插入全局 `globals.insert("Map", ...)`；arity 表加各方法。
-5. `vm/mod.rs` 的 `call_native_by_name`：加 `Map` 构造器与需要用户回调/内部方法的成员（`new Map(iterable)` 要走迭代协议 → **必须在 VM 侧**，用 `make_iterator` + `iterator_next`）。
-6. `tests/test262_runner.rs`：从 `IN_SCOPE_PENDING` 删掉 `"Map"`，并把 `built-ins/Map` 加进 `SUITES`（§2.2 的联动纪律）。
-7. `tests/features/`：至少覆盖 插入序 / `SameValueZero`（`-0`、`NaN`）/ `size` / 迭代 / 迭代期间的增删 / `new Map(iterable)`。
+1. `vm/object.rs`：新增 `SetObject { entries: Vec<Option<Value>>, ... }`，`impl JSObject`。
+   - 插入序用 `Vec` 保序，查找走 `SameValueZero`（`same_value_zero()` 已抽好放在 `MapObject` 旁边）。**别用 `HashMap` 直接当存储**：`SameValueZero` 与 `Hash` 在 `-0`/`NaN` 上不一致，且要保序。
+   - **删除留墓碑（`Option::None`）而不要 `Vec::remove`**：迭代器是"活"的（迭代期间增删可观察），按下标前进的迭代器一旦遇到"前面的条目被删、后面的元素左移"就会跳读。
+   - 转发 `properties`/`prototype` 的那几段照抄 `MapObject` 或 `OrdinaryObject`。
+2. `vm/iterator.rs`：`NativeIteratorState` 加变体（`Map` 的见 `Map{map,kind,idx}`），在 `native_next` 里推进。状态里**持有对象引用**（`Rc<RefCell<dyn JSObject>>`，每步 `as_any` 下转）而不是快照，且**每步只借一次**（用户回调可能在两步之间改它）。
+3. `builtins/set.rs`：纯方法（不需要用户代码的那些）用 `set_prototype_method`；`size` getter 用 `define_property` 装访问器；`Symbol.toStringTag` / `Symbol.species` 同理。
+4. `builtins/mod.rs`：`Builtins` 加 `set_prototype` 字段；`register()` 里建构造器、`link_constructor_prototype`、`set_static_method`（`Set.groupBy` 之类）、`@@iterator === values`、`globals.insert("Set", ...)`；arity 表加名字。
+5. `vm/mod.rs`：
+   - 构造器（要迭代协议 + `Get(adder)` + `IteratorClose`）走 `native_construct` 的一个专用分支，照抄 `map_construct`；
+   - 需要回调/迭代器的成员（`forEach`、迭代器工厂）用**独立前缀**注册（`MAP_METHOD_PREFIX` 的先例），并在 `call_native_by_name` 顶部按前缀派发 + 校验接收者；
+   - 只想让 VM 插手、名字与别处重名的（`get`/`set`/`add`/`delete`/`clear`）**必须带"接收者是本类型"的守卫**，否则会劫持任意对象上的同名方法；
+   - 还要检查 `CallMethod` 的数组回调拦截（`try_array_callback_method`）不会把新类型吞掉（Map 的 `forEach` 就中过这一枪）。
+6. `tests/test262_runner.rs`：从 `IN_SCOPE_PENDING` 删掉特性名 + 把套件加进 `SUITES`（§2.2）。**删之前先查 `is_unsupported` 的 `contains` 匹配**：`"Array.prototype.flatMap".contains("Map")` 为真，B2a 因此"顺带"放进池里 20 条未实现的用例。
+7. `tests/features/`：至少覆盖 插入序 / `SameValueZero`（`-0`、`NaN`）/ `size` / 迭代 / 迭代期间的增删 / `new T(iterable)`。**注意本引擎的闭包是创建时值快照**：计数器不能写在闭包里，只能往捕获的数组里 `push`（`state.i += 1` 会报 `Cannot create property 'i' on number`）。
 
 ---
 
@@ -159,6 +164,10 @@
 **builtin 层看不到原型链与访问器**。`builtins/*` 直接读 `ArrayObject::elements` 密集存储、走快照（`array_like_elements`），因此**绕过 `[[Get]]`/`[[Set]]` 与访问器**。凡语义要求"按 `[[Get]]` 取值 / 按 `[[Set]]` 写入 / 可能执行用户代码"的，必须上移 VM。已知欠账：Array 回调方法的泛型/访问器路径、`[...a]` 中数组元素的访问器、索引读写不经原型链。
 
 **访问器槽里的 `undefined` 不等于"没有"**。`PropertyDescriptor::getter/setter` 是 `Option<Value>`：`Some(Undefined)` 表示"字段存在、值是 `undefined`"——`{get: undefined}` 装出来的描述符仍是**访问器描述符**，只是读的时候没有东西可调。调用点在判断要不要 `invoke` 时必须走 `invoked_getter()` / `invoked_setter()`（把 `Some(Undefined)` 折成 `None`），不能直接 `match desc.getter`。同理，部分描述符（只给 `enumerable`/`configurable`）落在已有访问器上时**必须保持访问器**，不能按数据描述符重建 —— 见 `apply_property_descriptor` 里的两条早退回。
+
+**同名原型方法要靠"独立前缀 + 接收者守卫"分发，不能只看名字**。`call_prototype_method` 是一张按名字查的表：把 `get`/`set`/`has`/`delete`/`clear` 直接放进去，会劫持**任何**对象上的同名数据属性（`var o = { get: function () { … } }; o.get()`）。`Map.prototype` 的 `keys`/`values`/`entries`/`forEach` 更麻烦——名字和 `Array.prototype` 一模一样而接收者规则相反，所以它们走 `MAP_METHOD_PREFIX`（`__map_method__`）这一套独立前缀，名字表与 arity 表都要同步剥。另注意 `Opcode::CallMethod` 里的 `try_array_callback_method` **跑在原生派发之前**，新类型只要有一个叫 `forEach`/`map`/`sort` 的方法，就得在那里提前放行。
+
+**`IteratorClose` 要看外层完成是不是抛出**。ES 7.4.6 step 7：外层是 throw 时，`return()` 抛什么、返回什么都不是可观察的，原样把外层完成往上传即可。B2a 之前无论哪种情况都对 `return()` 的非对象结果抛 TypeError，于是把真正的 `Test262Error` 盖成了 TypeError（`iterator-item-*-returns-abrupt` 一族）。
 
 **帧深度必须在装帧之前取**。生成器恢复、`invoke`、迭代器体都要把"调用方的 `ctrl_stack` 深度"记为边界（`invoke_boundaries`）。用装帧**之后**的深度会让本帧自己的 handler 被判成"帧外"，表现为异常穿透、控制栈下溢。这条教训出现过四次。
 

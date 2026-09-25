@@ -1327,6 +1327,20 @@ impl VM {
         if name == crate::builtins::SYMBOL_DESCRIPTION_NATIVE {
             return crate::builtins::symbol_description(&this);
         }
+        // `Map.prototype.size` getter (ES 23.1.3.9).
+        if name == crate::builtins::MAP_SIZE_NATIVE {
+            return crate::builtins::map_size(&this);
+        }
+        // `get Map[Symbol.species]` answers its receiver (ES 23.1.2.2).
+        if name == crate::builtins::MAP_SPECIES_NATIVE {
+            return Ok(this);
+        }
+        // `Map.prototype.entries/keys/values/forEach`: they either call a user
+        // callback or mint an iterator object, so they are dispatched here
+        // rather than in the builtin layer.
+        if let Some(method) = name.strip_prefix(crate::builtins::MAP_METHOD_PREFIX) {
+            return self.map_method(&this, method, args, module);
+        }
         // Generator methods: `gen.next(v)` resumes the body, `gen.return(v)` /
         // `gen.throw(e)` complete it, and `gen[Symbol.iterator]()` hands the
         // generator itself back.
@@ -1393,7 +1407,7 @@ impl VM {
                 .parse()
                 .map_err(|_| RuntimeError::InternalError("malformed iterator id".to_string()))?;
             if let Some(iter_val) = self.iterator_registry.get(&id).cloned() {
-                self.iterator_close(iter_val, args.first(), module)?;
+                self.iterator_close(iter_val, args.first(), false, module)?;
             }
             // `return()` is an iterator method, so it answers with an iterator
             // result — `yield*` checks that the value is an object
@@ -1492,6 +1506,12 @@ impl VM {
             // the VM can do.
             if name == "Object.assign" {
                 return self.object_assign(args, module);
+            }
+            // `Map.groupBy(items, callbackfn)`: iterates and calls back.
+            if name == "Map.groupBy" {
+                let items = args.first().cloned().unwrap_or(Value::Undefined);
+                let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+                return self.map_group_by(&items, &callback, module);
             }
             // The descriptor arguments are read through [[Get]] first, which
             // only the VM can do (their fields may be accessors).
@@ -2157,7 +2177,7 @@ impl VM {
             }
             Opcode::IterClose => {
                 let iter_val = self.get_value(operands[0])?;
-                self.iterator_close(iter_val, None, module)?;
+                self.iterator_close(iter_val, None, false, module)?;
             }
             Opcode::RequireObjectCoercible => {
                 let src = self.get_value(operands[0])?;
@@ -3459,6 +3479,350 @@ impl VM {
     ///
     /// Returns `Ok(None)` when `method` is not one of those methods, so callers
     /// can fall back to the ordinary dispatch chain.
+    /// The `Map.prototype` methods that cannot live in the builtin layer
+    /// (ES 23.1.3.4–7 / 23.1.5.4): `forEach` calls the callback, and the three
+    /// iterator factories mint iterator objects, which only the VM's registry
+    /// can hand out.
+    ///
+    /// `None` means "not a Map method on a Map receiver" — the ordinary
+    /// dispatch then raises the TypeError the spec asks for
+    /// (`Map.prototype.get.call({}, 'x')`).
+    /// `Map.prototype.forEach` and the three iterator factories (ES 23.1.3.4–7).
+    ///
+    /// All four start with "the receiver must be an object carrying
+    /// `[[MapData]]`", which is why they carry their own dispatch prefix —
+    /// the same-named `Array.prototype` methods accept a non-array receiver
+    /// instead of rejecting it.
+    fn map_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let is_map = match this {
+            Value::Object(obj_ref) => obj_ref.borrow().kind() == ObjectKind::Map,
+            _ => false,
+        };
+        if !is_map {
+            return Err(RuntimeError::TypeError(format!(
+                "Map.prototype.{method} called on an incompatible receiver"
+            )));
+        }
+        match method {
+            "forEach" => self.map_for_each(this, args, module),
+            // `upsert` (ES2026 proposal, already in the pinned test262):
+            // "return the value for key, inserting one if it is missing".
+            "getOrInsert" => self.map_get_or_insert(this, args),
+            "getOrInsertComputed" => self.map_get_or_insert_computed(this, args, module),
+            _ => self.map_iterator(this, method, module),
+        }
+    }
+
+    /// `Map.prototype.getOrInsert(key, value)`.
+    fn map_get_or_insert(&mut self, this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+        let key = args.first().cloned().unwrap_or(Value::Undefined);
+        let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let Value::Object(obj_ref) = this else {
+            return Err(RuntimeError::TypeError(
+                "Map.prototype.getOrInsert called on a non-object".to_string(),
+            ));
+        };
+        let mut borrowed = obj_ref.borrow_mut();
+        let map = borrowed
+            .as_any_mut()
+            .downcast_mut::<crate::vm::object::MapObject>()
+            .expect("try_map_method checked the receiver");
+        match map.get(&key) {
+            Some(existing) => Ok(existing),
+            None => {
+                // The key is canonicalised (`-0` → `+0`) by `MapObject::set`.
+                map.set(key, value.clone());
+                Ok(value)
+            }
+        }
+    }
+
+    /// `Map.prototype.getOrInsertComputed(key, callbackfn)`: the callback
+    /// produces the value for a missing key (and is passed the canonical key
+    /// only). A value it inserts itself is overwritten by the one it returns.
+    fn map_get_or_insert_computed(
+        &mut self,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let key = args.first().cloned().unwrap_or(Value::Undefined);
+        let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+        if !callback.is_callable() {
+            return Err(RuntimeError::TypeError(
+                "Map.prototype.getOrInsertComputed callback is not a function".to_string(),
+            ));
+        }
+        let Value::Object(obj_ref) = this else {
+            return Err(RuntimeError::TypeError(
+                "Map.prototype.getOrInsertComputed called on a non-object".to_string(),
+            ));
+        };
+        // Canonicalise before the lookup so the callback receives the key the
+        // map would store (`-0` becomes `+0`).
+        let canonical = match &key {
+            Value::Number(n) if *n == 0.0 => Value::Number(0.0),
+            other => other.clone(),
+        };
+        let existing = obj_ref
+            .borrow()
+            .as_any()
+            .downcast_ref::<crate::vm::object::MapObject>()
+            .and_then(|map| map.get(&canonical));
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+        let value = self.invoke(
+            &callback,
+            Value::Undefined,
+            std::slice::from_ref(&canonical),
+            module,
+        )?;
+        let mut borrowed = obj_ref.borrow_mut();
+        let map = borrowed
+            .as_any_mut()
+            .downcast_mut::<crate::vm::object::MapObject>()
+            .expect("try_map_method checked the receiver");
+        map.set(canonical, value.clone());
+        Ok(value)
+    }
+
+    /// `Map.groupBy(items, callbackfn)` (ES2024 `array-grouping`).
+    ///
+    /// Not part of the ES6 target, but the pinned test262 already ships it and
+    /// it is the same iteration + callback machinery the `Map` constructor
+    /// needs. Keys are used as-is (`SameValueZero`), with `-0` normalised —
+    /// there is no `ToPropertyKey` coercion.
+    fn map_group_by(
+        &mut self,
+        items: &Value,
+        callback: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        if !callback.is_callable() {
+            return Err(RuntimeError::TypeError(
+                "Map.groupBy callback is not a function".to_string(),
+            ));
+        }
+        let map_val = Value::Object(Rc::new(RefCell::new(crate::vm::object::MapObject::new(
+            Some(Rc::clone(&self.builtins.map_prototype)),
+        ))));
+        let iter = self.make_iterator(items.clone(), module)?;
+        let mut index = 0usize;
+        loop {
+            let (value, done) = self.iterator_next(iter.clone(), None, module)?;
+            if done {
+                break;
+            }
+            let key = self.invoke(
+                callback,
+                Value::Undefined,
+                &[value.clone(), Value::Number(index as f64)],
+                module,
+            )?;
+            index += 1;
+            let Value::Object(obj_ref) = &map_val else {
+                unreachable!("Map.groupBy builds its own Map")
+            };
+            let mut borrowed = obj_ref.borrow_mut();
+            let map = borrowed
+                .as_any_mut()
+                .downcast_mut::<crate::vm::object::MapObject>()
+                .expect("Map.groupBy builds its own Map");
+            // Each group is a plain array appended to in encounter order.
+            let group = map.get(&key);
+            match group {
+                Some(Value::Object(list)) => {
+                    if let Some(arr) = list.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>()
+                    {
+                        arr.push(value);
+                    }
+                }
+                _ => {
+                    map.set(
+                        key,
+                        Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(vec![value])))),
+                    );
+                }
+            }
+        }
+        Ok(map_val)
+    }
+
+    /// `Map.prototype.forEach(cb, thisArg)` (ES 23.1.3.5).
+    ///
+    /// The callback receives `(value, key, map)` — note the order — and the
+    /// walk goes through `entry_from` so entries added while it runs are
+    /// visited and deleted ones are skipped.
+    fn map_for_each(
+        &mut self,
+        map_val: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let callback = args.first().cloned().unwrap_or(Value::Undefined);
+        if !callback.is_callable() {
+            return Err(RuntimeError::TypeError(
+                "Map.prototype.forEach callback is not a function".to_string(),
+            ));
+        }
+        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let Value::Object(obj_ref) = map_val else {
+            return Err(RuntimeError::TypeError(
+                "Map.prototype.forEach called on a non-object".to_string(),
+            ));
+        };
+        let mut idx = 0;
+        loop {
+            // The borrow must end before the callback runs: it may well mutate
+            // the map (`m.forEach(function () { m.delete(1) })`).
+            let step = {
+                let borrowed = obj_ref.borrow();
+                borrowed
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::MapObject>()
+                    .and_then(|map| map.entry_from(idx))
+            };
+            let Some((next, key, value)) = step else {
+                break;
+            };
+            idx = next + 1;
+            self.invoke(
+                &callback,
+                this_arg.clone(),
+                &[value, key, map_val.clone()],
+                module,
+            )?;
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// `Map.prototype.entries()` / `keys()` / `values()` (ES 23.1.3.4–7).
+    ///
+    /// The result is *live*: it keeps the map, not a snapshot.
+    fn map_iterator(
+        &mut self,
+        map_val: &Value,
+        method: &str,
+        _module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::iterator::{MapIterKind, NativeIteratorObject, NativeIteratorState};
+        let kind = match method {
+            "keys" => MapIterKind::Key,
+            "values" => MapIterKind::Value,
+            _ => MapIterKind::Entry,
+        };
+        let Value::Object(obj_ref) = map_val else {
+            return Err(RuntimeError::TypeError(format!(
+                "Map.prototype.{method} called on a non-object"
+            )));
+        };
+        let id = self.next_iterator_id;
+        self.next_iterator_id += 1;
+        let iter_val = Value::Object(Rc::new(RefCell::new(NativeIteratorObject::new(
+            id,
+            NativeIteratorState::Map {
+                map: Rc::clone(obj_ref),
+                kind,
+                idx: 0,
+            },
+        ))));
+        self.iterator_registry.insert(id, iter_val.clone());
+        Ok(iter_val)
+    }
+
+    /// `new Map([iterable])` (ES 23.1.1.1).
+    ///
+    /// The iterable is consumed through the real iteration protocol, and every
+    /// item is read with `[[Get]]` — `new Map([{ get 0() {…} }])` runs the
+    /// getter.
+    fn map_construct(
+        &mut self,
+        constructor_val: &Value,
+        args: &[Value],
+        new_target: Option<&Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let proto = self.prototype_from_constructor(constructor_val, new_target);
+        let prototype = match &proto {
+            Some(Value::Object(p)) => Some(Rc::clone(p)),
+            _ => Some(Rc::clone(&self.builtins.map_prototype)),
+        };
+        let map_val = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::MapObject::new(prototype),
+        )));
+
+        let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+        if !matches!(iterable, Value::Undefined | Value::Null) {
+            let iter = self.make_iterator(iterable, module)?;
+            // Step 9.a: the adder is looked up *once*, through `[[Get]]`, and
+            // it is a subclass's `set` when there is one
+            // (`iterable-calls-set.js`, `get-set-method-failure.js`).
+            let adder = match self.get_member(&map_val, &PropertyKey::from_str("set"), module) {
+                Ok(adder) => adder,
+                Err(err) => {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(err);
+                }
+            };
+            if !adder.is_callable() {
+                self.iterator_close(iter, None, true, module)?;
+                return Err(RuntimeError::TypeError(
+                    "Map constructor: 'set' is not callable".to_string(),
+                ));
+            }
+            loop {
+                // 9.b–d: `IteratorStep` + `IteratorValue`, and 9.l: any abrupt
+                // completion closes the iterator before it is propagated.
+                let (item, done) = match self.iterator_next(iter.clone(), None, module) {
+                    Ok(step) => step,
+                    Err(err) => {
+                        self.iterator_close(iter, None, true, module)?;
+                        return Err(err);
+                    }
+                };
+                if done {
+                    break;
+                }
+                // Step 9.f: a non-object item is a TypeError (unlike
+                // `Object.fromEntries`, `Map` takes no primitives).
+                if !item.is_object() {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(RuntimeError::TypeError(
+                        "Map constructor: iterator value is not an entry object".to_string(),
+                    ));
+                }
+                // 9.g–k: `Get(item, "0")` / `Get(item, "1")` run accessors, and
+                // the adder is called with the new map as `this`.
+                let key = match self.get_member(&item, &PropertyKey::from_str("0"), module) {
+                    Ok(key) => key,
+                    Err(err) => {
+                        self.iterator_close(iter, None, true, module)?;
+                        return Err(err);
+                    }
+                };
+                let value = match self.get_member(&item, &PropertyKey::from_str("1"), module) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.iterator_close(iter, None, true, module)?;
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = self.invoke(&adder, map_val.clone(), &[key, value], module) {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(map_val)
+    }
+
     fn try_array_callback_method(
         &mut self,
         receiver: &Value,
@@ -3490,6 +3854,16 @@ impl VM {
             return Err(RuntimeError::TypeError(format!(
                 "Array.prototype.{method} called on null or undefined"
             )));
+        }
+        // `forEach` also lives on `Map.prototype`, and this interception runs
+        // before the native dispatch (it is what makes `arr.forEach(cb)` call
+        // the callback at all). A Map has no `length`, so it would be treated
+        // as a zero-length array-like and the callback would never run —
+        // `m.forEach(cb)` has to fall through to `Map.prototype.forEach`.
+        // Every *other* receiver keeps the old behaviour, including primitives
+        // (`Array.prototype.forEach.call(true, cb)` iterates nothing).
+        if matches!(receiver, Value::Object(o) if o.borrow().kind() == ObjectKind::Map) {
+            return Ok(None);
         }
 
         let entries = match self.array_like_entries(receiver, module) {
@@ -5081,6 +5455,7 @@ impl VM {
         &mut self,
         iter_val: Value,
         value: Option<&Value>,
+        over_abrupt: bool,
         module: &Module,
     ) -> Result<(), RuntimeError> {
         use crate::vm::iterator::NativeIteratorState;
@@ -5116,10 +5491,18 @@ impl VM {
                 Some(v) => vec![v.clone()],
                 None => Vec::new(),
             };
+            // ES 7.4.6 step 7: when the completion being closed over is a
+            // *throw*, that completion wins — whatever `return()` raises or
+            // returns (a number, `null`, …) is not observable. Checking the
+            // result first turned a genuine `Test262Error` into a TypeError.
+            if over_abrupt {
+                let _ = self.invoke(&return_fn, iterator, &args, module);
+                return Ok(());
+            }
             // Step 5: an error raised by `return()` itself is swallowed — the
             // completion being closed over wins.
             if let Ok(result) = self.invoke(&return_fn, iterator, &args, module) {
-                // Step 6: but a *normal* result that is not an object is a
+                // Step 9: but a *normal* result that is not an object is a
                 // TypeError of its own. Without this an iterator whose `return`
                 // answers `null` closed silently (`*-close-null` families).
                 if !result.is_object() {
@@ -5323,6 +5706,11 @@ impl VM {
         if name.contains('.') {
             // A static method is not a constructor.
             return Err(RuntimeError::TypeError("not a constructor".to_string()));
+        }
+        // `new Map(iterable)`: the argument is consumed through the iteration
+        // protocol, which only the VM can drive.
+        if name == "Map" {
+            return self.map_construct(constructor_val, args, new_target, module);
         }
 
         // ES 9.1.14 `GetPrototypeFromConstructor`: `newTarget.prototype` when

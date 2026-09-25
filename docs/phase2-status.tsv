@@ -1,7 +1,7 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
 # 最近更新：2026-09-26
-language/statements/for-of	376	54	321
+language/statements/for-of	381	49	321
 language/statements/generators	165	14	87
 language/expressions/generators	176	18	96
 language/expressions/yield	40	3	20
@@ -18,7 +18,7 @@ language/expressions/bitwise-not	11	3	2
 language/expressions/bitwise-or	20	7	3
 language/expressions/bitwise-xor	20	7	3
 language/expressions/call	54	19	19
-language/expressions/class	995	2749	315
+language/expressions/class	996	2748	315
 language/expressions/coalesce	21	2	1
 language/expressions/comma	4	2	0
 language/expressions/complement	0	0	0
@@ -64,7 +64,7 @@ language/expressions/void	8	1	0
 language/expressions/arrow-function	174	22	147
 language/statements/block	11	7	3
 language/statements/break	11	2	7
-language/statements/class	1110	2871	386
+language/statements/class	1113	2870	384
 language/statements/const	108	5	23
 language/statements/continue	15	5	4
 language/statements/do-while	18	10	8
@@ -86,15 +86,16 @@ language/literals/numeric	93	64	0
 language/literals/string	67	6	0
 language/computed-property-names	40	0	8
 language/identifiers	202	66	0
-language/types	90	10	13
-built-ins/Array	1940	277	864
+language/types	91	10	12
+built-ins/Array	1941	277	863
 built-ins/Boolean	26	8	17
-built-ins/Error	36	19	38
-built-ins/Function	191	191	127
+built-ins/Error	38	19	36
+built-ins/Function	192	191	126
 built-ins/JSON	112	51	2
+built-ins/Map	155	42	7
 built-ins/Math	270	37	20
-built-ins/NativeErrors	62	12	20
-built-ins/Number	180	53	107
-built-ins/Object	2757	299	355
-built-ins/String	608	216	399
-built-ins/Symbol	39	27	32
+built-ins/NativeErrors	68	12	14
+built-ins/Number	189	53	98
+built-ins/Object	2759	298	354
+built-ins/String	609	216	398
+built-ins/Symbol	54	27	17

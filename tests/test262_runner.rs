@@ -172,6 +172,13 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 "async-iteration",
 "async-functions",
 "Atomics",
+// ES2019 (`Array.prototype.flatMap`), unimplemented and outside the ES6
+// target. It is listed *explicitly* even though the loose matching below used
+// to hide it anyway — `feature.contains("Map")` matched
+// `"Array.prototype.flatMap"`, so dropping `"Map"` from `IN_SCOPE_PENDING`
+// (B2a) silently put 20 unimplemented tests back into the pool. An accidental
+// skip is not a scope decision; this one is.
+"Array.prototype.flatMap",
 "BigInt",
 "class-fields-private",
 "class-methods-private",
@@ -203,8 +210,10 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 /// In scope (§1.2), not implemented yet. Sizes as of 2026-09-25 (test262 files):
 /// Map 204 / Set 383 / WeakMap 141 / WeakSet 85 / Promise 677 / Proxy 311 /
 /// Reflect 153 / TypedArray 2184.
+///
+/// `Map` left this list with B2a (`built-ins/Map` is in `SUITES`); the others
+/// stay gated until the feature exists.
 const IN_SCOPE_PENDING: &[&str] = &[
-"Map",
 "Promise",
 "Proxy",
 "Reflect",
@@ -215,6 +224,13 @@ const IN_SCOPE_PENDING: &[&str] = &[
 ];
 
 /// Every feature tag whose tests this engine currently cannot pass.
+///
+/// The match is `starts_with` **or** `contains`, which is deliberately loose
+/// (a `regexp-` entry covers every `regexp-*` tag) but has a sharp edge:
+/// `"Array.prototype.flatMap".contains("Map")` is true, so an entry for a
+/// *shorter* name also skips unrelated tags that merely embed it. Adding or
+/// removing an entry therefore has to be checked against the whole table —
+/// see the comment on `"Array.prototype.flatMap"` in `OUT_OF_SCOPE_FEATURES`.
 fn is_unsupported(feature: &str) -> bool {
     OUT_OF_SCOPE_FEATURES
         .iter()
@@ -594,6 +610,9 @@ const SUITES: &[&str] = &[
     "built-ins/Error",
     "built-ins/Function",
     "built-ins/JSON",
+    // `built-ins/Map` is in the denominator from B2a on (§2.2: implementing a
+    // feature and enrolling its suite happen in the same batch).
+    "built-ins/Map",
     "built-ins/Math",
     "built-ins/NativeErrors",
     "built-ins/Number",

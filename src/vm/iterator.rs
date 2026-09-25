@@ -62,6 +62,29 @@ pub fn iterator_symbol_value() -> Value {
     )))
 }
 
+/// Which half of a Map entry a Map iterator yields (ES 23.1.5.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MapIterKind {
+    Key,
+    Value,
+    /// `[key, value]` pairs — what `Map.prototype.entries` and
+    /// `Map.prototype[Symbol.iterator]` produce.
+    Entry,
+}
+
+impl MapIterKind {
+    /// Render one live entry as the value this iterator kind yields.
+    fn project(&self, key: Value, value: Value) -> Value {
+        match self {
+            MapIterKind::Key => key,
+            MapIterKind::Value => value,
+            MapIterKind::Entry => Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                crate::vm::object::ArrayObject::from_vec(vec![key, value]),
+            ))),
+        }
+    }
+}
+
 /// Internal state of an iterator produced by `MakeIterator`.
 #[derive(Debug)]
 pub enum NativeIteratorState {
@@ -71,6 +94,16 @@ pub enum NativeIteratorState {
     String { chars: Vec<Value>, idx: usize },
     /// Slow path: a JS iterator object from `src[Symbol.iterator]()`.
     Js { iterator: Value },
+    /// A *live* iterator over a `Map`: it walks the map itself, so entries
+    /// added during the iteration are visited and deleted ones are skipped.
+    ///
+    /// The map is held as `dyn JSObject` because an `Rc<RefCell<dyn …>>` cannot
+    /// be downcast to a concrete `Rc`; each step downcasts through `as_any`.
+    Map {
+        map: Rc<RefCell<dyn JSObject>>,
+        kind: MapIterKind,
+        idx: usize,
+    },
 }
 
 /// A `JSObject` wrapper around [`NativeIteratorState`].
@@ -204,5 +237,22 @@ pub fn native_next(state: &mut NativeIteratorState) -> Option<Value> {
             }
         }
         NativeIteratorState::Js { .. } => None,
+        NativeIteratorState::Map { map, kind, idx } => {
+            // The map is borrowed for one step only: whatever runs between two
+            // `next()` calls is allowed to mutate it (that is the whole point of
+            // a Map iterator being live).
+            let borrowed = map.borrow();
+            let step = borrowed
+                .as_any()
+                .downcast_ref::<crate::vm::object::MapObject>()
+                .and_then(|map| map.entry_from(*idx));
+            match step {
+                Some((i, key, value)) => {
+                    *idx = i + 1;
+                    Some(kind.project(key, value))
+                }
+                None => None,
+            }
+        }
     }
 }

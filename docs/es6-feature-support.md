@@ -314,7 +314,8 @@ This engine uses a **static compilation model** with register-based VM:
 | `Error` | ✅ | recent / M3 | All error types; `Error.prototype.name`/`message`, per-native prototypes own `name`/`message`, instance `[[Class]]` `"Error"`, `Error.prototype.toString` per ES 20.5.3.4, `Error.isError`, `new Error(msg, {cause})`; `stack` (ES2026 proposal) not implemented |
 | `Math` | ✅ | recent / M3 | Abs…trunc incl. the ES6 additions (hypot, sign, clz32, imul, log2/log10, cbrt, trunc, fround, expm1, log1p, sinh…); methods `{writable:true, enumerable:false, configurable:true}` and constants read-only (ES 17) |
 | `JSON` | ✅ | M3-B6 | `JSON.parse(text[, reviver])` (strict ECMA-404 parser, reviver walk with `CreateDataProperty` semantics) and `JSON.stringify(value[, replacer[, space]])` (`toJSON`, function/array replacer, number/string `space`, cycle detection, spec `finalize` indentation); `JSON[Symbol.toStringTag] === "JSON"`; `JSON.rawJSON`/`isRawJSON` (ES2025) and lone-surrogate escaping (ES2025) are out of scope |
-| `Map` / `Set` / `WeakMap` / `WeakSet` | ❌ | — | Planned (M5) |
+| `Map` | ✅ | B2a | Insertion order, `SameValueZero` keys (`-0` normalised to `+0`, `NaN` is one key), `size`, `get`/`set` (chainable)/`has`/`delete`/`clear`, `forEach(value, key, map)`, `keys`/`values`/`entries`/`@@iterator` (= `entries`), `new Map(iterable)` through the protocol (with `IteratorClose`), `Map[Symbol.species]`; iterators are **live** (entries added during iteration are visited, deleted ones are skipped); out-of-scope extras from the pinned test262 also work: `Map.groupBy`, `getOrInsert`, `getOrInsertComputed` |
+| `Set` / `WeakMap` / `WeakSet` | ❌ | — | Planned (B2b / M5) |
 
 ### Utility
 

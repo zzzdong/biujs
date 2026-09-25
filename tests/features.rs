@@ -49,6 +49,8 @@ mod json;
 mod language_semantics;
 #[path = "features/logical_typeof.rs"]
 mod logical_typeof;
+#[path = "features/map.rs"]
+mod map;
 #[path = "features/new_target.rs"]
 mod new_target;
 #[path = "features/object_builtins.rs"]

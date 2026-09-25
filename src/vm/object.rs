@@ -1661,6 +1661,14 @@ impl NativeFunctionObject {
         let display = if let Some(method) = self.name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX)
         {
             method.to_string()
+        } else if let Some(method) = self.name.strip_prefix(crate::builtins::MAP_METHOD_PREFIX) {
+            method.to_string()
+        } else if self.name == crate::builtins::MAP_SIZE_NATIVE {
+            // `Map.prototype.size` is an accessor, so its function object is
+            // named like one: "get size" (ES 23.1.3.9).
+            "get size".to_string()
+        } else if self.name == crate::builtins::MAP_SPECIES_NATIVE {
+            "get [Symbol.species]".to_string()
         } else if self.name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
             // `Array.prototype[Symbol.iterator].name` is "[Symbol.iterator]".
             "[Symbol.iterator]".to_string()
@@ -1732,11 +1740,27 @@ impl JSObject for NativeFunctionObject {
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
+        // Built-in function objects are ordinary objects from
+        // `[[DefineOwnProperty]]`'s point of view: `C.prototype` is
+        // non-configurable, so redefining it has to raise instead of silently
+        // replacing it (`built-ins/*/descriptor.js` checks exactly that).
+        match self.properties.get(&key).cloned() {
+            Some(current) => validate_property_redefinition(&current, &desc)?,
+            None if !self.extensible => {
+                return Err("Cannot add property to non-extensible object".to_string());
+            }
+            None => {}
+        }
         self.properties.insert(key, desc);
         Ok(true)
     }
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        if let Some(desc) = self.properties.get(key) {
+            if !desc.configurable {
+                return false;
+            }
+        }
         self.properties.remove(key).is_some()
     }
 
@@ -1998,6 +2022,248 @@ impl JSObject for PrimitiveWrapperObject {
 
     fn to_primitive(&self, _hint: &str) -> Result<Value, String> {
         Ok(self.primitive.clone())
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// MapObject — `Map` instances (ES 23.1)
+// ─────────────────────────────────────────────────────────
+
+/// ES `SameValueZero` (7.2.10): like `SameValue` but `-0` and `+0` are one key.
+///
+/// `NaN` is *also* a single key, which is the whole reason a `Map` cannot be
+/// backed by a `HashMap`: `Hash` on `f64` disagrees with `SameValueZero` for
+/// both `-0` and `NaN`, and it would lose the insertion order anyway.
+pub fn same_value_zero(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            if x.is_nan() && y.is_nan() {
+                true
+            } else {
+                x == y
+            }
+        }
+        _ => a.strict_eq(b),
+    }
+}
+
+/// Normalise a key the way `Map` does: `-0` becomes `+0` (ES 23.1.3.9 step 5),
+/// everything else is stored as given.
+fn map_key(key: Value) -> Value {
+    match key {
+        Value::Number(n) if n == 0.0 => Value::Number(0.0),
+        other => other,
+    }
+}
+
+/// An ES6 `Map`: entries in insertion order, looked up by `SameValueZero`.
+///
+/// Deleted entries become tombstones (`None`) instead of being spliced out of
+/// the vector, because Map iterators are *live*: an index-based iterator would
+/// start skipping entries as soon as an earlier one was deleted (the vector
+/// shifts left). `clear` is the only operation that drops the tombstones.
+#[derive(Debug)]
+pub struct MapObject {
+    entries: Vec<Option<(Value, Value)>>,
+    properties: PropertyTable,
+    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    extensible: bool,
+    frozen: bool,
+    sealed: bool,
+}
+
+impl MapObject {
+    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        Self {
+            entries: Vec::new(),
+            properties: PropertyTable::new(),
+            prototype,
+            extensible: true,
+            frozen: false,
+            sealed: false,
+        }
+    }
+
+    /// Number of live entries (`Map.prototype.size`).
+    pub fn size(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_some()).count()
+    }
+
+    /// Index of `key`, or `None` when the map does not hold it.
+    pub fn index_of(&self, key: &Value) -> Option<usize> {
+        let key = map_key(key.clone());
+        self.entries.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|(k, _)| same_value_zero(k, &key))
+        })
+    }
+
+    pub fn has(&self, key: &Value) -> bool {
+        self.index_of(key).is_some()
+    }
+
+    pub fn get(&self, key: &Value) -> Option<Value> {
+        let key = map_key(key.clone());
+        self.entries.iter().find_map(|slot| match slot {
+            Some((k, v)) if same_value_zero(k, &key) => Some(v.clone()),
+            _ => None,
+        })
+    }
+
+    /// `Map.prototype.set`: an existing key keeps its position, a new one is
+    /// appended, and `-0` is stored as `+0`.
+    pub fn set(&mut self, key: Value, value: Value) {
+        let key = map_key(key);
+        if let Some(idx) = self.index_of(&key) {
+            if let Some(slot) = self.entries.get_mut(idx) {
+                *slot = Some((key, value));
+            }
+            return;
+        }
+        self.entries.push(Some((key, value)));
+    }
+
+    /// `Map.prototype.delete`: replaces the entry with a tombstone so that live
+    /// iterators keep their positions.
+    pub fn delete(&mut self, key: &Value) -> bool {
+        match self.index_of(key) {
+            Some(idx) => {
+                self.entries[idx] = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// The live entry at `idx`, skipping tombstones — the step a Map iterator
+    /// makes. `None` means the iteration is finished.
+    pub fn entry_from(&self, idx: usize) -> Option<(usize, Value, Value)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .skip(idx)
+            .find_map(|(i, slot)| match slot {
+                Some((k, v)) => Some((i, k.clone(), v.clone())),
+                None => None,
+            })
+    }
+}
+
+impl JSObject for MapObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Map
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        self.properties.get(key).cloned()
+    }
+
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        if self.frozen {
+            return Err("Cannot set property on frozen object".to_string());
+        }
+        if let Some(existing) = self.properties.get(&key) {
+            if !existing.writable {
+                return Err("Cannot assign to read-only property".to_string());
+            }
+        } else if !self.extensible {
+            return Err("Cannot add property to non-extensible object".to_string());
+        }
+        self.properties
+            .insert(key, PropertyDescriptor::data_descriptor(value));
+        Ok(true)
+    }
+
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        match self.properties.get(&key).cloned() {
+            Some(current) => validate_property_redefinition(&current, &desc)?,
+            None if !self.extensible => {
+                return Err("Cannot add property to non-extensible object".to_string());
+            }
+            None => {}
+        }
+        self.properties.insert(key, desc);
+        Ok(true)
+    }
+
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        if self.frozen || self.sealed {
+            return false;
+        }
+        if let Some(desc) = self.properties.get(key) {
+            if !desc.configurable {
+                return false;
+            }
+        }
+        self.properties.remove(key).is_some()
+    }
+
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        self.properties.contains_key(key)
+    }
+
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.properties.keys()
+    }
+
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.prototype.clone()
+    }
+
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        if !self.frozen {
+            self.prototype = proto;
+        }
+    }
+
+    fn is_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    fn prevent_extensions(&mut self) {
+        self.extensible = false;
+    }
+
+    fn is_frozen(&self) -> bool {
+        is_frozen_desc_set(self)
+    }
+
+    fn freeze(&mut self) {
+        self.extensible = false;
+        freeze_property_table(&mut self.properties);
+    }
+
+    fn is_sealed(&self) -> bool {
+        is_sealed_desc_set(self)
+    }
+
+    fn seal(&mut self) {
+        self.extensible = false;
+        seal_property_table(&mut self.properties);
+    }
+
+    fn type_of(&self) -> &'static str {
+        "object"
+    }
+
+    fn class_name(&self) -> &'static str {
+        "Map"
     }
 }
 

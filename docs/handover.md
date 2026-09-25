@@ -44,18 +44,19 @@ BIUJS_DUMP=1 ./target/release/biujs /tmp/t.js   # 打印字节码（看帧布局
 
 | 指标 | 数值 |
 |------|------|
-| test262 执行 / 通过 / 失败 / 跳过 | 17477 / **13382** / 4095 / 8109 |
-| 通过率 | 76.57%（参考值；分母口径见计划书 §2.1） |
-| 单元测试 / feature 断言 | 190 / 429，全绿 |
+| test262 执行 / 通过 / 失败 / 跳过 | 17647 / **13584** / 4063 / 8143 |
+| 通过率 | 76.98%（参考值；分母口径见计划书 §2.1） |
+| 单元测试 / feature 断言 | 190 / 436，全绿 |
 | 全量耗时 | 约 2m50s |
 | runner 覆盖面 | 25586 / 53568 个测试文件（47%）——**未覆盖里约 4920 条属承诺的 M5/M6** |
 | 基线快照 | `phase2-status.tsv`（`scripts/phase2-status.sh` 生成的逐套件表） |
 
-**已完成**：M0 → M4（语法、内置对象、JSON、生成器与迭代协议）；阶段二的 B0（度量铺底）、B1（spread 走 `GetIterator`）、B5a（数组 `length` 的错误种类）、B5b（Object 描述符长尾 + 六个完整性方法）。
+**已完成**：M0 → M4（语法、内置对象、JSON、生成器与迭代协议）；阶段二的 B0（度量铺底）、B1（spread 走 `GetIterator`）、B5a（数组 `length` 的错误种类）、B5b（Object 描述符长尾 + 六个完整性方法）、B2a（`Map`：入册解锁后 155/162 = 95.68%）。
 
-**下一步**（计划书 §6 的批次表）：**B2a Map**（新的最大块，零脚手架，建议先做数据结构 + 核心方法 + 迭代器）。
-另有两条已定位、量不小的独立根因，可与 Map 并行挑选：
+**下一步**（计划书 §6 的批次表）：**B2b `Set`**（与 `Map` 同构，直接复用它的迭代器状态与接收者检查套路；`WeakMap`/`WeakSet` 可顺带）。
+另有三条已定位、量不小的独立根因，可与 B2b 并行挑选：
 
+- **`Array.from` 不走迭代协议**（`builtins/array.rs::array_from` 只按 `length` + 索引取快照）。ES6 范围内，`built-ins/Array/from` 有 30 条同源失败，也是 `Map.groupBy` 那 4 条失败的最后一环。修它要上移 VM（要 `GetMethod(@@iterator)` 与 `next()`）。
 - **缺全局对象**：脚本顶层的 `this` 是 `undefined`（`State::this_val` 初值），全局变量又活在 `State::globals` 的 `HashMap` 里 —— 这不是一行修得掉的：`this` 要真的拥有属性，全局读写就得改走对象 + 原型链。实测仅 `built-ins/Object` 里就有 40+ 条失败是被它拖住的（`var global = this` 一类写法）。
 - **数组字面量的省略元素不出 hole**：`[0,,2].hasOwnProperty("1")` 现在是 `true`（降级时把省略元素当成 push `undefined`）。需要给 `lower_array` 的 `Elision` 分支一条能在运行时标记 hole 的指令（五层改动，比这条纪律本身贵）。
 

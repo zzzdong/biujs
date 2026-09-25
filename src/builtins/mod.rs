@@ -3,6 +3,7 @@ mod boolean;
 mod error;
 mod function;
 mod json;
+mod map;
 mod math;
 mod number;
 mod object;
@@ -30,6 +31,10 @@ pub use function::{function_constructor, setup_function_prototype};
 pub use json::{
     json_number, json_parse, json_stringify, own_enumerable_string_keys, quote_json_string,
     register_json,
+};
+pub use map::{
+    MAP_SIZE_NATIVE, MAP_SPECIES_NATIVE, map_clear, map_delete, map_get, map_has, map_set,
+    map_size, register_map_prototype,
 };
 pub use number::{
     number_constructor, number_is_finite, number_is_integer, number_is_nan, number_to_exponential,
@@ -318,6 +323,7 @@ pub struct Builtins {
     pub string_prototype: Rc<RefCell<dyn JSObject>>,
     pub function_prototype: Rc<RefCell<dyn JSObject>>,
     pub symbol_prototype: Rc<RefCell<dyn JSObject>>,
+    pub map_prototype: Rc<RefCell<dyn JSObject>>,
 }
 
 impl Builtins {
@@ -336,6 +342,7 @@ impl Builtins {
         let string_proto = new_proto(Some(Rc::clone(&object_proto)), "String");
         let function_proto = new_proto(Some(Rc::clone(&object_proto)), "Function");
         let symbol_proto = new_proto(Some(Rc::clone(&object_proto)), "Symbol");
+        let map_proto = new_proto(Some(Rc::clone(&object_proto)), "Map");
 
         // Needed before any built-in function object is created: every one of
         // them inherits from `Function.prototype`.
@@ -359,6 +366,7 @@ impl Builtins {
             string_prototype: string_proto,
             function_prototype: function_proto,
             symbol_prototype: symbol_proto,
+            map_prototype: map_proto,
         }
     }
 
@@ -519,6 +527,54 @@ impl Builtins {
         symbol::register_symbol_statics(&symbol_fn_val, &self.symbol_prototype);
         symbol::register_symbol_prototype(&self.symbol_prototype);
         Self::link_constructor_prototype(&symbol_fn_val, &self.symbol_prototype);
+
+        // `Map` (ES 23.1). The constructor itself is dispatched by the VM:
+        // `new Map(iterable)` has to drive the iterator protocol, and calling
+        // it without `new` is a TypeError.
+        let map_fn_val = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("Map"))));
+        map::register_map_prototype(&self.map_prototype);
+        Self::link_constructor_prototype(&map_fn_val, &self.map_prototype);
+        // `%Map.prototype.entries%` and `Map.prototype[Symbol.iterator]` are
+        // the same object (ES 23.1.3.4), which also makes `for (x of map)`
+        // reach the VM through the ordinary `GetMethod` lookup.
+        let entries_fn = self
+            .map_prototype
+            .borrow()
+            .property_get(&PropertyKey::from_str("entries"))
+            .map(|desc| desc.value);
+        if let Some(entries_fn) = entries_fn {
+            let _ = self.map_prototype.borrow_mut().define_property(
+                crate::vm::iterator::iterator_symbol_key(),
+                method_descriptor(entries_fn),
+            );
+        }
+        // `Map.groupBy` (ES2024 `array-grouping`) — iterates + calls back, so
+        // the implementation is the VM's (`call_static_method` never sees it).
+        set_static_method(&map_fn_val, "groupBy", |_args| {
+            Err(RuntimeError::TypeError(
+                "Map.groupBy is dispatched by the VM".to_string(),
+            ))
+        });
+        register_wrapper_prototype("Map", Rc::clone(&self.map_prototype));
+        // `Map[Symbol.species]` is an accessor returning its receiver
+        // (ES 23.1.2.2); like `Array`'s, the getter is dispatched by the VM.
+        let species_getter = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+            map::MAP_SPECIES_NATIVE,
+        ))));
+        if let Value::Object(map_obj) = &map_fn_val {
+            let _ = map_obj.borrow_mut().define_property(
+                species_symbol_key(),
+                PropertyDescriptor {
+                    value: Value::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: Some(species_getter),
+                    setter: None,
+                },
+            );
+        }
+        globals.insert("Map".to_string(), map_fn_val);
 
         // Well-known symbols (ES6 §19.4.2): `Symbol.iterator` is required by
         // the iteration protocol; `toPrimitive` / `toStringTag` / `hasInstance`
@@ -684,6 +740,12 @@ pub fn call_native(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         "String" => string::string_constructor(args),
         "Function" => function::function_constructor(args),
         "Symbol" => symbol::symbol_constructor(args),
+        // `Map()` without `new` is a TypeError (ES 23.1.1.1 step 1); the
+        // `[[Construct]]` path is `VM::map_construct`, which needs the VM's
+        // iteration protocol for the optional iterable argument.
+        "Map" => Err(RuntimeError::TypeError(
+            "Constructor Map requires 'new'".to_string(),
+        )),
         // ES `isNaN` / `isFinite` coerce their argument with ToNumber first.
         "isNaN" => Ok(Value::Bool(
             args.first().map(|v| v.to_number().is_nan()).unwrap_or(true),
@@ -811,6 +873,18 @@ pub fn call_prototype_method(
             dispatch_to_string(obj)
         }
         "valueOf" => dispatch_value_of(obj),
+        // ── Map (ES 23.1) ──
+        //
+        // These four names are also perfectly ordinary data properties on any
+        // other object (`{ get: function () { … } }`), so each arm is guarded
+        // by "the receiver really is a Map"; everything else falls through to
+        // the default arm and the caller then does the ordinary property
+        // lookup.
+        "get" if map::is_map_receiver(obj) => map::map_get(obj, args),
+        "has" if map::is_map_receiver(obj) => map::map_has(obj, args),
+        "set" if map::is_map_receiver(obj) => map::map_set(obj, args),
+        "delete" if map::is_map_receiver(obj) => map::map_delete(obj, args),
+        "clear" if map::is_map_receiver(obj) => map::map_clear(obj, args),
         "hasOwnProperty" => object::object_has_own_property(obj, args),
         "isPrototypeOf" => object::object_is_prototype_of(obj, args),
         "propertyIsEnumerable" => object::object_property_is_enumerable(obj, args),
@@ -1236,6 +1310,30 @@ pub const CLASS_CTOR_FLAG: &str = "__isClassCtor__";
 
 pub const PROTO_METHOD_PREFIX: &str = "__proto_method__";
 
+/// Prefix used to name the `Map.prototype` methods the VM implements.
+///
+/// They cannot ride on [`PROTO_METHOD_PREFIX`] even though they answer to the
+/// same names: `keys` / `values` / `entries` / `forEach` also live on
+/// `Array.prototype`, and the two disagree about their receiver —
+/// `Array.prototype.keys.call(1)` yields an empty iterator while
+/// `Map.prototype.keys.call(1)` is a TypeError. Dispatching by name alone
+/// cannot tell them apart, so the Map ones carry their own prefix.
+pub const MAP_METHOD_PREFIX: &str = "__map_method__";
+
+/// Register a `Map.prototype` method whose implementation lives in the VM.
+///
+/// Nothing is stored but the marker function object; `VM::map_method` does the
+/// work (it needs a re-entrant call for `forEach`, and the iterator registry
+/// for the three factories).
+pub fn set_map_method(proto: &Rc<RefCell<dyn JSObject>>, name: &str) {
+    let method_val = Value::Object(Rc::new(RefCell::new(
+        crate::vm::object::NativeFunctionObject::new(&format!("{MAP_METHOD_PREFIX}{name}")),
+    )));
+    let _ = proto
+        .borrow_mut()
+        .define_property(PropertyKey::from_str(name), method_descriptor(method_val));
+}
+
 /// Declared arity (`length`) of a built-in, keyed by the name it is registered
 /// under: `"Array"` (constructor), `"Object.keys"` (static), `"push"`
 /// (prototype method, registered as `"__proto_method__push"`) or `"Math.atan"`.
@@ -1252,6 +1350,9 @@ pub fn builtin_arity(registered_name: &str) -> usize {
     let name = registered_name
         .strip_prefix(PROTO_METHOD_PREFIX)
         .unwrap_or(registered_name);
+    let name = name
+        .strip_prefix(MAP_METHOD_PREFIX)
+        .unwrap_or(name);
     match name {
         // ── Constructors ──
         "Object" | "Array" | "Boolean" | "Number" | "String" | "Function" | "Error"
@@ -1293,6 +1394,12 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         "normalize" | "trim" | "trimStart" | "trimEnd" | "toUpperCase" | "toLowerCase"
         | "toLocaleUpperCase" | "toLocaleLowerCase" | "valueOf" => 0,
         "search" | "match" | "localeCompare" => 1,
+        // ── Map (ES 23.1): `Map.length` is 0, and these are the only
+        // prototype methods whose arity is not 0 by default ──
+        "Map" => 0,
+        "Map.groupBy" => 2,
+        "get" | "has" | "delete" => 1,
+        "set" | "getOrInsert" | "getOrInsertComputed" => 2,
         // ── Function ──
         "call" | "bind" => 1,
         "apply" => 2,
