@@ -71,10 +71,10 @@
 | 指标 | 数值 |
 |------|------|
 | test262 已执行 | 17477 |
-| 通过 | **12480** |
-| 失败 | 4997 |
+| 通过 | **13003** |
+| 失败 | 4474 |
 | 跳过 | 8109（全部为 §1.2 范围外或 §1.1 G3 排除项，见 §3.2） |
-| 通过率 | 71.41%（参考值，分母见 §2.1y） |
+| 通过率 | 74.40%（参考值，分母见 §2.1y） |
 | 单元测试 | 190（全绿） |
 | feature 集成测试 | 23 个文件 / 412 个用例（全绿） |
 | 全量耗时基线 | 2m05s |
@@ -956,6 +956,40 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 - 77 条 `expected Some("SyntaxError") at Parse phase but compilation succeeded` —— 集中在 `yield` 作标识符（strict / generator 体内）、`labelled-fn-stmt-*`（标签函数的声明位置）、`obj-id-*-strict`。属**解析期校验缺口**，与 §2.1y 暴露的 153 条同类，是同一批工作。
 - 56 条 `Expected a TypeError` / 36 条 `Test262Error` 未抛 —— 迭代协议的异常路径。
 - 5 条 `execution step limit exceeded`（`S12.14_A9_T2` 等 + `for-of/body-dstr-assign-error.js`）—— 被 §6.5 的步数护栏兜住，需要逐条确认是测试自身的循环还是引擎缺陷。
+
+### 2.1aa 解析期早期错误：接入 oxc 语义构建器 + runner 的 `onlyStrict`（2026-09-25）
+
+**起点**：通过 12480 / 17477（71.41%）。§2.1z 收尾时把失败池里最大的一类"能编译但规范要求 SyntaxError"数出来是 **533 条**，逐族看全部是 **strict 模式早期错误**：`yield` 作标识符、保留字作标识符（`eval` / `implements` / `let` …）、重复形参、标签函数声明、箭头函数参数的重复绑定。
+
+**两个独立缺口，缺一不可**：
+
+1. **runner 无视了 `onlyStrict`**。test262 的约定是 `onlyStrict` 用例的源里**没有** `"use strict"`，由 runner 补在第一行。而且这行必须落在**整段装配程序的指令序言**里 —— 把它插在 harness 之后就只是一条普通表达式语句，整体仍是 sloppy。修前：这些用例按 sloppy 解析，`for ({ eval } of [])` 自然被接受，于是"该报错却没报"。
+2. **早期错误在 oxc 的语义构建器里，不在解析器里**。实测 `'use strict'; function f(a, a){}` 在 `SourceType::cjs()` 下不报错 —— oxc 把这些非纯语法的早期错误放进了 `oxc_semantic::SemanticBuilder`（`check_syntax_error`），而本项目只依赖 `oxc_parser/ast/span/allocator/syntax/diagnostics`，**从未跑过语义阶段**。
+
+**改动**：三处，都很小。
+
+1. `Cargo.toml` 增加 `oxc_semantic = "0.132"`（与既有 oxc 组件同版本）。
+2. `parse_js`（`src/compiler/parser.rs:153`）在解析成功后跑一遍
+   `SemanticBuilder::new().with_check_syntax_error(true).build(&program)`，把它的 `errors` 并入既有的 `ParseErrors` 通道 —— 于是这些诊断走的是和其它语法错误完全相同的路径（同样有 `negative: phase: parse` 的判定逻辑接收）。
+3. `build_source`（`tests/test262_runner.rs:117`）对带 `flag: onlyStrict` 的用例在装配结果**最前面**加一行 `"use strict";`。
+
+**效果**：
+
+| 指标 | §2.1z 后 | 本批后 | 变化 |
+|------|----------|--------|------|
+| 全量通过 | 12480（71.41%） | **13003**（74.40%） | **+523** |
+| 失败 | 4474 | **4474** | −523 |
+| "能编译但应报 SyntaxError" | 533 | **10** | −523 |
+
+即**这一类几乎被一次扫空**（剩下 10 条不是早期错误，是别的 negative 用例）。提升最大的套件：`language/statements/class` 995 → **1066**、`language/expressions/class` 889 → **955**、`for-of` 318 → **357**、`switch` 13 → **49**、`expressions/object` 595 → **631**、`for-in` 42 → **75**、`variable` 87 → **118**、`arrow-function` 137 → **168**、`function` 279 → **307`、`assignment` 348 → **374**。
+
+逐套件比对**零回退**（这点特意核对过：新增的语义检查有误报风险，会把本来能过的用例打掉；实测没有任何一套件的通过数下降）。单元 190 全绿；features 412 全绿。
+
+**为什么这一步值 +523 而不是 +150**：手写那 5 族的估计是基于"每族只影响自己那批用例"，但早期错误是**横切**的 —— 每个套件里都散着一批 `onlyStrict` 的 negative 用例（class 的求值顺序测试、`switch` 的保留字测试、`variable` 的 `let` 作标识符测试…），一次性全部到位。
+
+**残留**：剩余 10 条 parse-phase 缺口里已无早期错误；但**引入语义阶段后出现了新的可见簇**（此前被"能编译"掩盖）：92 条 `arrow function invoked exactly once`、42 条 `a should be an own property`、39 条 `Actual argument [undefined] shouldn't be primitive.`，以及 112 条 `Cannot convert undefined or null to object`。这些属实现型工作，按 §3.1 排队。
+
+**一个提醒**：`build_source` 只补了 `onlyStrict`。按 test262 的规范，**既无 `onlyStrict` 也无 `noStrict`** 的用例要跑两遍（sloppy + strict），两边都得过。本引擎本就是 strict-only（§1.1 G1），实际跑的已经是接近 strict 的那一边，所以这一批不追加第二遍；若要完全对齐 test262 的口径，这是个可选项（会引入一批新的失败面）。
 
 ### 2.2 已交付（M0 → M2'）
 

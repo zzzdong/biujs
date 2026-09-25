@@ -24,6 +24,7 @@ oxc_span = "0.132"
 oxc_allocator = "0.132"
 oxc_syntax = "0.132"
 oxc_diagnostics = "0.132"
+oxc_semantic = "0.132"
 
 # Graph algorithms for CFG
 petgraph = "0.8"

@@ -136,7 +136,18 @@ fn build_source(test: &Test) -> String {
     }
 
     parts.push(&test.source);
-    parts.join("\n")
+    let source = parts.join("\n");
+
+    // test262's `onlyStrict` tests carry no `"use strict"` of their own — the
+    // runner supplies it, and it has to be the *first* statement of the
+    // assembled program or it is an ordinary expression statement and the whole
+    // program stays sloppy. Without this, a test whose entire point is a strict
+    // early error (`for ({ eval } of [])`, `function f(a, a) {}`, …) was parsed
+    // as sloppy code and the engine was asked to accept it.
+    if test.desc.flags.contains(&Flag::OnlyStrict) {
+        return format!("\"use strict\";\n{source}");
+    }
+    source
 }
 
 // ─────────────────────────────────────────────────────────

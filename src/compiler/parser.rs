@@ -160,6 +160,24 @@ pub fn parse_js<'a>(allocator: &'a Allocator, source: &'a str) -> Result<Program
             .collect();
         return Err(ParseErrors::new(errors));
     }
+
+    // oxc leaves the *early errors* that are not purely syntactic to its
+    // semantic builder: strict-mode reserved words used as identifiers
+    // (`eval`, `implements`, …), duplicate parameter names, `yield` as an
+    // identifier, a labelled function declaration. None of them are reported by
+    // `Parser::parse`, and this engine is strict-only (§1.1 G1), so every one of
+    // them is owed on every source.
+    let semantic = oxc_semantic::SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&ret.program)
+        .errors;
+    if !semantic.is_empty() {
+        let errors: Vec<ParseError> = semantic
+            .iter()
+            .map(|e| convert_diagnostic(e, source))
+            .collect();
+        return Err(ParseErrors::new(errors));
+    }
     Ok(ret.program)
 }
 
