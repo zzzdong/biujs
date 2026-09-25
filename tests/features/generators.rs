@@ -444,3 +444,96 @@ fn a_try_finally_around_a_yield_survives_suspension() {
         "1|2|true|none"
     );
 }
+
+#[test]
+fn return_resumes_the_body_so_finally_runs() {
+    // ES 25.4.3.4: the return completion is delivered to the suspended body, so
+    // a `finally` around the `yield` runs on the way out.
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             function* g() { try { yield 1; yield 2; } finally { log.push('fin'); } }
+             var it = g();
+             it.next();
+             var r = it.return(7);
+             [r.value, r.done, log.join(',')].join('|')"
+        ),
+        "7|true|fin"
+    );
+    // The body is not resumed past the suspension point.
+    assert!(!eval_bool(
+        "var reached = false;
+         function* g() { try { yield 1; } finally { } reached = true; }
+         var it = g();
+         it.next();
+         it.return(1);
+         reached"
+    ));
+}
+
+#[test]
+fn throw_is_delivered_to_the_generator_body() {
+    // A `try` inside the generator catches what `throw()` delivers at the
+    // `yield`, and the generator keeps going.
+    assert_eq!(
+        eval_string(
+            "var caught = 'none';
+             function* g() { try { yield 1; } catch (e) { caught = e; } yield 2; }
+             var it = g();
+             it.next();
+             var r = it.throw('boom');
+             [r.value, r.done, caught].join('|')"
+        ),
+        "2|false|boom"
+    );
+    // Uncaught: the `finally` still runs and the exception reaches the caller.
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             function* g() { try { yield 1; } finally { log.push('fin'); } }
+             var it = g();
+             it.next();
+             var seen = 'none';
+             try { it.throw('boom'); } catch (e) { seen = e; }
+             [seen, log.join(',')].join('|')"
+        ),
+        "boom|fin"
+    );
+    // A generator that never started has no body to run.
+    assert_eq!(
+        eval_string(
+            "var started = false;
+             function* g() { started = true; yield 1; }
+             var it = g();
+             var seen = 'none';
+             try { it.throw('early'); } catch (e) { seen = e; }
+             [seen, started].join('|')"
+        ),
+        "early|false"
+    );
+}
+
+#[test]
+fn a_delegate_close_error_reaches_the_generator_body() {
+    // ES 14.4.14 step 5.c: `IteratorClose` happens *inside* the generator's
+    // resumption, so an iterator whose `return` throws is caught by the body.
+    assert_eq!(
+        eval_string(
+            "var caught = 'none';
+             var thrown = new Error('from return');
+             var iterable = {};
+             iterable[Symbol.iterator] = function() {
+               return {
+                 next: function() { return { done: false }; },
+                 return: function() { throw thrown; }
+               };
+             };
+             function* g() { try { yield* iterable; } catch (e) { caught = e; } }
+             var it = g();
+             it.next();
+             var r = it.return(5);
+             [caught === thrown, r.done].join('|')"
+        ),
+        "true|true"
+    );
+}

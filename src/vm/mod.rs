@@ -273,9 +273,18 @@ impl VM {
                 return Ok(false);
             }
             Opcode::Ret => {
-                // Check if we need to execute any finally blocks before returning
+                // Check if we need to execute any finally blocks before returning.
+                //
+                // The *innermost* pending one goes first, which is both what the
+                // language requires and what the epilogue assumes: `ResumeExc`
+                // reads `seh_stack.last()`, so it can only finish the record that
+                // is on top. Scanning from the front made a nested
+                // `try { try { return x } finally {…} } finally {…}` run the
+                // outer `finally` while the inner record was still on top — the
+                // epilogue then did nothing, fell into the implicit `Mov rv,
+                // undefined`, and the return value was lost.
                 let mut finally_to_execute = None;
-                for (idx, record) in self.state.seh_stack.iter().enumerate() {
+                for (idx, record) in self.state.seh_stack.iter().enumerate().rev() {
                     if record.finally_pc != 0 && !record.in_finally {
                         finally_to_execute = Some(idx);
                         break;
@@ -1639,7 +1648,9 @@ impl VM {
                 let stack_len = self.state.seh_stack.len();
                 let start_idx = stack_len.saturating_sub(seh_depth);
 
-                for idx in start_idx..stack_len {
+                // Innermost first, for the same reason as `Opcode::Ret`: the
+                // epilogue can only finish the record on top of the stack.
+                for idx in (start_idx..stack_len).rev() {
                     if let Some(record) = self.state.seh_stack.get(idx) {
                         if record.finally_pc != 0 && !record.in_finally {
                             finally_to_execute = Some((idx, record.finally_pc));
@@ -3056,10 +3067,24 @@ impl VM {
                         self.state.jump(target_pc.max(0) as usize);
                         return Ok(());
                     } else if delayed_return {
-                        // Delayed return after finally execution
+                        // Delayed return after finally execution: jump back to
+                        // the function's trailing `Ret` (the return value is
+                        // already in `Rv`).
+                        //
+                        // Falling through is wrong: the instruction after
+                        // `ResumeExc` is the *normal* completion's continuation
+                        // (`Br` to the code following the `try`), so a `return`
+                        // inside `try`/`finally` would run the statements it was
+                        // skipping and then hit the exit block's implicit
+                        // `Mov rv, undefined`, losing the value — which is what
+                        // broke `return_in_try_finally` and friends.
                         self.state.seh_stack.pop();
-                        // Continue to normal return flow - re-execute Ret opcode
-                        // The return value is already in Rv
+                        if let Some(pc) = self
+                            .current_function_id()
+                            .and_then(|id| module.exit_pc.get(&id).copied())
+                        {
+                            self.state.jump(pc);
+                        }
                         return Ok(());
                     }
                 } else if let Some(record) = self.state.seh_stack.last_mut() {
@@ -4254,117 +4279,48 @@ impl VM {
                     .take()
                     .expect("SuspendedYield without a frame")
             };
-            let base = self.state.data_stack.len();
-            self.delegate_stack.extend(frame.delegates.iter().cloned());
-            self.state.data_stack.extend(frame.data.iter().cloned());
-            self.state.rbp = base + frame.argc;
-            self.state.rsp = self.state.rbp + frame.bp_offset;
-            self.state.this_val = frame.this.clone();
-            self.state.function_val = frame.function_val.clone();
-            self.state.enter_frame(frame.argc)?;
-            for map in &frame.closure_maps {
-                self.state.closure_var_stack.push(map.clone());
-            }
-            // The body's live exception handlers come back with the frame; a
-            // `finally` that had not run yet must still run.
-            self.state.seh_stack.extend(frame.seh.iter().cloned());
-            self.state.pushc(self.state.closure_var_stack.len())?;
-            self.state.pushc(self.state.seh_stack.len())?;
-            self.state.pushc(self.resume_sentinel(module))?;
-            self.state.construct_stack.push(false);
-            self.state.new_target_stack.push(Value::Undefined);
+            let resume_pc = frame.pc;
+            self.restore_generator_frame(&frame, module)?;
             // `yield expr` evaluates to the value the resumer supplied. The
             // instruction itself does not run again, so the destination is read
             // from the bytecode and written here, with the restored `rbp`.
-            // The register file is global, so the body's in-flight values have
-            // to come back before anything else runs.
-            for (slot, value) in self
-                .state
-                .registers
-                .iter_mut()
-                .zip(frame.registers.iter())
-            {
-                *slot = value.clone();
-            }
-            if let Some(inst) = module.instructions.get(frame.pc) {
+            if let Some(inst) = module.instructions.get(resume_pc) {
                 if matches!(inst.opcode, Opcode::Yield) {
                     let dst = inst.operands[0];
                     self.set_value(dst, send)?;
                 }
             }
-            self.state.jump(frame.pc + 1);
+            self.state.jump(resume_pc + 1);
         }
 
         let closure_depth = self.state.closure_var_stack.len();
-        self.generator_yielded = None;
-        let outcome = (|| -> Result<(), RuntimeError> {
-            while self.step(module)? {}
-            Ok(())
-        })();
-
-        // A `yield` left the frame on the value stack: lift it out before the
-        // caller's context is restored (which would rewind `rsp` below it).
-        let yielded = self.generator_yielded.take();
-        let suspended = if yielded.is_some() {
-            Some(self.extract_generator_frame(closure_depth, delegate_depth, saved.seh))
-        } else {
-            None
-        };
-        let rv = self.state.get_register(Register::Rv)?;
-        if suspended.is_some() {
-            // The body suspended rather than returned, so `Ret` never ran and
-            // the frame's bookkeeping is still on the stacks. Unwind it before
-            // the resumer's context is restored (which only truncates the
-            // stacks it saved — the control stack is not among them).
-            let _ = self.state.popc();
-            let _ = self.state.popc();
-            let _ = self.state.popc();
-            self.state.function_stack.pop();
-        }
-        self.restore_execution_state(&saved);
-        outcome?;
-
-        let Value::Object(obj_ref) = &gen_value else {
-            return Err(RuntimeError::TypeError("not a generator".to_string()));
-        };
-        let mut gobj = obj_ref.borrow_mut();
-        let Some(gobj) = gobj
-            .as_any_mut()
-            .downcast_mut::<crate::vm::object::GeneratorObject>()
-        else {
-            return Err(RuntimeError::TypeError("not a generator".to_string()));
-        };
-        match (yielded, suspended) {
-            (Some(value), Some(frame)) => {
-                gobj.state = crate::vm::object::GeneratorState::SuspendedYield;
-                gobj.suspended = Some(frame);
-                Ok(Self::iterator_result(value, false))
-            }
-            _ => {
-                gobj.state = crate::vm::object::GeneratorState::Completed;
-                gobj.suspended = None;
-                Ok(Self::iterator_result(rv, true))
-            }
-        }
+        let run = self.run_generator_frame(&saved, closure_depth, delegate_depth, module)?;
+        Ok(self.finish_generator(&gen_value, run))
     }
 
     /// `gen.return(v)` / `gen.throw(e)`: complete the generator with the given
-    /// completion instead of resuming the body.
+    /// completion instead of resuming it normally (ES 25.4.3.4 / 25.4.3.5).
     ///
-    /// `Ok(value)` is a return completion and reports `{ value, done: true }`;
-    /// `Err(Thrown(reason))` completes the generator and re-raises `reason` to
-    /// the caller, which is what `throw()` does (ES 25.4.3.4 / 25.4.3.5).
+    /// The body *is* resumed, which is the whole point:
     ///
-    /// The body is *not* resumed: the full specification resumes it so that
-    /// `finally` blocks run, and a `yield*` closes its delegate iterator. Both
-    /// need the SEH records and the delegate stack that this subset does not
-    /// carry yet — see §2.1u of the conformance plan.
+    /// * a **return** completion re-enters the frame at the function's trailing
+    ///   `Ret` (`Module::exit_pc`). That is what makes `Opcode::Ret`'s `finally`
+    ///   dispatch fire, and it is why the body cannot simply be abandoned — a
+    ///   `finally` that pushes to a log has to run;
+    /// * a **throw** completion is handed to the resumed frame's SEH machinery,
+    ///   so it lands on the `yield` exactly as if the `yield` had thrown and a
+    ///   surrounding `try` can catch it.
+    ///
+    /// A parked `yield*` intercepts the completion first (ES 14.4.14 step 5):
+    /// `return(v)` closes the delegate, `throw(e)` calls its `throw` method.
     fn generator_abrupt(
         &mut self,
         id: u64,
         completion: Result<Value, RuntimeError>,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        let saved = self.save_execution_state();
+        let delegate_depth = self.delegate_stack.len();
         let gen_value = match self.generator_registry.get(&id).cloned() {
             Some(v) => v,
             None => {
@@ -4373,12 +4329,11 @@ impl VM {
                 ))
             }
         };
-        let Value::Object(obj_ref) = &gen_value else {
-            return Err(RuntimeError::TypeError("not a generator".to_string()));
-        };
-        // The borrow must end before anything below re-borrows the generator
-        // (the `throw` path has to put the frame back).
-        let (suspended, delegates) = {
+
+        let (state, func_id, frame) = {
+            let Value::Object(obj_ref) = &gen_value else {
+                return Err(RuntimeError::TypeError("not a generator".to_string()));
+            };
             let mut borrowed = obj_ref.borrow_mut();
             let Some(gobj) = borrowed
                 .as_any_mut()
@@ -4386,72 +4341,257 @@ impl VM {
             else {
                 return Err(RuntimeError::TypeError("not a generator".to_string()));
             };
-            let suspended = gobj.suspended.take();
-            let delegates = suspended
-                .as_ref()
-                .map(|f| f.delegates.clone())
-                .unwrap_or_default();
-            // A generator that has not started yet still becomes completed, and
-            // the completion is what the caller sees.
-            gobj.state = crate::vm::object::GeneratorState::Completed;
-            (suspended, delegates)
+            let state = gobj.state;
+            let func_id = gobj.func_id;
+            let frame = if state == crate::vm::object::GeneratorState::SuspendedYield {
+                gobj.state = crate::vm::object::GeneratorState::Executing;
+                gobj.suspended.take()
+            } else {
+                None
+            };
+            (state, func_id, frame)
         };
 
-        // ES 14.4.14 step 5: `yield*` forwards the abrupt completion to the
-        // delegate it is parked on — `return(v)` closes it, `throw(e)` calls its
-        // `throw` method. Only the innermost delegate is involved.
-        match (completion, delegates.last().cloned()) {
-            (Ok(value), Some(iter)) => {
-                // Step 5.c: `GetMethod(iterator, "return")`; an absent one means
-                // the completion simply stands.
-                self.close_delegates(&[iter], &value, module)?;
-                Ok(Self::iterator_result(value, true))
-            }
-            (Ok(value), None) => Ok(Self::iterator_result(value, true)),
-            (Err(RuntimeError::Thrown(reason)), Some(iter)) => {
-                // `MakeIterator` wraps a JS iterator in a native object that
-                // only knows `next`/`return`, so the delegate's own `throw` has
-                // to be looked up on the iterator it wraps.
-                let iter = self.delegate_js_iterator(&iter).unwrap_or(iter);
-                let throw_method =
-                    self.get_member(&iter, &PropertyKey::from_str("throw"), module)?;
-                if !throw_method.is_callable() {
-                    // No `throw` on the delegate: the completion reaches the
-                    // generator body itself, which means resuming it — and that
-                    // needs the frame's exception handlers, which this subset
-                    // does not carry yet (see §2.1u of the conformance plan).
-                    return Err(RuntimeError::Thrown(reason));
-                }
-                let inner = self.invoke(&throw_method, iter, &[reason], module)?;
-                if !inner.is_object() {
-                    return Err(RuntimeError::TypeError(
-                        "iterator.throw() returned a non-object value".to_string(),
-                    ));
-                }
-                let done = self
-                    .get_member(&inner, &PropertyKey::from_str("done"), module)?
-                    .to_boolean();
-                let value = self.get_member(&inner, &PropertyKey::from_str("value"), module)?;
-                if done {
-                    Ok(Self::iterator_result(value, true))
-                } else {
-                    // The delegate produced another value: the generator stays
-                    // suspended where it was, still parked on the delegate.
-                    let Value::Object(obj_ref) = &gen_value else {
-                        return Err(RuntimeError::TypeError("not a generator".to_string()));
-                    };
-                    let mut gobj = obj_ref.borrow_mut();
-                    if let Some(gobj) = gobj
-                        .as_any_mut()
-                        .downcast_mut::<crate::vm::object::GeneratorObject>()
-                    {
-                        gobj.state = crate::vm::object::GeneratorState::SuspendedYield;
-                        gobj.suspended = suspended;
+        // A generator that never started, or already finished, has no frame to
+        // unwind: the completion is simply what the caller sees.
+        let Some(mut frame) = frame else {
+            self.mark_generator_completed(&gen_value);
+            return match completion {
+                Ok(value) => Ok(Self::iterator_result(value, true)),
+                Err(err) => Err(err),
+            };
+        };
+
+        match completion {
+            Ok(value) => {
+                // The delegates are taken out of the frame so the resume path
+                // does not push them back onto `delegate_stack`; they are closed
+                // by hand just below.
+                let delegates = std::mem::take(&mut frame.delegates);
+                self.restore_generator_frame(&frame, module)?;
+                // ES 14.4.14 step 5.c `IteratorClose` runs *inside* the
+                // generator's resumption, so an abrupt completion from the
+                // delegate's `return` (or from the "result must be an object"
+                // check) is delivered to the body: its own `try` catches it
+                // (`star-rhs-iter-rtrn-rtrn-call-err.js`).
+                let close = self.close_delegates(&delegates, &value, module);
+                let start_pc = match close {
+                    Ok(()) => {
+                        self.state.set_register(Register::Rv, value.clone())?;
+                        // The function's trailing `Ret` is what makes
+                        // `Opcode::Ret`'s `finally` dispatch run on the way out.
+                        // `None` only for a hand-built module without any `Ret`.
+                        module.exit_pc.get(&func_id).copied()
                     }
-                    Ok(Self::iterator_result(value, false))
+                    Err(err) => match self.deliver_into_frame(err, saved.ctrl) {
+                        Ok(()) => None,
+                        Err(esc) => {
+                            self.discard_generator_frame();
+                            self.restore_execution_state(&saved);
+                            self.mark_generator_completed(&gen_value);
+                            return Err(esc);
+                        }
+                    },
+                };
+                if let Some(pc) = start_pc {
+                    self.state.jump(pc);
+                }
+                let closure_depth = self.state.closure_var_stack.len();
+                let run = self.run_generator_frame(&saved, closure_depth, delegate_depth, module)?;
+                match run.yielded {
+                    // A `finally` that yields keeps the generator alive.
+                    Some(_) => Ok(self.finish_generator(&gen_value, run)),
+                    // Otherwise the completion's value is what the caller gets.
+                    // `run.rv` cannot be used: the function's exit block opens
+                    // with the implicit `Mov rv, undefined`, so a `finally` that
+                    // merely runs would report `undefined` (see §2.1x).
+                    None => {
+                        self.mark_generator_completed(&gen_value);
+                        Ok(Self::iterator_result(value, true))
+                    }
                 }
             }
-            (Err(err), _) => Err(err),
+            Err(RuntimeError::Thrown(reason)) => {
+                // Step 5.b: a delegate with its own `throw` consumes the
+                // completion and the generator keeps going from there.
+                if let Some(iter) = frame.delegates.last().cloned() {
+                    let iter = self.delegate_js_iterator(&iter).unwrap_or(iter);
+                    let throw_method =
+                        self.get_member(&iter, &PropertyKey::from_str("throw"), module)?;
+                    if throw_method.is_callable() {
+                        let inner = self.invoke(&throw_method, iter, &[reason], module)?;
+                        if !inner.is_object() {
+                            self.mark_generator_completed(&gen_value);
+                            return Err(RuntimeError::TypeError(
+                                "iterator.throw() returned a non-object value".to_string(),
+                            ));
+                        }
+                        let done = self
+                            .get_member(&inner, &PropertyKey::from_str("done"), module)?
+                            .to_boolean();
+                        let value =
+                            self.get_member(&inner, &PropertyKey::from_str("value"), module)?;
+                        if !done {
+                            // The delegate produced another value: the generator
+                            // stays parked on it, right where it was.
+                            self.store_suspended_generator(&gen_value, frame);
+                            return Ok(Self::iterator_result(value, false));
+                        }
+                        self.mark_generator_completed(&gen_value);
+                        return Ok(Self::iterator_result(value, true));
+                    }
+                }
+                // No delegate `throw`: the completion lands on the `yield`
+                // itself, so the frame's own `try`/`finally` gets its chance.
+                self.restore_generator_frame(&frame, module)?;
+                match self.handle_throw(reason) {
+                    Ok(()) => {
+                        let closure_depth = self.state.closure_var_stack.len();
+                        let run = self
+                            .run_generator_frame(&saved, closure_depth, delegate_depth, module)?;
+                        Ok(self.finish_generator(&gen_value, run))
+                    }
+                    Err(err) => {
+                        // Nothing in the body caught it: the generator is over
+                        // and the exception belongs to the caller.
+                        self.discard_generator_frame();
+                        self.restore_execution_state(&saved);
+                        self.mark_generator_completed(&gen_value);
+                        Err(err)
+                    }
+                }
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The bytecode function this frame belongs to, when it is known.
+    ///
+    /// `function_val` is the callee object (`FunctionObject`, or a bare
+    /// `Value::Function` reference before materialization).
+    fn current_function_id(&self) -> Option<u32> {
+        match &self.state.function_val {
+            Value::Function(id) => Some(*id),
+            Value::Object(obj_ref) => obj_ref
+                .borrow()
+                .as_any()
+                .downcast_ref::<crate::vm::object::FunctionObject>()
+                .map(|f| f.func_id),
+            _ => None,
+        }
+    }
+
+    /// Hand an error to the *enclosing generator frame's* handlers.
+    ///
+    /// `boundary` is the resumer's control-stack depth: the frame's own handlers
+    /// sit above it and win, anything below is left to the caller (returned as
+    /// `Err`), which is what keeps the nested loop's bookkeeping sound.
+    fn deliver_into_frame(&mut self, err: RuntimeError, boundary: usize) -> Result<(), RuntimeError> {
+        let Some(exc) = self.as_js_exception(&err) else {
+            return Err(err);
+        };
+        self.invoke_boundaries.push(boundary);
+        let dispatched = self.handle_throw(exc);
+        self.invoke_boundaries.pop();
+        dispatched
+    }
+
+        /// Drive the generator frame that is currently installed until it yields or
+    /// returns, then take the frame down and restore the resumer's context.
+    ///
+    /// On `Err` the caller's context has already been restored.
+    fn run_generator_frame(
+        &mut self,
+        saved: &SavedExecutionState,
+        closure_depth: usize,
+        delegate_depth: usize,
+        module: &Module,
+    ) -> Result<GeneratorRunOutcome, RuntimeError> {
+        // A generator body is a Rust-driven frame, exactly like the callee of
+        // `invoke_with_new_target`: an exception that reaches the frame's
+        // bottom must come back as `Err(Thrown(_))` so the *resumer* dispatches
+        // it. Letting it jump straight to a handler outside the frame would
+        // unwind control-stack entries the nested loop still has to pop.
+        self.invoke_boundaries.push(saved.ctrl);
+        self.generator_yielded = None;
+        let outcome = (|| -> Result<(), RuntimeError> {
+            while self.step(module)? {}
+            Ok(())
+        })();
+        self.invoke_boundaries.pop();
+
+        // A `yield` left the frame on the value stack: lift it out before the
+        // resumer's context is restored (which would rewind `rsp` below it).
+        let yielded = self.generator_yielded.take();
+        let frame = if yielded.is_some() {
+            Some(self.extract_generator_frame(closure_depth, delegate_depth, saved.seh))
+        } else {
+            None
+        };
+        let rv = self.state.get_register(Register::Rv)?;
+        if frame.is_some() {
+            self.discard_generator_frame();
+        }
+        self.restore_execution_state(saved);
+        outcome?;
+        Ok(GeneratorRunOutcome { yielded, frame, rv })
+    }
+
+    /// Unwind the bookkeeping of a frame that suspended: `Ret` never ran, so its
+    /// control entries and `function_stack` entry are still there. The value
+    /// stack and the other stacks are rewound by `restore_execution_state`.
+    fn discard_generator_frame(&mut self) {
+        let _ = self.state.popc();
+        let _ = self.state.popc();
+        let _ = self.state.popc();
+        self.state.function_stack.pop();
+    }
+
+    /// Report what a finished run means for the generator object.
+    fn finish_generator(
+        &mut self,
+        gen_value: &Value,
+        run: GeneratorRunOutcome,
+    ) -> Value {
+        match (run.yielded, run.frame) {
+            (Some(value), Some(frame)) => {
+                self.store_suspended_generator(gen_value, frame);
+                Self::iterator_result(value, false)
+            }
+            _ => {
+                self.mark_generator_completed(gen_value);
+                Self::iterator_result(run.rv, true)
+            }
+        }
+    }
+
+    fn store_suspended_generator(
+        &mut self,
+        gen_value: &Value,
+        frame: crate::vm::object::SuspendedFrame,
+    ) {
+        if let Value::Object(obj_ref) = gen_value {
+            let mut gobj = obj_ref.borrow_mut();
+            if let Some(gobj) = gobj
+                .as_any_mut()
+                .downcast_mut::<crate::vm::object::GeneratorObject>()
+            {
+                gobj.state = crate::vm::object::GeneratorState::SuspendedYield;
+                gobj.suspended = Some(frame);
+            }
+        }
+    }
+
+    fn mark_generator_completed(&mut self, gen_value: &Value) {
+        if let Value::Object(obj_ref) = gen_value {
+            let mut gobj = obj_ref.borrow_mut();
+            if let Some(gobj) = gobj
+                .as_any_mut()
+                .downcast_mut::<crate::vm::object::GeneratorObject>()
+            {
+                gobj.state = crate::vm::object::GeneratorState::Completed;
+                gobj.suspended = None;
+            }
         }
     }
 
@@ -4481,7 +4621,12 @@ impl VM {
         module: &Module,
     ) -> Result<(), RuntimeError> {
         for iter in delegates.iter().rev() {
-            let return_method = self.get_member(iter, &PropertyKey::from_str("return"), module)?;
+            // Unwrap the `MakeIterator` wrapper: its native `return` is
+            // `IteratorClose`, which *swallows* whatever `return()` throws. A
+            // `yield*` has to see it (`? Call(return, iterator, …)` in step
+            // 5.c.iv — `star-rhs-iter-rtrn-rtrn-call-err.js`).
+            let iter = self.delegate_js_iterator(iter).unwrap_or_else(|| iter.clone());
+            let return_method = self.get_member(&iter, &PropertyKey::from_str("return"), module)?;
             if return_method.is_undefined() || return_method.is_null() {
                 continue;
             }
@@ -4490,12 +4635,49 @@ impl VM {
                     "iterator.return is not a function".to_string(),
                 ));
             }
-            let result = self.invoke(&return_method, iter.clone(), &[value.clone()], module)?;
+            let result = self.invoke(&return_method, iter, &[value.clone()], module)?;
             if !result.is_object() {
                 return Err(RuntimeError::TypeError(
                     "iterator.return() returned a non-object value".to_string(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Put a suspended generator frame back on the stacks.
+    ///
+    /// Everything except the program counter: `generator_next` continues after
+    /// the `Yield`, an abrupt completion re-enters at the function's `Ret` (see
+    /// `Module::exit_pc`).
+    fn restore_generator_frame(
+        &mut self,
+        frame: &crate::vm::object::SuspendedFrame,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        let base = self.state.data_stack.len();
+        self.delegate_stack.extend(frame.delegates.iter().cloned());
+        self.state.data_stack.extend(frame.data.iter().cloned());
+        self.state.rbp = base + frame.argc;
+        self.state.rsp = self.state.rbp + frame.bp_offset;
+        self.state.this_val = frame.this.clone();
+        self.state.function_val = frame.function_val.clone();
+        self.state.enter_frame(frame.argc)?;
+        for map in &frame.closure_maps {
+            self.state.closure_var_stack.push(map.clone());
+        }
+        // The body's live exception handlers come back with the frame; a
+        // `finally` that had not run yet must still run.
+        self.state.seh_stack.extend(frame.seh.iter().cloned());
+        self.state.pushc(self.state.closure_var_stack.len())?;
+        self.state.pushc(self.state.seh_stack.len())?;
+        self.state.pushc(self.resume_sentinel(module))?;
+        self.state.construct_stack.push(false);
+        self.state.new_target_stack.push(Value::Undefined);
+        // The register file is global, not per frame, so the body's in-flight
+        // values have to come back before anything else runs.
+        for (slot, value) in self.state.registers.iter_mut().zip(frame.registers.iter()) {
+            *slot = value.clone();
         }
         Ok(())
     }
@@ -4528,6 +4710,7 @@ impl VM {
             construct: self.state.construct_stack.len(),
             new_target: self.state.new_target_stack.len(),
             function: self.state.function_val.clone(),
+            ctrl: self.state.ctrl_stack.len(),
             delegate: self.delegate_stack.len(),
             registers: std::array::from_fn(|i| self.state.registers[i].clone()),
         }
@@ -5424,6 +5607,16 @@ const THIS_NONE: u8 = 0;
 const THIS_DERIVED_UNBOUND: u8 = 1;
 const THIS_DERIVED_BOUND: u8 = 2;
 
+/// What a run of a generator body ended with.
+///
+/// `frame` is `Some` when the body suspended again (at a `yield`, possibly one
+/// inside a `finally` that a return completion is running).
+struct GeneratorRunOutcome {
+    yielded: Option<Value>,
+    frame: Option<crate::vm::object::SuspendedFrame>,
+    rv: Value,
+}
+
 /// Per-frame execution context saved across a nested (`invoke`-style or
 /// generator-resume) execution loop.
 #[derive(Debug, Clone)]
@@ -5438,6 +5631,9 @@ struct SavedExecutionState {
     construct: usize,
     new_target: usize,
     function: Value,
+    /// Control-stack depth *before* the callee's own entries: the boundary a
+    /// generator body (or an `invoke`) may not dispatch an exception across.
+    ctrl: usize,
     delegate: usize,
     registers: [Value; 19],
 }
@@ -5786,6 +5982,7 @@ mod tests {
             HashMap::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            HashMap::new(),
             instructions,
         )
     }

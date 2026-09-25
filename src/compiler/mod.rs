@@ -82,6 +82,7 @@ impl Compiler {
         // Function metadata (declared name + arity) travels with the module so
         // function objects can expose `name` and `length`.
         let mut func_info: HashMap<u32, (String, usize)> = HashMap::new();
+        let mut exit_pc: HashMap<u32, usize> = HashMap::new();
         let mut generators: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut derived_ctors: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for func in &unit.functions {
@@ -125,6 +126,16 @@ impl Compiler {
             // Record offset and append bytecodes
             let offset = all_codes.len();
             symtab.insert(func_id, offset);
+            // The function's exit is its trailing `Ret` — the one the lowering
+            // appends after sealing the last block. A suspended generator
+            // resumed with a return completion re-enters here (see
+            // `Module::exit_pc`).
+            if let Some(idx) = func_codes
+                .iter()
+                .rposition(|code| matches!(code.opcode, crate::bytecode::Opcode::Ret))
+            {
+                exit_pc.insert(func_id.as_usize() as u32, offset + idx);
+            }
             all_codes.extend(func_codes);
         }
 
@@ -136,6 +147,7 @@ impl Compiler {
             func_info,
             generators,
             derived_ctors,
+            exit_pc,
             all_codes,
         ))
     }

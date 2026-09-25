@@ -20,6 +20,17 @@ pub struct Module {
     /// Ids of constructors declared in a class with an `extends` clause. Their
     /// `this` is uninitialized until `super()` runs.
     pub derived_ctors: std::collections::HashSet<u32>,
+    /// The pc of every function's trailing `Ret`.
+    ///
+    /// A suspended generator that is resumed with a *return* completion has to
+    /// re-enter its body at a `Ret` so that `Opcode::Ret`'s `finally` dispatch
+    /// runs (and so that the finally's `ResumeExc` epilogue finds a `Ret` to
+    /// fall through to). The suspension point is a `Yield`, which has no `Ret`
+    /// of its own, so the function's exit is looked up here instead.
+    ///
+    /// `default_instructions()` is the fallback when a function has no `Ret`
+    /// at all (a module built by hand, as the unit tests do).
+    pub exit_pc: HashMap<u32, usize>,
     pub instructions: Vec<Bytecode>,
     pub debug_instructions: BTreeMap<usize, crate::compiler::ir::Instruction>,
 }
@@ -32,6 +43,7 @@ impl Module {
         func_info: HashMap<u32, (String, usize)>,
         generators: std::collections::HashSet<u32>,
         derived_ctors: std::collections::HashSet<u32>,
+        exit_pc: HashMap<u32, usize>,
         instructions: Vec<Bytecode>,
     ) -> Self {
         Self {
@@ -41,6 +53,7 @@ impl Module {
             func_info,
             generators,
             derived_ctors,
+            exit_pc,
             instructions,
             debug_instructions: BTreeMap::new(),
         }
@@ -913,6 +926,7 @@ mod tests {
             HashMap::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            HashMap::new(),
             vec![],
         );
         assert_eq!(module.name, Some("test".to_string()));
@@ -930,6 +944,7 @@ mod tests {
             HashMap::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            HashMap::new(),
             vec![Bytecode::empty(Opcode::Halt)],
         );
         let display = format!("{}", module);
