@@ -213,7 +213,7 @@ This engine uses a **static compilation model** with register-based VM:
 |---------|--------|-------|-------|
 | `Object.defineProperty()` | ✅ | M2' | Full descriptor on every object kind; partial descriptors merge with the existing property |
 | `Object.getOwnPropertyDescriptor()` | ⚠️ | recent | Basic implementation (symbol keys and bare-function receivers pending M3) |
-| `Object.freeze()` | 🚧 | — | Object trait has methods |
+| `Object.freeze()` / `seal()` / `preventExtensions()` | ✅ | B5b | Applied per object kind (incl. wrappers, functions and dense array elements); `isFrozen`/`isSealed`/`isExtensible` are computed from the descriptors; primitives answer the level they cannot violate |
 | `Object.keys/values/entries` | ✅ | M2' | Own enumerable string keys only |
 
 ---
