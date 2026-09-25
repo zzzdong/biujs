@@ -127,7 +127,7 @@ pub fn internal_set(
             return borrowed.property_set(key, value);
         } else {
             // Accessor property — call setter
-            if let Some(setter) = desc.setter {
+            if desc.invoked_setter().is_some() {
                 // TODO: call setter function with value
                 // For now, just store the value directly
                 let mut borrowed = obj.borrow_mut();
@@ -158,7 +158,7 @@ pub fn internal_set(
                 return borrowed.property_set(key, value);
             }
             // Accessor on prototype — call setter
-            if let Some(_setter) = desc.setter {
+            if desc.invoked_setter().is_some() {
                 // TODO: call setter on obj with value
                 let mut borrowed = obj.borrow_mut();
                 return borrowed.property_set(key, value);

@@ -751,37 +751,12 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
         "Object.getOwnPropertyDescriptor" => object::object_get_own_property_descriptor(args),
         "Object.hasOwn" => object::object_has_own(args),
         "Object.is" => object::object_is(args),
-        "Object.isExtensible" => Ok(Value::Bool(match args.first() {
-            Some(Value::Object(o)) => o.borrow().is_extensible(),
-            Some(_) => false,
-            None => false,
-        })),
-        "Object.isFrozen" => Ok(Value::Bool(match args.first() {
-            Some(Value::Object(o)) => o.borrow().is_frozen(),
-            _ => false,
-        })),
-        "Object.isSealed" => Ok(Value::Bool(match args.first() {
-            Some(Value::Object(o)) => o.borrow().is_sealed(),
-            _ => false,
-        })),
-        "Object.preventExtensions" => {
-            if let Some(Value::Object(o)) = args.first() {
-                o.borrow_mut().prevent_extensions();
-            }
-            Ok(args.first().cloned().unwrap_or(Value::Undefined))
-        }
-        "Object.seal" => {
-            if let Some(Value::Object(o)) = args.first() {
-                o.borrow_mut().seal();
-            }
-            Ok(args.first().cloned().unwrap_or(Value::Undefined))
-        }
-        "Object.freeze" => {
-            if let Some(Value::Object(o)) = args.first() {
-                o.borrow_mut().freeze();
-            }
-            Ok(args.first().cloned().unwrap_or(Value::Undefined))
-        }
+        "Object.isExtensible" => object::object_is_extensible(args),
+        "Object.isFrozen" => object::object_is_frozen(args),
+        "Object.isSealed" => object::object_is_sealed(args),
+        "Object.preventExtensions" => object::object_prevent_extensions(args),
+        "Object.seal" => object::object_seal(args),
+        "Object.freeze" => object::object_freeze(args),
         "Array.isArray" => Ok(Value::Bool(matches!(
             args.first(),
             Some(Value::Object(o)) if o.borrow().kind() == ObjectKind::Array

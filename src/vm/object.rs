@@ -314,6 +314,56 @@ pub(crate) fn validate_property_redefinition(
     Ok(())
 }
 
+/// Shared implementations of `[[Freeze]]` / `[[Seal]]` over a plain property
+/// table, and of the matching `TestIntegrityLevel` answers.
+///
+/// Every object kind that keeps a `PropertyTable` (functions, primitive
+/// wrappers, …) uses these so that `Object.freeze(new Number(1))` and
+/// `Object.isSealed(f)` agree with `Object.freeze({})`.
+fn freeze_property_table(properties: &mut PropertyTable) {
+    for key in properties.keys() {
+        if let Some(desc) = properties.get_mut(&key) {
+            desc.configurable = false;
+            if desc.is_data_descriptor() {
+                desc.writable = false;
+            }
+        }
+    }
+}
+
+fn seal_property_table(properties: &mut PropertyTable) {
+    for key in properties.keys() {
+        if let Some(desc) = properties.get_mut(&key) {
+            desc.configurable = false;
+        }
+    }
+}
+
+/// ES `TestIntegrityLevel(O, "frozen")`: every own property is
+/// non-configurable (and non-writable when it is data) and the object itself
+/// is non-extensible. An object with *no* own properties therefore inherits
+/// the answer from its extensibility alone.
+fn is_frozen_desc_set(obj: &dyn JSObject) -> bool {
+    if obj.is_extensible() {
+        return false;
+    }
+    obj.own_keys().iter().all(|key| {
+        obj.property_get(key)
+            .is_some_and(|desc| !desc.configurable && (!desc.is_data_descriptor() || !desc.writable))
+    })
+}
+
+/// `TestIntegrityLevel(O, "sealed")`: every own property is non-configurable
+/// and the object is non-extensible.
+fn is_sealed_desc_set(obj: &dyn JSObject) -> bool {
+    if obj.is_extensible() {
+        return false;
+    }
+    obj.own_keys()
+        .iter()
+        .all(|key| obj.property_get(key).is_some_and(|desc| !desc.configurable))
+}
+
 // ─────────────────────────────────────────────────────────
 // OrdinaryObject — standard JS object
 // ─────────────────────────────────────────────────────────
@@ -490,7 +540,7 @@ impl JSObject for OrdinaryObject {
     }
 
     fn is_frozen(&self) -> bool {
-        self.frozen
+        is_frozen_desc_set(self)
     }
 
     fn freeze(&mut self) {
@@ -499,29 +549,18 @@ impl JSObject for OrdinaryObject {
         self.sealed = true;
         // Freezing makes every own property non-configurable, and data
         // properties non-writable as well.
-        for key in self.properties.keys() {
-            if let Some(desc) = self.properties.get_mut(&key) {
-                desc.configurable = false;
-                if desc.is_data_descriptor() {
-                    desc.writable = false;
-                }
-            }
-        }
+        freeze_property_table(&mut self.properties);
     }
 
     fn is_sealed(&self) -> bool {
-        self.sealed
+        is_sealed_desc_set(self)
     }
 
     fn seal(&mut self) {
         self.sealed = true;
         self.extensible = false;
         // Sealing makes every own property non-configurable.
-        for key in self.properties.keys() {
-            if let Some(desc) = self.properties.get_mut(&key) {
-                desc.configurable = false;
-            }
-        }
+        seal_property_table(&mut self.properties);
     }
 
     fn class_name(&self) -> &'static str {
@@ -775,6 +814,51 @@ impl ArrayObject {
     fn index_key(index: usize) -> PropertyKey {
         PropertyKey::Str(std::rc::Rc::new(index.to_string()))
     }
+
+    /// ES 10.4.2.4 `ArraySetLength`: change the dense store's length, deleting
+    /// elements from the top down on the way down.
+    ///
+    /// The first index that refuses deletion (`[[Configurable]] === false`, or
+    /// a frozen/sealed array) stops the walk: the length is clamped to just
+    /// above that index, the rest of the descriptor still takes effect, and
+    /// the request reports *failure* — the caller turns that into a TypeError.
+    /// Returns `false` exactly in that case.
+    pub fn resize_length(&mut self, new_len: usize) -> bool {
+        let old_len = self.elements.len();
+        if new_len >= old_len {
+            self.elements.resize(new_len, Value::Undefined);
+            return true;
+        }
+        let mut clamped = new_len;
+        let mut idx = old_len;
+        while idx > new_len {
+            idx -= 1;
+            let key = Self::index_key(idx);
+            let undeletable = self.properties.get(&key).is_some_and(|d| !d.configurable)
+                || self.frozen
+                || self.sealed;
+            if undeletable {
+                clamped = idx + 1;
+                break;
+            }
+        }
+        self.elements.resize(clamped, Value::Undefined);
+        self.holes.retain(|&i| i < clamped);
+        let stale: Vec<PropertyKey> = self
+            .properties
+            .keys()
+            .into_iter()
+            .filter(|k| {
+                k.as_str()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .is_some_and(|i| i >= clamped)
+            })
+            .collect();
+        for key in stale {
+            self.properties.remove(&key);
+        }
+        clamped == new_len
+    }
 }
 
 impl JSObject for ArrayObject {
@@ -846,7 +930,12 @@ impl JSObject for ArrayObject {
                 let n = value.to_number();
                 let new_len = crate::builtins::validate_array_length(n)
                     .map_err(crate::vm::RuntimeError::into_property_error)?;
-                self.elements.resize(new_len, Value::Undefined);
+                if !self.resize_length(new_len) {
+                    return Err(
+                        "Cannot assign to 'length': an index beyond it cannot be deleted"
+                            .to_string(),
+                    );
+                }
                 Ok(true)
             }
             // An existing table entry (index override or named property):
@@ -878,6 +967,16 @@ impl JSObject for ArrayObject {
                         return Err(format!(
                             "Array index {idx} is out of the supported range"
                         ));
+                    }
+                    // An assignment that would *add* an element goes through
+                    // `[[DefineOwnProperty]]` (ES 10.4.2.1 step 4.b), which
+                    // refuses it while `length` is read-only — the same guard
+                    // as in `define_property`.
+                    if idx >= self.elements.len() && !self.length_writable {
+                        return Err(
+                            "Cannot add element to an array with a non-writable length"
+                                .to_string(),
+                        );
                     }
                     if idx >= self.elements.len() {
                         self.elements.resize(idx + 1, Value::Undefined);
@@ -949,22 +1048,18 @@ impl JSObject for ArrayObject {
                 if !self.length_writable && new_len != self.elements.len() {
                     return Err("Cannot redefine property: length is non-writable".to_string());
                 }
+                // The *whole* descriptor takes effect even when the shrink fails
+                // partway (ES 10.4.2.4 step 12.c): `Object.defineProperty(a,
+                // "length", {value: 0, writable: false})` over a
+                // non-configurable index leaves `length` clamped and read-only,
+                // and then reports failure, which `[[DefineOwnProperty]]`
+                // raises as a TypeError.
                 self.length_writable = desc.writable;
-                self.elements.resize(new_len, Value::Undefined);
-                self.holes.retain(|&i| i < new_len);
-                // Drop index-keyed entries beyond the new length.
-                let stale: Vec<PropertyKey> = self
-                    .properties
-                    .keys()
-                    .into_iter()
-                    .filter(|k| {
-                        k.as_str()
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .is_some_and(|i| i >= new_len)
-                    })
-                    .collect();
-                for k in stale {
-                    self.properties.remove(&k);
+                if !self.resize_length(new_len) {
+                    return Err(
+                        "Cannot redefine property: length is beyond a non-configurable index"
+                            .to_string(),
+                    );
                 }
                 Ok(true)
             }
@@ -980,6 +1075,16 @@ impl JSObject for ArrayObject {
                         Some(current) => validate_property_redefinition(&current, &desc)?,
                         None if !self.extensible => {
                             return Err("Cannot add property to non-extensible array".to_string());
+                        }
+                        // ES 10.4.2.1: an index at or above the length can only
+                        // be *added* while the length itself is writable — a
+                        // read-only `length` makes the array behave as if it
+                        // were non-extensible for new indices.
+                        None if idx >= self.elements.len() && !self.length_writable => {
+                            return Err(
+                                "Cannot add element to an array with a non-writable length"
+                                    .to_string(),
+                            );
                         }
                         None => {}
                     }
@@ -1118,7 +1223,7 @@ impl JSObject for ArrayObject {
     }
 
     fn is_frozen(&self) -> bool {
-        self.frozen
+        is_frozen_desc_set(self)
     }
 
     fn freeze(&mut self) {
@@ -1152,7 +1257,7 @@ impl JSObject for ArrayObject {
     }
 
     fn is_sealed(&self) -> bool {
-        self.sealed
+        is_sealed_desc_set(self)
     }
 
     fn seal(&mut self) {
@@ -1162,6 +1267,23 @@ impl JSObject for ArrayObject {
             if let Some(desc) = self.properties.get_mut(&key) {
                 desc.configurable = false;
             }
+        }
+        // Sealing covers the dense elements as well: they stay *writable* but
+        // become non-configurable, which is exactly what makes them undeletable
+        // and stops `length` from shrinking past them.
+        for i in 0..self.elements.len() {
+            if self.holes.contains(&i) || self.properties.contains_key(&Self::index_key(i)) {
+                continue;
+            }
+            let desc = PropertyDescriptor {
+                value: self.elements[i].clone(),
+                writable: true,
+                enumerable: true,
+                configurable: false,
+                getter: None,
+                setter: None,
+            };
+            self.properties.insert(Self::index_key(i), desc);
         }
     }
 
@@ -1225,6 +1347,7 @@ pub struct FunctionObject {
     pub func_id: u32,
     pub name: String,
     properties: PropertyTable,
+    extensible: bool,
     prototype: Option<Rc<RefCell<dyn JSObject>>>,
     /// For arrow functions: captured `this` value
     pub captured_this: Option<Value>,
@@ -1242,6 +1365,7 @@ impl FunctionObject {
             func_id,
             name: name.to_string(),
             properties: PropertyTable::new(),
+            extensible: true,
             prototype: None,
             captured_this: None,
             captured_new_target: None,
@@ -1260,6 +1384,7 @@ impl FunctionObject {
             func_id,
             name: name.to_string(),
             properties: PropertyTable::new(),
+            extensible: true,
             prototype: None,
             captured_this: Some(captured_this),
             captured_new_target: None,
@@ -1298,11 +1423,23 @@ impl JSObject for FunctionObject {
     ) -> Result<bool, String> {
         // Class members are defined through this path (`static get x()`), so
         // the descriptor attributes have to survive on function objects.
+        match self.properties.get(&key).cloned() {
+            Some(current) => validate_property_redefinition(&current, &desc)?,
+            None if !self.extensible => {
+                return Err("Cannot add property to non-extensible object".to_string());
+            }
+            None => {}
+        }
         self.properties.insert(key, desc);
         Ok(true)
     }
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        if let Some(desc) = self.properties.get(key) {
+            if !desc.configurable {
+                return false;
+            }
+        }
         self.properties.remove(key).is_some()
     }
 
@@ -1323,22 +1460,30 @@ impl JSObject for FunctionObject {
     }
 
     fn is_extensible(&self) -> bool {
-        true
+        self.extensible
     }
 
-    fn prevent_extensions(&mut self) {}
+    fn prevent_extensions(&mut self) {
+        self.extensible = false;
+    }
 
     fn is_frozen(&self) -> bool {
-        false
+        crate::vm::object::is_frozen_desc_set(self)
     }
 
-    fn freeze(&mut self) {}
+    fn freeze(&mut self) {
+        self.extensible = false;
+        freeze_property_table(&mut self.properties);
+    }
 
     fn is_sealed(&self) -> bool {
-        false
+        crate::vm::object::is_sealed_desc_set(self)
     }
 
-    fn seal(&mut self) {}
+    fn seal(&mut self) {
+        self.extensible = false;
+        seal_property_table(&mut self.properties);
+    }
 
     fn type_of(&self) -> &'static str {
         "function"
@@ -1483,6 +1628,10 @@ pub struct NativeFunctionObject {
     /// `Object.getOwnPropertyDescriptor`, `delete` and redefinition behave
     /// uniformly instead of going through special cases.
     properties: PropertyTable,
+    /// Built-in function objects start extensible like any other object, so
+    /// `Object.isExtensible(Object)` reports `true` and `Object.freeze` has
+    /// something to switch off.
+    extensible: bool,
 }
 
 impl NativeFunctionObject {
@@ -1494,6 +1643,7 @@ impl NativeFunctionObject {
             name: name.to_string(),
             prototype: crate::builtins::wrapper_prototype("Function"),
             properties: PropertyTable::new(),
+            extensible: true,
         };
         obj.install_metadata();
         obj
@@ -1607,22 +1757,30 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn is_extensible(&self) -> bool {
-        false
+        self.extensible
     }
 
-    fn prevent_extensions(&mut self) {}
+    fn prevent_extensions(&mut self) {
+        self.extensible = false;
+    }
 
     fn is_frozen(&self) -> bool {
-        false
+        is_frozen_desc_set(self)
     }
 
-    fn freeze(&mut self) {}
+    fn freeze(&mut self) {
+        self.extensible = false;
+        freeze_property_table(&mut self.properties);
+    }
 
     fn is_sealed(&self) -> bool {
-        false
+        is_sealed_desc_set(self)
     }
 
-    fn seal(&mut self) {}
+    fn seal(&mut self) {
+        self.extensible = false;
+        seal_property_table(&mut self.properties);
+    }
 
     fn type_of(&self) -> &'static str {
         "function"
@@ -1738,6 +1896,19 @@ impl JSObject for PrimitiveWrapperObject {
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
+        // A wrapper is an ordinary object as far as its own extra keys go, so
+        // `[[DefineOwnProperty]]` applies: extensibility gates additions and an
+        // existing non-configurable entry can only be redefined opaquely. The
+        // index keys of a String wrapper (`length` included) already report
+        // `configurable: false` from `property_get`, which is what makes them
+        // impossible to redefine (ES 10.4.3).
+        match self.property_get(&key) {
+            Some(current) => validate_property_redefinition(&current, &desc)?,
+            None if !self.extensible => {
+                return Err("Cannot add property to non-extensible object".to_string());
+            }
+            None => {}
+        }
         self.properties.insert(key, desc);
         Ok(true)
     }
@@ -1798,19 +1969,21 @@ impl JSObject for PrimitiveWrapperObject {
     }
 
     fn is_frozen(&self) -> bool {
-        false
+        is_frozen_desc_set(self)
     }
 
     fn freeze(&mut self) {
         self.extensible = false;
+        freeze_property_table(&mut self.properties);
     }
 
     fn is_sealed(&self) -> bool {
-        false
+        is_sealed_desc_set(self)
     }
 
     fn seal(&mut self) {
         self.extensible = false;
+        seal_property_table(&mut self.properties);
     }
 
     fn class_name(&self) -> &'static str {

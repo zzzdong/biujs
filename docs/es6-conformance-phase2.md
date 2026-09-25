@@ -11,13 +11,13 @@
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | test262 执行 | 17477 | runner 实际跑的数 |
-| 通过 | **13264** | 主指标（B5a 后） |
-| 失败 | 4213 | 其中约 3570 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
+| 通过 | **13382** | 主指标（B5b 后） |
+| 失败 | 4095 | 其中约 3460 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
 | 跳过 | 8109 | 全部为范围外或 G3 排除项 |
-| 通过率 | 75.89% | 参考值 |
+| 通过率 | 76.57% | 参考值 |
 | 单元测试 | 190 全绿 | |
-| feature 集成测试 | 23 个文件 / 421 用例全绿 | |
-| 全量耗时 | 2m48s | B1 的协议化 spread 带来的上升，见 §6.1 |
+| feature 集成测试 | 24 个文件 / 429 用例全绿 | |
+| 全量耗时 | 2m50s | B1 的协议化 spread 带来的上升，见 §6.1 |
 | runner 覆盖面 | 25586 / 53568 个测试文件（**47%**） | 见 §2.3 |
 
 **关键事实（本轮实测）**：把 M5/M6 的 11 个套件加进 runner 后，**通过数一条不变（13211）**，执行数只从 17477 涨到 19029，多出来的 1552 条**全是失败**，通过率掉到 69.43%。原因是那些套件里绝大多数测试仍被 `UNSUPPORTED_FEATURES` 挡着被跳过 —— 光"入册"不解决问题，必须**入册与解除门控联动**（§2.2）。
@@ -155,7 +155,7 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | **B3** | M5-C2 `WeakMap`/`WeakSet` | 226 | 与 B2 同构，可顺带 |
 | **B4** | M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策 | — | 把 KPI 的杂音清掉，再动大件 |
 | **B5a** ✅ | M7-P4 前半：数组 `length` 的错误种类（应为 RangeError） | +32 | **已完成**，见 §6.1 |
-| **B5b** | M7-P4 后半：非可写索引的重定义未抛错、`defineProperty` 的其余 TypeError 缺口 | ≈60 | 已定位，见 §6.1 残留 |
+| **B5b** ✅ | M7-P4 后半：`defineProperty` 的 TypeError 缺口、六个完整性方法、数组 `length` 的下取整 | **+118**（净） | **已完成**，见 §6.1；含一条**已解释的** `built-ins/Array` −11（strict-only 所致，见 §6.1 末） |
 | **B6** | M7-P6 生成器剩余 + M7-P5 数据模型三债 | 203 + — | 债不还，后面的用例会持续被它误导 |
 | **B7** | M7-P1 Array 回调泛型/访问器上移 VM | ≈450 | **最贵的一批**，跨 builtin/VM 两层，建议再拆 2–3 个小批 |
 | **B8** | M7-P2 class 求值顺序与 own-property | 705 | 单批第二贵 |
@@ -233,6 +233,69 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 
 - `*.length = X` 之外，**非可写数组索引的重定义没有抛错**：实测 `Object.defineProperty(a, 0, {value:1,writable:false}); Object.defineProperty(a, 0, {value:2})` 静默通过，应为 TypeError。属 `validate_property_redefinition` 在数组索引分支的缺口。
 - P4 里剩下的 `Expected a TypeError to be thrown`（约 42 条）与 `TypeError: undefined is not a function`（26 条）尚未归族。
+
+#### B5b Object 描述符长尾 —— 已完成（2026-09-25）
+
+**起点**：通过 13264 / 17477（75.89%）；`built-ins/Object` 2639 / 3112；`built-ins/Array` 1951。
+
+**先订正一处错误的"已定位根因"**。B5a 的残留里写着"`Object.defineProperty(a, 0, {value:1, writable:false})` 之后再 `{value:2}` 静默通过，应为 TypeError"。这条**是错的**：拿 node 对照，那两句本来就该静默通过 —— 描述符没提 `configurable` 时它继承当前值（数组元素默认 `true`），所以第二步合法。本批没有动它（动就会引入回退）。真正的根因是在把 `built-ins/Object` 的 473 条失败按消息聚合之后才浮出来的，共 8 条，都在下面。
+
+**根因**
+
+| # | 根因 | 证据（失败规模） |
+|---|------|------------------|
+| R1 | 访问器槽里装着 `undefined` 却被当成可调用：`{get: undefined}` 装的 getter 是 `Some(Undefined)`，读属性时 `invoke` 一个 `undefined` | 26 条 `TypeError: undefined is not a function`（`defineProperty/15.2.3.6-4-4xx` 一族） |
+| R2 | 只改 `enumerable`/`configurable` 的部分描述符把已有访问器**重写成数据属性**；`{}` 也没有按"字段全缺 → 直接 true"早退 | 20 条 `Expected obj[x] to equal data, actually undefined` / `to be writable, but was not` |
+| R3 | `ToPropertyDescriptor` 没拒绝"访问器字段 + `value`/`writable`"的混合描述符 | 12 条 `Expected a TypeError to be thrown`（`15.2.3.6-3-*`、`15.2.3.7-5-b-*`） |
+| R4 | `ArraySetLength` 缺"删到非可配置索引就停下"的规则（ES 10.4.2.4 step 12.c：先把 `length` 夹到该索引之上，再报失败） | `defineProperty/15.2.3.6-4-11x/16x/17x` 与 `defineProperties/15.2.3.7-6-a-16x` 约 20 条 |
+| R5 | `length` 只读时仍能往 `length` 之上新增索引（ES 10.4.2.1 step 4.b 走 `[[DefineOwnProperty]]`） | `15.2.3.6-4-188/189` 等 4 条 |
+| R6 | `Object.preventExtensions` / `seal` / `freeze` / `isExtensible` / `isSealed` / `isFrozen` 六个动词在 `register_object_statics` 里还是桩，且 `FunctionObject` / `PrimitiveWrapperObject` / `NativeFunctionObject` 的 `[[Freeze]]`/`[[Seal]]` 是空实现，`is_frozen`/`is_sealed` 返回的是一个布尔字段而不是"现算" | `seal` 34 / `freeze` 9 / `preventExtensions` 11 / `isExtensible` 8 / `isFrozen` 3 一族 |
+| R7 | `Object.getPrototypeOf` 不做 `ToObject`（`null` 应当 TypeError，原始值应当回答其包装对象的原型） | `getPrototypeOf/*` 13 条中的 8 条 |
+| R8 | `Object.setPrototypeOf` 既不检查目标是否可扩展，也不断环（`Object.setPrototypeOf(o, o)` 会留下循环原型链） | 3 条（`set-failure-non-extensible`、`prototype/__proto__/set-cycle`/`set-immutable`） |
+
+**改动**
+
+1. `vm/property.rs`：新增 `invoked_getter()` / `invoked_setter()`（把 `Some(Undefined)` 折成 `None`），所有发起调用的点改走它 —— `get_member`、`get_from_prototype`、`set_member`、`prototype::internal_set` 两处。R1。
+2. `builtins/object.rs::apply_property_descriptor`：① 描述符六个字段全缺且属性已存在 → 直接 `Ok(true)`；② 已有访问器且描述符没提 `value`/`writable` → 走访问器分支（保留现有 get/set）；③ 补 `get`/`set` 必须"可调用或 undefined"的校验。R2、R3（后半）。
+3. `vm/mod.rs::to_property_descriptor`：先扫一遍四个字段的存在性，混合即 TypeError。R3（前半）。
+4. `vm/object.rs`：抽出 `ArrayObject::resize_length(new_len) -> bool`（顶层元素逐个删，遇到非可配置索引就把 length 夹到它上面并报失败），`define_property` 与 `property_set` 的 `length` 分支共用；两处索引分支补"`length` 只读时不得新增元素"。R4、R5。
+5. `builtins/object.rs`：六个完整性动词有了真身（原始值参数不报错 —— `isExtensible` 答 `false`、`isFrozen`/`isSealed` 答 `true`、三个动词原样返回），`register_object_statics` 的桩改成转发同一份实现，两条派发路径不会再漂；`setPrototypeOf` 补"同值短路 / 非可扩展 / 环检测"；`getPrototypeOf` 改走 `ToObject`。R6、R7、R8。
+6. `vm/object.rs`：新增 `freeze_property_table` / `seal_property_table` / `is_frozen_desc_set` / `is_sealed_desc_set` 四个共享实现 —— `[[Freeze]]`/`[[Seal]]` 作用于属性表，`is_frozen`/`is_sealed` 改为**按 `TestIntegrityLevel`（ES 6.1.7.4）现算**（不是布尔字段），因此对没有自有属性的对象会正确地继承"是否可扩展"的答案；`FunctionObject` / `NativeFunctionObject` 各加 `extensible` 字段，`PrimitiveWrapperObject` 的 `define_property` 补可扩展性与重定义校验，`ArrayObject::seal` 补密集元素（只去 `configurable`，保留可写）。R6。
+
+**效果**
+
+| 指标 | 起点 | R1+R2 后 | +R3…R5 后 | +R6…R8 后 |
+|------|------|----------|-----------|-----------|
+| 全量通过 | 13264 | 未测（套件定向跑） | 13354 | **13382** |
+| `built-ins/Object` | 2639 | 2691 | 2738 | **2757** |
+| `built-ins/Array` | 1951 | — | 1940 | **1940** |
+
+净 **+118**（13264 → 13382，75.89% → 76.57%，失败 4213 → 4095）。逐套件口径：
+
+```
+提升  language/statements/class                        1106 -> 1110
+提升  language/computed-property-names                 36 -> 40
+提升  built-ins/Symbol                                 37 -> 39
+提升  built-ins/Object                                 2639 -> 2757
+提升  built-ins/Function                               190 -> 191
+回退  built-ins/Array                                  1951 -> 1940
+```
+
+单元 190 全绿；features 421 → **429**（新增 8 组：`object_builtins.rs` 的 undefined 访问器槽、部分描述符保留访问器、混合描述符、`length` 下取整、只读 `length` 下的新增索引、完整性等级覆盖包装对象与函数、`setPrototypeOf` 拒绝冻结目标与环、`getPrototypeOf` 需要对象）。跳过数仍是 8109。
+
+**关于 `built-ins/Array` 的 −11（已解释，选择不回退）**：这 11 条全是 `every`/`filter`/`forEach`/`map`/`some`/`reduce`/`reduceRight`/`indexOf`/`lastIndexOf` 的 `*-7-b-16` / `*-9-a-19` 变体，**flags 是 `noStrict`**，要点恰恰是"`arr.length = 2` 失败时**静默忽略**、被长度截掉的索引不该被删"。本引擎 strict-only（§3 硬约束 1），赋值失败只能抛 TypeError。同一段输入在 node 的 strict 模式下同样抛 TypeError（`len` 保持 3），所以新行为是对的，是这批测试的 sloppy 语义不可达。取舍与第一阶段 §2.1n（`set_member` 改为抛错）一致。**若将来要拿回它们，只能引入"assignment failure is silent"的 sloppy 通道，那是一个独立的、比 B5b 大得多的批次。**
+
+另有 2 条 `built-ins/Object` 的 `isFrozen/15.2.3.12-3-1`、`isSealed/15.2.3.11-4-1` 由**假通过**转为真失败：它们写的是 `Object.isFrozen(this)`，`this` 是 `undefined`（缺全局对象），而 `Object.isFrozen(undefined)` 按规范是 `true`。修好全局对象会同时修好这两条。
+
+**残留**（下一批的输入）
+
+- **缺全局对象**：脚本顶层 `this` 是 `undefined`，全局变量活在 `State::globals` 这个 `HashMap` 里、不挂在对象上。`built-ins/Object` 现在有 46 条 `Cannot convert undefined or null to object` 直接或间接来自它，跨套件的量更大。它不是一个 5 行改动：要让 `this` 真的拥有属性，全局读写就得改走对象 + 原型链。**建议单独成批**。
+- **数组字面量的省略元素不出 hole**：`[0,,2].hasOwnProperty("1")` 现在给 `true`（`lower_array` 的 `Elision` 分支退化成 push `undefined`）。要修得给 `Elision` 一条能在运行时标记 hole 的指令（五层改动），并把 `hasOwnProperty` / `in` / `Array.prototype` 各方法的口径一起对齐。
+- **`ToPropertyKey` 走不通用户代码**：`Object.defineProperty(obj, {toString: function () { return 'abc'; }}, {})` 应当用 `"abc"` 作键；builtin 层做不了 `ToPrimitive`（要跑用户函数），得上移 VM。约 10 条（`defineProperty/15.2.3.6-2-4x`、`getOwnPropertyDescriptor/15.2.3.3-2-4x`）。
+- **`ToNumber` 走不通用户代码**：`Object.defineProperty(a, 'length', {value: {toString: ...}})` 现在只会得到 `RangeError: Invalid array length`（因为对象是 NaN）。同一条病根的约 14 条。
+- **严格模式下删除不可配置属性不抛 TypeError**：`obj[sym] = ...` 之后再 `delete obj[sym]` 应抛（`symbol-data-property-default-strict`）。
+- **Annex B 遗留访问器**：`prototype/__proto__`（13）、`__defineGetter__`/`__defineSetter__`（各 10）、`__lookupGetter__`/`__lookupSetter__`（各 7）合计约 47 条，都要按 `[[Get]]`/`[[Set]]` 走接收者，必须在 VM 侧实现。
+- **范围外杂音**（M8-V3 处理，本批不动）：`Object.fromEntries` 24（ES2019）、`Object.groupBy` 14（ES2024）、`Object.getOwnPropertyDescriptors` 13（ES2017）—— 它们已在执行、计入失败，但不在 ES6 目标集里。
 
 ---
 

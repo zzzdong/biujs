@@ -770,6 +770,37 @@ impl VM {
         let desc = Value::Object(Rc::new(RefCell::new(
             crate::vm::object::OrdinaryObject::new(),
         )));
+        // ES 6.2.4.6 step 10: a descriptor that carries both accessor fields
+        // (`get`/`set`) and data fields (`value`/`writable`) is invalid — the
+        // mixed objects caught here are exactly the ones test262 expects to
+        // raise `TypeError` (`defineProperty/15.2.3.6-3-*`, `defineProperties/
+        // 15.2.3.7-5-b-*`).
+        let mut has_accessor_field = false;
+        let mut has_data_field = false;
+        for present_name in ["value", "writable", "get", "set"] {
+            let key = PropertyKey::from_str(present_name);
+            let present = match value {
+                Value::Object(obj) => {
+                    crate::vm::prototype::internal_has_property(Rc::clone(obj), &key)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !present {
+                continue;
+            }
+            if present_name == "get" || present_name == "set" {
+                has_accessor_field = true;
+            } else {
+                has_data_field = true;
+            }
+        }
+        if has_accessor_field && has_data_field {
+            return Err(RuntimeError::TypeError(
+                "Invalid property descriptor: cannot both specify accessors and a value or writable attribute"
+                    .to_string(),
+            ));
+        }
         for name in ["enumerable", "configurable", "value", "writable", "get", "set"] {
             let key = PropertyKey::from_str(name);
             let present = match value {
@@ -3990,8 +4021,8 @@ impl VM {
                         // descriptor — class accessors live on the prototype.
                         let receiver = Value::Object(Rc::clone(obj_ref));
                         let _ = owner;
-                        return match desc.getter {
-                            Some(getter) => self.invoke(&getter, receiver, &[], module),
+                        return match desc.invoked_getter() {
+                            Some(getter) => self.invoke(getter, receiver, &[], module),
                             None => Ok(Value::Undefined),
                         };
                     }
@@ -4051,8 +4082,8 @@ impl VM {
                 .map_err(RuntimeError::TypeError)?
         {
             if desc.is_accessor_descriptor() {
-                return match desc.getter {
-                    Some(getter) => self.invoke(&getter, receiver.clone(), &[], module),
+                return match desc.invoked_getter() {
+                    Some(getter) => self.invoke(getter, receiver.clone(), &[], module),
                     None => Ok(Value::Undefined),
                 };
             }
@@ -4093,9 +4124,9 @@ impl VM {
                         // Same receiver rule as `get_member` above.
                         let receiver = Value::Object(Rc::clone(obj_ref));
                         let _ = owner;
-                        return match desc.setter {
+                        return match desc.invoked_setter() {
                             Some(setter) => {
-                                self.invoke(&setter, receiver, &[value], module)?;
+                                self.invoke(setter, receiver, &[value], module)?;
                                 Ok(())
                             }
                             // G1 (README target): the engine has no sloppy

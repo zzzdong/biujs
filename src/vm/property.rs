@@ -82,6 +82,31 @@ impl PropertyDescriptor {
         self.getter.is_some() || self.setter.is_some()
     }
 
+    /// The getter to *call*, if any.
+    ///
+    /// `{ get: undefined }` installs `undefined` in the slot: the field is
+    /// *present* (so the descriptor stays an accessor one) but there is no
+    /// function to invoke — reading the property yields `undefined`. Since
+    /// `None` and `Some(undefined)` therefore behave identically at every
+    /// call site, they are collapsed here.
+    pub fn invoked_getter(&self) -> Option<&Value> {
+        match &self.getter {
+            Some(v) if !v.is_undefined() => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The setter to *call*, if any (mirror of `invoked_getter`).
+    ///
+    /// An accessor installed with `set: undefined` has no setter, which in
+    /// strict mode makes an assignment a TypeError.
+    pub fn invoked_setter(&self) -> Option<&Value> {
+        match &self.setter {
+            Some(v) if !v.is_undefined() => Some(v),
+            _ => None,
+        }
+    }
+
     pub fn writable_data_descriptor(value: Value, writable: bool) -> Self {
         Self {
             value,

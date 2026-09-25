@@ -283,16 +283,20 @@ pub fn object_get_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
             "Object.getPrototypeOf requires at least 1 argument".to_string(),
         ));
     }
-    match &args[0] {
-        Value::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            if let Some(proto) = borrowed.get_prototype() {
-                Ok(Value::Object(Rc::clone(&proto)))
-            } else {
-                Ok(Value::Null)
-            }
-        }
-        _ => Ok(Value::Null),
+    // ES 20.1.2.9: `ToObject(O)` first — `null`/`undefined` raise a TypeError
+    // and every other primitive answers the prototype of its wrapper
+    // (`Number.prototype`, `String.prototype`, …).
+    let obj_val = super::to_object(&args[0])?;
+    let Value::Object(obj_ref) = &obj_val else {
+        return Err(RuntimeError::TypeError(
+            "Object.getPrototypeOf called on non-object".to_string(),
+        ));
+    };
+    let borrowed = obj_ref.borrow();
+    if let Some(proto) = borrowed.get_prototype() {
+        Ok(Value::Object(Rc::clone(&proto)))
+    } else {
+        Ok(Value::Null)
     }
 }
 
@@ -319,6 +323,39 @@ pub fn object_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
             ));
         }
     };
+    // Never observable as changed: ES 20.1.2.10 step 5 returns true before any
+    // work when the prototype is already what was asked for, even on a
+    // non-extensible target.
+    {
+        let borrowed = obj.borrow();
+        let same = match (&proto, borrowed.get_prototype()) {
+            (None, None) => true,
+            (Some(p), Some(c)) => Rc::ptr_eq(p, &c),
+            _ => false,
+        };
+        if same {
+            return Ok(Value::Object(Rc::clone(obj)));
+        }
+    }
+    if !obj.borrow().is_extensible() {
+        return Err(RuntimeError::TypeError(
+            "Object.setPrototypeOf called on a non-extensible object".to_string(),
+        ));
+    }
+    // A prototype chain that reaches the object itself would loop forever on
+    // every subsequent lookup, so it is rejected up front (ES 20.1.2.10 step 6
+    // reaches the same conclusion by recursing).
+    if let Some(new_proto) = &proto {
+        let mut chain = Some(Rc::clone(new_proto));
+        while let Some(link) = chain {
+            if Rc::ptr_eq(&link, obj) {
+                return Err(RuntimeError::TypeError(
+                    "Cyclic __proto__ value".to_string(),
+                ));
+            }
+            chain = link.borrow().get_prototype();
+        }
+    }
     obj.borrow_mut().set_prototype(proto);
     Ok(Value::Object(Rc::clone(obj)))
 }
@@ -404,6 +441,12 @@ pub fn apply_property_descriptor(
             .property_get(&PropertyKey::from_str(name))
             .map(|d| d.value)
     };
+    let has = |name: &str| -> bool {
+        desc_ref
+            .borrow()
+            .property_get(&PropertyKey::from_str(name))
+            .is_some()
+    };
 
     // Attributes the descriptor does not mention keep the value they already
     // have; for a brand-new property they default to `false` (ES `[[DefineOwnProperty]]`
@@ -415,13 +458,52 @@ pub fn apply_property_descriptor(
 
     let getter = read("get");
     let setter = read("set");
-    if getter.is_some() || setter.is_some() {
+    for (field, value) in [("get", &getter), ("set", &setter)] {
+        if let Some(v) = value {
+            // ES 6.2.4.6 (ToPropertyDescriptor): the field may only hold a
+            // callable or `undefined`; anything else is a TypeError. The VM's
+            // own conversion checks this too, but this entry point is also
+            // reached directly (class static getters, `Object.create`).
+            if !v.is_undefined() && !v.is_callable() {
+                return Err(RuntimeError::TypeError(format!(
+                    "Object.defineProperty: {field} must be callable or undefined"
+                )));
+            }
+        }
+    }
+
+    let mentions_data = has("value") || has("writable");
+    // ES 6.2.4.6 step 10: mixing accessor fields with `value`/`writable` is an
+    // invalid descriptor regardless of the target object.
+    if (has("get") || has("set")) && mentions_data {
+        return Err(RuntimeError::TypeError(
+            "Invalid property descriptor: cannot both specify accessors and a value or writable attribute"
+                .to_string(),
+        ));
+    }
+
+    // A descriptor that mentions nothing at all is a no-op on an existing
+    // property (`validate_and_apply` step 3), and its *kind* must not be
+    // guessed: `defineProperty(o, k, {})` over an accessor property has to
+    // keep the accessor instead of replacing it with a data one.
+    let existing_is_accessor = existing
+        .as_ref()
+        .is_some_and(|d| d.getter.is_some() || d.setter.is_some());
+    let mentions_nothing = !(has("get")
+        || has("set")
+        || mentions_data
+        || has("enumerable")
+        || has("configurable"));
+    if mentions_nothing && existing.is_some() {
+        return Ok(true);
+    }
+
+    if getter.is_some() || setter.is_some() || (existing_is_accessor && !mentions_data) {
         // Accessor descriptor. Omitting `get`/`set` preserves the half that is
         // already installed, so `defineProperty(o, k, {set})` keeps an existing
-        // getter instead of dropping it.
-        let existing_is_accessor = existing
-            .as_ref()
-            .is_some_and(|d| d.getter.is_some() || d.setter.is_some());
+        // getter instead of dropping it. A descriptor that only touches
+        // `enumerable`/`configurable` is a *generic* one and must not turn an
+        // accessor into a data property either.
         let mut current_get = if existing_is_accessor {
             existing.as_ref().and_then(|d| d.getter.clone())
         } else {
@@ -515,6 +597,61 @@ pub fn object_is(args: &[Value]) -> Result<Value, RuntimeError> {
         (a, b) => a == b,
     };
     Ok(Value::Bool(result))
+}
+
+/// The six integrity verbs (ES 20.1.2.15–20.1.2.22).
+///
+/// They all share one rule that is easy to miss: a *primitive* argument is not
+/// an error. `preventExtensions`/`seal`/`freeze` return it unchanged, while
+/// `isExtensible` answers `false` and `isFrozen`/`isSealed` answer `true`
+/// (a primitive has no properties to violate any invariant).
+fn integrity_target(args: &[Value]) -> Option<Rc<RefCell<dyn JSObject>>> {
+    match args.first() {
+        Some(Value::Object(obj_ref)) => Some(Rc::clone(obj_ref)),
+        _ => None,
+    }
+}
+
+pub fn object_prevent_extensions(args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Some(obj) = integrity_target(args) {
+        obj.borrow_mut().prevent_extensions();
+    }
+    Ok(args.first().cloned().unwrap_or(Value::Undefined))
+}
+
+pub fn object_seal(args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Some(obj) = integrity_target(args) {
+        obj.borrow_mut().seal();
+    }
+    Ok(args.first().cloned().unwrap_or(Value::Undefined))
+}
+
+pub fn object_freeze(args: &[Value]) -> Result<Value, RuntimeError> {
+    if let Some(obj) = integrity_target(args) {
+        obj.borrow_mut().freeze();
+    }
+    Ok(args.first().cloned().unwrap_or(Value::Undefined))
+}
+
+pub fn object_is_extensible(args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Bool(match integrity_target(args) {
+        Some(obj) => obj.borrow().is_extensible(),
+        None => false,
+    }))
+}
+
+pub fn object_is_frozen(args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Bool(match integrity_target(args) {
+        Some(obj) => obj.borrow().is_frozen(),
+        None => true,
+    }))
+}
+
+pub fn object_is_sealed(args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Bool(match integrity_target(args) {
+        Some(obj) => obj.borrow().is_sealed(),
+        None => true,
+    }))
 }
 
 /// `Object.assign(target, ...sources)` — copies own enumerable properties
@@ -765,16 +902,17 @@ pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins) {
     set_static_method(object_fn, "create", |args| object_create(args));
     set_static_method(object_fn, "hasOwn", |args| object_has_own(args));
     set_static_method(object_fn, "is", |args| object_is(args));
-    set_static_method(object_fn, "isExtensible", |args| Ok(Value::Bool(false)));
-    set_static_method(object_fn, "isFrozen", |args| Ok(Value::Bool(false)));
-    set_static_method(object_fn, "isSealed", |args| Ok(Value::Bool(false)));
+    // The integrity verbs forward to the same implementations `call_native`
+    // dispatches to, so the two paths cannot drift apart: the static method is
+    // only ever reached directly (`Object.freeze` referenced as a value), but
+    // answering `false` there while the VM path answered `true` would be a bug
+    // no test would pin down cleanly.
+    set_static_method(object_fn, "isExtensible", |args| object_is_extensible(args));
+    set_static_method(object_fn, "isFrozen", |args| object_is_frozen(args));
+    set_static_method(object_fn, "isSealed", |args| object_is_sealed(args));
     set_static_method(object_fn, "preventExtensions", |args| {
-        Ok(args.first().cloned().unwrap_or(Value::Undefined))
+        object_prevent_extensions(args)
     });
-    set_static_method(object_fn, "seal", |args| {
-        Ok(args.first().cloned().unwrap_or(Value::Undefined))
-    });
-    set_static_method(object_fn, "freeze", |args| {
-        Ok(args.first().cloned().unwrap_or(Value::Undefined))
-    });
+    set_static_method(object_fn, "seal", |args| object_seal(args));
+    set_static_method(object_fn, "freeze", |args| object_freeze(args));
 }

@@ -335,6 +335,199 @@ fn get_own_property_descriptor_accepts_string_primitives() {
 }
 
 #[test]
+fn undefined_getter_and_setter_are_not_called() {
+    // `{ get: undefined }` installs `undefined` in the slot: the descriptor is
+    // an accessor one, but there is nothing to invoke — reading yields
+    // `undefined` and writing is a TypeError (no setter).
+    eval_js(
+        "var o = {};
+         Object.defineProperty(o, 'p', { get: undefined, set: undefined, enumerable: true });
+         var d = Object.getOwnPropertyDescriptor(o, 'p');
+         var out = [typeof o.p, typeof d.get];
+         var threw = 'no';
+         try { o.p = 1; } catch (e) { threw = e.name; }
+         if (out.join(',') !== 'undefined,undefined' || threw !== 'TypeError') {
+           throw new Error('got ' + out.join(',') + ' / ' + threw);
+         }
+         // Replacing a real getter with `undefined` must quiet it down again.
+         var q = {};
+         Object.defineProperty(q, 'r', { get: function () { return 42; }, configurable: true });
+         Object.defineProperty(q, 'r', { get: undefined });
+         if (typeof q.r !== 'undefined') throw new Error('getter still ran');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn partial_descriptor_preserves_an_accessor_property() {
+    // A descriptor that mentions no data field is generic: the existing getter
+    // and setter survive, even for `{}` (ES ValidateAndApplyPropertyDescriptor
+    // step 3 / step 8).
+    eval_js(
+        "var arr = [];
+         var got = false;
+         Object.defineProperty(arr, '0', {
+           get: function () { got = true; return 11; },
+           set: function (v) { arr.stored = v; },
+           enumerable: true,
+           configurable: true
+         });
+         Object.defineProperty(arr, '0', {});
+         if (arr[0] !== 11 || !got) throw new Error('empty descriptor lost the getter');
+         Object.defineProperty(arr, '0', { enumerable: false });
+         arr[0] = 'v';
+         var d = Object.getOwnPropertyDescriptor(arr, '0');
+         if (arr.stored !== 'v') throw new Error('setter lost');
+         if (d.enumerable !== false || d.configurable !== true) throw new Error('attributes lost');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn mixed_accessor_and_data_descriptor_is_a_type_error() {
+    eval_js(
+        "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+         var out = [
+           name_of(function () { Object.defineProperty({}, 'p', { get: function () {}, value: 1 }); }),
+           name_of(function () { Object.defineProperty({}, 'p', { set: function () {}, writable: true }); }),
+           name_of(function () { Object.defineProperties({}, { p: { get: function () {}, value: 1 } }); }),
+           name_of(function () { Object.create({}, { p: { set: function () {}, value: 1 } }); }),
+           name_of(function () { Object.create({}, { p: { set: {} } }); })
+         ];
+         if (out.join(',') !== 'TypeError,TypeError,TypeError,TypeError,TypeError') {
+           throw new Error('got ' + out.join(','));
+         }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn shrinking_length_stops_at_a_non_configurable_index() {
+    // ES 10.4.2.4: elements are deleted from the top down, and the first index
+    // that refuses deletion clamps `length` to just above itself *before* the
+    // request reports failure — so `length` has moved even though a TypeError
+    // is thrown.
+    eval_js(
+        "var a = [0, 1, 2];
+         Object.defineProperty(a, '1', { configurable: false });
+         var threw = 'no';
+         try { Object.defineProperty(a, 'length', { value: 0, writable: false }); } catch (e) { threw = e.name; }
+         if (threw !== 'TypeError') throw new Error('no TypeError: ' + threw);
+         if (a.length !== 2) throw new Error('length ' + a.length);
+         if (Object.getOwnPropertyDescriptor(a, 'length').writable !== false) throw new Error('writable kept');
+         if (a.hasOwnProperty('2') !== false || a.hasOwnProperty('1') !== true) throw new Error('elements kept');
+
+         // The same rule applies to the plain assignment path, and to a sealed
+         // array (whose elements became non-configurable).
+         var b = [0, 1, 2];
+         Object.defineProperty(b, '2', { configurable: false });
+         threw = 'no';
+         try { b.length = 1; } catch (e) { threw = e.name; }
+         if (threw !== 'TypeError' || b.length !== 3) throw new Error('assign: ' + threw + ' ' + b.length);
+         var c = Object.seal([1, 2]);
+         threw = 'no';
+         try { c.length = 1; } catch (e) { threw = e.name; }
+         if (threw !== 'TypeError' || c.length !== 2) throw new Error('seal: ' + threw + ' ' + c.length);",
+    )
+    .unwrap();
+}
+
+#[test]
+fn index_beyond_a_non_writable_length_cannot_be_defined() {
+    eval_js(
+        "var a = [1, 2, 3];
+         Object.defineProperty(a, 'length', { writable: false });
+         var threw = 'no';
+         try { Object.defineProperty(a, 3, { value: 'x' }); } catch (e) { threw = e.name; }
+         if (threw !== 'TypeError') throw new Error('defineProperty: ' + threw);
+         threw = 'no';
+         try { a[3] = 'x'; } catch (e) { threw = e.name; }
+         if (threw !== 'TypeError') throw new Error('set: ' + threw);
+         if (a.length !== 3) throw new Error('length ' + a.length);",
+    )
+    .unwrap();
+}
+
+#[test]
+fn integrity_levels_cover_wrappers_and_functions() {
+    // `Object.freeze` / `seal` used to be answered per object kind, and every
+    // kind but `OrdinaryObject` (and `ArrayObject`) reported `false` forever.
+    eval_js(
+        "var n = new Number(1); n.foo = 1; Object.freeze(n);
+         var s = new String('ab'); s.foo = 1; Object.freeze(s);
+         var f = function () {}; f.foo = 1; Object.freeze(f);
+         var g = function () {}; g.foo = 1; Object.seal(g);
+         var dn = Object.getOwnPropertyDescriptor(n, 'foo');
+         var dg = Object.getOwnPropertyDescriptor(g, 'foo');
+         var out = [
+           Object.isFrozen(n), Object.isSealed(n), Object.isExtensible(n),
+           Object.isFrozen(s), Object.isFrozen(f),
+           Object.isSealed(g), Object.isFrozen(g),
+           dn.writable, dn.configurable, dg.writable, dg.configurable
+         ];
+         if (out.join(',') !== 'true,true,false,true,true,true,false,false,false,true,false') {
+           throw new Error('got ' + out.join(','));
+         }
+         // Primitives are neither objects nor errors: they answer the integrity
+         // level they cannot violate, and the three verbs return them as-is.
+         if (Object.isExtensible(1) !== false) throw new Error('isExtensible(1)');
+         if (Object.isFrozen(1) !== true) throw new Error('isFrozen(1)');
+         if (Object.isSealed('x') !== true) throw new Error('isSealed(x)');
+         if (Object.freeze(3) !== 3 || Object.seal(4) !== 4 || Object.preventExtensions(5) !== 5) {
+           throw new Error('verbs must return their argument');
+         }
+         // A non-extensible function refuses new properties.
+         var h = function () {};
+         Object.preventExtensions(h);
+         var threw = 'no';
+         try { Object.defineProperty(h, 'x', { value: 1 }); } catch (e) { threw = e.name; }
+         if (threw !== 'TypeError' || Object.isExtensible(h) !== false) throw new Error('preventExtensions(fn)');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn set_prototype_of_rejects_frozen_targets_and_cycles() {
+    eval_js(
+        "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+         var o = {};
+         Object.preventExtensions(o);
+         var out = [name_of(function () { Object.setPrototypeOf(o, null); })];
+         var p = {};
+         Object.setPrototypeOf(p, null);
+         out.push(name_of(function () { Object.setPrototypeOf(p, p); }));
+         // Still works on an object that may change, `this`-free included.
+         var child = {};
+         var parent = { x: 1 };
+         Object.setPrototypeOf(child, parent);
+         out.push(child.x === 1 ? 'true' : 'false');
+         Object.setPrototypeOf(child, null);
+         out.push(Object.getPrototypeOf(child) === null ? 'true' : 'false');
+         if (out.join(',') !== 'TypeError,TypeError,true,true') throw new Error('got ' + out.join(','));",
+    )
+    .unwrap();
+}
+
+#[test]
+fn get_prototype_of_needs_an_object() {
+    eval_js(
+        "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+         var out = [
+           name_of(function () { Object.getPrototypeOf(null); }),
+           name_of(function () { Object.getPrototypeOf(undefined); }),
+           Object.getPrototypeOf(1) === Number.prototype ? 'true' : 'false',
+           Object.getPrototypeOf('x') === String.prototype ? 'true' : 'false',
+           Object.getPrototypeOf(true) === Boolean.prototype ? 'true' : 'false',
+           Object.getPrototypeOf(Object.prototype) === null ? 'true' : 'false'
+         ];
+         if (out.join(',') !== 'TypeError,TypeError,true,true,true,true') {
+           throw new Error('got ' + out.join(','));
+         }",
+    )
+    .unwrap();
+}
+
+#[test]
 fn array_length_errors_are_range_errors() {
     // `ArraySetLength` (ES 10.4.2.4) throws a *RangeError* for a length that is
     // not a valid array index. The engine's `[[DefineOwnProperty]]` reports

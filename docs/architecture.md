@@ -158,6 +158,8 @@
 
 **builtin 层看不到原型链与访问器**。`builtins/*` 直接读 `ArrayObject::elements` 密集存储、走快照（`array_like_elements`），因此**绕过 `[[Get]]`/`[[Set]]` 与访问器**。凡语义要求"按 `[[Get]]` 取值 / 按 `[[Set]]` 写入 / 可能执行用户代码"的，必须上移 VM。已知欠账：Array 回调方法的泛型/访问器路径、`[...a]` 中数组元素的访问器、索引读写不经原型链。
 
+**访问器槽里的 `undefined` 不等于"没有"**。`PropertyDescriptor::getter/setter` 是 `Option<Value>`：`Some(Undefined)` 表示"字段存在、值是 `undefined`"——`{get: undefined}` 装出来的描述符仍是**访问器描述符**，只是读的时候没有东西可调。调用点在判断要不要 `invoke` 时必须走 `invoked_getter()` / `invoked_setter()`（把 `Some(Undefined)` 折成 `None`），不能直接 `match desc.getter`。同理，部分描述符（只给 `enumerable`/`configurable`）落在已有访问器上时**必须保持访问器**，不能按数据描述符重建 —— 见 `apply_property_descriptor` 里的两条早退回。
+
 **帧深度必须在装帧之前取**。生成器恢复、`invoke`、迭代器体都要把"调用方的 `ctrl_stack` 深度"记为边界（`invoke_boundaries`）。用装帧**之后**的深度会让本帧自己的 handler 被判成"帧外"，表现为异常穿透、控制栈下溢。这条教训出现过四次。
 
 **`invoke` 与 `Call` opcode 必须行为一致**（见 2.2）。
