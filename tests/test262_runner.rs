@@ -154,51 +154,73 @@ fn build_source(test: &Test) -> String {
 // Filtering
 // ─────────────────────────────────────────────────────────
 
-/// test262 feature tags biujs does not implement (ES6 subset, no eval/with).
-const UNSUPPORTED_FEATURES: &[&str] = &[
-    "async-iteration",
-    "async-functions",
-    "Atomics",
-    "BigInt",
-    "class-fields-private",
-    "class-methods-private",
-    // test262 spells the static variants separately, and `contains` does not
-    // relate them: `"class-static-methods-private"` matches neither
-    // `class-methods-private` nor `class-fields-private`. Without these two the
-    // `generated` destructuring tests for private static members ran and failed
-    // (~970 cases) — see §2.1y.
-    "class-static-methods-private",
-    "class-static-fields-private",
-    "class-static-block",
-    "cross-realm",
-    "dynamic-import",
-    "import.meta",
-    "import-assertions",
-    "Intl",
-    "json-parse-with-source",
-    "logical-assignment",
-    "Map",
-    "modules",
-    "numeric-separator",
-    "optional-chaining",
-    "Promise",
-    "Proxy",
-    "Reflect",
-    "reflect-metadata",
-    "regexp-",
-    "Set",
-    "SharedArrayBuffer",
-    "String.prototype.replaceAll",
-    "symbol-description",
-    "tail-call-optimization",
-    "Temporal",
-    "TypedArray",
-    "WeakMap",
-    "WeakRef",
-    "WeakSet",
-    "u180e",
-    "well-formed-json-stringify",
+/// Two lists, because "skipped" has two different meanings. Conflating them
+/// is how a skip table stops telling the truth (see §2.1y of
+/// `es6-conformance-plan.md`):
+///
+/// * `OUT_OF_SCOPE_FEATURES` — outside the ES6 target, or excluded by G3
+///   forever. These tests are expected to stay skipped indefinitely.
+/// * `IN_SCOPE_PENDING` — **inside** the ES6 target but not implemented yet.
+///   Skipped only because the feature is missing. The phase-2 plan
+///   (`docs/es6-conformance-phase2.md` §2.2) makes removing an entry from
+///   this list part of the feature's definition of done: implement the
+///   feature, drop the tag here, and add the suite to `SUITES` if it is not
+///   there yet. Doing only the first step is wasted work — the progress never
+///   reaches a single number (measured: adding the M5/M6 suites without
+///   unlocking anything moved 17477 executed / 13211 passed to 19029 / 13211).
+const OUT_OF_SCOPE_FEATURES: &[&str] = &[
+"async-iteration",
+"async-functions",
+"Atomics",
+"BigInt",
+"class-fields-private",
+"class-methods-private",
+"class-static-methods-private",
+"class-static-fields-private",
+"class-static-block",
+"cross-realm",
+"dynamic-import",
+"import.meta",
+"import-assertions",
+"Intl",
+"json-parse-with-source",
+"logical-assignment",
+"modules",
+"numeric-separator",
+"optional-chaining",
+"reflect-metadata",
+"regexp-",
+"SharedArrayBuffer",
+"String.prototype.replaceAll",
+"symbol-description",
+"tail-call-optimization",
+"Temporal",
+"WeakRef",
+"u180e",
+"well-formed-json-stringify",
 ];
+
+/// In scope (§1.2), not implemented yet. Sizes as of 2026-09-25 (test262 files):
+/// Map 204 / Set 383 / WeakMap 141 / WeakSet 85 / Promise 677 / Proxy 311 /
+/// Reflect 153 / TypedArray 2184.
+const IN_SCOPE_PENDING: &[&str] = &[
+"Map",
+"Promise",
+"Proxy",
+"Reflect",
+"Set",
+"TypedArray",
+"WeakMap",
+"WeakSet",
+];
+
+/// Every feature tag whose tests this engine currently cannot pass.
+fn is_unsupported(feature: &str) -> bool {
+    OUT_OF_SCOPE_FEATURES
+        .iter()
+        .chain(IN_SCOPE_PENDING.iter())
+        .any(|f| feature.starts_with(f) || feature.contains(f))
+}
 
 /// Source patterns biujs cannot handle at all.
 const UNSUPPORTED_PATTERNS: &[&str] = &[
@@ -253,10 +275,7 @@ fn should_skip(test: &Test) -> Option<String> {
     }
 
     for feature in &test.desc.features {
-        if UNSUPPORTED_FEATURES
-            .iter()
-            .any(|f| feature.starts_with(f) || feature.contains(f))
-        {
+        if is_unsupported(feature) {
             return Some(format!("feature {feature}"));
         }
     }

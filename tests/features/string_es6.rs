@@ -13,8 +13,12 @@ fn builtin_name_has_no_owner_prefix() {
     assert_eq!(eval_string("Math.atan.name"), "atan");
     assert_eq!(eval_string("String.fromCharCode.name"), "fromCharCode");
     assert_eq!(eval_string("Array.prototype.push.name"), "push");
+    // ES 23.1.3.30: the array's `@@iterator` *is* `Array.prototype.values`, so it
+    // reports that function's name; only `String.prototype[Symbol.iterator]` is
+    // its own function, defined with the `[Symbol.iterator]` property name.
+    assert_eq!(eval_string("Array.prototype[Symbol.iterator].name"), "values");
     assert_eq!(
-        eval_string("Array.prototype[Symbol.iterator].name"),
+        eval_string("String.prototype[Symbol.iterator].name"),
         "[Symbol.iterator]"
     );
 }

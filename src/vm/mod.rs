@@ -1421,7 +1421,13 @@ impl VM {
             // snapshot; only the VM can mint iterator objects (they live in the
             // iterator registry so `next()` can find its state).
             if matches!(method, "entries" | "keys" | "values") {
-                if let Some(items) = self.array_like_elements(&this) {
+                // ES 23.1.3.28-30 start with `Let O be ? ToObject(this value)`:
+                // `values.call(null)` is a TypeError, not an empty iterator.
+                crate::builtins::require_object_coercible(&this)?;
+                // *Then* `ToLength(Get(O, "length"))`. A receiver without a
+                // usable `length` iterates as empty (`values.call({})`).
+                {
+                    let items = self.array_like_elements(&this).unwrap_or_default();
                     let snapshot: Vec<Value> = match method {
                         "entries" => items
                             .iter()
@@ -2259,14 +2265,32 @@ impl VM {
                 self.set_value(operands[0], arr_val)?;
             }
             Opcode::ArrayPushSpread => {
-                // `[...src]` / `f(...src)`: append every element of `src`.
-                // The loop runs here rather than in lowered bytecode so that no
-                // value has to stay live across a basic-block boundary.
+                // `[...src]` / `f(...src)`: append every element of `src`. The
+                // loop runs here rather than in lowered bytecode so that no value
+                // has to stay live across a basic-block boundary.
+                //
+                // ES 13.2.5.5 (`ArrayAccumulation`) and 13.3.8.1 both go through
+                // `GetIterator`, so a replaced or deleted `@@iterator` has to be
+                // honoured and accessors on the source have to run. This used to
+                // call `array_like_elements`, a `length` + integer-key snapshot:
+                // neither the protocol nor accessors were observable, and
+                // `delete Array.prototype[Symbol.iterator]` left `[...[1]]`
+                // working (see §2.3 of the conformance log).
+                //
+                // No `IteratorClose` is owed: the source is iterated to
+                // exhaustion, and an abrupt `next()` propagates as-is — ES
+                // 13.2.5.5 has no close step.
                 let array_val = self.get_value(operands[0])?;
                 let src = self.get_value(operands[1])?;
-                let items = self.array_like_elements(&src).ok_or_else(|| {
-                    RuntimeError::TypeError(format!("{} is not iterable", src.type_of()))
-                })?;
+                let iter = self.make_iterator(src, module)?;
+                let mut items: Vec<Value> = Vec::new();
+                loop {
+                    let (item, done) = self.iterator_next(iter.clone(), None, module)?;
+                    if done {
+                        break;
+                    }
+                    items.push(item);
+                }
                 match array_val {
                     Value::Object(obj_ref) => {
                         let mut obj = obj_ref.borrow_mut();
@@ -4874,8 +4898,19 @@ impl VM {
                 src.type_of()
             )));
         }
-        let is_default_factory = crate::builtins::native_function_name(&factory).as_deref()
-            == Some(crate::vm::iterator::ITERATOR_NATIVE_NAME);
+        // `Array.prototype[Symbol.iterator]` *is* `Array.prototype.values`
+        // (ES 23.1.3.30), so both names mean "iterate the receiver as an
+        // array-like" and both take the fast path below.
+        let is_default_factory = match crate::builtins::native_function_name(&factory) {
+            Some(name) => {
+                name == crate::vm::iterator::ITERATOR_NATIVE_NAME
+                    // `Array.prototype[Symbol.iterator]` is the same object as
+                    // `Array.prototype.values`, whose native name carries the
+                    // prototype-method prefix.
+                    || name == format!("{}{}", crate::builtins::PROTO_METHOD_PREFIX, "values")
+            }
+            None => false,
+        };
 
         let state = match &src {
             Value::Object(obj_ref) if is_default_factory => {
@@ -4893,7 +4928,20 @@ impl VM {
                         chars: self.array_like_elements(&src).unwrap_or_default(),
                         idx: 0,
                     }),
-                    _ => None,
+                    // The built-in factory is `Array.prototype.values`, which is
+                    // *generic*: it iterates any receiver through
+                    // `ToLength(Get(O, "length"))` plus the indexed properties.
+                    // A receiver that reaches it without being an array —
+                    // `o[Symbol.iterator] = Array.prototype[Symbol.iterator]` —
+                    // has to iterate its array-like shape. Falling through to
+                    // `invoke` here would call the factory back into
+                    // `make_iterator` for ever (a Rust stack overflow, aborting
+                    // the process). An object without a usable `length` iterates
+                    // as empty, which is what `ToLength(undefined)` gives.
+                    _ => Some(NativeIteratorState::Array {
+                        items: self.array_like_elements(&src).unwrap_or_default(),
+                        idx: 0,
+                    }),
                 }
             }
             Value::String(s) if is_default_factory => Some(NativeIteratorState::String {

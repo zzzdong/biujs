@@ -11,13 +11,13 @@
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | test262 执行 | 17477 | runner 实际跑的数 |
-| 通过 | **13211** | 主指标 |
-| 失败 | 4266 | 其中 3622 条由 ES6 范围内特性驱动，644 条涉及范围外特性 |
+| 通过 | **13232** | 主指标（B1 后） |
+| 失败 | 4245 | 其中约 3600 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
 | 跳过 | 8109 | 全部为范围外或 G3 排除项 |
-| 通过率 | 75.59% | 参考值 |
+| 通过率 | 75.71% | 参考值 |
 | 单元测试 | 190 全绿 | |
-| feature 集成测试 | 23 个文件 / 417 用例全绿 | |
-| 全量耗时 | 2m05s | |
+| feature 集成测试 | 23 个文件 / 420 用例全绿 | |
+| 全量耗时 | 2m48s | B1 的协议化 spread 带来的上升，见 §6.1 |
 | runner 覆盖面 | 25586 / 53568 个测试文件（**47%**） | 见 §2.3 |
 
 **关键事实（本轮实测）**：把 M5/M6 的 11 个套件加进 runner 后，**通过数一条不变（13211）**，执行数只从 17477 涨到 19029，多出来的 1552 条**全是失败**，通过率掉到 69.43%。原因是那些套件里绝大多数测试仍被 `UNSUPPORTED_FEATURES` 挡着被跳过 —— 光"入册"不解决问题，必须**入册与解除门控联动**（§2.2）。
@@ -96,7 +96,7 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 悬空 | 结论落地（实现则 ≥ 50%，降级则写进范围外栏） |
-| A8 | 计划内通过数 | 13211 | ≥ 20000（本阶段结束时） |
+| A8 | 计划内通过数 | 13232 | ≥ 20000（本阶段结束时） |
 | A9 | 单元 / feature 测试 | 190 / 417 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
@@ -149,8 +149,8 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 
 | 批次 | 内容 | 规模 | 说明 |
 |------|------|------|------|
-| **B0** | 度量铺底：§2.3 清单入文档；把"入册+解锁联动"写进 runner 的注释与 §6.2 | — | 无功能改动，但后续每一步都靠它可见 |
-| **B1** | M7-P3 的 spread 走 `GetIterator`（含 `ArrayPushSpread` 重写） | 独立 | 刚暴露、边界清楚，与 P1 同源，先验证"协议步骤"这条打法 |
+| **B0** ✅ | 度量铺底：§2.3 清单入文档；把"入册+解锁联动"写进 runner 的注释与 §6.2 | — | **已完成**，见 §6.1 |
+| **B1** ✅ | M7-P3 的 spread 走 `GetIterator`（含 `ArrayPushSpread` 重写） | +21 | **已完成**，见 §6.1；顺带修好 `@@iterator === values` 与 `values/keys/entries` 的接收者校验 |
 | **B2** | M5-C1 `Map`/`Set`（含入册解锁） | 587 | ES6 承诺内最早能整体交付、不依赖新机制 |
 | **B3** | M5-C2 `WeakMap`/`WeakSet` | 226 | 与 B2 同构，可顺带 |
 | **B4** | M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策 | — | 把 KPI 的杂音清掉，再动大件 |
@@ -165,6 +165,49 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | **B13** | M8-V1/V4 收口 | — | 覆盖率清单 + 三方文档对齐 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
+
+### 6.1 批次记录
+
+#### B0 度量铺底 —— 已完成（2026-09-25）
+
+`tests/test262_runner.rs` 里原来的 `UNSUPPORTED_FEATURES` 把两种含义不同的跳过混在一起。已拆成两条：
+
+| 常量 | 含义 | 处理 |
+|------|------|------|
+| `OUT_OF_SCOPE_FEATURES`（29 条） | 范围外或 G3 永久排除 | 预期长期跳过 |
+| `IN_SCOPE_PENDING`（8 条：`Map` / `Promise` / `Proxy` / `Reflect` / `Set` / `TypedArray` / `WeakMap` / `WeakSet`） | **在范围但未实现** | §2.2 的纪律写在常量注释里：实现该特性时**必须同批**从这里删掉，必要时同时把套件加进 `SUITES` |
+
+`should_skip` 改调 `is_unsupported()`，两个表都查。**行为中性已验证**：拆分后跳过数仍是 8109，通过数不变。
+
+#### B1 spread 走 `GetIterator` —— 已完成（2026-09-25）
+
+**起点**：通过 13211 / 17477（75.59%）。
+
+`Opcode::ArrayPushSpread`（`[...src]` 与 `f(...src)` 共用）原来用 `array_like_elements` —— 那是 `length` + 整数键的**快照**，既不走迭代协议也不执行访问器。改成 `make_iterator` + 循环 `iterator_next` 到结束（ES 13.2.5.5 / 13.3.8.1）。不需要 `IteratorClose`：源被抽干，`next()` 抛出时按规范直接传播。
+
+**这一批的实际范围比计划大**：把协议接上之后，三处被快照掩盖的缺陷立刻暴露出来，都在同一批修掉：
+
+1. **内置工厂对普通对象无限递归**。`o[Symbol.iterator] = Array.prototype[Symbol.iterator]` 会让内置工厂调回 `make_iterator` 再调回工厂 —— Rust 栈溢出、进程 SIGABRT（正是 §7.1 记过的那类崩溃）。根因是内置工厂被写成"回到 `make_iterator(this)`"，而普通对象既不匹配数组分支也不匹配字符串分支。改为按 `ToLength(Get(O,"length"))` + 索引的**泛型类数组**语义 —— 这本来就是 `Array.prototype.values` 的定义（ES 23.1.3.30）。
+2. **`Array.prototype[Symbol.iterator]` 不是 `Array.prototype.values`**。规范要求两者是**同一个函数对象**；原来是给数组和字符串各注册一个共享的 `__iterator_factory__`。结果是 `@@iterator === values` 为假，且 `Array.prototype[Symbol.iterator].call(o)` 不可用（工厂假定接收者已带该方法）。改为数组的 `@@iterator` 直接指向已注册的 `values`；字符串保留自己的函数（它迭代码点，不是索引）。`make_iterator` 相应地把 `__proto_method__values` 也认作内置工厂。
+3. **`values` / `keys` / `entries` 对非类数组接收者会抛错**。它们现在先做 `require_object_coercible(this)`（`values.call(null)` 是 TypeError），再按 `ToLength(Get(O,"length"))` 取值，没有 `length` 的接收者迭代为空（`values.call({})` 是空迭代器，不是错误）。
+
+**效果**：
+
+| 指标 | 起点 | 本批后 |
+|------|------|--------|
+| 全量通过 | 13211（75.59%） | **13232**（75.71%） |
+| 失败 | 4266 | **4245** |
+| `language/expressions/call` | 44 | **54** |
+| `language/expressions/new` | 25 | **35** |
+| `built-ins/Array` | 1946 | **1947** |
+
+**+21，逐套件零回退**（含一次用 `git stash` 做的 Array 套件前后对比：三条新失败来自 `values/keys/entries` 的接收者校验被我改宽，补上 `RequireObjectCoercible` 后消失；同时修好 `Array/prototype/Symbol.iterator.js`）。单元 190 全绿；features 417 → 420（新增三组：spread 走协议、替换工厂被复用、内置工厂是泛型的）。
+
+**耗时**：全量 2m05s → **2m48s**。协议化 spread 每次多一次 `@@iterator` 查询与逐元素 `next`（原生迭代器路径无 `invoke`，但不为零）。仍在 §7 的 2× 护栏内，但**下一批要盯着这个数**：若继续上升，需要为 `[...真数组]` 加一条"解析到内置工厂时直接取快照"的快速路径（须保证访问器语义与协议一致，即与 M7-P1 一起做）。
+
+**残留**（转入 M7-P1，不在本批范围）：
+
+- `[...a]` 中数组元素的**访问器不执行**（`array_like_elements` 对真数组读密集存储）。实测 `var a=[1,2]; Object.defineProperty(a,0,{get:()=>99}); [...a]` 得到 `[,2]`，应为 `[99,2]`。与 `built-ins/Array/prototype/includes/values-are-not-cached.js`、`.../values/iteration-mutable.js` 同源，都是"builtin 层读不到访问器/不按 `[[Get]]` 取值"。
 
 ---
 

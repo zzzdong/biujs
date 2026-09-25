@@ -578,3 +578,94 @@ fn generator_functions_reached_through_invoke_build_a_generator() {
     )
     .unwrap();
 }
+
+#[test]
+fn spread_goes_through_the_iterator_protocol() {
+    // ES 13.2.5.5 / 13.3.8.1 both start with `GetIterator`. `[...src]` and
+    // `f(...src)` used to read a `length` + integer-key snapshot instead, which
+    // made the protocol itself unobservable.
+    eval_js(
+        "var a = [...[1, 2, 3]];
+         if (a.join(',') !== '1,2,3') throw new Error('array spread');
+         var b = [...'ab'];
+         if (b.join(',') !== 'a,b') throw new Error('string spread');
+         function f(x, y) { return x + y; }
+         if (f(...[1, 2]) !== 3) throw new Error('call spread');
+         var C = function (x, y) { this.sum = x + y; };
+         var c = new C(...[3, 4]);
+         if (c.sum !== 7) throw new Error('new spread');",
+    )
+    .unwrap();
+
+    // A deleted `@@iterator` is a TypeError, and a getter that throws is
+    // observable — neither was reachable while the snapshot path was in use.
+    eval_js(
+        "delete Array.prototype[Symbol.iterator];
+         delete String.prototype[Symbol.iterator];
+         function t(fn) { try { fn(); } catch (e) { return e.name === 'TypeError'; } return false; }
+         if (!t(function () { return [...[1]]; })) throw new Error('spread of array');
+         if (!t(function () { return [...'ab']; })) throw new Error('spread of string');
+         if (!t(function () { var C = function (x) { return x; }; return new C(...[1]); })) {
+           throw new Error('new spread');
+         }",
+    )
+    .unwrap();
+
+    eval_js(
+        "var o = {};
+         Object.defineProperty(o, Symbol.iterator, { get: function () { throw 'boom'; } });
+         var seen = 'none';
+         try { var a = [...o]; } catch (e) { seen = e; }
+         if (seen !== 'boom') throw new Error('getter error was swallowed');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn spread_reuses_a_replaced_iterator_factory() {
+    eval_js(
+        "Array.prototype[Symbol.iterator] = function* () { yield 'replaced'; yield 'second'; };
+         var a = [...[1, 2, 3]];
+         if (a.join(',') !== 'replaced,second') throw new Error('spread ignored the replacement');
+         var seen = [];
+         for (var v of [9]) { seen.push(v); }
+         if (seen.join(',') !== 'replaced,second') {
+           throw new Error('for-of ignored the replacement: ' + seen.join(','));
+         }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn the_builtin_iterator_factory_is_generic() {
+    // `Array.prototype[Symbol.iterator]` is `Array.prototype.values`, which
+    // iterates any receiver through `ToLength(Get(O, "length"))` plus the
+    // indexed properties. A receiver that is not a real array must not fall back
+    // into the iterator builder — that recursed until the process died with a
+    // host stack overflow.
+    eval_js(
+        // ES 23.1.3.30: the array's `@@iterator` *is* `Array.prototype.values`.
+        "if (Array.prototype[Symbol.iterator] !== Array.prototype.values) {
+           throw new Error('@@iterator is not values');
+         }
+         var o = { 0: 'a', 1: 'b', length: 2 };
+         o[Symbol.iterator] = Array.prototype[Symbol.iterator];
+         if ([...o].join(',') !== 'a,b') throw new Error('generic spread');
+         var viaValues = [];
+         for (var v of Array.prototype.values.call(o)) { viaValues.push(v); }
+         if (viaValues.join(',') !== 'a,b') throw new Error('generic values()');
+         var empty = [];
+         for (var w of Array.prototype.values.call({})) { empty.push(w); }
+         if (empty.length !== 0) throw new Error('empty receiver');
+         var direct = [];
+         for (var d of Array.prototype[Symbol.iterator].call(o)) { direct.push(d); }
+         if (direct.join(',') !== 'a,b') throw new Error('@@iterator.call(receiver)');
+         function f() {
+           var out = [];
+           for (var a of arguments) { out.push(a); }
+           return out.join(',');
+         }
+         if (f(1, 2) !== '1,2') throw new Error('arguments is iterable');",
+    )
+    .unwrap();
+}

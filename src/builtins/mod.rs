@@ -449,17 +449,38 @@ impl Builtins {
         }
 
         // Register `Symbol.iterator` on the natively iterable prototypes.
-        // The factory is dispatched by name in `call_native_by_name`, which
-        // builds an internal iterator over `this`.
-        let iterator_fn = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
-            crate::vm::iterator::ITERATOR_NATIVE_NAME,
-        ))));
-        for proto in [&self.array_prototype, &self.string_prototype] {
-            let _ = proto.borrow_mut().define_property(
+        //
+        // For an array it *is* `Array.prototype.values` — the very same function
+        // object (ES 23.1.3.30: "the initial value of the @@iterator property is
+        // the %Array.prototype.values% intrinsic object"). Registering a
+        // separate factory made `Array.prototype[Symbol.iterator] ===
+        // Array.prototype.values` false and made
+        // `Array.prototype[Symbol.iterator].call(o)` unreachable, since the
+        // factory expects its receiver to already carry the method.
+        //
+        // A string gets its own function: it iterates code points, not indices.
+        // Both are dispatched by name in `call_native_by_name` / recognized by
+        // `make_iterator` as the built-in factory.
+        // The read has to end before the write: `borrow()` in an `if let`
+        // scrutinee lives for the whole body.
+        let array_values_fn = self
+            .array_prototype
+            .borrow()
+            .property_get(&PropertyKey::from_str("values"))
+            .map(|desc| desc.value);
+        if let Some(values_fn) = array_values_fn {
+            let _ = self.array_prototype.borrow_mut().define_property(
                 crate::vm::iterator::iterator_symbol_key(),
-                method_descriptor(iterator_fn.clone()),
+                method_descriptor(values_fn),
             );
         }
+        let string_iterator_fn = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+            crate::vm::iterator::ITERATOR_NATIVE_NAME,
+        ))));
+        let _ = self.string_prototype.borrow_mut().define_property(
+            crate::vm::iterator::iterator_symbol_key(),
+            method_descriptor(string_iterator_fn),
+        );
 
         let bool_fn_val = Value::Object(Rc::new(RefCell::new(
             NativeFunctionObject::new("Boolean"),
