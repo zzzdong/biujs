@@ -44,7 +44,8 @@
 |--------------|------|------|
 | `async` / `await`、异步迭代、`for-await` | **不在** | 非 ES6；依赖 Promise 与生成器，可在 M5 后评估 |
 | BigInt、可选链 `?.`、空值合并 `??`、逻辑赋值 | **不在** | 非 ES6（`??`/`?.` 可顺带，成本极低） |
-| class 私有字段/方法（`#x`）、static block | **不在** | 非 ES6（ES2022） |
+| class 私有字段/方法（`#x`）、static block | **不在** | 非 ES6（ES2022）；跳过表按 `class-methods-private` / `class-fields-private` / `class-static-methods-private` / `class-static-fields-private` 四条门控（§2.1y） |
+| class **公开**字段（`x = 1` / `static x = 1`） | **不在** | 非 ES6（ES2022）；**但不进跳过表** —— 失败的公开字段用例 833 / 838 与范围内特性（`computed-property-names`、`generators`、`destructuring-binding`）共存，跳掉会埋掉范围内覆盖（§2.1y）。它因此留在失败池里，是池中已知的「非 ES6」成分 |
 | `Temporal` / `Intl` / `SharedArrayBuffer` / `Atomics` | **不在** | 非 ES6 且依赖宿主能力 |
 | RegExp 及 `u`/`y` 标志 | **不在** | 引擎无正则实现（1879 个测试，独立子项目量级） |
 
@@ -64,6 +65,21 @@
 | feature 集成测试 | 17 个文件 |
 
 > **KPI 约定**：解锁特性会让分母变大、通过率下降，因此**主指标是通过的绝对数 + 目标套件通过率**，通过率仅作参考。
+
+### 2.1a 当前基线（2026-09-25，§2.1y 之后）
+
+| 指标 | 数值 |
+|------|------|
+| test262 已执行 | 17477 |
+| 通过 | **12217** |
+| 失败 | 5260 |
+| 跳过 | 8109（全部为 §1.2 范围外或 §1.1 G3 排除项，见 §3.2） |
+| 通过率 | 69.90%（参考值，分母见 §2.1y） |
+| 单元测试 | 190（全绿） |
+| feature 集成测试 | 23 个文件 / 411 个用例（全绿） |
+| 全量耗时基线 | 2m05s |
+
+> **分母变更提醒（§2.1y）**：2026-09-25 之前，通过率的分母是 10825 —— 跳过表里混着两条与特性无关的规则（`Flag::Generated`、`$DONOTEVALUATE`），把 6652 个可执行测试排除在外。修正后分母是 17477，因此**通过率旧值（73.73%）与新值（69.90%）不可直接比较**；同一批 10825 个测试上的成绩在两个版本里都是 7981 / 10825 = 73.73%，没有变化。
 
 ### 2.1b M2' + M3-B1 进展（本次工作，逐套件实测）
 
@@ -847,6 +863,60 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 - `finally { return x }` 期间的返回值以请求值为准，不看 `finally` 自己的 `return`（出口块 `Mov rv, undefined` 所致，见第 6 条）。
 - `yield*` 的委托没有 `throw` 方法时，规范要求先 `IteratorClose(代理)` 再把异常交给函数体；目前直接交给函数体（`-thrw-violation-*` 5 条）。
 
+### 2.1y 跳过表里有两条不是"特性门控"的（2026-09-25）
+
+**起点**：通过 7981 / 10825（73.73%），跳过 14761。
+
+§2.1p 起就能看到一件怪事：两个生成器目录共 556 个测试文件，怎么跑都只有 66 个在执行。本轮顺着这条线查 `should_skip`，发现跳过表里混进了两条**与特性无关**的规则 —— 它们不是"引擎支持不了"，而是当初为了少看失败随手加的：
+
+1. **`Flag::Generated` 被当成跳过理由**。test262 的 `generated` flag 的含义是"这个文件由工具自动生成、别手改"，是**出处标记**，不是能力要求。这些是普通测试，必须跑。它压掉的量：两个生成器目录 556 个文件里有 **463 个**带 `flags: [generated]`。
+2. **`$DONOTEVALUATE` 被列进 `UNSUPPORTED_PATTERNS`**。这些是**普通的 negative 用例**：测试源里先写一段必须被拒绝的语法，再调 `$DONOTEVALUATE()`；harness 让它抛错，所以那行只有"引擎错误地接受了语法"时才会执行 —— 而 runner **本来就支持 `negative:` 元数据**（`tests/test262_runner.rs:301`，parse / resolution / runtime 三个阶段都做）。这条规则纯属多余。
+
+**改动**（无新增机制，只有三处表项增删）：
+
+1. `should_skip` 的 flag 分支只保留 `Async` / `Module` —— 这两条是真的：源码需要本引擎按 G3 永久排除的语法。
+2. 删掉 `UNSUPPORTED_PATTERNS` 里的 `$DONOTEVALUATE`。
+3. 补上 `class-static-methods-private` / `class-static-fields-private` —— 见下。
+
+**第 3 条是顺出来的**：解锁后失败池里冒出 971 条"method invoked exactly once"，全是 `dstr/private-*-static-*`。查下去发现这批用例声明的是 `class-static-methods-private`，而跳过表里只有 `class-methods-private` / `class-fields-private`，`contains` 不会把 static 变体认作同一件事（`"class-static-methods-private"` 既不 startswith 也不 contains 前者）。§1.2 已判定"class 私有字段/方法"非 ES6、不在范围内，所以这是跳过表的**漏项**，补上。
+
+**效果**（三次改动分别实测）：
+
+| 阶段 | 执行数 | 通过 | 失败 | 跳过 | 通过率 |
+|------|--------|------|------|------|--------|
+| 起点（§2.1x 后） | 10825 | 7981 | 2844 | 14761 | 73.73% |
+| 去掉 `Flag::Generated` | 17005 | **11349** | 5656 | 8581 | 66.74% |
+| 再去掉 `$DONOTEVALUATE` | 18504 | **12299** | 6205 | 7082 | 66.47% |
+| 再补两行 private-static | 17477 | **12217** | 5260 | 8109 | **69.90%** |
+
+**最终：通过 7981 → 12217（+4236）**，执行数 10825 → 17477。逐套件比对，前两步**零回退**；第三步只影响两个 class 套件（各 -41 通过 / -470 失败）。
+
+**那 82 个通过是第 3 条的成本，说明一下**：带这两个特性的用例共 1824 个，其中 179 个 negative、1645 个 positive。跳掉它们会连带失去 82 个原本能过的用例。选择跳过，理由是 §6.2 自己定的规则（"范围外特性在表内注明理由"）以及失败池的可用性 —— 池里少 944 条与 ES2022 私有成员有关的噪声，通过率也更能代表引擎的真实水平。**若要绝对数最大化，删掉那两行即可拿回 82**，代价是失败池重新被这 944 条淹没。记录在此，便于日后反悔。
+
+**同一批顺手量清的边界**（避免下次重复判断）：`class-fields-public` / `class-static-fields-public`（公开 class 字段，ES2022）**不跳** —— 失败的公开字段用例里 **833 个与范围内特性共存**（`computed-property-names`、`generators`、`destructuring-binding` 等），只有 5 个是纯范围外；跳掉会连带埋掉 833 个范围内测试。已把"公开 class 字段"补进 §1.2 的范围外表并注明这一取舍。
+
+**关键套件**：
+
+| 套件 | §2.1x 后 | 本批后 |
+|------|----------|--------|
+| `language/statements/generators` | 21 | **156** |
+| `language/expressions/generators` | 18 | **165** |
+| `language/statements/for-of` | 50 | **121** |
+| `language/statements/try` | 34 | **61** |
+| `language/expressions/yield` | 36 | **39** |
+| `language/statements/class` | 115 | **995** |
+| `language/expressions/class` | 15 | **889** |
+| `language/identifiers` | 92 | **201** |
+
+**通过率下降是分母的假象**。旧的 10825 个测试全部仍在执行且一个没退，它们上面的成绩仍是 **7981 / 10825 = 73.73%**；新解锁的 6652 个里 4236 个通过（63.7%）。引擎本身的水平没有变化，是**度量范围**修正了。往后引用通过率时都要说明分母 —— 旧数字与新数字不可直接比较。
+
+**M4 完成标准达成**：`generators` 解锁后的通过率要求是 ≥ 40%，现在是 `statements/generators` 156/(156+96) = **61.9%**、`expressions/generators` 165/(165+107) = **60.7%**。
+
+**耗时**：全量从约 40s 增至 **2m05s**（+212%），工作量 +61%。新解锁的多为失败用例（异常路径与解析失败比正常路径贵），单测耗时上升。§6.4 的时间基线按 2m05s 重记。
+
+**跳过池 8109 例的构成**（按声明特性归拢）：`Temporal`、`async-iteration` / `async-functions` / `await`、`class-methods-private` / `class-fields-private` 及其 static 变体、`BigInt`、`TypedArray`、`dynamic-import` / `modules`、`Proxy` / `Reflect`、`Atomics` / `SharedArrayBuffer`、`Intl`；源码模式则是 `Date` / `RegExp` / `eval(` / `new Function(` / `with (`（§1.2 范围外，§1.1 的 G3 永久排除）。**跳过表至此可以认为只剩真话了**，§6.2 的治理到此收敛。
+
+**残留**：`$DONOTEVALUATE` 解锁后出现了 153 条 `expected Some("SyntaxError") at Parse phase but compilation succeeded` —— 引擎接受了本应拒绝的语法。这批从"看不见"变成"红着"是好事，属 M6-T2 的一致性收尾。
 ### 2.2 已交付（M0 → M2'）
 
 - **M0**：值/对象/原型链/SEH/寄存器 VM 骨架
@@ -889,7 +959,7 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 | 无正则引擎 | 1879 个 RegExp 测试 | 明确不在范围 |
 | 顶层 `this` 为 `undefined` | 依赖全局对象作 `this` 的 sloppy 用例 | 与"strict only"目标一致，允许失败 |
 | Tagged template 未实现（tag 不调用） | `tag\`\`` 用例 | 计划 M2' 补：strings 数组 + tag 调用 |
-| 慢：内置方法多经 `invoke` 派发 | 全量 ~数分钟（高负载机器上更久） | 建性能护栏 |
+| 慢：内置方法多经 `invoke` 派发 | 全量 **2m05s** / 17477 例（2026-09-25 实测，§2.1y） | 建性能护栏 |
 | **按名派发忽略属性归属** | `call_prototype_method(this, name)` 只按方法名分派、不看该方法实际来自哪个原型：`var f = Error.prototype.toString; f()` 走通用 `toString`（返回 `"[object Undefined]"`）而非 `Error.prototype.toString` 应抛的 TypeError；`at`/`toString` 的接收者判定只能靠"是不是字符串/有没有 length"这类启发式 | 2026-09-22 登记（§2.1h/§2.1i 两处被迫使用启发式）：少量用例；根治需在派发时携带 [[HomeObject]]，归 M6 |
 | `ToString(Symbol)` 不抛 TypeError | `to_js_string` 返回 `String`、无 `Result` 通道，于是 `String.prototype.trim.call(Symbol())`、模板插值里的 Symbol、`Array/String` 方法的参数 Symbol 校验用例失败 | ✅ **部分消除**（2026-09-23，§2.1n）：builtin 层新增 `to_string_throwing` / `to_number_throwing` / `to_integer_or_infinity_throwing`，String/Array/Object 内置方法的参数与接收者已走抛错通道。**残留**：`Value::to_js_string` 本身仍是全函数，模板插值、`String(x)` 隐式转换等引擎内部路径对 Symbol 仍不抛错；把这些路径也铺上 `Result` 通道属跨层改动，归 M6 |
 | ~~严格模式下对只读属性的赋值不抛 TypeError~~ | `set_member` 对非可写属性静默 no-op（注释称"引擎不追踪 strict 来源"），`*-gs.js` 生成用例（约 33 例）失败 | ✅ **2026-09-23 修复**（§2.1n）：G1 已确定引擎是 strict-only，改为抛 TypeError（非可写属性 / 只有 getter 的访问器 / 原始值上的属性）；逐套件比对确认无回退（`built-ins/Object` 反 +1），仅 1 条 feature 断言按新语义更新 |
@@ -934,43 +1004,43 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 
 ### 3.1 失败池（已执行但未通过 —— 最高 ROI）
 
-| 套件 | 失败数（§2.1x 后） | 主要缺口 |
+| 套件 | 失败数（§2.1y 后） | 主要缺口 |
 |------|--------------------|----------|
-| `built-ins/Array` | 857 | `flat`/`flatMap`（ES2019）、`findLast*` 与 change-array-by-copy（ES2023）整体缺失；`resizable-arraybuffer` 类用例；sloppy-mode 依赖的 ES5 用例 |
-| `built-ins/Object` | 499 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |
-| `built-ins/String` | 399 | 主要被 `replace`/`match`/`search`/`split`（RegExp，范围外）占据；其余是 `String.prototype.X.call(obj)` 的接收者 ToString（对象经 ToPrimitive 的路径仍需 VM 参与） |
-| `built-ins/Function` | 131 | `prototype/toString`（36，需源码文本）、`bind` 细节、`Symbol.hasInstance` |
-| `language/statements/class` | 124 | 字段初始化次序、私有字段（范围外）、`Symbol` 交互 |
-| `built-ins/Number` | 104 | `toString(radix)`/`toFixed`/`toExponential`/`toPrecision` 的精确格式化、`toLocaleString` |
-| `language/statements/for-of` | 40 | 用户自定义迭代器的 `return()`/`throw()`、字符串码元 |
-| `built-ins/Error` | 39 | `Error.prototype.stack`（22，ES2026 提案）、`toString` 的按名派发归属问题 |
-| `built-ins/Symbol` | 34 | `Symbol.prototype[Symbol.toPrimitive]`、`Symbol.for/keyFor` 细节、描述符 |
-| `built-ins/NativeErrors` | 20 | 少量描述符与 `new.target` 交互 |
-| `built-ins/Math` | 19 | 常量描述符、`fround`/`hypot` 边界 |
-| `built-ins/JSON` | 2 | 顶层 `this`、RegExp 字面量（均非 JSON 语义问题） |
+| `built-ins/Array` | 858 | 泛型路径长尾（species 交互、类数组访问器）、`resizable-arraybuffer` 类用例、sloppy-mode 依赖的 ES5 用例 |
+| `language/statements/for-of` | 576 | **解锁后新暴露**：迭代协议的异常路径与 `IteratorClose` 计数（§2.1y 前整个套件只有 50 例在执行） |
+| `built-ins/Object` | 501 | `__proto__`/`__lookupGetter__` 等 Annex B、`Object.fromEntries`（ES2019）、描述符长尾 |
+| `language/statements/class` + `language/expressions/class` | 501 + 421 | **ES6 核心的最大单块**（合计 922）：`super` 与 home object 语义、字段/方法求值顺序、`computed-property-names` 交互；其中约 1000 条失败属 ES2022 公开字段（§1.2 已注明范围外但留在池中） |
+| `built-ins/String` | 399 | 主要被 `replace`/`match`/`search`/`split`（RegExp，范围外）占据；其余是对象接收者经 ToPrimitive 的路径 |
+| `language/expressions/arrow-function` | 184 | 解锁后新暴露 |
+| `language/statements/try` | 118 | `catch` 绑定与 finally 顺序的剩余组合 |
 
 ### 3.2 跳过池（未执行 —— 决定下一步解锁顺序）
 
-| 特性 | 规模 | 归属 |
-|------|------|------|
-| ~~`generators`~~ | ~~4061~~ | ✅ **2026-09-23 解锁**（§2.1p）：两个目录共 556 例进入分母，35 通过 / 31 失败（53%），达到 §4 的 ≥ 40% 标准 |
-| `Symbol.iterator` / `Symbol` | 1829 / 1452 | M2 收尾 + M4 |
-| `class` | 4734 | 已在执行；剩余失败见 3.1 |
-| `computed-property-names` | 478 | M2 收尾 |
-| `Reflect.construct` / `Proxy` / `Reflect` | 692 / 457 / 436 | M5 |
-| `object-rest` | 355 | 已实现（ES2018），可执行 |
-| `new.target` | 61 | M2 收尾 |
-| `exponentiation` (`**`) | 102 | M2 收尾（ES2016，成本低） |
-| `u180e` / `String.prototype.replaceAll` | 25 / 31 | M3 顺带 |
+**2026-09-25 重记（§2.1y）**：跳过 8109 例。经 §2.1y 的治理，表里剩下的**全部是真实的范围外特性或 G3 永久排除项**，不再有"因为当初没实现而随手加"的条目：
 
-目录级规模（内置对象，供排期）：Object 3411、Array 3081、TypedArray 1446、String 1223、TypedArrayConstructors 738、Promise 677、Date 594、DataView 561、Function 509、Set 383、Number 340、Math 327、Proxy 311、ArrayBuffer 221、Map 204、JSON 165、Reflect 153、WeakMap 141、Symbol 98、NativeErrors 94、Error 93。
+| 类别 | 规模 | 判定依据 |
+|------|------|----------|
+| `Temporal` / `Intl` | 6385 / 150 | §1.2 非 ES6 且依赖宿主能力 |
+| `async-iteration` / `async-functions` / `await` | 4507 / 558 | §1.2 非 ES6 |
+| class 私有成员（4 条特性） | 1493 + 775 + 278 | §1.2 非 ES6（ES2022） |
+| `BigInt` | 1369 | §1.2 非 ES6 |
+| `TypedArray` | 1272 | §1.2 降级项，M6-T1 |
+| `dynamic-import` / `modules` | 943 / 389 | §1.1 G3 + §1.2 不承诺 |
+| `Proxy` / `Reflect` | 412 / 230 | M5-C4 |
+| `Atomics` / `SharedArrayBuffer` | 274 / 179 | §1.2 非 ES6 |
+| 源码模式：`Date` / `RegExp` / `eval(` / `new Function(` / `with (` | — | §1.2 范围外 + §1.1 G3 |
 
+（规模按"声明了该特性的测试文件数"计，同一测试可计入多类，故合计大于 8109。）
+
+**解锁顺序**：跳过池里已**没有 ES6 核心项** —— M5（`Map`/`Set`/`Promise`/`Proxy`/`Reflect`）与 M6（`TypedArray`）是仅剩的两个池子，二者都已在路线图上。也就是说从本节之后，**"解锁"这个动作本身已经做完，剩下的全是"实现"**。
 ### 3.3 优先级结论
 
-1. **M3 内置对象**：失败池主体（Object+Array+String ≈ 4700 失败），且多为"缺方法 / 语义细节"，单点成本低、收益确定 ——**优先**。
-2. **M4 生成器**：ES6 核心语义，解锁 4061 个测试，但需引入挂起/恢复机制 ——**成本最高，排第二**。
-3. **M5 集合与反射**：Map/Set/WeakMap/Promise/Proxy/Reflect，规模中等、相互独立，可增量交付。
-4. **M6 TypedArray + 收尾**：规模大但同质，可批量；同时做一致性收尾与文档。
+**2026-09-25 重排（§2.1y 之后）**。跳过池里已无 ES6 核心项，"解锁"这个动作做完了，下面是纯实现顺序：
+
+1. **ES6 核心语义的残余（M2/M3/M4 收尾）**：`for-of`/迭代协议异常路径 576、`class` 两目录合计 922（`super`/home object/求值顺序）、`built-ins/Array` 858、`Object` 501、`String` 399、`try` 118 —— 都是"已实现但语义没对齐"，单点成本低、收益确定，且互相牵连少。**优先**。
+2. **M5 集合与反射**：`Map`/`Set`/`WeakMap`/`Promise`/`Proxy`/`Reflect`。这是跳过池里最大的两块（Proxy 412 + Reflect 230 + Map/Set/Promise/WeakMap）之一，且相互独立、可增量交付。
+3. **M4 剩余项**：`yield*` 委托无 `throw` 时的 `IteratorClose`、`finally { return x }` 的值、生成器作构造器与原型链元数据（§2.3 已逐条登记）。规模小，混在 1 里边做。
+4. **M6 TypedArray + 一致性收尾**：跳过池的另一大块（TypedArray 1272）；同时做 §2.1y 暴露出来的 153 条 `negative: phase: parse` 缺口，以及文档一致性。
 
 ---
 
@@ -1057,7 +1127,7 @@ ES 9.2.2 的第 13 步：基础构造器返回原始值 → 忽略、用 `this`�
 2. **跳过表治理**：特性实现后即从 `UNSUPPORTED_FEATURES` 移除；范围外特性在表内注明理由（如 `Temporal`、`async-functions`）。
 3. **失败原因聚合**：每里程碑开始/结束各跑一次
    `TEST262_SUITES=... TEST262_FAILURES=300 ... | grep FAIL | sed ... | sort | uniq -c | sort -rn`，用于排下一轮优先级。
-4. **性能护栏**：记录全量耗时基线；劣化 > 2× 需定位（热点：慢路径迭代的 `invoke`、内置方法派发）。
+4. **性能护栏**：全量耗时基线 **2m05s / 17477 例**（2026-09-25，§2.1y 解锁后重记；解锁前为约 40s / 10825 例）。劣化 > 2× 需定位（热点：慢路径迭代的 `invoke`、内置方法派发、失败用例的异常路径）。
 5. **单元测试**：190 个保持全绿；新增运行时机制（生成器帧、微任务）需补单元测试。
 6. **内存护栏**：全量与定向回归**一律带内存上限**运行，例如
    `ulimit -v 6000000; TEST262_FAILURES=20000 cargo test --release --test test262_runner -- --nocapture`。

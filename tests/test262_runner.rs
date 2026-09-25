@@ -151,6 +151,13 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "BigInt",
     "class-fields-private",
     "class-methods-private",
+    // test262 spells the static variants separately, and `contains` does not
+    // relate them: `"class-static-methods-private"` matches neither
+    // `class-methods-private` nor `class-fields-private`. Without these two the
+    // `generated` destructuring tests for private static members ran and failed
+    // (~970 cases) — see §2.1y.
+    "class-static-methods-private",
+    "class-static-fields-private",
     "class-static-block",
     "cross-realm",
     "dynamic-import",
@@ -189,7 +196,10 @@ const UNSUPPORTED_PATTERNS: &[&str] = &[
     // real built-in, so tests that exercise it must run.
     "Date",
     "RegExp",
-    "$DONOTEVALUATE",
+    // `$DONOTEVALUATE` is *not* unsupported: these are ordinary negative tests.
+    // The harness makes `$DONOTEVALUATE` throw, so the call is only reached if
+    // the engine wrongly accepted the syntax it was supposed to reject — and the
+    // runner already handles `negative:` metadata (§2.1y).
     "new Function(",
     "Function(\"",
     "Function('",
@@ -217,7 +227,14 @@ fn should_skip(test: &Test) -> Option<String> {
 
     for flag in &test.desc.flags {
         match flag {
-            Flag::Async | Flag::Module | Flag::Generated => {
+            // `Async` and `Module` are real gating conditions: the source needs
+            // a syntax this engine deliberately does not have (G3).
+            //
+            // `Generated` is *not*. It only records that the file was produced
+            // by a tool rather than typed by hand; such tests are ordinary
+            // tests and have to run. Skipping them silently dropped ~5k tests
+            // (463 of the 556 generator tests alone) — see §2.1y.
+            Flag::Async | Flag::Module => {
                 return Some(format!("flag {flag:?}"));
             }
             _ => {}
