@@ -840,10 +840,12 @@ impl JSObject for ArrayObject {
                 if !self.length_writable {
                     return Err("Cannot assign to read-only property 'length'".to_string());
                 }
-                // Adjust array length (with the usual ArrayLength validation)
+                // Adjust array length (with the usual ArrayLength validation).
+                // `ArraySetLength` throws a *RangeError*; the `String` channel
+                // would flatten it into a TypeError, so it travels prefixed.
                 let n = value.to_number();
                 let new_len = crate::builtins::validate_array_length(n)
-                    .map_err(|_| "Invalid array length".to_string())?;
+                    .map_err(crate::vm::RuntimeError::into_property_error)?;
                 self.elements.resize(new_len, Value::Undefined);
                 Ok(true)
             }
@@ -938,8 +940,12 @@ impl JSObject for ArrayObject {
                     return Err("Cannot redefine property: length is non-configurable".to_string());
                 }
                 let n = desc.value.to_number();
+                // `validate_array_length` already builds the right error
+                // (`RangeError`); the `String` channel of `define_property`
+                // would flatten it into a TypeError, so it travels prefixed and
+                // `RuntimeError::from_property_error` unpacks it.
                 let new_len = crate::builtins::validate_array_length(n)
-                    .map_err(|_| "Invalid array length".to_string())?;
+                    .map_err(crate::vm::RuntimeError::into_property_error)?;
                 if !self.length_writable && new_len != self.elements.len() {
                     return Err("Cannot redefine property: length is non-writable".to_string());
                 }

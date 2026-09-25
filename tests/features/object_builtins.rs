@@ -2,7 +2,7 @@
 //! predicates, `ToObject` handling in the key/enumeration helpers, and
 //! descriptor conversion through `[[Get]]`.
 
-use crate::helpers::{eval_bool, eval_number, eval_string};
+use crate::helpers::{eval_bool, eval_js, eval_number, eval_string};
 
 #[test]
 fn is_prototype_of_walks_the_chain() {
@@ -332,4 +332,51 @@ fn get_own_property_descriptor_accepts_string_primitives() {
         eval_string("Object.getOwnPropertyNames('ab').join(',')"),
         "0,1,length"
     );
+}
+
+#[test]
+fn array_length_errors_are_range_errors() {
+    // `ArraySetLength` (ES 10.4.2.4) throws a *RangeError* for a length that is
+    // not a valid array index. The engine's `[[DefineOwnProperty]]` reports
+    // failure through a `String` channel, which used to flatten every failure
+    // into a TypeError — see `RuntimeError::from_property_error`.
+    eval_js(
+        "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+         var out = [
+           name_of(function () { var a = []; a.length = 4294967296; }),
+           name_of(function () { var a = []; a.length = 4294967297; }),
+           name_of(function () { var a = [1]; a.length = -1; }),
+           name_of(function () { var a = [1]; a.length = 1.5; }),
+           name_of(function () { Object.defineProperty([1], 'length', { value: -1 }); }),
+           name_of(function () { Object.defineProperty([1], 'length', { value: 4294967296 }); }),
+           name_of(function () { Object.defineProperties([1], { length: { value: -1 } }); }),
+           name_of(function () { new Array(-1); })
+         ];
+         if (out.join(',') !== 'RangeError,RangeError,RangeError,RangeError,RangeError,RangeError,RangeError,RangeError') {
+           throw new Error('got ' + out.join(','));
+         }",
+    )
+    .unwrap();
+
+    // Other property-write failures stay TypeErrors, and valid length writes
+    // keep working.
+    eval_js(
+        "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+         var o = {};
+         Object.defineProperty(o, 'x', { value: 1 });
+         var out = [
+           name_of(function () { Object.defineProperty(o, 'x', { value: 2 }); }),
+           name_of(function () { var a = [1]; Object.defineProperty(a, 'length', { writable: false }); a.length = 5; }),
+           name_of(function () { var a = Object.freeze([1]); a[0] = 2; })
+         ];
+         if (out.join(',') !== 'TypeError,TypeError,TypeError') {
+           throw new Error('got ' + out.join(','));
+         }
+         var a = [1, 2, 3];
+         a.length = 1;
+         if (a.join(',') !== '1') throw new Error('shrink');
+         a.length = 3;
+         if (a.length !== 3 || a[2] !== undefined) throw new Error('grow');",
+    )
+    .unwrap();
 }

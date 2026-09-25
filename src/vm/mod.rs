@@ -3213,7 +3213,7 @@ impl VM {
             &PropertyKey::from_str("length"),
             None,
         )
-        .map_err(RuntimeError::TypeError)?;
+        .map_err(RuntimeError::from_property_error)?;
         // ToLength: clamp negatives to 0 and cap the allocation, which keeps a
         // bogus `length` from trying to materialize billions of slots.
         let len = len_value.to_number();
@@ -3948,7 +3948,7 @@ impl VM {
             Value::Object(obj_ref) => {
                 let key = PropertyKey::from_str(prop);
                 crate::vm::prototype::internal_get(obj_ref.clone(), &key, None)
-                    .map_err(|e| RuntimeError::TypeError(e))
+                    .map_err(RuntimeError::from_property_error)
             }
             _ => Ok(Value::Undefined),
         }
@@ -4115,13 +4115,13 @@ impl VM {
                     let mut borrowed = obj_ref.borrow_mut();
                     borrowed
                         .property_set(key, value)
-                        .map_err(RuntimeError::TypeError)?;
+                        .map_err(RuntimeError::from_property_error)?;
                     return Ok(());
                 }
                 let mut borrowed = obj_ref.borrow_mut();
                 borrowed
                     .property_set(key, value)
-                    .map_err(RuntimeError::TypeError)?;
+                    .map_err(RuntimeError::from_property_error)?;
                 Ok(())
             }
             Value::Function(id) => {
@@ -5380,7 +5380,7 @@ impl VM {
                     let key = crate::vm::property::PropertyKey::from_str(method_name);
                     match crate::vm::prototype::internal_get(obj_ref.clone(), &key, None) {
                         Ok(v) => Ok(v),
-                        Err(e) => Err(RuntimeError::TypeError(e)),
+                        Err(e) => Err(RuntimeError::from_property_error(e)),
                     }
                 } else {
                     Ok(Value::Undefined)
@@ -5759,6 +5759,35 @@ pub enum RuntimeError {
     InternalError(String),
     /// A JS exception thrown by user code (via `throw`)
     Thrown(Value),
+}
+
+/// `[[DefineOwnProperty]]` reports failure as a plain `String`, which cannot
+/// carry the error *kind* — every failure out of that channel used to become a
+/// TypeError. One case genuinely needs a `RangeError` to survive: writing an
+/// array's `length` (ES 10.4.2.4 `ArraySetLength` throws RangeError, and
+/// `Object.defineProperty([], "length", {value: -1})` must not report a
+/// TypeError). The array's own `define_property` prefixes such messages with
+/// `RANGE_ERROR_PREFIX` and this is where they are turned back.
+pub const PROPERTY_ERROR_RANGE_PREFIX: &str = "RangeError: ";
+
+impl RuntimeError {
+    /// Turn a `[[DefineOwnProperty]]` failure message back into an error,
+    /// preserving the one kind that the `String` channel has to carry.
+    pub fn from_property_error(msg: String) -> Self {
+        match msg.strip_prefix(PROPERTY_ERROR_RANGE_PREFIX) {
+            Some(rest) => RuntimeError::RangeError(rest.to_string()),
+            None => RuntimeError::TypeError(msg),
+        }
+    }
+
+    /// Render an error for the `[[DefineOwnProperty]]` `String` channel,
+    /// preserving `RangeError` through [`PROPERTY_ERROR_RANGE_PREFIX`].
+    pub fn into_property_error(self) -> String {
+        match self {
+            RuntimeError::RangeError(msg) => format!("{PROPERTY_ERROR_RANGE_PREFIX}{msg}"),
+            other => other.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for RuntimeError {

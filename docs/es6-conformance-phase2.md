@@ -11,12 +11,12 @@
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | test262 执行 | 17477 | runner 实际跑的数 |
-| 通过 | **13232** | 主指标（B1 后） |
-| 失败 | 4245 | 其中约 3600 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
+| 通过 | **13264** | 主指标（B5a 后） |
+| 失败 | 4213 | 其中约 3570 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
 | 跳过 | 8109 | 全部为范围外或 G3 排除项 |
-| 通过率 | 75.71% | 参考值 |
+| 通过率 | 75.89% | 参考值 |
 | 单元测试 | 190 全绿 | |
-| feature 集成测试 | 23 个文件 / 420 用例全绿 | |
+| feature 集成测试 | 23 个文件 / 421 用例全绿 | |
 | 全量耗时 | 2m48s | B1 的协议化 spread 带来的上升，见 §6.1 |
 | runner 覆盖面 | 25586 / 53568 个测试文件（**47%**） | 见 §2.3 |
 
@@ -96,7 +96,7 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 悬空 | 结论落地（实现则 ≥ 50%，降级则写进范围外栏） |
-| A8 | 计划内通过数 | 13232 | ≥ 20000（本阶段结束时） |
+| A8 | 计划内通过数 | 13264 | ≥ 20000（本阶段结束时） |
 | A9 | 单元 / feature 测试 | 190 / 417 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
@@ -154,7 +154,8 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | **B2** | M5-C1 `Map`/`Set`（含入册解锁） | 587 | ES6 承诺内最早能整体交付、不依赖新机制 |
 | **B3** | M5-C2 `WeakMap`/`WeakSet` | 226 | 与 B2 同构，可顺带 |
 | **B4** | M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策 | — | 把 KPI 的杂音清掉，再动大件 |
-| **B5** | M7-P4 Object 描述符长尾 | 217 | 单点确定 |
+| **B5a** ✅ | M7-P4 前半：数组 `length` 的错误种类（应为 RangeError） | +32 | **已完成**，见 §6.1 |
+| **B5b** | M7-P4 后半：非可写索引的重定义未抛错、`defineProperty` 的其余 TypeError 缺口 | ≈60 | 已定位，见 §6.1 残留 |
 | **B6** | M7-P6 生成器剩余 + M7-P5 数据模型三债 | 203 + — | 债不还，后面的用例会持续被它误导 |
 | **B7** | M7-P1 Array 回调泛型/访问器上移 VM | ≈450 | **最贵的一批**，跨 builtin/VM 两层，建议再拆 2–3 个小批 |
 | **B8** | M7-P2 class 求值顺序与 own-property | 705 | 单批第二贵 |
@@ -208,6 +209,30 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 **残留**（转入 M7-P1，不在本批范围）：
 
 - `[...a]` 中数组元素的**访问器不执行**（`array_like_elements` 对真数组读密集存储）。实测 `var a=[1,2]; Object.defineProperty(a,0,{get:()=>99}); [...a]` 得到 `[,2]`，应为 `[99,2]`。与 `built-ins/Array/prototype/includes/values-are-not-cached.js`、`.../values/iteration-mutable.js` 同源，都是"builtin 层读不到访问器/不按 `[[Get]]` 取值"。
+
+#### B5a 数组 `length` 的错误种类 —— 已完成（2026-09-25）
+
+**起点**：通过 13232 / 17477（75.71%）。
+
+**根因**：`[[DefineOwnProperty]]` / `[[Set]]` 的失败只能通过一个 `String` 通道上报，调用点一律 `.map_err(RuntimeError::TypeError)` —— **错误种类在通道里被抹平**。而 `ArraySetLength`（ES 10.4.2.4）对非法的 `length` 要求 **RangeError**，`ArrayObject` 的两个分支（`define_property` 与 `property_set`）里 `validate_array_length(n)` 本来返回的正是 `RuntimeError::RangeError`，却被 `.map_err(|_| "Invalid array length".to_string())` 丢掉了。
+
+**改动**：给 `String` 通道加一个只承载这一种差异的前缀。
+
+1. `RuntimeError::into_property_error()`：把 `RangeError` 渲染成 `"RangeError: <msg>"`，其余照旧（`PROPERTY_ERROR_RANGE_PREFIX`）。
+2. `RuntimeError::from_property_error()`：把带前缀的消息还原成 `RangeError`，其余仍是 `TypeError`。
+3. `ArrayObject` 的 `define_property` / `property_set` 两处对 `length` 改用 `into_property_error`（不再丢类型）。
+4. 所有**写入路径**的 `String → RuntimeError` 转换点改用 `from_property_error`：`Object.defineProperty` / `defineProperties` 的两处、`set_member` 的两处 `property_set`、以及 `define_property` 的 `length` 用法。
+
+只改写入路径，读路径（`find_descriptor` / `internal_get` / `internal_has_property`）保持原样 —— 它们不可能产生带前缀的消息。
+
+**效果**：**+32**（13232 → 13264），通过率 75.71% → 75.89%，失败 4245 → 4213。`built-ins/Object` 2611 → **2639**（`defineProperties/15.2.3.7-6-a-*` 一族的 28 条），`built-ins/Array` 1947 → **1951**（`length/15.4.5.1-3.d-*`、`define-own-prop-length-error`、`splice/create-non-array-invalid-len`）。
+
+**逐套件零回退**；单元 190 全绿；features 420 → 421（新增 `array_length_errors_are_range_errors`，覆盖 8 种非法长度写入的 RangeError 与 3 种仍应为 TypeError 的写入，加上长度合法增减）。
+
+**残留**（M7-P4 的后半）：
+
+- `*.length = X` 之外，**非可写数组索引的重定义没有抛错**：实测 `Object.defineProperty(a, 0, {value:1,writable:false}); Object.defineProperty(a, 0, {value:2})` 静默通过，应为 TypeError。属 `validate_property_redefinition` 在数组索引分支的缺口。
+- P4 里剩下的 `Expected a TypeError to be thrown`（约 42 条）与 `TypeError: undefined is not a function`（26 条）尚未归族。
 
 ---
 

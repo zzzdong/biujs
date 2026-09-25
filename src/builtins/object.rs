@@ -198,36 +198,36 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
                     PropertyKey::from_str("get"),
                     desc.getter.clone().unwrap_or(undefined.clone()),
                 )
-                .map_err(|e| RuntimeError::TypeError(e))?;
+                .map_err(RuntimeError::from_property_error)?;
             desc_obj
                 .property_set(
                     PropertyKey::from_str("set"),
                     desc.setter.clone().unwrap_or(undefined),
                 )
-                .map_err(|e| RuntimeError::TypeError(e))?;
+                .map_err(RuntimeError::from_property_error)?;
         } else {
             desc_obj
                 .property_set(PropertyKey::from_str("value"), desc.value.clone())
-                .map_err(|e| RuntimeError::TypeError(e))?;
+                .map_err(RuntimeError::from_property_error)?;
             desc_obj
                 .property_set(
                     PropertyKey::from_str("writable"),
                     Value::Bool(desc.writable),
                 )
-                .map_err(|e| RuntimeError::TypeError(e))?;
+                .map_err(RuntimeError::from_property_error)?;
         }
         desc_obj
             .property_set(
                 PropertyKey::from_str("enumerable"),
                 Value::Bool(desc.enumerable),
             )
-            .map_err(|e| RuntimeError::TypeError(e))?;
+            .map_err(RuntimeError::from_property_error)?;
         desc_obj
             .property_set(
                 PropertyKey::from_str("configurable"),
                 Value::Bool(desc.configurable),
             )
-            .map_err(|e| RuntimeError::TypeError(e))?;
+            .map_err(RuntimeError::from_property_error)?;
         Ok(Value::Object(Rc::new(RefCell::new(desc_obj))))
     } else {
         Ok(Value::Undefined)
@@ -448,7 +448,7 @@ pub fn apply_property_descriptor(
             .unwrap_or_else(|| current(|d| d.configurable));
         return obj
             .define_property(key.clone(), descriptor)
-            .map_err(RuntimeError::TypeError);
+            .map_err(RuntimeError::from_property_error);
     }
 
     let value = match read("value") {
@@ -466,7 +466,7 @@ pub fn apply_property_descriptor(
         .map(|v| v.to_boolean())
         .unwrap_or_else(|| current(|d| d.configurable));
     obj.define_property(key.clone(), descriptor)
-        .map_err(RuntimeError::TypeError)
+        .map_err(RuntimeError::from_property_error)
 }
 
 pub fn object_has_own(args: &[Value]) -> Result<Value, RuntimeError> {
