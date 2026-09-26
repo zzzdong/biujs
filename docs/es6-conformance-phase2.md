@@ -10,13 +10,13 @@
 
 | 指标 | 数值 | 说明 |
 |------|------|------|
-| test262 执行 | 17647 | runner 实际跑的数（B2a 起含 `built-ins/Map`） |
-| 通过 | **13584** | 主指标（B2a 后） |
-| 失败 | 4063 | 其中约 3430 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
-| 跳过 | 8143 | 范围外 / G3 排除项 + 已入册套件自己的 feature 门控（`built-ins/Map` 42 条） |
-| 通过率 | 76.98% | 参考值 |
+| test262 执行 | 18024 | runner 实际跑的数（B2a 起含 `built-ins/Map`，B2b 起含 `built-ins/Set`） |
+| 通过 | **13943** | 主指标（B2b 后） |
+| 失败 | 4081 | 其中约 3400 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
+| 跳过 | 8149 | 范围外 / G3 排除项 + 已入册套件自己的 feature 门控（`Map` 30 条 + `Set` 26 条） |
+| 通过率 | 77.36% | 参考值 |
 | 单元测试 | 190 全绿 | |
-| feature 集成测试 | 31 个文件 / 436 用例全绿 | |
+| feature 集成测试 | 32 个文件 / 442 用例全绿 | |
 | 全量耗时 | 2m50s | B1 的协议化 spread 带来的上升，见 §6.1 |
 | runner 覆盖面 | 25586 / 53568 个测试文件（**47%**） | 见 §2.3 |
 
@@ -152,7 +152,7 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | **B0** ✅ | 度量铺底：§2.3 清单入文档；把"入册+解锁联动"写进 runner 的注释与 §6.2 | — | **已完成**，见 §6.1 |
 | **B1** ✅ | M7-P3 的 spread 走 `GetIterator`（含 `ArrayPushSpread` 重写） | +21 | **已完成**，见 §6.1；顺带修好 `@@iterator === values` 与 `values/keys/entries` 的接收者校验 |
 | **B2a** ✅ | M5-C1 前半：`Map`（含入册解锁） | 204（入册后执行 162） | **已完成**，见 §6.1；套件通过率 95.68%，A3 的 ≥80% 达标 |
-| **B2b** | M5-C1 后半：`Set`（与 `Map` 同构，可顺带做 `WeakMap`/`WeakSet`） | 383 | 复用 B2a 的迭代器与接收者检查套路 |
+| **B2b** ✅ | M5-C1 后半：`Set`（含 `set-methods` 七个算子） | 383 | **已完成**，见 §6.1；套件通过率 94.40%，A3 的 ≥80% 达标 |
 | **B3** | M5-C2 `WeakMap`/`WeakSet` | 226 | 与 B2 同构，可顺带 |
 | **B4** | M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策 | — | 把 KPI 的杂音清掉，再动大件 |
 | **B5a** ✅ | M7-P4 前半：数组 `length` 的错误种类（应为 RangeError） | +32 | **已完成**，见 §6.1 |
@@ -352,6 +352,58 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 - `built-ins/Map` 剩 7 条：4 条是 `Map.groupBy` 之后用 `Array.from(map.keys())` 取结果 —— **`Array.from` 根本不走迭代协议**（`builtins/array.rs::array_from` 只按 `length` + 索引取快照），这是 ES6 范围内的独立缺口，`built-ins/Array/from` 里还有 30 条同源失败；1 条 `map.js` 等全局对象（顶层 `this`）；2 条需要"闭包内可写外部变量"（M7-P5 数据模型债）。
 - **`Set` / `WeakMap` / `WeakSet` 仍未开工**（B2b），`Map` 的迭代器状态与接收者检查可以直接复用。
 - `Map.groupBy`（ES2024）与 `getOrInsert`/`getOrInsertComputed`（ES2026 提案）**不在 ES6 承诺面内**，但已在钉住的 test262 里、且和 `Map` 同一套迭代/回调机制，所以随本批实现了（38 条）。M8-V3 若要按"范围外"把它们从 KPI 里摘掉，可以再讨论 —— 它们不是 M7 的承诺。
+
+#### B2b `Set` —— 已完成（2026-09-26）
+
+**起点**：通过 13584 / 17647（76.98%）。
+
+**交付**：`Set` 从 `IN_SCOPE_PENDING` 摘掉，`built-ins/Set` 加进 `SUITES`。入册后 `built-ins/Set` **337 / 357 = 94.40%**，A3 的 ≥80% 达标。
+
+**改动**
+
+| 层 | 内容 |
+|----|------|
+| `vm/object.rs` | `SetObject`（`Vec<Option<Value>>` 保插入序、`SameValueZero`、`-0` 归一、墓碑删除）+ `impl JSObject`，与 `MapObject` 同构 |
+| `vm/iterator.rs` | `NativeIteratorState::Set { set, kind, idx, done }` + `SetIterKind{Value, Entry}`（`entries` 产出 `[v, v]`） |
+| `builtins/set.rs`（新） | `add`/`has`/`delete`/`clear`、`size` 访问器、`Symbol.toStringTag`、`Set.prototype.keys === values`（同一个函数对象） |
+| `builtins/mod.rs` | `set_prototype` 字段与装配、`Set[Symbol.species]` 访问器、arity（`Set` 0、`add`/`has`/`delete` 1、`set-methods` 各 1） |
+| `vm/mod.rs` | `set_construct`（`GetIterator` + `Get(set,"add")` 后 `Call`，任一 abrupt 先 `IteratorClose`）、`set_for_each`、`set_iterator`、`map_method`/`set_method` 拆分、`SetRecord` + 七个集合算子 |
+| `tests/` | `tests/features/set.rs`（6 组断言）+ runner 的解锁/入册 |
+
+**两个必须记住的坑**
+
+1. **Map 与 Set 的原型方法必须各有各的派发前缀**。B2a 时我用的是单一 `__collection_method__` + "按接收者类型分派"，结果 `Set.prototype.has.call(new Map())` 会被分派到 `Map.prototype.has` 而**不抛错** —— 规范要求它是 TypeError。同名方法（`has`/`delete`/`clear`）到底属于哪个原型，只能靠**派发名**区分：现在 `MAP_METHOD_PREFIX` 与 `SET_METHOD_PREFIX` 各自成对，`VM::map_method` / `VM::set_method` 各自校验接收者。`call_prototype_method` 里那批带接收者守卫的同名分支随之删掉。
+2. **集合迭代器"走完一轮"是永久的**。`values-iteration-mutable.js` 明确要求：迭代器耗尽之后再 `add` 新元素，后续 `next()` 仍然是 `done`。规范的做法是把内部"迭代对象"置空（ES 23.2.5.2.1 step 9），实现里就是状态上一个 `done` 标志。Map 侧同源，一并加上。
+
+**顺带把 `set-methods`（ES2024）实现掉了**：`union` / `intersection` / `difference` / `symmetricDifference` / `isSubsetOf` / `isSupersetOf` / `isDisjointFrom` 共 179 条，是本套件最大的失败族。要点：
+
+- `GetSetRecord` 的 `ToNumber(size)` **会跑用户代码**（`size` 可以是带 `valueOf` 的对象，测试会数这个调用），所以不能停留在 `Value::to_number()`，要走 VM 的 `to_primitive`；
+- `intersection` / `difference` 按**较小的一侧**决定遍历谁，这直接决定结果顺序（`[...new Set([3,2,1,0]).intersection(new Set([1,3,5]))]` 是 `[1,3]` 而不是 `[3,1]`）；`difference` 在 `this.size ≤ arg.size` 时**根本不创建** `keys()` 迭代器（`allows-set-like-*.js` 就查这个）；
+- 提前得出答案时（`isSupersetOf`/`isDisjointFrom` 返回 `false`）必须 `IteratorClose`，测试数 `return()` 调用次数；
+- 结果永远是**普通 `Set`**（`%Set.prototype%`），不看子类也不看 `@@species`。
+
+**效果**
+
+| 指标 | 起点 | 本批后 |
+|------|------|--------|
+| 全量通过 | 13584（76.98%） | **13943**（77.36%） |
+| 失败 | 4063 | **4081**（新增执行的用例里含失败） |
+| 执行 / 跳过 | 17647 / 8143 | 18024 / 8149 |
+| `built-ins/Set` | 未入册 | **337 / 357 = 94.40%** |
+| `built-ins/Map` | 155（+ 新解锁 12 条） | **167 / 174 = 95.98%** |
+| `language/statements/for-of` | 381 | **386** |
+| `language/statements/class` | 1113 | **1116** |
+| 其余 | — | `Object`+1、`expressions/class`+1 |
+
+净 **+359**，**逐套件零回退**。单元 190 全绿；features 436 → **442**（新增 `tests/features/set.rs`，6 组）。
+
+**残留**
+
+- `built-ins/Set` 剩 20 条，全部是**结构性债**而不是 Set 本身的问题：
+  - 7 条 `*/size-is-a-number.js` 要求 `size` 是 BigInt 时抛 TypeError —— **引擎没有 BigInt**（§3 范围外），这 7 条要等 BigInt 决策；
+  - 7 条 `*/set-like-class-order.js`、`*/set-like-class-mutation.js` 依赖"闭包内自增外部标量"（`index++`、`nextCalls++`），即 M7-P5 的闭包捕获债 —— 其中 `symmetricDifference` 那条会退化成死循环（撞步数上限）；
+  - 1 条 `set.js` 等全局对象（顶层 `this`）。
+- `WeakMap` / `WeakSet` 仍未开工（B3）。它们可以完全复用本批的 `MAP_METHOD_PREFIX`/`SET_METHOD_PREFIX` 套路，但**只有 `get`/`set`/`has`/`delete` 四个方法**（无 `size`、无迭代器），`Rc` 下"弱"引用退化为强引用这一点要按 §8 登记偏差。
 
 ---
 

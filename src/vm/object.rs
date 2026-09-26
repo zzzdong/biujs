@@ -1663,11 +1663,17 @@ impl NativeFunctionObject {
             method.to_string()
         } else if let Some(method) = self.name.strip_prefix(crate::builtins::MAP_METHOD_PREFIX) {
             method.to_string()
-        } else if self.name == crate::builtins::MAP_SIZE_NATIVE {
-            // `Map.prototype.size` is an accessor, so its function object is
-            // named like one: "get size" (ES 23.1.3.9).
+        } else if let Some(method) = self.name.strip_prefix(crate::builtins::SET_METHOD_PREFIX) {
+            method.to_string()
+        } else if self.name == crate::builtins::MAP_SIZE_NATIVE
+            || self.name == crate::builtins::SET_SIZE_NATIVE
+        {
+            // `Map.prototype.size` / `Set.prototype.size` are accessors, so
+            // their function objects are named like one: "get size".
             "get size".to_string()
-        } else if self.name == crate::builtins::MAP_SPECIES_NATIVE {
+        } else if self.name == crate::builtins::MAP_SPECIES_NATIVE
+            || self.name == crate::builtins::SET_SPECIES_NATIVE
+        {
             "get [Symbol.species]".to_string()
         } else if self.name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
             // `Array.prototype[Symbol.iterator].name` is "[Symbol.iterator]".
@@ -2264,6 +2270,199 @@ impl JSObject for MapObject {
 
     fn class_name(&self) -> &'static str {
         "Map"
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// SetObject — `Set` instances (ES 23.2)
+// ─────────────────────────────────────────────────────────
+
+/// An ES6 `Set`: values in insertion order, looked up by `SameValueZero`.
+///
+/// Same storage discipline as [`MapObject`] — tombstones instead of splicing,
+/// because Set iterators are live (`delete` during iteration must not make the
+/// walk skip the entry that shifts into the freed slot).
+#[derive(Debug)]
+pub struct SetObject {
+    entries: Vec<Option<Value>>,
+    properties: PropertyTable,
+    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    extensible: bool,
+    frozen: bool,
+    sealed: bool,
+}
+
+impl SetObject {
+    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        Self {
+            entries: Vec::new(),
+            properties: PropertyTable::new(),
+            prototype,
+            extensible: true,
+            frozen: false,
+            sealed: false,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_some()).count()
+    }
+
+    pub fn index_of(&self, value: &Value) -> Option<usize> {
+        let value = map_key(value.clone());
+        self.entries.iter().position(|slot| {
+            slot.as_ref().is_some_and(|v| same_value_zero(v, &value))
+        })
+    }
+
+    pub fn has(&self, value: &Value) -> bool {
+        self.index_of(value).is_some()
+    }
+
+    /// `Set.prototype.add` — `-0` is stored as `+0`, a duplicate is a no-op.
+    pub fn add(&mut self, value: Value) {
+        let value = map_key(value);
+        if self.index_of(&value).is_some() {
+            return;
+        }
+        self.entries.push(Some(value));
+    }
+
+    pub fn delete(&mut self, value: &Value) -> bool {
+        match self.index_of(value) {
+            Some(idx) => {
+                self.entries[idx] = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// The live value at or after `idx`, skipping tombstones (ES 23.2.5.2.1).
+    pub fn entry_from(&self, idx: usize) -> Option<(usize, Value)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .skip(idx)
+            .find_map(|(i, slot)| slot.as_ref().map(|v| (i, v.clone())))
+    }
+}
+
+impl JSObject for SetObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Set
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        self.properties.get(key).cloned()
+    }
+
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        if self.frozen {
+            return Err("Cannot set property on frozen object".to_string());
+        }
+        if let Some(existing) = self.properties.get(&key) {
+            if !existing.writable {
+                return Err("Cannot assign to read-only property".to_string());
+            }
+        } else if !self.extensible {
+            return Err("Cannot add property to non-extensible object".to_string());
+        }
+        self.properties
+            .insert(key, PropertyDescriptor::data_descriptor(value));
+        Ok(true)
+    }
+
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        desc: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        match self.properties.get(&key).cloned() {
+            Some(current) => validate_property_redefinition(&current, &desc)?,
+            None if !self.extensible => {
+                return Err("Cannot add property to non-extensible object".to_string());
+            }
+            None => {}
+        }
+        self.properties.insert(key, desc);
+        Ok(true)
+    }
+
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        if self.frozen || self.sealed {
+            return false;
+        }
+        if let Some(desc) = self.properties.get(key) {
+            if !desc.configurable {
+                return false;
+            }
+        }
+        self.properties.remove(key).is_some()
+    }
+
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        self.properties.contains_key(key)
+    }
+
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.properties.keys()
+    }
+
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.prototype.clone()
+    }
+
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        if !self.frozen {
+            self.prototype = proto;
+        }
+    }
+
+    fn is_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    fn prevent_extensions(&mut self) {
+        self.extensible = false;
+    }
+
+    fn is_frozen(&self) -> bool {
+        is_frozen_desc_set(self)
+    }
+
+    fn freeze(&mut self) {
+        self.extensible = false;
+        freeze_property_table(&mut self.properties);
+    }
+
+    fn is_sealed(&self) -> bool {
+        is_sealed_desc_set(self)
+    }
+
+    fn seal(&mut self) {
+        self.extensible = false;
+        seal_property_table(&mut self.properties);
+    }
+
+    fn type_of(&self) -> &'static str {
+        "object"
+    }
+
+    fn class_name(&self) -> &'static str {
+        "Set"
     }
 }
 

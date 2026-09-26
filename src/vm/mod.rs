@@ -1331,15 +1331,25 @@ impl VM {
         if name == crate::builtins::MAP_SIZE_NATIVE {
             return crate::builtins::map_size(&this);
         }
-        // `get Map[Symbol.species]` answers its receiver (ES 23.1.2.2).
-        if name == crate::builtins::MAP_SPECIES_NATIVE {
+        // `Set.prototype.size` getter (ES 23.2.3.9).
+        if name == crate::builtins::SET_SIZE_NATIVE {
+            return crate::builtins::set_size(&this);
+        }
+        // `get Map[Symbol.species]` / `get Set[Symbol.species]` (23.1.2.2,
+        // 23.2.2.2) both answer their receiver.
+        if name == crate::builtins::MAP_SPECIES_NATIVE
+            || name == crate::builtins::SET_SPECIES_NATIVE
+        {
             return Ok(this);
         }
-        // `Map.prototype.entries/keys/values/forEach`: they either call a user
-        // callback or mint an iterator object, so they are dispatched here
-        // rather than in the builtin layer.
+        // `Map`/`Set` prototype methods are dispatched here, not in the builtin
+        // layer: they either call a user callback or mint an iterator object,
+        // and their dispatch name carries which prototype they came from.
         if let Some(method) = name.strip_prefix(crate::builtins::MAP_METHOD_PREFIX) {
             return self.map_method(&this, method, args, module);
+        }
+        if let Some(method) = name.strip_prefix(crate::builtins::SET_METHOD_PREFIX) {
+            return self.set_method(&this, method, args, module);
         }
         // Generator methods: `gen.next(v)` resumes the body, `gen.return(v)` /
         // `gen.throw(e)` complete it, and `gen[Symbol.iterator]()` hands the
@@ -3475,24 +3485,9 @@ impl VM {
         Ok(Value::Number(-1.0))
     }
 
-    /// Run an `Array.prototype` method that has to call back into user code.
-    ///
-    /// Returns `Ok(None)` when `method` is not one of those methods, so callers
-    /// can fall back to the ordinary dispatch chain.
-    /// The `Map.prototype` methods that cannot live in the builtin layer
-    /// (ES 23.1.3.4–7 / 23.1.5.4): `forEach` calls the callback, and the three
-    /// iterator factories mint iterator objects, which only the VM's registry
-    /// can hand out.
-    ///
-    /// `None` means "not a Map method on a Map receiver" — the ordinary
-    /// dispatch then raises the TypeError the spec asks for
-    /// (`Map.prototype.get.call({}, 'x')`).
-    /// `Map.prototype.forEach` and the three iterator factories (ES 23.1.3.4–7).
-    ///
-    /// All four start with "the receiver must be an object carrying
-    /// `[[MapData]]`", which is why they carry their own dispatch prefix —
-    /// the same-named `Array.prototype` methods accept a non-array receiver
-    /// instead of rejecting it.
+    /// `Map.prototype` methods (ES 23.1.3). Dispatched under
+    /// `MAP_METHOD_PREFIX`, so the receiver check is exact: an object that is
+    /// not a Map raises, even when the method name also exists elsewhere.
     fn map_method(
         &mut self,
         this: &Value,
@@ -3500,16 +3495,20 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Value, RuntimeError> {
-        let is_map = match this {
-            Value::Object(obj_ref) => obj_ref.borrow().kind() == ObjectKind::Map,
-            _ => false,
-        };
+        let is_map = matches!(this, Value::Object(o) if o.borrow().kind() == ObjectKind::Map);
         if !is_map {
             return Err(RuntimeError::TypeError(format!(
                 "Map.prototype.{method} called on an incompatible receiver"
             )));
         }
         match method {
+            // The pure methods reuse the builtin layer's implementations; they
+            // re-check the receiver, which is harmless.
+            "get" => crate::builtins::map_get(this, args),
+            "has" => crate::builtins::map_has(this, args),
+            "set" => crate::builtins::map_set(this, args),
+            "delete" => crate::builtins::map_delete(this, args),
+            "clear" => crate::builtins::map_clear(this, args),
             "forEach" => self.map_for_each(this, args, module),
             // `upsert` (ES2026 proposal, already in the pinned test262):
             // "return the value for key, inserting one if it is missing".
@@ -3517,6 +3516,167 @@ impl VM {
             "getOrInsertComputed" => self.map_get_or_insert_computed(this, args, module),
             _ => self.map_iterator(this, method, module),
         }
+    }
+
+    /// `Set.prototype` methods (ES 23.2.3) — the Set-side mirror of
+    /// [`Self::map_method`].
+    fn set_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let is_set = matches!(this, Value::Object(o) if o.borrow().kind() == ObjectKind::Set);
+        if !is_set {
+            return Err(RuntimeError::TypeError(format!(
+                "Set.prototype.{method} called on an incompatible receiver"
+            )));
+        }
+        match method {
+            "add" => crate::builtins::set_add(this, args),
+            "has" => crate::builtins::set_has(this, args),
+            "delete" => crate::builtins::set_delete(this, args),
+            "clear" => crate::builtins::set_clear(this, args),
+            "forEach" => self.set_for_each(this, args, module),
+            // `set-methods` (ES2024 24.2.3.9–15): the seven operators over a
+            // set-like argument (`{ size, has, keys }`).
+            "union" | "intersection" | "difference" | "symmetricDifference" | "isSubsetOf"
+            | "isSupersetOf" | "isDisjointFrom" => {
+                self.set_like_method(this, method, args, module)
+            }
+            _ => self.set_iterator(this, method, module),
+        }
+    }
+
+    /// `Set.prototype.forEach(cb, thisArg)` (ES 23.2.3.6): the callback gets
+    /// `(value, value, set)`.
+    fn set_for_each(
+        &mut self,
+        set_val: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let callback = args.first().cloned().unwrap_or(Value::Undefined);
+        if !callback.is_callable() {
+            return Err(RuntimeError::TypeError(
+                "Set.prototype.forEach callback is not a function".to_string(),
+            ));
+        }
+        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let Value::Object(obj_ref) = set_val else {
+            return Err(RuntimeError::TypeError(
+                "Set.prototype.forEach called on a non-object".to_string(),
+            ));
+        };
+        let mut idx = 0;
+        loop {
+            let step = {
+                let borrowed = obj_ref.borrow();
+                borrowed
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::SetObject>()
+                    .and_then(|set| set.entry_from(idx))
+            };
+            let Some((next, value)) = step else {
+                break;
+            };
+            idx = next + 1;
+            self.invoke(
+                &callback,
+                this_arg.clone(),
+                &[value.clone(), value, set_val.clone()],
+                module,
+            )?;
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// `Set.prototype.values()` / `keys()` / `entries()` (ES 23.2.3.4–8). The
+    /// result is live: it holds the set, not a snapshot.
+    fn set_iterator(
+        &mut self,
+        set_val: &Value,
+        method: &str,
+        _module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::iterator::{NativeIteratorObject, NativeIteratorState, SetIterKind};
+        let kind = match method {
+            "entries" => SetIterKind::Entry,
+            _ => SetIterKind::Value,
+        };
+        let Value::Object(obj_ref) = set_val else {
+            return Err(RuntimeError::TypeError(format!(
+                "Set.prototype.{method} called on a non-object"
+            )));
+        };
+        let id = self.next_iterator_id;
+        self.next_iterator_id += 1;
+        let iter_val = Value::Object(Rc::new(RefCell::new(NativeIteratorObject::new(
+            id,
+            NativeIteratorState::Set {
+                set: Rc::clone(obj_ref),
+                kind,
+                idx: 0,
+                done: false,
+            },
+        ))));
+        self.iterator_registry.insert(id, iter_val.clone());
+        Ok(iter_val)
+    }
+
+    /// `new Set([iterable])` (ES 23.2.1.1) — same shape as `map_construct`.
+    fn set_construct(
+        &mut self,
+        constructor_val: &Value,
+        args: &[Value],
+        new_target: Option<&Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let proto = self.prototype_from_constructor(constructor_val, new_target);
+        let prototype = match &proto {
+            Some(Value::Object(p)) => Some(Rc::clone(p)),
+            _ => Some(Rc::clone(&self.builtins.set_prototype)),
+        };
+        let set_val = Value::Object(Rc::new(RefCell::new(crate::vm::object::SetObject::new(
+            prototype,
+        ))));
+
+        let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+        if !matches!(iterable, Value::Undefined | Value::Null) {
+            let iter = self.make_iterator(iterable, module)?;
+            // Step 8.a: the adder is fetched once, through `[[Get]]`.
+            let adder = match self.get_member(&set_val, &PropertyKey::from_str("add"), module) {
+                Ok(adder) => adder,
+                Err(err) => {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(err);
+                }
+            };
+            if !adder.is_callable() {
+                self.iterator_close(iter, None, true, module)?;
+                return Err(RuntimeError::TypeError(
+                    "Set constructor: 'add' is not callable".to_string(),
+                ));
+            }
+            loop {
+                let (value, done) = match self.iterator_next(iter.clone(), None, module) {
+                    Ok(step) => step,
+                    Err(err) => {
+                        self.iterator_close(iter, None, true, module)?;
+                        return Err(err);
+                    }
+                };
+                if done {
+                    break;
+                }
+                if let Err(err) = self.invoke(&adder, set_val.clone(), &[value], module) {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(set_val)
     }
 
     /// `Map.prototype.getOrInsert(key, value)`.
@@ -3541,6 +3701,298 @@ impl VM {
                 Ok(value)
             }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Set methods (`set-methods`, ES2024)
+    // ─────────────────────────────────────────────────────────
+
+    /// `Set.prototype.union` / `intersection` / … (ES2024 24.2.3).
+    ///
+    /// Seven methods share one shape: validate `this` (done by the caller),
+    /// turn the argument into a *set record* through `GetSetRecord`, then walk
+    /// one side's keys/values. `union` and `difference` were designed to be
+    /// order-stable; check each one's doc before "optimising" the walk.
+    fn set_like_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let other = args.first().cloned().unwrap_or(Value::Undefined);
+        let record = self.get_set_record(&other, method, module)?;
+        match method {
+            // Copy `this`, then append everything from `other` that is new.
+            "union" => {
+                let result = self.set_copy_of(this);
+                let iter = self.iter_from_method(&record.object, &record.keys, module)?;
+                loop {
+                    let (value, done) = self.iterator_next(iter.clone(), None, module)?;
+                    if done {
+                        break;
+                    }
+                    if !set_data_has(&result, &value) {
+                        set_data_add(&result, value);
+                    }
+                }
+                Ok(result)
+            }
+            // Spec: when `other` is strictly smaller it is the side that is
+            // walked (the result then comes out in `other`'s order), otherwise
+            // `this` is walked and filtered through `otherRec.[[Has]]`.
+            "intersection" => {
+                let this_size = set_data_size(this);
+                if record.size >= this_size {
+                    let result = set_data_new(Some(self.builtins.set_prototype.clone()));
+                    for value in set_data_values(this) {
+                        let keep = self.invoke(
+                            &record.has,
+                            record.object.clone(),
+                            std::slice::from_ref(&value),
+                            module,
+                        )?;
+                        if keep.to_boolean() {
+                            set_data_add(&result, value);
+                        }
+                    }
+                    Ok(result)
+                } else {
+                    let result = set_data_new(Some(self.builtins.set_prototype.clone()));
+                    let iter = self.iter_from_method(&record.object, &record.keys, module)?;
+                    loop {
+                        let (value, done) = self.iterator_next(iter.clone(), None, module)?;
+                        if done {
+                            break;
+                        }
+                        if set_data_has(this, &value) {
+                            set_data_add(&result, value);
+                        }
+                    }
+                    Ok(result)
+                }
+            }
+            // Same size rule as `intersection`, mirrored: when `this` is the
+            // smaller side it is walked and each element asked of
+            // `otherRec.[[Has]]`; `other`'s keys iterator is not even created
+            // (`difference/allows-set-like-*.js` asserts exactly that).
+            "difference" => {
+                if set_data_size(this) <= record.size {
+                    let result = set_data_new(Some(self.builtins.set_prototype.clone()));
+                    for value in set_data_values(this) {
+                        let found = self.invoke(
+                            &record.has,
+                            record.object.clone(),
+                            std::slice::from_ref(&value),
+                            module,
+                        )?;
+                        if !found.to_boolean() {
+                            set_data_add(&result, value);
+                        }
+                    }
+                    Ok(result)
+                } else {
+                    let result = self.set_copy_of(this);
+                    let iter = self.iter_from_method(&record.object, &record.keys, module)?;
+                    loop {
+                        let (value, done) = self.iterator_next(iter.clone(), None, module)?;
+                        if done {
+                            break;
+                        }
+                        set_data_delete(&result, &value);
+                    }
+                    Ok(result)
+                }
+            }
+            // Copy `this`; each of `other`'s keys toggles membership.
+            "symmetricDifference" => {
+                let result = self.set_copy_of(this);
+                let iter = self.iter_from_method(&record.object, &record.keys, module)?;
+                loop {
+                    let (value, done) = self.iterator_next(iter.clone(), None, module)?;
+                    if done {
+                        break;
+                    }
+                    if !set_data_delete(&result, &value) {
+                        set_data_add(&result, value);
+                    }
+                }
+                Ok(result)
+            }
+            // `isSubsetOf` walks `this` and asks `otherRec.[[Has]]` for each
+            // element; the size check is only a shortcut (ES 24.2.3.16).
+            "isSubsetOf" => {
+                if set_data_size(this) > record.size {
+                    return Ok(Value::Bool(false));
+                }
+                for value in set_data_values(this) {
+                    let found = self.invoke(
+                        &record.has,
+                        record.object.clone(),
+                        std::slice::from_ref(&value),
+                        module,
+                    )?;
+                    if !found.to_boolean() {
+                        return Ok(Value::Bool(false));
+                    }
+                }
+                Ok(Value::Bool(true))
+            }
+            // …and `isSupersetOf` the other way round: walk `other`'s keys and
+            // look each one up in `this`.
+            "isSupersetOf" => {
+                if record.size > set_data_size(this) {
+                    return Ok(Value::Bool(false));
+                }
+                let iter = self.iter_from_method(&record.object, &record.keys, module)?;
+                loop {
+                    let (value, done) = self.iterator_next(iter.clone(), None, module)?;
+                    if done {
+                        break;
+                    }
+                    if !set_data_has(this, &value) {
+                        // The answer is known, so the iterator is abandoned —
+                        // and abandoning one is `IteratorClose`
+                        // (`isSupersetOf/set-like-iter-return.js` counts the
+                        // `return()` calls).
+                        self.iterator_close(iter.clone(), None, false, module)?;
+                        return Ok(Value::Bool(false));
+                    }
+                }
+                Ok(Value::Bool(true))
+            }
+            // `isDisjointFrom` walks the smaller side: `this` (asking `has`) or
+            // `other` (testing membership in `this`).
+            "isDisjointFrom" => {
+                if set_data_size(this) <= record.size {
+                    for value in set_data_values(this) {
+                        let found = self.invoke(
+                            &record.has,
+                            record.object.clone(),
+                            std::slice::from_ref(&value),
+                            module,
+                        )?;
+                        if found.to_boolean() {
+                            return Ok(Value::Bool(false));
+                        }
+                    }
+                    Ok(Value::Bool(true))
+                } else {
+                    let iter = self.iter_from_method(&record.object, &record.keys, module)?;
+                    loop {
+                        let (value, done) = self.iterator_next(iter.clone(), None, module)?;
+                        if done {
+                            break;
+                        }
+                        if set_data_has(this, &value) {
+                            self.iterator_close(iter.clone(), None, false, module)?;
+                            return Ok(Value::Bool(false));
+                        }
+                    }
+                    Ok(Value::Bool(true))
+                }
+            }
+            _ => Err(RuntimeError::InternalError(format!(
+                "unhandled set method: {method}"
+            ))),
+        }
+    }
+
+    /// ES 24.2.3.1 `GetSetRecord(obj)`: the `{ size, has, keys }` shape a
+    /// set-like argument must expose, validated in the spec's order.
+    fn get_set_record(
+        &mut self,
+        value: &Value,
+        method: &str,
+        module: &Module,
+    ) -> Result<SetRecord, RuntimeError> {
+        if !value.is_object() {
+            return Err(RuntimeError::TypeError(format!(
+                "Set.prototype.{method}: the argument must be an object"
+            )));
+        }
+        let raw_size = self.get_member(value, &PropertyKey::from_str("size"), module)?;
+        // `ToNumber(rawSize)` runs user code when `size` is an object
+        // (`{ valueOf() { … } }`), which is observable — the tests count those
+        // coercions — so it cannot be a plain `Value::to_number()`.
+        let number = if raw_size.is_object() {
+            self.to_primitive(&raw_size, "number", module)?.to_number()
+        } else {
+            raw_size.to_number()
+        };
+        if number.is_nan() {
+            return Err(RuntimeError::TypeError(format!(
+                "Set.prototype.{method}: size must be a number"
+            )));
+        }
+        if number < 0.0 {
+            return Err(RuntimeError::RangeError(
+                "Set-like object's size must not be negative".to_string(),
+            ));
+        }
+        let size = if number.is_finite() && number < usize::MAX as f64 {
+            number.trunc() as usize
+        } else {
+            usize::MAX
+        };
+        let has = self.get_member(value, &PropertyKey::from_str("has"), module)?;
+        if !has.is_callable() {
+            return Err(RuntimeError::TypeError(format!(
+                "Set.prototype.{method}: has must be callable"
+            )));
+        }
+        let keys = self.get_member(value, &PropertyKey::from_str("keys"), module)?;
+        if !keys.is_callable() {
+            return Err(RuntimeError::TypeError(format!(
+                "Set.prototype.{method}: keys must be callable"
+            )));
+        }
+        Ok(SetRecord {
+            object: value.clone(),
+            size,
+            has,
+            keys,
+        })
+    }
+
+    /// `GetIteratorFromMethod(obj, method)`: call `method` on `obj` and wrap the
+    /// result as a JS iterator, without consulting `@@iterator` (a set-like
+    /// object only has `keys`).
+    fn iter_from_method(
+        &mut self,
+        target: &Value,
+        method: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::iterator::{NativeIteratorObject, NativeIteratorState};
+        let iterator = self.invoke(method, target.clone(), &[], module)?;
+        if !iterator.is_object() {
+            return Err(RuntimeError::TypeError(
+                "keys() did not return an object".to_string(),
+            ));
+        }
+        let id = self.next_iterator_id;
+        self.next_iterator_id += 1;
+        let iter_val = Value::Object(Rc::new(RefCell::new(NativeIteratorObject::new(
+            id,
+            NativeIteratorState::Js { iterator },
+        ))));
+        self.iterator_registry.insert(id, iter_val.clone());
+        Ok(iter_val)
+    }
+
+    /// A fresh `Set` holding the same live entries as `this` (the starting
+    /// point of `union` / `difference` / `symmetricDifference`).
+    ///
+    /// The result always has `%Set.prototype%`: the set methods are specified
+    /// to return a plain `Set` even on a subclass receiver, and `@@species` is
+    /// never consulted (`union/subclass-symbol-species.js` checks the counter).
+    fn set_copy_of(&self, this: &Value) -> Value {
+        let result = set_data_new(Some(self.builtins.set_prototype.clone()));
+        for value in set_data_values(this) {
+            set_data_add(&result, value);
+        }
+        result
     }
 
     /// `Map.prototype.getOrInsertComputed(key, callbackfn)`: the callback
@@ -3731,6 +4183,7 @@ impl VM {
                 map: Rc::clone(obj_ref),
                 kind,
                 idx: 0,
+                done: false,
             },
         ))));
         self.iterator_registry.insert(id, iter_val.clone());
@@ -3855,14 +4308,17 @@ impl VM {
                 "Array.prototype.{method} called on null or undefined"
             )));
         }
-        // `forEach` also lives on `Map.prototype`, and this interception runs
-        // before the native dispatch (it is what makes `arr.forEach(cb)` call
-        // the callback at all). A Map has no `length`, so it would be treated
-        // as a zero-length array-like and the callback would never run —
-        // `m.forEach(cb)` has to fall through to `Map.prototype.forEach`.
-        // Every *other* receiver keeps the old behaviour, including primitives
+        // `forEach` also lives on `Map.prototype` / `Set.prototype`, and this
+        // interception runs before the native dispatch (it is what makes
+        // `arr.forEach(cb)` call the callback at all). A collection has no
+        // `length`, so it would be treated as a zero-length array-like and the
+        // callback would never run — `m.forEach(cb)` / `s.forEach(cb)` has to
+        // fall through to the collection's own method. Every *other* receiver
+        // keeps the old behaviour, including primitives
         // (`Array.prototype.forEach.call(true, cb)` iterates nothing).
-        if matches!(receiver, Value::Object(o) if o.borrow().kind() == ObjectKind::Map) {
+        if matches!(receiver, Value::Object(o)
+            if matches!(o.borrow().kind(), ObjectKind::Map | ObjectKind::Set))
+        {
             return Ok(None);
         }
 
@@ -5707,10 +6163,13 @@ impl VM {
             // A static method is not a constructor.
             return Err(RuntimeError::TypeError("not a constructor".to_string()));
         }
-        // `new Map(iterable)`: the argument is consumed through the iteration
-        // protocol, which only the VM can drive.
+        // `new Map(iterable)` / `new Set(iterable)`: the argument is consumed
+        // through the iteration protocol, which only the VM can drive.
         if name == "Map" {
             return self.map_construct(constructor_val, args, new_target, module);
+        }
+        if name == "Set" {
+            return self.set_construct(constructor_val, args, new_target, module);
         }
 
         // ES 9.1.14 `GetPrototypeFromConstructor`: `newTarget.prototype` when
@@ -6081,6 +6540,65 @@ pub fn to_int32(n: f64) -> i32 {
 /// ES `ToUint32` (ECMAScript 7.1.7).
 pub fn to_uint32(n: f64) -> u32 {
     to_int32(n) as u32
+}
+
+/// The shape `GetSetRecord` validates for the `set-methods` operators
+/// (ES2024 24.2.3.1): a set-like argument is any object with a numeric `size`,
+/// a callable `has` and a callable `keys`.
+struct SetRecord {
+    object: Value,
+    size: usize,
+    has: Value,
+    keys: Value,
+}
+
+/// A fresh `Set` with the given prototype and no entries.
+fn set_data_new(prototype: Option<Rc<RefCell<dyn crate::vm::object::JSObject>>>) -> Value {
+    Value::Object(Rc::new(RefCell::new(crate::vm::object::SetObject::new(
+        prototype,
+    ))))
+}
+
+/// Run `f` with the `SetObject` behind `value` (no-op when it is not a Set).
+fn with_set_data<R>(value: &Value, f: impl FnOnce(&mut crate::vm::object::SetObject) -> R) -> Option<R> {
+    let Value::Object(obj_ref) = value else {
+        return None;
+    };
+    let mut borrowed = obj_ref.borrow_mut();
+    borrowed
+        .as_any_mut()
+        .downcast_mut::<crate::vm::object::SetObject>()
+        .map(f)
+}
+
+fn set_data_size(value: &Value) -> usize {
+    with_set_data(value, |set| set.size()).unwrap_or(0)
+}
+
+fn set_data_has(value: &Value, needle: &Value) -> bool {
+    with_set_data(value, |set| set.has(needle)).unwrap_or(false)
+}
+
+fn set_data_add(value: &Value, entry: Value) {
+    with_set_data(value, |set| set.add(entry));
+}
+
+fn set_data_delete(value: &Value, needle: &Value) -> bool {
+    with_set_data(value, |set| set.delete(needle)).unwrap_or(false)
+}
+
+/// Live entries in insertion order.
+fn set_data_values(value: &Value) -> Vec<Value> {
+    with_set_data(value, |set| {
+        let mut out = Vec::new();
+        let mut idx = 0;
+        while let Some((next, entry)) = set.entry_from(idx) {
+            idx = next + 1;
+            out.push(entry);
+        }
+        out
+    })
+    .unwrap_or_default()
 }
 
 /// SEH (Structured Exception Handling) record for try/catch/finally

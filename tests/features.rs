@@ -57,6 +57,8 @@ mod new_target;
 mod object_builtins;
 #[path = "features/objects_and_arrays.rs"]
 mod objects_and_arrays;
+#[path = "features/set.rs"]
+mod set;
 #[path = "features/stack_overflow.rs"]
 mod stack_overflow;
 #[path = "features/string_es6.rs"]

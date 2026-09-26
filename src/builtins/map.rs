@@ -115,26 +115,28 @@ pub fn map_clear(this: &Value, _args: &[Value]) -> Result<Value, RuntimeError> {
 /// `VM::try_map_method`): they either call a user callback or mint an iterator
 /// object, and neither is possible from this layer.
 pub fn register_map_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
-    use super::set_prototype_method;
 
-    set_prototype_method(proto, "get", map_get);
-    set_prototype_method(proto, "has", map_has);
-    set_prototype_method(proto, "set", map_set);
-    set_prototype_method(proto, "delete", map_delete);
-    set_prototype_method(proto, "clear", map_clear);
-    // The VM implements these four: they either call a user callback
-    // (`forEach`) or mint an iterator object. They carry the Map-specific
-    // prefix so the receiver check cannot be confused with
-    // `Array.prototype.keys` and friends.
-    super::set_map_method(proto, "forEach");
-    super::set_map_method(proto, "entries");
-    super::set_map_method(proto, "keys");
-    super::set_map_method(proto, "values");
-    // `upsert` (ES2026): `getOrInsert` needs no user code but shares the
-    // "receiver must carry [[MapData]]" rule with the rest, so it rides the
-    // same dispatch.
-    super::set_map_method(proto, "getOrInsert");
-    super::set_map_method(proto, "getOrInsertComputed");
+    // Every method carries the Map-specific dispatch prefix: they either call
+    // a user callback / mint an iterator (`forEach`, `entries`, `keys`,
+    // `values`) or their *name* is also an ordinary property name elsewhere
+    // (`get`, `has`, `set`, `delete`, `clear` — and `has`/`delete`/`clear` also
+    // exist on `Set.prototype`). The VM validates the receiver kind.
+    for name in [
+        "get",
+        "has",
+        "set",
+        "delete",
+        "clear",
+        "forEach",
+        "entries",
+        "keys",
+        "values",
+        // `upsert` (ES2026, already in the pinned test262).
+        "getOrInsert",
+        "getOrInsertComputed",
+    ] {
+        super::set_map_method(proto, name);
+    }
 
     // `size` is an accessor (ES 23.1.3.9): a getter with no setter.
     let getter = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(

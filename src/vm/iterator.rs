@@ -85,6 +85,26 @@ impl MapIterKind {
     }
 }
 
+/// Which shape a Set iterator yields (ES 23.2.5.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SetIterKind {
+    /// `Set.prototype.keys` / `values` / `[Symbol.iterator]` — the value.
+    Value,
+    /// `Set.prototype.entries` — a `[value, value]` pair.
+    Entry,
+}
+
+impl SetIterKind {
+    fn project(&self, value: Value) -> Value {
+        match self {
+            SetIterKind::Value => value,
+            SetIterKind::Entry => Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                crate::vm::object::ArrayObject::from_vec(vec![value.clone(), value]),
+            ))),
+        }
+    }
+}
+
 /// Internal state of an iterator produced by `MakeIterator`.
 #[derive(Debug)]
 pub enum NativeIteratorState {
@@ -103,6 +123,18 @@ pub enum NativeIteratorState {
         map: Rc<RefCell<dyn JSObject>>,
         kind: MapIterKind,
         idx: usize,
+        /// Once the walk has run off the end, the iterator stays done even if
+        /// new entries appear (ES 23.1.5.2.1 step 12: `[[MapIteratorMap]]` is
+        /// cleared, so a later `next()` answers `undefined` immediately).
+        done: bool,
+    },
+    /// A *live* iterator over a `Set` — same discipline as the `Map` one.
+    Set {
+        set: Rc<RefCell<dyn JSObject>>,
+        kind: SetIterKind,
+        idx: usize,
+        /// See the `Map` arm: exhaustion is permanent (`values-iteration-mutable`).
+        done: bool,
     },
 }
 
@@ -237,7 +269,30 @@ pub fn native_next(state: &mut NativeIteratorState) -> Option<Value> {
             }
         }
         NativeIteratorState::Js { .. } => None,
-        NativeIteratorState::Map { map, kind, idx } => {
+        NativeIteratorState::Set { set, kind, idx, done } => {
+            if *done {
+                return None;
+            }
+            let borrowed = set.borrow();
+            let step = borrowed
+                .as_any()
+                .downcast_ref::<crate::vm::object::SetObject>()
+                .and_then(|set| set.entry_from(*idx));
+            match step {
+                Some((i, value)) => {
+                    *idx = i + 1;
+                    Some(kind.project(value))
+                }
+                None => {
+                    *done = true;
+                    None
+                }
+            }
+        }
+        NativeIteratorState::Map { map, kind, idx, done } => {
+            if *done {
+                return None;
+            }
             // The map is borrowed for one step only: whatever runs between two
             // `next()` calls is allowed to mutate it (that is the whole point of
             // a Map iterator being live).
@@ -251,7 +306,10 @@ pub fn native_next(state: &mut NativeIteratorState) -> Option<Value> {
                     *idx = i + 1;
                     Some(kind.project(key, value))
                 }
-                None => None,
+                None => {
+                    *done = true;
+                    None
+                }
             }
         }
     }

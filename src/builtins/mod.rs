@@ -7,6 +7,7 @@ mod map;
 mod math;
 mod number;
 mod object;
+mod set;
 mod string;
 mod symbol;
 
@@ -41,6 +42,10 @@ pub use number::{
     number_to_fixed, number_to_precision,
 };
 pub use object::{OBJECT_TO_STRING_NATIVE, object_constructor, object_prototype_to_string};
+pub use set::{
+    SET_SIZE_NATIVE, SET_SPECIES_NATIVE, register_set_prototype, set_add, set_clear, set_delete,
+    set_has, set_size,
+};
 
 // ─────────────────────────────────────────────────────────
 // Wrapper-object prototypes (for `Object(value)` / ToObject)
@@ -324,6 +329,7 @@ pub struct Builtins {
     pub function_prototype: Rc<RefCell<dyn JSObject>>,
     pub symbol_prototype: Rc<RefCell<dyn JSObject>>,
     pub map_prototype: Rc<RefCell<dyn JSObject>>,
+    pub set_prototype: Rc<RefCell<dyn JSObject>>,
 }
 
 impl Builtins {
@@ -343,6 +349,7 @@ impl Builtins {
         let function_proto = new_proto(Some(Rc::clone(&object_proto)), "Function");
         let symbol_proto = new_proto(Some(Rc::clone(&object_proto)), "Symbol");
         let map_proto = new_proto(Some(Rc::clone(&object_proto)), "Map");
+        let set_proto = new_proto(Some(Rc::clone(&object_proto)), "Set");
 
         // Needed before any built-in function object is created: every one of
         // them inherits from `Function.prototype`.
@@ -367,6 +374,7 @@ impl Builtins {
             function_prototype: function_proto,
             symbol_prototype: symbol_proto,
             map_prototype: map_proto,
+            set_prototype: set_proto,
         }
     }
 
@@ -576,6 +584,52 @@ impl Builtins {
         }
         globals.insert("Map".to_string(), map_fn_val);
 
+        // `Set` (ES 23.2) — same shape as `Map`; the constructor is the VM's
+        // (`new Set(iterable)` drives the iteration protocol, `Set()` without
+        // `new` is a TypeError).
+        let set_fn_val = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("Set"))));
+        set::register_set_prototype(&self.set_prototype);
+        Self::link_constructor_prototype(&set_fn_val, &self.set_prototype);
+        // `Set.prototype.keys` and `Set.prototype[Symbol.iterator]` are the
+        // *same* function object, namely `Set.prototype.values` (ES 23.2.3.10).
+        let set_values_fn = self
+            .set_prototype
+            .borrow()
+            .property_get(&PropertyKey::from_str("values"))
+            .map(|desc| desc.value);
+        if let Some(values_fn) = set_values_fn {
+            {
+                let mut proto = self.set_prototype.borrow_mut();
+                let _ = proto.define_property(
+                    PropertyKey::from_str("keys"),
+                    method_descriptor(values_fn.clone()),
+                );
+                let _ = proto.define_property(
+                    crate::vm::iterator::iterator_symbol_key(),
+                    method_descriptor(values_fn),
+                );
+            }
+        }
+        register_wrapper_prototype("Set", Rc::clone(&self.set_prototype));
+        // `Set[Symbol.species]` (ES 23.2.2.2), mirroring `Map`'s accessor.
+        let set_species_getter = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+            set::SET_SPECIES_NATIVE,
+        ))));
+        if let Value::Object(set_obj) = &set_fn_val {
+            let _ = set_obj.borrow_mut().define_property(
+                species_symbol_key(),
+                PropertyDescriptor {
+                    value: Value::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: Some(set_species_getter),
+                    setter: None,
+                },
+            );
+        }
+        globals.insert("Set".to_string(), set_fn_val);
+
         // Well-known symbols (ES6 §19.4.2): `Symbol.iterator` is required by
         // the iteration protocol; `toPrimitive` / `toStringTag` / `hasInstance`
         // are honoured by `ToPrimitive`, `Object.prototype.toString` and
@@ -746,6 +800,11 @@ pub fn call_native(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         "Map" => Err(RuntimeError::TypeError(
             "Constructor Map requires 'new'".to_string(),
         )),
+        // `Set()` without `new` (ES 23.2.1.1 step 1); `[[Construct]]` is
+        // `VM::set_construct`.
+        "Set" => Err(RuntimeError::TypeError(
+            "Constructor Set requires 'new'".to_string(),
+        )),
         // ES `isNaN` / `isFinite` coerce their argument with ToNumber first.
         "isNaN" => Ok(Value::Bool(
             args.first().map(|v| v.to_number().is_nan()).unwrap_or(true),
@@ -873,18 +932,12 @@ pub fn call_prototype_method(
             dispatch_to_string(obj)
         }
         "valueOf" => dispatch_value_of(obj),
-        // ── Map (ES 23.1) ──
-        //
-        // These four names are also perfectly ordinary data properties on any
-        // other object (`{ get: function () { … } }`), so each arm is guarded
-        // by "the receiver really is a Map"; everything else falls through to
-        // the default arm and the caller then does the ordinary property
-        // lookup.
-        "get" if map::is_map_receiver(obj) => map::map_get(obj, args),
-        "has" if map::is_map_receiver(obj) => map::map_has(obj, args),
-        "set" if map::is_map_receiver(obj) => map::map_set(obj, args),
-        "delete" if map::is_map_receiver(obj) => map::map_delete(obj, args),
-        "clear" if map::is_map_receiver(obj) => map::map_clear(obj, args),
+        // Map / Set prototype methods are deliberately *not* in this table:
+        // `get`, `has`, `delete`, … are ordinary property names on any other
+        // object (`{ get: function () { … } }`), and `Map.prototype.has` is not
+        // `Set.prototype.has`. They carry a collection-specific dispatch prefix
+        // instead (`MAP_METHOD_PREFIX` / `SET_METHOD_PREFIX`), which is what
+        // lets `VM::map_method` / `VM::set_method` check the receiver kind.
         "hasOwnProperty" => object::object_has_own_property(obj, args),
         "isPrototypeOf" => object::object_is_prototype_of(obj, args),
         "propertyIsEnumerable" => object::object_property_is_enumerable(obj, args),
@@ -1310,28 +1363,42 @@ pub const CLASS_CTOR_FLAG: &str = "__isClassCtor__";
 
 pub const PROTO_METHOD_PREFIX: &str = "__proto_method__";
 
-/// Prefix used to name the `Map.prototype` methods the VM implements.
+/// Prefixes for the `Map.prototype` / `Set.prototype` methods the VM
+/// implements (`has`, `delete`, `clear`, `forEach`, `entries`, …).
 ///
 /// They cannot ride on [`PROTO_METHOD_PREFIX`] even though they answer to the
 /// same names: `keys` / `values` / `entries` / `forEach` also live on
-/// `Array.prototype`, and the two disagree about their receiver —
+/// `Array.prototype`, and the receiver rules disagree —
 /// `Array.prototype.keys.call(1)` yields an empty iterator while
-/// `Map.prototype.keys.call(1)` is a TypeError. Dispatching by name alone
-/// cannot tell them apart, so the Map ones carry their own prefix.
+/// `Map.prototype.keys.call(1)` is a TypeError. Nor can `Map` and `Set` *share*
+/// a prefix: `Set.prototype.has` and `Map.prototype.has` are different methods
+/// with the same name, and `Set.prototype.has.call(new Map())` has to be a
+/// TypeError — decidable only if the dispatch name says which prototype the
+/// method came from.
 pub const MAP_METHOD_PREFIX: &str = "__map_method__";
+pub const SET_METHOD_PREFIX: &str = "__set_method__";
 
-/// Register a `Map.prototype` method whose implementation lives in the VM.
+/// Register a VM-implemented prototype method under `prefix`.
 ///
-/// Nothing is stored but the marker function object; `VM::map_method` does the
-/// work (it needs a re-entrant call for `forEach`, and the iterator registry
-/// for the three factories).
-pub fn set_map_method(proto: &Rc<RefCell<dyn JSObject>>, name: &str) {
+/// Nothing is stored but the marker function object; the VM does the work (a
+/// re-entrant call for `forEach`, the iterator registry for the factories).
+pub fn set_vm_method(proto: &Rc<RefCell<dyn JSObject>>, prefix: &str, name: &str) {
     let method_val = Value::Object(Rc::new(RefCell::new(
-        crate::vm::object::NativeFunctionObject::new(&format!("{MAP_METHOD_PREFIX}{name}")),
+        crate::vm::object::NativeFunctionObject::new(&format!("{prefix}{name}")),
     )));
     let _ = proto
         .borrow_mut()
         .define_property(PropertyKey::from_str(name), method_descriptor(method_val));
+}
+
+/// [`set_vm_method`] for `Map.prototype`.
+pub fn set_map_method(proto: &Rc<RefCell<dyn JSObject>>, name: &str) {
+    set_vm_method(proto, MAP_METHOD_PREFIX, name);
+}
+
+/// [`set_vm_method`] for `Set.prototype`.
+pub fn set_set_method(proto: &Rc<RefCell<dyn JSObject>>, name: &str) {
+    set_vm_method(proto, SET_METHOD_PREFIX, name);
 }
 
 /// Declared arity (`length`) of a built-in, keyed by the name it is registered
@@ -1350,9 +1417,8 @@ pub fn builtin_arity(registered_name: &str) -> usize {
     let name = registered_name
         .strip_prefix(PROTO_METHOD_PREFIX)
         .unwrap_or(registered_name);
-    let name = name
-        .strip_prefix(MAP_METHOD_PREFIX)
-        .unwrap_or(name);
+    let name = name.strip_prefix(MAP_METHOD_PREFIX).unwrap_or(name);
+    let name = name.strip_prefix(SET_METHOD_PREFIX).unwrap_or(name);
     match name {
         // ── Constructors ──
         "Object" | "Array" | "Boolean" | "Number" | "String" | "Function" | "Error"
@@ -1396,9 +1462,12 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         "search" | "match" | "localeCompare" => 1,
         // ── Map (ES 23.1): `Map.length` is 0, and these are the only
         // prototype methods whose arity is not 0 by default ──
-        "Map" => 0,
+        "Map" | "Set" => 0,
         "Map.groupBy" => 2,
-        "get" | "has" | "delete" => 1,
+        "get" | "has" | "delete" | "add" => 1,
+        // `set-methods` operators each take the set-like argument.
+        "union" | "intersection" | "difference" | "symmetricDifference" | "isSubsetOf"
+        | "isSupersetOf" | "isDisjointFrom" => 1,
         "set" | "getOrInsert" | "getOrInsertComputed" => 2,
         // ── Function ──
         "call" | "bind" => 1,

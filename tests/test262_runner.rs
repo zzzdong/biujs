@@ -211,13 +211,12 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 /// Map 204 / Set 383 / WeakMap 141 / WeakSet 85 / Promise 677 / Proxy 311 /
 /// Reflect 153 / TypedArray 2184.
 ///
-/// `Map` left this list with B2a (`built-ins/Map` is in `SUITES`); the others
-/// stay gated until the feature exists.
+/// `Map` left this list with B2a and `Set` with B2b (both suites are in
+/// `SUITES`); the others stay gated until the feature exists.
 const IN_SCOPE_PENDING: &[&str] = &[
 "Promise",
 "Proxy",
 "Reflect",
-"Set",
 "TypedArray",
 "WeakMap",
 "WeakSet",
@@ -610,9 +609,11 @@ const SUITES: &[&str] = &[
     "built-ins/Error",
     "built-ins/Function",
     "built-ins/JSON",
-    // `built-ins/Map` is in the denominator from B2a on (§2.2: implementing a
-    // feature and enrolling its suite happen in the same batch).
+    // `built-ins/Map` and `built-ins/Set` are in the denominator from B2a/B2b
+    // on (§2.2: implementing a feature and enrolling its suite happen in the
+    // same batch).
     "built-ins/Map",
+    "built-ins/Set",
     "built-ins/Math",
     "built-ins/NativeErrors",
     "built-ins/Number",

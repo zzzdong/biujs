@@ -107,9 +107,10 @@
 | `NativeFunctionObject`（`:1476`） | `name`（**派发就靠它**）、`properties`（`length`/`name` 元数据，`install_metadata:1510`） |
 | `GeneratorObject`（`:1890`） | `state`、`args`、`this`、`suspended: Option<SuspendedFrame>` |
 | `MapObject`（B2a） | `entries: Vec<Option<(Value, Value)>>`（插入序；`None` 是删除留下的墓碑）、`properties`、`prototype` |
+| `SetObject`（B2b） | `entries: Vec<Option<Value>>`（同上，插入序 + 墓碑） |
 | `NativeIteratorObject`（`iterator.rs:100`） | 迭代器状态（`Map` 变体见 `NativeIteratorState`） |
 
-- `PropertyKey`（`property.rs:5`）= `Str(Rc<String>) | Symbol(u64)`；`PropertyDescriptor:45`；`ObjectKind:99`（20 个变体，`Set`/`WeakMap` 等**目前只是占位**，无实现）。
+- `PropertyKey`（`property.rs:5`）= `Str(Rc<String>) | Symbol(u64)`；`PropertyDescriptor:45`；`ObjectKind:99`（20 个变体，`Map`/`Set` 已实现，`WeakMap`/`WeakSet`/`Promise`/`Proxy` 等**仍是占位**）。
 - `prototype.rs`：`find_descriptor:83` / `internal_get:36` / `internal_set:110` / `internal_has_property:183` / `internal_delete:212`。**错误类型是 `String`**（见地雷 5）。
 
 ### 2.7 内置对象层
@@ -138,7 +139,7 @@
 
 ### 3.1 新增一个集合类型（Map / Set / WeakMap / TypedArray）的改动清单
 
-`Map` 已在 B2a 落地，下面是"照着做 `Set`/`WeakMap`"时的落点，**以及 B2a 实际踩到的三个坑**（比清单本身值钱）：
+`Map`（B2a）与 `Set`（B2b）已落地，下面是"照着做 `WeakMap`/`WeakSet`"时的落点，**以及 B2a/B2b 实际踩到的坑**（比清单本身值钱）：
 
 1. `vm/object.rs`：新增 `SetObject { entries: Vec<Option<Value>>, ... }`，`impl JSObject`。
    - 插入序用 `Vec` 保序，查找走 `SameValueZero`（`same_value_zero()` 已抽好放在 `MapObject` 旁边）。**别用 `HashMap` 直接当存储**：`SameValueZero` 与 `Hash` 在 `-0`/`NaN` 上不一致，且要保序。
