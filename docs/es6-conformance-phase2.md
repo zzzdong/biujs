@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14360 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 454 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14384 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 459 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -205,7 +205,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B12** | M5-C3 `Promise`（先定微任务调度点） | 677 | 需新机制，放最后 |
 | **B13** | M8-V1/V4 收口 | — | 覆盖率清单 + 三方文档对齐 |
 | **B14** | M5-C5 `Date`（含入册解锁） | 594 | B4 判定的落点；336 条纯算术 + 148 条 `Date.UTC` 不依赖外部数据，偏差见 §3.1 |
-| **B15** | M7-P7 解构赋值族（B4 侦察出的五族，按 1→3→2 拆批） | 974 | **B15a 已完成**（头部赋值模式，+177），见 §6.1；余下四族见该批的残留 |
+| **B15** | M7-P7 解构赋值族（B4 侦察出的五族，按 1→3→2 拆批） | 974 | **B15a 已完成**（头部赋值模式，+177）、**B15b 已完成**（顺带挖出的"标签语句被整段丢弃"，+24），见 §6.1；族 3/2 与生成器参数债见 B15b 的残留 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -601,6 +601,67 @@ var w; for (var [w] of [[2]]) { w = w + 1; }   // 声明形式一直是好的
   （本项目已有多次：iterator 计数器、`return()` 计数器）。**结论一律以 test262 的路径级 diff 为准**。
 - §6.1 的侦察里余下四族仍在队列：3（解构 `null`/`undefined` 不抛 TypeError）、2（默认值匿名函数的 NamedEvaluation）、
   4（迭代器/rest）、5（对象模式）。
+
+---
+
+#### B15b 标签语句被整段丢弃 —— 已完成（2026-09-26）
+
+**起点**：通过 14360 / 18266（78.62%），失败 3906，跳过 8133。
+
+**怎么发现的**：B15a 之后 for-of 还剩 144 条，其中一族叫 `break-label` / `continue-label` /
+`*-label-from-try|catch|finally`，报文是 `Expected SameValue(«0», «1»)`。最小复现直接把触发条件缩到最窄：
+
+```js
+lblD: while (d < 2) { d = d + 1; }   // d 仍是 0
+lblG: { g = 5; }                     // g 仍是 0
+```
+
+**根因**：`lower_statement` 里**没有 `Statement::LabeledStatement` 分支**，标签语句落进
+`_ => log::warn!("unimplemented statement")` —— 不只是 `break label` 不工作，而是**带标签的语句体
+被整段删掉**。任何形如 `lbl: while (…)`、`lbl: { … }` 的代码都静默地什么都不做（只留一行 warning）。
+
+**改动**（`src/compiler/lowering/mod.rs`）：
+
+- 新增 `LabelContext`（break 目标、可空的 continue 目标、SEH 深度、所属循环深度）与
+  `pending_labels`：标签在循环之前降级，所以先挂起，由 `enter_loop_context` 认领 —— 这就是
+  `a: b: for (…)` 链式标签共享同一对目标的方式；
+- `leave_loop_context` 回收该循环认领的标签（按 `loop_depth` 判定，非循环标签由 `lower_labeled` 自己弹栈）；
+- 非迭代标签（`lbl: { … }`、`lbl: switch (…)`）自己开一个 `label_after` 块，`break lbl` 跳到块尾；
+- `lower_break`/`lower_continue` 接受可选标签，按名字从内向外解析；
+- **`lower_loop_exit` 增加 `ctx_seh_depth` 参数**：跨多层循环的标签跳转要按*标签所属*循环的
+  `finally` 层数展开，而不是最内层的（否则 `lbl: while (true) { try { …; break lbl; } finally { … } }` 会漏跑或重跑 `finally`）。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14360 | **14384** | **+24** |
+| 失败 | 3906 | 3882 | −24 |
+| 通过率 | 78.62% | **78.75%** | +0.13pp |
+| 单元 / feature / 护栏 | 190 / 454 / 7 | 190 / **459** / 7 | +5 条断言（`tests/features/control_flow.rs`） |
+
+逐套件：`break` 11 → **18**（7 条全清）、`for-of` 563 → 571、`for` 314 → 318、`continue` 15 → 18、
+`while` 17 → 18、`do-while` 18 → 19；**其余零变化**（`./scripts/phase2-status.sh` 结论：无逐套件回退）。
+
+**残留**（下一批的输入）
+
+1. **早错误缺失（与上面同族，但需要新机制）**：未定义标签、`continue` 指向非迭代标签在规范里都是
+   *SyntaxError*，现在只 `log::warn!`。lowerer 目前没有错误通道，要修得先给它一个（或加一趟后置检查）。
+2. **生成器参数绑定时机（B15b 顺带挖出，独立根因）**：
+   ```js
+   function* f([[x]]) {}   f([null]);   // node: 调用时抛 TypeError；本站：不抛
+   var it = f([null]); it.next();        // 本站把错误推迟到这里才报
+   ```
+   引擎把生成器的参数绑定推迟到第一次 `next()`（`generator_next` 的 `SuspendedStart` 分支才建帧），
+   规范要求在**调用时**（FunctionDeclarationInstantiation）完成。受影响的是
+   `language/{statements,expressions}/generators/dstr/*` 里所有"应在调用时抛"的用例（实测三个套件里
+   `Expected a TypeError` 共 40 条，多数属这一族）。修法需要给生成器标出"参数区结束"的 pc，
+   在 `create_generator` 里跑完参数区再挂起 —— 不要图省事把整个函数体跑起来（`var it = g(); calls++` 这类
+   用例会立刻挂）。
+3. **生成器 rest 参数完全未绑定**：`function* g7(...rest) { yield rest.length; }` → `ReferenceError: undefined variable: rest`
+   （普通函数的 rest 参数正常，只有生成器这条路径漏了）。这条独立、量小，可以和第 2 条一批做。
+4. B4 侦察出的五族里**族 3（解构 null/undefined 的 abrupt 检查）在简单形状上已是对的**（实测 12 个形状与 node 一致），
+   剩下的失败全部落在上面的生成器参数族里；族 2（默认值匿名函数的 NamedEvaluation）仍在队列。
 
 ---
 

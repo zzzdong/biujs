@@ -47,6 +47,26 @@ impl LoopContext {
     }
 }
 
+/// A `label:` binding a name to a jump target, for `break label` / `continue label`.
+///
+/// A label on an iteration statement shares that loop's break *and* continue
+/// targets; a label anywhere else only owns the end of its statement, which is
+/// what makes `continue outer` valid where `continue some_block` is an early
+/// SyntaxError.
+struct LabelContext {
+    name: String,
+    break_point: BlockId,
+    /// `None` for a label that does not precede an iteration statement.
+    continue_point: Option<BlockId>,
+    /// SEH depth where the label was entered. A labeled jump may cross several
+    /// loops, so the number of `finally` blocks to unwind comes from the
+    /// *label's* context, not from the innermost loop.
+    seh_depth: usize,
+    /// `loop_contexts.len()` when this label was registered, so that a label
+    /// belonging to a loop can be dropped when that loop's lowering ends.
+    loop_depth: usize,
+}
+
 /// The name of an object-literal property or class member.
 ///
 /// Non-computed literals stay static strings (cheaper, and the property order
@@ -55,6 +75,20 @@ impl LoopContext {
 enum MemberKey {
     Static(String),
     Dynamic(Value),
+}
+
+/// Whether `stmt` is an iteration statement, i.e. the only kind of body a label
+/// can attach a `continue` target to (ES `IsLabelledFunction` / the early error
+/// for `continue`).
+fn is_iteration_statement(stmt: &Statement<'_>) -> bool {
+    matches!(
+        stmt,
+        Statement::WhileStatement(_)
+            | Statement::DoWhileStatement(_)
+            | Statement::ForStatement(_)
+            | Statement::ForOfStatement(_)
+            | Statement::ForInStatement(_)
+    )
 }
 
 /// Debug name for a class member function (`C.m`, `C.[computed]`).
@@ -70,6 +104,14 @@ pub struct JSASTLower<'a> {
     builder: &'a mut dyn InstBuilder,
     symbols: SymbolTable<Variable>,
     loop_contexts: Vec<LoopContext>,
+    /// Open `label:` targets, innermost last.
+    labels: Vec<LabelContext>,
+    /// Labels that have been seen but not yet bound to a jump target.
+    ///
+    /// `outer: for (…)` lowers the label *before* the loop knows its own blocks,
+    /// so the label waits here and `enter_loop_context` claims it — that is how
+    /// `a: b: for (…)` gives both names the same targets.
+    pending_labels: Vec<String>,
     /// Current SEH depth (number of nested try blocks)
     seh_depth: usize,
     /// Arrow function this capture: if Some, contains the variable holding captured `this`
@@ -95,6 +137,8 @@ impl<'a> JSASTLower<'a> {
             builder,
             symbols,
             loop_contexts: Vec::new(),
+            labels: Vec::new(),
+            pending_labels: Vec::new(),
             seh_depth: 0,
             arrow_this_var: None,
             is_script: false,
@@ -219,8 +263,11 @@ impl<'a> JSASTLower<'a> {
             Statement::ForInStatement(for_in) => self.lower_for_in(for_in),
             Statement::SwitchStatement(switch) => self.lower_switch(switch),
             Statement::BlockStatement(block) => self.lower_block_stmt(block),
-            Statement::BreakStatement(_) => self.lower_break(),
-            Statement::ContinueStatement(_) => self.lower_continue(),
+            Statement::LabeledStatement(labeled) => self.lower_labeled(labeled),
+            Statement::BreakStatement(break_stmt) => self.lower_break(&break_stmt.label),
+            Statement::ContinueStatement(continue_stmt) => {
+                self.lower_continue(&continue_stmt.label)
+            }
             Statement::ThrowStatement(throw) => self.lower_throw(throw),
             Statement::TryStatement(try_stmt) => {
                 self.lower_try(try_stmt);
@@ -1074,10 +1121,7 @@ impl<'a> JSASTLower<'a> {
     /// SSA builder still inserts (and fills) the phi parameters the real target
     /// block needs — otherwise loop-carried variables would read stale
     /// registers after the finally block ran.
-    fn lower_loop_exit(&mut self, target: BlockId, label: &str) {
-        let Some(ctx_seh_depth) = self.loop_contexts.last().map(|c| c.seh_depth) else {
-            return;
-        };
+    fn lower_loop_exit(&mut self, target: BlockId, label: &str, ctx_seh_depth: usize) {
         let seh_depth_to_pop = self.seh_depth.saturating_sub(ctx_seh_depth);
         if seh_depth_to_pop > 0 {
             // `DelayedJump` carries no block arguments, so it targets a small
@@ -1101,23 +1145,100 @@ impl<'a> JSASTLower<'a> {
         self.builder.seal_block(self.builder.current_block());
     }
 
-    fn lower_break(&mut self) {
-        if let Some(ctx) = self.loop_contexts.last() {
-            let break_point = ctx.break_point;
-            self.lower_loop_exit(break_point, "break");
-        } else {
-            log::warn!("break outside loop - ignoring");
+    fn lower_break(&mut self, label: &Option<LabelIdentifier<'_>>) {
+        if let Some(id) = label {
+            match self.resolve_label(id.name.as_str()) {
+                Some((target, seh_depth)) => self.lower_loop_exit(target, "break", seh_depth),
+                // An undefined label is an early SyntaxError; the lowerer has no
+                // error channel yet (see the residual note in the plan).
+                None => log::warn!("undefined label: {}", id.name),
+            }
+            return;
+        }
+        match self.loop_contexts.last() {
+            Some(ctx) => {
+                let (break_point, seh_depth) = (ctx.break_point, ctx.seh_depth);
+                self.lower_loop_exit(break_point, "break", seh_depth);
+            }
+            None => log::warn!("break outside loop - ignoring"),
         }
     }
 
-    fn lower_continue(&mut self) {
-        if let Some(ctx) = self.loop_contexts.last() {
-            let continue_point = ctx.continue_point;
-            self.lower_loop_exit(continue_point, "continue");
-        } else {
-            log::warn!("continue outside loop - ignoring");
+    fn lower_continue(&mut self, label: &Option<LabelIdentifier<'_>>) {
+        if let Some(id) = label {
+            // `continue label` is only legal when the label precedes an iteration
+            // statement — which is exactly the case where the label owns a
+            // continue target. A labeled *block* has none (the spec makes
+            // `continue` to it an early SyntaxError, so such code should never
+            // have been compiled).
+            let resolved = self
+                .labels
+                .iter()
+                .rev()
+                .find(|label| label.name == id.name.as_str())
+                .map(|label| (label.continue_point, label.seh_depth));
+            match resolved {
+                Some((Some(target), seh_depth)) => {
+                    self.lower_loop_exit(target, "continue", seh_depth)
+                }
+                Some((None, _)) => {
+                    log::warn!("continue to a non-iteration label: {}", id.name)
+                }
+                None => log::warn!("undefined label: {}", id.name),
+            }
+            return;
+        }
+        match self.loop_contexts.last() {
+            Some(ctx) => {
+                let (continue_point, seh_depth) = (ctx.continue_point, ctx.seh_depth);
+                self.lower_loop_exit(continue_point, "continue", seh_depth);
+            }
+            None => log::warn!("continue outside loop - ignoring"),
         }
     }
+
+    /// `label:` — bind the name for the statement that follows.
+    ///
+    /// `break label` / `continue label` need a jump target, and the target only
+    /// exists after the body has been lowered, so iteration statements claim the
+    /// pending name in `enter_loop_context` (their targets are known there) while
+    /// everything else gets a fresh "end of statement" block here.
+    fn lower_labeled(&mut self, labeled: &LabeledStatement<'_>) {
+        let name = labeled.label.name.to_string();
+        if is_iteration_statement(&labeled.body) {
+            self.pending_labels.push(name.clone());
+            self.lower_statement(&labeled.body);
+            // A loop always claims its pending labels; if it somehow did not,
+            // drop the name so it cannot leak into a later statement.
+            self.pending_labels.retain(|pending| *pending != name);
+            return;
+        }
+
+        let after_blk = self.create_block("label_after");
+        self.labels.push(LabelContext {
+            name,
+            break_point: after_blk,
+            continue_point: None,
+            seh_depth: self.seh_depth,
+            loop_depth: self.loop_contexts.len(),
+        });
+        self.lower_statement(&labeled.body);
+        if !self.current_block_is_terminated() {
+            self.builder.jump(after_blk);
+        }
+        self.labels.pop();
+        self.builder.switch_to_block(after_blk);
+    }
+
+    /// The break target and SEH depth of `name`, innermost label first.
+    fn resolve_label(&self, name: &str) -> Option<(BlockId, usize)> {
+        self.labels
+            .iter()
+            .rev()
+            .find(|label| label.name == name)
+            .map(|label| (label.break_point, label.seh_depth))
+    }
+
 
     fn lower_throw(&mut self, throw: &ThrowStatement<'_>) {
         let val = match &throw.argument {
@@ -3196,10 +3317,33 @@ impl<'a> JSASTLower<'a> {
             continue_point,
             self.seh_depth,
         ));
+        // `outer: for (…)`: the label was lowered before the loop existed, so it
+        // is claimed here, where the loop's own targets are known. Chained labels
+        // (`a: b: for (…)`) all land on the same pair.
+        let loop_depth = self.loop_contexts.len();
+        for name in std::mem::take(&mut self.pending_labels) {
+            self.labels.push(LabelContext {
+                name,
+                break_point,
+                continue_point: Some(continue_point),
+                seh_depth: self.seh_depth,
+                loop_depth,
+            });
+        }
     }
 
     fn leave_loop_context(&mut self) {
+        let loop_depth = self.loop_contexts.len();
         self.loop_contexts.pop();
+        // Drop the labels this loop bound (they are the innermost ones, and a
+        // label registered outside a loop has a smaller `loop_depth`).
+        while self
+            .labels
+            .last()
+            .is_some_and(|label| label.loop_depth >= loop_depth)
+        {
+            self.labels.pop();
+        }
     }
 
     /// Check if the current block already has a terminator instruction.

@@ -558,3 +558,105 @@ fn nested_loops_keep_outer_values_alive() {
     // inner sums: (10+0)+(10+3)+(10+6)=39, 42, 45  -> 126
     assert_eq!(eval_number(js), 126.0);
 }
+
+// ============================================================
+// Labeled statements (`label:`)
+// ============================================================
+//
+// A labeled statement used to be dropped whole by the lowering — it fell into the
+// `_ =>` arm of `lower_statement` — so *any* statement carrying a label behaved as
+// if it had been deleted, including the plain `lbl: while (…)` whose body then
+// never ran. These assertions pin the label itself plus the two jumps that can
+// target it.
+
+#[test]
+fn labeled_statement_still_executes_its_body() {
+    // The old failure mode was silent: no error, no output, just a missing effect.
+    assert_eq!(eval_number("var a = 0; lbl: while (a < 3) { a = a + 1; } a"), 3.0);
+    assert_eq!(
+        eval_number("var b = 0; lbl: for (var i = 0; i < 2; i = i + 1) { b = b + 1; } b"),
+        2.0
+    );
+    assert_eq!(eval_number("var c = 0; lbl: { c = 5; } c"), 5.0);
+    assert_eq!(eval_number("var d = 0; lbl: switch (1) { case 1: d = 6; } d"), 6.0);
+}
+
+#[test]
+fn labeled_break_leaves_the_labeled_statement() {
+    // The label wins over the innermost loop: `break outer` leaves the `while`
+    // even though the `for-of` is the innermost breakable statement.
+    assert_eq!(
+        eval_number(
+            "var i = 0;
+             outer: while (true) {
+               for (var x of [1, 2, 3]) { i = i + 1; break outer; }
+             }
+             i"
+        ),
+        1.0
+    );
+    // A labeled block is a legal `break` target too, and the rest of the block
+    // must not run.
+    assert_eq!(
+        eval_number("var j = 0; blk: { j = 1; break blk; j = 99; } j"),
+        1.0
+    );
+}
+
+#[test]
+fn labeled_continue_targets_the_named_loop() {
+    // `continue outer` restarts the *outer* loop, so the inner loop runs once per
+    // outer iteration instead of being exhausted.
+    assert_eq!(
+        eval_number(
+            "var n = 0;
+             outer: for (var p of [1, 2]) {
+               for (var q of [1, 2]) { n = n + 1; continue outer; }
+             }
+             n"
+        ),
+        2.0
+    );
+    // Chained labels (`a: b: for (…)`) share the loop's targets.
+    assert_eq!(
+        eval_number(
+            "var m = 0;
+             a: b: for (var r of [1, 2, 3]) { m = m + 1; break a; }
+             m"
+        ),
+        1.0
+    );
+    // A labeled `do-while` can continue to itself.
+    assert_eq!(
+        eval_number("var f = 0; lbl: do { f = f + 1; if (f < 2) continue lbl; } while (f < 3); f"),
+        3.0
+    );
+}
+
+#[test]
+fn labeled_jumps_run_intervening_finally_blocks() {
+    // A labeled jump may leave several loops; the number of `finally` blocks to
+    // run comes from the *label's* nesting, not from the innermost loop's.
+    assert_eq!(
+        eval_number(
+            "var i = 0, log = 0;
+             lbl: while (true) { try { i = i + 1; break lbl; } finally { log = log + 1; } }
+             i * 10 + log"
+        ),
+        11.0
+    );
+}
+
+#[test]
+fn break_inside_switch_targets_the_label_not_the_switch() {
+    // `break lbl` must not be confused with the switch's own break target, and it
+    // must not fall through to the statement after the switch.
+    assert_eq!(
+        eval_number(
+            "var e = 0;
+             lbl: while (true) { switch (1) { case 1: e = 7; break lbl; } e = 99; }
+             e"
+        ),
+        7.0
+    );
+}
