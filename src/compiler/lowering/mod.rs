@@ -116,13 +116,23 @@ enum MemberKey {
 /// skipped for the same reason as in `collect_var_names`.
 fn collect_lexical_names(stmts: &[Statement<'_>], out: &mut Vec<String>) {
     for stmt in stmts {
-        if let Statement::VariableDeclaration(decl) = stmt {
-            if decl.kind == VariableDeclarationKind::Var {
-                continue;
+        match stmt {
+            Statement::VariableDeclaration(decl) => {
+                if decl.kind == VariableDeclarationKind::Var {
+                    continue;
+                }
+                for declarator in &decl.declarations {
+                    collect_binding_names(&declarator.id, out);
+                }
             }
-            for declarator in &decl.declarations {
-                collect_binding_names(&declarator.id, out);
+            // `class` is lexical too: its name is not a property of the global
+            // object either. (`function` declarations *are*, so they stay out.)
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    out.push(id.name.to_string());
+                }
             }
+            _ => {}
         }
         // A `for (let …)` head is lowered while the head's own scope is open, so
         // it pre-declares the names itself; the loop body is a block.
@@ -289,6 +299,11 @@ pub struct JSASTLower<'a> {
     seh_frames: Vec<SehFrameInfo>,
     /// Names published into the global environment by this (script) lowerer.
     global_names: std::collections::HashSet<String>,
+    /// Names registered in the script's **declarative record** (`let`/`const`/
+    /// `class` at script scope). Publishing one of these initializes that
+    /// record's entry — it is not a property of the global object, so
+    /// `globalThis.x` stays `undefined`.
+    script_lexical: std::collections::HashSet<String>,
 }
 
 impl<'a> JSASTLower<'a> {
@@ -311,6 +326,7 @@ impl<'a> JSASTLower<'a> {
             var_binding: false,
             seh_frames: Vec::new(),
             global_names: std::collections::HashSet::new(),
+            script_lexical: std::collections::HashSet::new(),
         }
     }
 
@@ -376,9 +392,20 @@ impl<'a> JSASTLower<'a> {
         }
     }
 
-    /// Publish `name -> value` into the global environment (script scope only).
+    /// Publish `name -> value` into the environment (script scope only).
+    ///
+    /// For a `var` (or a `function` declaration) that is the global *object* —
+    /// `globalThis.x` becomes the value. For a script-scope `let`/`const`/`class`
+    /// it initializes the script's declarative record instead: the name is
+    /// visible to nested functions and to later reads, but it is deliberately
+    /// **not** a property of the global object.
     fn define_global(&mut self, name: &str, value: Value) {
-        self.builder.store_external_variable(name.to_string(), value);
+        if self.script_lexical.contains(name) {
+            let name_const = self.make_name_constant(name);
+            self.builder.init_lexical(name_const, value);
+        } else {
+            self.builder.store_external_variable(name.to_string(), value);
+        }
         self.global_names.insert(name.to_string());
     }
 
@@ -410,9 +437,10 @@ impl<'a> JSASTLower<'a> {
         // `var` names exist from the start of the script, even when their
         // declaration sits in a block that has not run yet.
         self.hoist_var_bindings(&program.body);
-        // The same for the script scope's own `let`/`const` — in their dead zone
-        // until their declaration runs.
-        self.hoist_lexical_bindings(&program.body);
+        // The same for the script scope's own `let`/`const`/`class` — in their
+        // dead zone until their declaration runs, and registered in the script's
+        // declarative record so nested functions can see them at all.
+        self.hoist_lexical_bindings(&program.body, true);
 
         // Now assign hoisted functions (we have a current block)
         for (name, func_val) in hoisted_funcs {
@@ -516,8 +544,12 @@ impl<'a> JSASTLower<'a> {
                 None => self.builder.alloc(),
             };
             self.builder.assign(dst, class_val);
+            // Publish the *slot*, not `class_val`: the class body lowers into its
+            // own blocks, and a value defined in one of them would reach
+            // `init_lexical` through a block parameter nothing ever feeds — the
+            // same trap that made the hoisted `var` slot necessary in B18.
             if self.at_script_scope() {
-                self.define_global(&id.name.to_string(), class_val);
+                self.define_global(&id.name.to_string(), dst);
             }
             self.symbols.mark_initialized(id.name.as_str());
             if existing.is_none() {
@@ -975,7 +1007,7 @@ impl<'a> JSASTLower<'a> {
     /// (so an outer or global binding of the same name is shadowed) but reading or
     /// writing it before its declaration is evaluated raises a `ReferenceError`
     /// instead of quietly yielding `undefined`.
-    fn hoist_lexical_bindings(&mut self, stmts: &[Statement<'_>]) {
+    fn hoist_lexical_bindings(&mut self, stmts: &[Statement<'_>], declare_in_script_record: bool) {
         let mut names = Vec::new();
         collect_lexical_names(stmts, &mut names);
         for name in names {
@@ -989,7 +1021,25 @@ impl<'a> JSASTLower<'a> {
                 self.symbols
                     .insert(name.clone(), Variable::uninitialized(dst));
             }
+            // The script's own lexical bindings go into the script's declarative
+            // record, which is what nested functions read: it is the *only* way
+            // they can see these names (`define_global` publishes them there, not
+            // onto the global object), and an entry created here is the temporal
+            // dead zone for any function called before the declaration runs.
+            if declare_in_script_record {
+                let name_const = self.make_name_constant(&name);
+                self.builder.declare_lexical(name_const);
+                self.script_lexical.insert(name.clone());
+            }
         }
+    }
+
+    /// A `Constant::String` operand carrying `name` (what `LoadEnv`/`StoreEnv`
+    /// and `DeclareLexical` read out of the constant pool).
+    fn make_name_constant(&mut self, name: &str) -> Value {
+        self.builder.make_constant(crate::bytecode::Constant::String(
+            std::sync::Arc::new(name.to_string()),
+        ))
     }
 
     /// Declare every `var` of `stmts` — *recursively, but never inside a nested
@@ -1486,7 +1536,7 @@ impl<'a> JSASTLower<'a> {
         self.scope_depth += 1;
         // `let`/`const` of this block are bound (but uninitialized) from the
         // moment the block is entered.
-        self.hoist_lexical_bindings(&block.body);
+        self.hoist_lexical_bindings(&block.body, false);
         for stmt in &block.body {
             self.lower_statement(stmt);
             if self.current_block_is_terminated() {
@@ -2936,6 +2986,18 @@ impl<'a> JSASTLower<'a> {
                 symbols.remove(name);
             }
         }
+        // Script-scope `let`/`const`/`class` are read through the environment
+        // too — the script's *declarative record* is the truth, and it is what
+        // carries their dead zone. The script's own table keeps a pre-bound
+        // register so that a read before the declaration can be rejected at
+        // compile time, but that copy is `uninitialized` on purpose and must
+        // never leak into a nested function: a method reading its class name
+        // (`class C { m() { return C; } }`) used to trip over it — the binding
+        // looked like a dead-zone read even though the class was long since
+        // defined.
+        for name in &self.script_lexical {
+            symbols.remove(name);
+        }
 
         let mut func_builder = FunctionBuilder::new(self.builder.module_mut(), &mut func);
         let mut func_lower = JSASTLower::new(&mut func_builder, symbols);
@@ -3017,7 +3079,7 @@ impl<'a> JSASTLower<'a> {
         func_lower.hoist_var_bindings(&body.statements);
         // The function scope's own `let`/`const`, in their dead zone until their
         // declaration is evaluated.
-        func_lower.hoist_lexical_bindings(&body.statements);
+        func_lower.hoist_lexical_bindings(&body.statements, false);
 
         // First pass: collect nested function declarations for hoisting
         let mut hoisted_funcs: Vec<(String, Value)> = Vec::new();
@@ -3176,9 +3238,11 @@ impl<'a> JSASTLower<'a> {
             BindingPattern::BindingIdentifier(id) => {
                 self.insert_binding(id.name.as_str(), Variable::new(value));
                 if publish_global && self.publishes_as_global() {
-                    self.builder
-                        .store_external_variable(id.name.to_string(), value.clone());
-                    self.global_names.insert(id.name.to_string());
+                    // Through `define_global`, not a raw store: a script-scope
+                    // `let`/`const` bound by a *pattern* (`const [x] = [1]`) is
+                    // initialized here, and initialization is the one write that
+                    // may end the binding's dead zone.
+                    self.define_global(id.name.as_str(), value.clone());
                 }
             }
             BindingPattern::AssignmentPattern(ap) => {

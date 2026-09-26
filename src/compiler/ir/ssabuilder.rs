@@ -798,6 +798,19 @@ impl<'a> SSABuilder<'a> {
             }
             Instruction::PushSeh { .. } => {}
             Instruction::PopSeh => {}
+            // No definition, and the operands are a constant and a value that is
+            // read, not written: nothing to rename.
+            Instruction::DeclareLexical { name } => {
+                SSABuilder::rename_use(name, stacks);
+            }
+            Instruction::InitLexical { name, value } => {
+                // `name` is a constant, but `value` is not: it has to be renamed
+                // like any other operand, or codegen sees a stale id and writes an
+                // unwritten register — which is exactly how `class Foo {}` bound
+                // `undef` (measured: `typeof Foo === "undefined"`).
+                SSABuilder::rename_use(name, stacks);
+                SSABuilder::rename_use(value, stacks);
+            }
             // No operands, no definitions: nothing to rename.
             Instruction::PrologueEnd => {}
             Instruction::Throw { value, args } => {

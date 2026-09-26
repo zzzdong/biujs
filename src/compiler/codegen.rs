@@ -158,6 +158,17 @@ impl Codegen {
                             const_id.to_operand(),
                         ));
                     }
+                    Instruction::DeclareLexical { name } => {
+                        let name = name.to_operand();
+                        self.codes
+                            .push(Bytecode::single(Opcode::DeclareLexical, name));
+                    }
+                    Instruction::InitLexical { name, value } => {
+                        let name = name.to_operand();
+                        let value = self.gen_operand(value);
+                        self.codes
+                            .push(Bytecode::double(Opcode::InitLexical, name, value));
+                    }
                     Instruction::LoadEnv { dst, name } => {
                         let dst = self.gen_operand(dst);
                         self.codes

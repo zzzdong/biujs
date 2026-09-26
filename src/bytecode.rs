@@ -144,6 +144,12 @@ impl fmt::Display for Bytecode {
 pub enum Opcode {
     /// load_const dst, const_id
     LoadConst,
+    /// declare_lexical name — register a script-scope `let`/`const`/`class`
+    /// name in the script's declarative record, uninitialized (its dead zone).
+    DeclareLexical,
+    /// init_lexical name, value — initialize a script-scope lexical binding
+    /// (the declaration; the only write the dead zone allows)
+    InitLexical,
     /// load_env dst, name
     LoadEnv,
     /// halt
@@ -351,6 +357,8 @@ impl fmt::Display for Opcode {
             Opcode::CallNative => write!(f, "call_native"),
             Opcode::Ret => write!(f, "ret"),
             Opcode::LoadConst => write!(f, "load_const"),
+            Opcode::DeclareLexical => write!(f, "declare_lexical"),
+            Opcode::InitLexical => write!(f, "init_lexical"),
             Opcode::LoadEnv => write!(f, "load_env"),
             Opcode::Mov => write!(f, "mov"),
             Opcode::Not => write!(f, "not"),

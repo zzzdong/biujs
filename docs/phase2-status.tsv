@@ -73,7 +73,7 @@ language/statements/expression	1	2	0
 language/statements/for	326	19	40
 language/statements/function	319	79	53
 language/statements/if	47	22	0
-language/statements/let	113	6	26
+language/statements/let	114	6	25
 language/statements/return	4	1	11
 language/statements/switch	49	56	6
 language/statements/throw	13	1	0
@@ -99,6 +99,6 @@ built-ins/WeakSet	79	5	1
 built-ins/Math	270	37	20
 built-ins/NativeErrors	68	12	14
 built-ins/Number	189	53	98
-built-ins/Object	2764	295	352
+built-ins/Object	2766	295	350
 built-ins/String	617	216	390
 built-ins/Symbol	54	27	17

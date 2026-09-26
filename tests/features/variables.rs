@@ -182,3 +182,54 @@ fn a_class_name_is_in_its_own_dead_zone() {
         2.0
     );
 }
+
+#[test]
+fn a_script_lexical_lives_in_the_script_record_not_the_global_object() {
+    // A nested function resolves the binding through the script's *declarative
+    // record*, so it sees the live value instead of a copy taken when the closure
+    // was created — and a write from the function is visible to the script.
+    assert_eq!(
+        eval_number("let n = 1; function bump() { n = n + 1; } bump(); n"),
+        2.0
+    );
+    // The same for `const`, read-only side of the record.
+    assert_eq!(
+        eval_number("const k = 3; function get() { return k; } get()"),
+        3.0
+    );
+
+    // The dead zone belongs to the binding, not to the scope: a function called
+    // before the declaration reads the record's uninitialized entry, and the
+    // global lookup must not paper over it with `undefined`.
+    assert_eq!(
+        eval_string(
+            "function r() { try { return String(z); } catch (e) { return e.name; } }
+             var early = r();
+             let z = 1;
+             early + '/' + r()"
+        ),
+        "ReferenceError/1"
+    );
+    // Writing is the same dead zone.
+    assert_eq!(
+        eval_string(
+            "function w() { try { q = 1; return 'no-throw'; } catch (e) { return e.name; } }
+             var wf = w();
+             let q;
+             wf + '/' + q"
+        ),
+        "ReferenceError/undefined"
+    );
+
+    // A method reading its own class name goes through the record too: the
+    // pre-bound register in the script's table is a dead-zone marker and must
+    // never leak into a nested function (it did, and every class method broke).
+    assert_eq!(
+        eval_string("class C { m() { return typeof C; } } new C().m()"),
+        "function"
+    );
+    assert_eq!(
+        eval_number("class D { s() { return 4; } } new D().s()"),
+        4.0
+    );
+}

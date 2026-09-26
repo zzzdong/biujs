@@ -1999,20 +1999,32 @@ impl VM {
                 let value = Self::from_constant(&module.constants[const_index as usize]);
                 self.set_value(operands[0], value)?;
             }
+            Opcode::DeclareLexical => {
+                let name_index = operands[0].as_immd();
+                let name = match &module.constants[name_index as usize] {
+                    Constant::String(s) => s.as_str().to_string(),
+                };
+                // Idempotent, and never overwrites a value: the declaration that
+                // follows is what initializes it.
+                self.state.script_env.entry(name).or_insert(None);
+            }
+            Opcode::InitLexical => {
+                let name_index = operands[0].as_immd();
+                let name = match &module.constants[name_index as usize] {
+                    Constant::String(s) => s.as_str().to_string(),
+                };
+                let value = self.get_value(operands[1])?;
+                // Ends the dead zone. This is the declaration's own write, so it
+                // is allowed even though a plain `StoreEnv` to an uninitialized
+                // binding would throw.
+                self.state.script_env.insert(name, Some(value));
+            }
             Opcode::LoadEnv => {
                 let name_index = operands[1].as_immd();
                 let name = &module.constants[name_index as usize];
                 match name {
                     Constant::String(name) => {
-                        // Search closure_var_stack first (newest entries first)
-                        let mut found = None;
-                        for map in self.state.closure_var_stack.iter().rev() {
-                            if let Some(value) = map.get(name.as_str()) {
-                                found = Some(value.clone());
-                                break;
-                            }
-                        }
-                        match found {
+                        match self.state.resolve_env_name(name.as_str())? {
                             Some(value) => {
                                 self.set_value(operands[0], value)?;
                             }
@@ -2218,13 +2230,9 @@ impl VM {
                 let name = match &module.constants[name_index as usize] {
                     Constant::String(s) => s.as_str().to_string(),
                 };
-                let value = self
-                    .state
-                    .closure_var_stack
-                    .iter()
-                    .rev()
-                    .find_map(|map| map.get(&name).cloned())
-                    .or_else(|| self.state.get_global(&name));
+                // A dead-zone read *does* throw here — unlike an unresolvable
+                // name, which is the one case `typeof` has to tolerate.
+                let value = self.state.resolve_env_name(&name)?;
                 let type_str = match value {
                     Some(v) => v.type_of().to_string(),
                     None => "undefined".to_string(),
@@ -2612,7 +2620,20 @@ impl VM {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 let value = self.get_value(operands[1])?;
-                self.state.globals.insert(name, value);
+                match self.state.script_env.get_mut(&name) {
+                    Some(slot @ Some(_)) => *slot = Some(value),
+                    // Writing into a binding that has not been initialized is the
+                    // dead zone too (a `let x;` declared after the loop that
+                    // assigns to it).
+                    Some(None) => {
+                        return Err(RuntimeError::ReferenceError(format!(
+                            "Cannot access '{name}' before initialization"
+                        )))
+                    }
+                    None => {
+                        self.state.globals.insert(name, value);
+                    }
+                }
             }
             Opcode::CallMethod => {
                 let mut obj_val = self.get_value(operands[0])?;
@@ -6837,6 +6858,15 @@ struct State {
     registers: [Value; 19],
     seh_stack: Vec<SehRecord>,
     globals: HashMap<String, Value>,
+    /// The script's **declarative record**: `let` / `const` / `class` declared at
+    /// script scope. Distinct from `globals` (the global *object*) because those
+    /// bindings are not properties: `globalThis.x` stays `undefined` for
+    /// `let x`, while a nested function still resolves the name. `None` is an
+    /// uninitialized binding — the temporal dead zone.
+    ///
+    /// Fresh per `run` (`run` replaces the whole `State`), so one test's
+    /// declarations cannot leak into the next.
+    script_env: HashMap<String, Option<Value>>,
     this_val: Value,
     /// Stack of captured variable maps for active closure scopes
     closure_var_stack: Vec<HashMap<String, Value>>,
@@ -6879,6 +6909,7 @@ impl State {
             registers: std::array::from_fn(|_| Value::Undefined),
             seh_stack: Vec::new(),
             globals: HashMap::new(),
+            script_env: HashMap::new(),
             this_val: Value::Undefined,
             closure_var_stack: Vec::new(),
             construct_stack: Vec::new(),
@@ -7047,6 +7078,35 @@ impl State {
         self.function_stack.push(self.function_val.clone());
         self.frame_argc.push(argc);
         Ok(())
+    }
+
+    /// Resolve `name` in the environment.
+    ///
+    /// Order: the script's **declarative record** first (the truth for
+    /// script-scope `let`/`const`/`class`, and the carrier of their temporal dead
+    /// zone), then the closure snapshots, then the global object. Splitting this
+    /// out matters because `typeof` has to consult exactly the same chain — a
+    /// `typeof` that skipped the record answered `"undefined"` for a name the
+    /// ordinary read resolves to a function.
+    fn resolve_env_name(&self, name: &str) -> Result<Option<Value>, RuntimeError> {
+        match self.script_env.get(name) {
+            Some(Some(value)) => return Ok(Some(value.clone())),
+            Some(None) => {
+                return Err(RuntimeError::ReferenceError(format!(
+                    "Cannot access '{name}' before initialization"
+                )))
+            }
+            None => {}
+        }
+        if let Some(value) = self
+            .closure_var_stack
+            .iter()
+            .rev()
+            .find_map(|map| map.get(name).cloned())
+        {
+            return Ok(Some(value));
+        }
+        Ok(self.get_global(name))
     }
 
     fn get_global(&self, name: &str) -> Option<Value> {

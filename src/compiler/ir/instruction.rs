@@ -190,6 +190,29 @@ pub enum Instruction {
         dst: Value,
         const_id: Value,
     },
+    /// Register a script-scope lexical name (`let` / `const` / `class`) in the
+    /// script's declarative record, *uninitialized*.
+    ///
+    /// A script-level `let` is **not** a property of the global object, so it
+    /// cannot live in the global environment: `globalThis.x` has to stay
+    /// `undefined` while a nested function still sees the binding. The record is
+    /// what nested functions read, and an uninitialized entry is the temporal
+    /// dead zone — a `ReferenceError`, where the global lookup used to answer
+    /// `undefined` for "no such property".
+    DeclareLexical {
+        name: Value,
+    },
+    /// Initialize a script-scope lexical binding — the one write the temporal
+    /// dead zone permits.
+    ///
+    /// ES separates `InitializeBinding` (the declaration) from
+    /// `SetMutableBinding` (an assignment): the former ends the dead zone, the
+    /// latter raises a `ReferenceError` while it is still open. Using `StoreEnv`
+    /// for both would make the declaration throw at itself.
+    InitLexical {
+        name: Value,
+        value: Value,
+    },
     LoadEnv {
         dst: Value,
         name: Value,
@@ -509,6 +532,8 @@ impl Instruction {
         match self {
             Instruction::LoadArg { dst, .. } => (vec![*dst], vec![]),
             Instruction::LoadConst { dst, .. } => (vec![*dst], vec![]),
+            Instruction::DeclareLexical { name } => (vec![], vec![*name]),
+            Instruction::InitLexical { name, value } => (vec![], vec![*name, *value]),
             Instruction::LoadEnv { dst, .. } => (vec![*dst], vec![]),
             Instruction::Move { dst, src } => (vec![*dst], vec![*src]),
             Instruction::UnaryOp { op: _, dst, src } => (vec![*dst], vec![*src]),
@@ -678,6 +703,10 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::LoadConst { dst, const_id: src } => {
                 write!(f, "{dst} = load_const {src}")
+            }
+            Instruction::DeclareLexical { name } => write!(f, "declare_lexical {name}"),
+            Instruction::InitLexical { name, value } => {
+                write!(f, "init_lexical {name}, {value}")
             }
             Instruction::LoadEnv { dst, name } => {
                 write!(f, "{dst} = load_env {name}")

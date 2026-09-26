@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14564 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 482 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14567 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 483 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -211,6 +211,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B18** | M7-P10 `var` 的**函数作用域与提升** + 块作用域遮蔽 | 60 + | **已完成**，见 §6.1；+62，2 处回退已逐条解释 |
 | **B19** | M7-P11 `try` 内 abrupt 完成（`break`/`continue` 跳出 `try`） | 6 + | **已完成**，见 §6.1；+6，零回退，并修回 B18 被它遮挡的 2 条用例 |
 | **B20** | M7-P12 TDZ（`let`/`const`/类名绑定的"已绑定但未初始化"窗口） | 20 + | **已完成**，见 §6.1；+9，零回退，修回 B18 遗留的 class 用例 |
+| **B21** | M7-P13 脚本**声明记录**与全局对象分离（数据模型债第一件） | 3 + | **已完成**，见 §6.1：+3，零回退；B20 残留 1 落地，闭包从此看到脚本级 `let` 的**活**绑定 |
+| **B22** | M7-P14 NamedEvaluation（默认值上的匿名函数取绑定名） | 1056 | 下一批：`*fn-name-*` 测试文件 1056 个，`dflt-*-elem-id-init-fn-name-*` 五族各 11 条 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -990,6 +992,73 @@ try 内 throw 被 catch（循环继续），以及 while / do-while 里的 break
    （`closure-per-iteration=2,2`，应为 `0,1`）。
 3. **闭包共享可变单元**：`var` 捕获仍是创建时快照；生成器 `SuspendedFrame::closure_maps` 切片口径
    也在这条线索上。第 1 条做完之后这两条会一起顺。
+
+#### B21 脚本声明记录与全局对象分离 —— 已完成（2026-09-27）
+
+**起点**：通过 14564 / 18277（79.64%），失败 3713，跳过 8133。
+
+**根因（B20 残留 1，也是数据模型债的第一件）**：脚本层的 `let`/`const`/`class` 一直是
+**用 `define_global` 发布进全局环境**的 —— 与 `var` 同一个 `HashMap`。这违反规范的
+GlobalEnvironmentRecord 结构（它有 **ObjectRecord + DeclarativeRecord 两个分量**），
+后果有三条：闭包经 `LoadEnv` 读到的是"全局属性"，**没有死区信息**（B20 残留 1）；
+`globalThis.x` 本应是 `undefined` 却能看到 `let x`；闭包里的读取还会走
+`closure_var_stack` 的**创建时快照**，脚本级 `let` 的跨函数写入看不见。
+
+**设计**（照规范的两个分量拆开，三条新机制）：
+
+| 机制 | 作用 |
+|------|------|
+| `DeclareLexical` 指令 | 脚本入口登记脚本级词法名 → 声明记录里一条**未初始化**项（死区） |
+| `InitLexical` 指令 | 声明自身的初始化 —— 死区唯一允许的写（`InitializeBinding`） |
+| `State::resolve_env_name` | `LoadEnv` / `StoreEnv` / `TypeOfEnv` **统一**的解析链：声明记录 → 闭包快照 → 全局对象 |
+
+规范依据：`InitializeBinding` 与 `SetMutableBinding` 是两回事（前者结束死区，后者在死区里抛
+`ReferenceError`）；`typeof` 必须在死区抛错、只在**未解析**时才答 `"undefined"` —— 两条链必须同源，
+否则 `typeof C` 在方法里得到 `"undefined"`（实测就是这样）。
+
+降级侧四处改动：`collect_lexical_names` 开始收集 `class` 名字（类名同样不是全局属性）；
+`hoist_lexical_bindings(…, declare_in_script_record)` 只在脚本层发 `DeclareLexical`；
+`define_global` 分流（脚本词法名 → `InitLexical`，其余 → `StoreEnv`）；嵌套函数的符号表
+**剔除脚本词法名**（剔除 `global_names` 的同一处理）。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14564 | **14567** | **+3** |
+| 失败 | 3713 | 3710 | −3 |
+| 通过率 | 79.64% | **79.70%** | +0.06pp |
+| 单元 / feature / 护栏 | 190 / 482 / 7 | 190 / **483** / 7 | +1 用例（6 条断言） |
+
+逐套件（`./scripts/phase2-status.sh`）：`language/statements/let` 113 → 114、
+`built-ins/Object` 2764 → 2766，**其余持平、无回退**。另对
+`language/statements/{let,const,class}` 做了路径级 diff：修好 1（
+`let/global-closure-set-before-initialization.js` —— 正是 B20 残留 1），零新失败。
+
+**四条踩出来的规矩**（都写进代码注释）
+
+1. **声明自身的初始化不能走 `StoreEnv`**：会被自己刚立的死区规则拒绝（`let x = 1` 自抛）。
+   规范早就把这两件事分开，编译器侧也要分成两条指令。
+2. **`init_lexical` 要传"刚赋好值的槽位"，不能传另一个块里的 SSA 值** —— 后者会落到一个
+   没人喂过的 phi 上（与 B18 提升 `var` 槽位时的坑同源）。
+3. **SSA 重命名不能偷懒**：`InitLexical` 的 `value` 是*使用*，漏了重命名让 codegen 写进
+   未写过的寄存器 —— 表现为 `class Ok {}` 之后 `typeof Ok === "undefined"`。
+4. **嵌套函数必须把脚本词法名从符号表剔除**：脚本层的预绑定是"死区标记"，泄漏进方法体后
+   **每个 class 方法读自己的类名都抛 `ReferenceError`**（实测让 class/let/const 三套件一次掉 81 条）。
+
+**残留**（下一批的输入）
+
+1. **函数级的闭包共享可变单元**（B19 残留 + 本条之后的最后一块）：脚本记录已经能跨函数共享，
+   但**函数内**的 `var`/`let` 捕获仍是创建时快照 —— 探针 `counter()` 三次调用仍是 `1,1,1`。
+   它与 per-iteration 绑定（`closure-per-iteration=2,2` 应为 `0,1`）是同一处机制，
+   生成器 `SuspendedFrame::closure_maps` 的切片口径也在这条线上。
+2. **NamedEvaluation**（B15b 侦察的第 2 族）：`*fn-name-*` 测试文件 **1056 个**，
+   `dflt-*-elem-id-init-fn-name-{arrow,cls,cover,fn,gen}` 五族各 11 条 —— 规范要求
+   `[x = function () {}] = []` 里的函数名取自绑定名。这是范围内失败里**最集中的一族**，排为 B22。
+3. `let`/`const` 套件剩余的 `dstr/*` 失败几乎全是上面这条；此外 `engine panic: SuspendedYield
+   without a frame`（`ary-ptrn-*-step-err`，20 条）是生成器债，与 B6 一起看。
+
+---
 
 ---
 

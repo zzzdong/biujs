@@ -172,6 +172,16 @@ pub trait InstBuilder {
         dst
     }
 
+    /// Register a script-scope lexical name (see `Instruction::DeclareLexical`).
+    fn declare_lexical(&mut self, name: Value) {
+        self.emit(Instruction::DeclareLexical { name });
+    }
+
+    /// Initialize a script-scope lexical binding (see `Instruction::InitLexical`).
+    fn init_lexical(&mut self, name: Value, value: Value) {
+        self.emit(Instruction::InitLexical { name, value });
+    }
+
     fn load_external_variable(&mut self, name: String) -> Value {
         let result = self.alloc();
 
