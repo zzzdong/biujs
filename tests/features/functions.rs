@@ -1,4 +1,4 @@
-use crate::helpers::{eval_js, eval_number, eval_string};
+use crate::helpers::{eval_bool, eval_js, eval_number, eval_string};
 use biujs::Value;
 
 // ============================================================
@@ -222,4 +222,97 @@ fn class_with_multiple_methods() {
         c.result()
     "#;
     assert_eq!(eval_number(js), 130.0);
+}
+
+// ============================================================
+// Rest parameters (`...rest`)
+// ============================================================
+//
+// `FormalParameters.rest` is a *separate* AST field from `items`, and the
+// lowering only walked `items` — so the rest binding never happened at all and
+// every function using one died with `ReferenceError: undefined variable`.
+// That also left `language/rest-parameters` (11 tests) reporting 0/0/0, because
+// `SUITES` named a directory that does not exist.
+
+#[test]
+fn rest_parameter_binds_a_fresh_array() {
+    // Always an array, always a *new* one, and present even for a bare call.
+    assert_eq!(
+        eval_string(
+            "function f(...a) { return [a.length, Array.isArray(a), typeof a[0]].join(','); }
+             f()"
+        ),
+        "0,true,undefined"
+    );
+    // Each call gets its *own* array, so the identity check yields 0*100 + 2.
+    assert_eq!(
+        eval_number(
+            "function f(...a) { return a; }
+             var x = f(1, 2);
+             var y = f(1, 2);
+             (x === y ? 1 : 0) * 100 + x.length"
+        ),
+        2.0
+    );
+    assert_eq!(
+        eval_bool(
+            "function f(...a) { return a; }
+             var x = f(1);
+             x.push(2);
+             f(1).length === 1"
+        ),
+        true
+    );
+}
+
+#[test]
+fn rest_parameter_follows_the_declared_parameters() {
+    assert_eq!(
+        eval_string("function f(x, ...r) { return x + ':' + r.join('-'); } f(1, 2, 3)"),
+        "1:2-3"
+    );
+    // `fn.length` counts neither the rest element nor anything from the first
+    // default onwards.
+    assert_eq!(eval_number("function f(a, ...b) {} f.length"), 1.0);
+    assert_eq!(eval_number("function g(...a) {} g.length"), 0.0);
+    assert_eq!(eval_number("function h(a = 1, ...b) {} h.length"), 0.0);
+}
+
+#[test]
+fn rest_parameter_may_be_a_pattern() {
+    // `...[] { }` and `...{} { }`: the rest array is destructured like any other
+    // value, so defaults and nesting come for free.
+    assert_eq!(eval_string("function f(...[a, b]) { return a + '/' + b; } f(1, 2, 3)"), "1/2");
+    assert_eq!(eval_number("function f(...[a, b = 9]) { return b; } f(1)"), 9.0);
+    assert_eq!(eval_string("function f(...{length}) { return 'n' + length; } f(1, 2, 3)"), "n3");
+}
+
+#[test]
+fn rest_parameter_works_in_every_function_shape() {
+    // Arrow, method, class method, constructor and generator all share the
+    // lowering that used to drop the rest element.
+    assert_eq!(eval_number("var f = (...a) => a.length; f(1, 2, 3)"), 3.0);
+    assert_eq!(eval_number("var o = { m(...a) { return a.length; } }; o.m(1, 2)"), 2.0);
+    assert_eq!(
+        eval_number(
+            "class C { constructor(...a) { this.n = a.length; } m(...a) { return a.length; } }
+             new C(1, 2, 3).n * 10 + new C().m(9)"
+        ),
+        31.0
+    );
+    assert_eq!(eval_number("function* g(...a) { yield a.length; } g(1, 2, 3, 4).next().value"), 4.0);
+}
+
+#[test]
+fn rest_parameter_survives_call_and_apply() {
+    assert_eq!(eval_string("function f(...a) { return a.join('-'); } f.apply(null, [1, 2, 3])"), "1-2-3");
+    assert_eq!(eval_string("function f(...a) { return a.join('-'); } f.call(null, 4, 5)"), "4-5");
+    // `arguments` and the rest array are independent bindings.
+    assert_eq!(
+        eval_string(
+            "function f(a, ...r) { arguments[0] = 'changed'; r[0] = 'also'; return arguments[0] + '/' + r[0]; }
+             f(1, 2)"
+        ),
+        "changed/also"
+    );
 }

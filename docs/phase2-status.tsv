@@ -8,7 +8,7 @@ language/expressions/yield	40	3	20
 language/statements/for-in	75	22	18
 language/destructuring	15	3	1
 language/expressions/assignment/destructuring	1	1	6
-language/functions/rest-parameters	0	0	0
+language/rest-parameters	11	0	0
 built-ins/Array/prototype/Symbol.iterator	0	1	0
 built-ins/String/prototype/Symbol.iterator	4	1	1
 language/expressions/addition	35	8	5
@@ -61,7 +61,7 @@ language/expressions/unary-minus	10	3	1
 language/expressions/unary-plus	12	3	2
 language/expressions/unsigned-right-shift	25	7	13
 language/expressions/void	8	1	0
-language/expressions/arrow-function	174	22	147
+language/expressions/arrow-function	177	22	144
 language/statements/block	11	7	3
 language/statements/break	18	2	0
 language/statements/class	1122	2863	382
@@ -92,7 +92,7 @@ built-ins/Boolean	26	8	17
 built-ins/Error	38	19	36
 built-ins/Function	192	191	126
 built-ins/JSON	112	51	2
-built-ins/Map	180	17	7
+built-ins/Map	181	17	6
 built-ins/Set	344	19	20
 built-ins/WeakMap	131	9	1
 built-ins/WeakSet	79	5	1

@@ -697,7 +697,11 @@ const SUITES: &[&str] = &[
     "language/statements/for-in",
     "language/destructuring",
     "language/expressions/assignment/destructuring",
-    "language/functions/rest-parameters",
+    // The rest-parameter tests live in `language/rest-parameters`; the old entry
+    // named a directory that does not exist, so the suite silently reported
+    // 0/0/0 — a coverage hole that was invisible because a missing directory is
+    // not an error.
+    "language/rest-parameters",
     "built-ins/Array/prototype/Symbol.iterator",
     "built-ins/String/prototype/Symbol.iterator",
     // ── Expressions: operators ──

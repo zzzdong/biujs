@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14384 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 459 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14399 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 464 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -206,6 +206,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B13** | M8-V1/V4 收口 | — | 覆盖率清单 + 三方文档对齐 |
 | **B14** | M5-C5 `Date`（含入册解锁） | 594 | B4 判定的落点；336 条纯算术 + 148 条 `Date.UTC` 不依赖外部数据，偏差见 §3.1 |
 | **B15** | M7-P7 解构赋值族（B4 侦察出的五族，按 1→3→2 拆批） | 974 | **B15a 已完成**（头部赋值模式，+177）、**B15b 已完成**（顺带挖出的"标签语句被整段丢弃"，+24），见 §6.1；族 3/2 与生成器参数债见 B15b 的残留 |
+| **B16** | M7-P8 `rest` 参数（全形态）+ `SUITES` 空条目造成的覆盖空洞 | 11 + | **已完成**，见 §6.1；生成器参数的"调用时绑定"仍在 B15c 残留 2 里 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -662,6 +663,60 @@ lblG: { g = 5; }                     // g 仍是 0
    （普通函数的 rest 参数正常，只有生成器这条路径漏了）。这条独立、量小，可以和第 2 条一批做。
 4. B4 侦察出的五族里**族 3（解构 null/undefined 的 abrupt 检查）在简单形状上已是对的**（实测 12 个形状与 node 一致），
    剩下的失败全部落在上面的生成器参数族里；族 2（默认值匿名函数的 NamedEvaluation）仍在队列。
+
+---
+
+#### B16 `rest` 参数（全形态）与覆盖空洞 —— 已完成（2026-09-26）
+
+**起点**：通过 14384 / 18266（78.75%），失败 3882，跳过 8133。
+
+**怎么发现的**：B15b 的残留 3 写的是"生成器 rest 参数完全未绑定"。动手前先确认根因，结果比描述严重得多：
+
+```js
+function f(...a) { return a.length; }   // ReferenceError: undefined variable: a
+```
+
+**rest 参数在所有函数形态下都没实现**（普通函数/函数表达式/箭头/方法/构造器/生成器），不只是生成器。
+
+**根因**：`lower_function_inner` 拿的是 `&func.params.items` —— 而 rest 元素在 AST 里是
+`FormalParameters::rest`，**不在 `items` 里**。降级遍历 `items` 时它从未被绑定，`...rest` 的名字
+自然不在符号表里，任何引用都直接 `ReferenceError`。
+
+**顺带挖出一个覆盖空洞**：`SUITES` 里写的是 `language/functions/rest-parameters`，
+而测试实际在 `language/rest-parameters`（`language/functions/` 目录根本不存在）。`run_suite`
+对不存在的目录返回 0，于是这个套件在每张表里都是 `0 0 0` —— **静默的覆盖空洞**。已改名，
+`phase2-status.sh` 的对比也把这次改名如实报成"移除一个套件 / 新增一个套件"。
+
+**改动**：
+
+- `lower_function_inner` 改为接收整个 `FormalParameters`，在参数循环之后绑定 rest：
+  `make_rest(params.len())`（`MakeRest` 指令早就存在，类的默认构造器一直在用它）+ `bind_pattern`，
+  因此 `...[]`/`...{}` 这类 *模式* rest 也一并可用；
+- `SUITES`：`language/functions/rest-parameters` → `language/rest-parameters`。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14384 | **14399** | +15 |
+| 执行 | 18266 | **18277** | +11（新入册的套件） |
+| 失败 | 3882 | 3878 | −4 |
+| 跳过 | 8133 | 8133 | 0（跳过表未动） |
+| 通过率 | 78.75% | **78.78%** | |
+| 单元 / feature / 护栏 | 190 / 459 / 7 | 190 / **464** / 7 | +5 条断言（`tests/features/functions.rs`） |
+
+逐套件核对：`language/rest-parameters` 新增（**11/11，100%**）、`language/expressions/arrow-function`
+174 → 177、`built-ins/Map` 180 → 181，**无任何回退**。
+
+**残留**
+
+1. **生成器参数的"调用时绑定"**（B15b 残留 2，实测两个生成器套件里 `Expected a TypeError to be thrown`
+   共 39 条属这一族）：参数绑定被推迟到第一次 `next()`，而规范要求在调用时完成。修法已论证：
+   在参数区末尾发一条屏障指令，`create_generator` 里建帧并跑到屏障后挂起（复用
+   `restore_generator_frame`/`store_suspended_generator` 的帧快照），**不要**把函数体也跑起来。
+   这块是生成器帧机制（本项目的地雷区），单独一批做并单独回归。
+2. rest 参数本身的语义边界（`no-alias-arguments` 等 11 条已全绿）没有已知缺口。
+3. B15b 残留 1（标签早错误）与 B4 侦察的族 2（默认值匿名函数的 NamedEvaluation）仍在队列。
 
 ---
 

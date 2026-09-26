@@ -408,7 +408,7 @@ impl<'a> JSASTLower<'a> {
                 // sets the constructor's name to the binding identifier).
                 constructor_id = Some(self.lower_function_inner(
                     Some(class_name.clone()),
-                    &func.params.items,
+                    &func.params,
                     func.body.as_ref().unwrap(),
                     None,
                     false,
@@ -504,7 +504,7 @@ impl<'a> JSASTLower<'a> {
                     let name = member_display_name(&class_name, key);
                     let func_val = self.lower_function_inner(
                         Some(name),
-                        &func.params.items,
+                        &func.params,
                         func.body.as_ref().unwrap(),
                         None,
                         false,
@@ -521,7 +521,7 @@ impl<'a> JSASTLower<'a> {
                     let name = member_display_name(&class_name, key);
                     let func_val = self.lower_function_inner(
                         Some(name),
-                        &func.params.items,
+                        &func.params,
                         func.body.as_ref().unwrap(),
                         None,
                         false,
@@ -538,7 +538,7 @@ impl<'a> JSASTLower<'a> {
                     let name = member_display_name(&class_name, key);
                     let func_val = self.lower_function_inner(
                         Some(name),
-                        &func.params.items,
+                        &func.params,
                         func.body.as_ref().unwrap(),
                         None,
                         false,
@@ -560,7 +560,7 @@ impl<'a> JSASTLower<'a> {
                     let name = member_display_name(&class_name, key);
                     let func_val = self.lower_function_inner(
                         Some(name),
-                        &func.params.items,
+                        &func.params,
                         func.body.as_ref().unwrap(),
                         None,
                         false,
@@ -2334,7 +2334,7 @@ impl<'a> JSASTLower<'a> {
         // Lower the arrow function body
         let func_val = self.lower_function_inner(
             Some(name),
-            &arrow.params.items,
+            &arrow.params,
             &arrow.body,
             None,
             is_expression_body,
@@ -2380,7 +2380,7 @@ impl<'a> JSASTLower<'a> {
         if let Some(body) = &func.body {
             self.lower_function_inner(
                 Some(name),
-                &func.params.items,
+                &func.params,
                 body,
                 None,
                 false,
@@ -2445,7 +2445,7 @@ impl<'a> JSASTLower<'a> {
         if let Some(body) = &func.body {
             let func_id_val = self.lower_function_inner(
                 Some(name.clone()),
-                &func.params.items,
+                &func.params,
                 body,
                 None,
                 false,
@@ -2469,7 +2469,7 @@ impl<'a> JSASTLower<'a> {
     fn lower_function_inner(
         &mut self,
         name: Option<String>,
-        params: &[FormalParameter<'_>],
+        formal_params: &FormalParameters<'_>,
         body: &FunctionBody<'_>,
         captured_this: Option<Value>,
         auto_return: bool,
@@ -2481,6 +2481,10 @@ impl<'a> JSASTLower<'a> {
     ) -> Value {
         // During hoisting, there may be no current block yet
         let curr = self.builder.try_current_block();
+        // `...rest` lives outside `items` in the AST, so the lowering uses this
+        // slice for the declared parameters and handles the rest element once,
+        // after them.
+        let params = &formal_params.items[..];
 
         let sig_params: Vec<FuncParam> = params
             .iter()
@@ -2573,6 +2577,15 @@ impl<'a> JSASTLower<'a> {
             if !matches!(&param.pattern, BindingPattern::BindingIdentifier(_)) {
                 func_lower.bind_pattern(&param.pattern, arg, false);
             }
+        }
+
+        // `...rest` (ES 14.1 `BindingRestElement`): an array of the arguments
+        // from `params.len()` on. Unlike every other parameter it is *never*
+        // absent — `f()` still binds `rest` to `[]` — and its target may itself
+        // be a pattern (`function f(...[a, b])`).
+        if let Some(rest) = formal_params.rest.as_deref() {
+            let rest_args = func_lower.builder.make_rest(params.len());
+            func_lower.bind_pattern(&rest.rest.argument, rest_args, false);
         }
 
         // Every ordinary function (`...args`): binds a fresh array of every argument `arguments` binding. It has to be
