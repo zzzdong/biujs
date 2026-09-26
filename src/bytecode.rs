@@ -313,6 +313,11 @@ pub enum Opcode {
     /// nested execution loop (the VM jumps past the last instruction, which is
     /// what terminates a nested `step` loop).
     Yield,
+    /// prologue_end — end of a generator's parameter prologue. A generator
+    /// function binds its parameters when it is *called*; the VM parks the
+    /// frame here until the first `next()` continues past it. Emitted only for
+    /// generators, so ordinary functions never carry it.
+    PrologueEnd,
     /// to_string dst, src — ES ToString (objects via ToPrimitive("string"))
     ToString,
     /// to_number dst, src — ES ToNumber (objects via ToPrimitive("number"))
@@ -411,6 +416,7 @@ impl fmt::Display for Opcode {
             Opcode::IterClose => write!(f, "iter_close"),
             Opcode::RequireObjectCoercible => write!(f, "require_object_coercible"),
             Opcode::Yield => write!(f, "yield"),
+            Opcode::PrologueEnd => write!(f, "prologue_end"),
             Opcode::ToString => write!(f, "to_string"),
             Opcode::ToNumber => write!(f, "to_number"),
             Opcode::MakeRest => write!(f, "make_rest"),

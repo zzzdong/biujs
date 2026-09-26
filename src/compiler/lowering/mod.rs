@@ -2598,6 +2598,14 @@ impl<'a> JSASTLower<'a> {
                 .insert("arguments".to_string(), Variable::new(args_val));
         }
 
+        // A generator binds its parameters — and builds `arguments` — when it is
+        // *called*, so everything up to here is the prologue the VM runs eagerly.
+        // The barrier marks its end: the frame parks there and the first `next()`
+        // continues right after it. Declarations and the body stay deferred.
+        if is_generator {
+            func_lower.builder.prologue_end();
+        }
+
         // First pass: collect nested function declarations for hoisting
         let mut hoisted_funcs: Vec<(String, Value)> = Vec::new();
         for stmt in &body.statements {

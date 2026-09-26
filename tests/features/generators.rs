@@ -537,3 +537,115 @@ fn a_delegate_close_error_reaches_the_generator_body() {
         "true|true"
     );
 }
+
+// ============================================================
+// Parameters bind at call time (ES 9.2.12)
+// ============================================================
+//
+// A generator binds its parameters when it is *called*, not on the first
+// `next()`: `function* f([[x]]) {}` must throw `TypeError` out of `f([null])`,
+// before the caller ever sees the generator object. The VM now builds the frame
+// eagerly and parks it at an `Opcode::PrologueEnd` barrier, which is also why
+// the *body* still must not run until `next()`.
+
+#[test]
+fn generator_parameters_bind_when_the_generator_is_called() {
+    // Destructuring a non-object, a non-iterable argument and a throwing default
+    // all complete abruptly at call time.
+    assert_eq!(
+        eval_string(
+            "function* f([[x]]) {}
+             try { f([null]); 'no-throw'; } catch (e) { e.name; }"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        eval_string(
+            "function* f({} = null) {}
+             try { f(); 'no-throw'; } catch (e) { e.name; }"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        eval_string(
+            "function* f([x]) {}
+             try { f({}); 'no-throw'; } catch (e) { e.name; }"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        eval_string(
+            "function* f(a = (function () { throw new Error('boom'); })()) {}
+             try { f(); 'no-throw'; } catch (e) { e.message; }"
+        ),
+        "boom"
+    );
+}
+
+#[test]
+fn a_called_generator_still_has_not_started_its_body() {
+    // The eager part is the *parameter* prologue only: the body waits for the
+    // first `next()`. (A log array is used rather than a counter variable,
+    // because captured scalars are still snapshot-on-capture in this engine.)
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             function* g(a) { log.push('body:' + a); yield 1; log.push('body2'); yield 2; }
+             var it = g(7);
+             var before = log.length;
+             var y1 = it.next().value;
+             var mid = log.length;
+             var y2 = it.next().value;
+             [before, mid, log.length, y1, y2].join(',')"
+        ),
+        "0,1,2,1,2"
+    );
+}
+
+#[test]
+fn a_parked_generator_can_be_returned_before_it_starts() {
+    // `return()` on a generator that was called but never resumed completes it
+    // without running the body — and without leaking the parked frame.
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             function* g(a) { log.push('body'); yield 1; }
+             var it = g(1);
+             var r = it.return('early');
+             [r.value, r.done, it.next().done, log.length].join(',')"
+        ),
+        "early,true,true,0"
+    );
+    // Same for `throw()`.
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             function* g(a) { log.push('body'); yield 1; }
+             var it = g(1);
+             try { it.throw(new Error('nope')); 'no-throw'; } catch (e) { e.message; }"
+        ),
+        "nope"
+    );
+}
+
+#[test]
+fn bound_parameters_are_visible_to_the_body() {
+    // The parked frame carries the bound parameters, so the body sees them —
+    // including a rest array and a destructured pattern.
+    assert_eq!(
+        eval_string(
+            "function* g(x, ...rest) { yield x; yield rest.length; yield rest.join('-'); }
+             var it = g(1, 'a', 'b');
+             [it.next().value, it.next().value, it.next().value].join(',')"
+        ),
+        "1,2,a-b"
+    );
+    assert_eq!(
+        eval_string(
+            "function* g([a, b = 9]) { yield a; yield b; }
+             var it = g([1]);
+             [it.next().value, it.next().value].join(',')"
+        ),
+        "1,9"
+    );
+}

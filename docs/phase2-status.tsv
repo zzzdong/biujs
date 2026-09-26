@@ -2,8 +2,8 @@
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
 # 最近更新：2026-09-26
 language/statements/for-of	571	44	136
-language/statements/generators	165	14	87
-language/expressions/generators	176	18	96
+language/statements/generators	209	14	43
+language/expressions/generators	220	18	52
 language/expressions/yield	40	3	20
 language/statements/for-in	75	22	18
 language/destructuring	15	3	1

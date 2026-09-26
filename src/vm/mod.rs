@@ -173,6 +173,10 @@ pub struct VM {
     next_guard_check: u64,
     /// Sticky guard failure for the current run (see `GuardFired`).
     guard_fired: Option<GuardFired>,
+    /// Set while a generator's *parameter* prologue runs eagerly (see
+    /// `create_generator`): `Opcode::PrologueEnd` then parks the frame and stops
+    /// the nested loop instead of being a no-op.
+    running_generator_prologue: bool,
     /// Bound functions created by `Function.prototype.bind`, keyed by a
     /// synthetic id that is embedded in the wrapper's name.
     bound_functions: HashMap<u32, BoundFunction>,
@@ -245,6 +249,7 @@ impl VM {
             deadline: None,
             next_guard_check: GUARD_CHECK_INTERVAL,
             guard_fired: None,
+            running_generator_prologue: false,
             bound_functions: HashMap::new(),
             next_bound_id: 0,
             invoke_boundaries: Vec::new(),
@@ -767,12 +772,13 @@ impl VM {
         // which reaches this call again: unbounded recursion for a source as
         // ordinary as `Array.prototype[Symbol.iterator] = function* () {…}`.
         if module.generators.contains(&func_id) {
-            return Ok(self.create_generator(
+            return self.create_generator(
                 func_id,
                 effective_this,
                 args.to_vec(),
                 captured_vars,
-            ));
+                module,
+            );
         }
 
         let saved_pc = self.state.pc;
@@ -1688,6 +1694,19 @@ impl VM {
             // `rsp`. Jumping past the last instruction ends the nested `step`
             // loop the resumer is driving, exactly as a `Ret` to the sentinel
             // return address would.
+            Opcode::PrologueEnd => {
+                // Only reached while `create_generator` runs the parameter
+                // prologue: on any later resume the instruction is already behind
+                // the frame's pc. Parking mirrors `Yield` exactly — the frame is
+                // what `run_generator_frame` snapshots — but no value is reported:
+                // the generator is still `suspendedStart`, and its first `next()`
+                // continues right after this instruction.
+                if self.running_generator_prologue {
+                    self.generator_yielded = Some(Value::Undefined);
+                    self.generator_yield_pc = self.state.pc;
+                    self.state.jump(module.instructions.len());
+                }
+            }
             Opcode::Yield => {
                 // `-1` is the "no operand" marker emitted for a bare `yield`
                 // (codegen cannot leave an operand slot empty).
@@ -1757,7 +1776,8 @@ impl VM {
                                 Value::Undefined,
                                 args,
                                 Vec::new(),
-                            );
+                                module,
+                            )?;
                             self.state.set_register(Register::Rv, gobj)?;
                             self.state.jump_offset(1);
                             return Ok(());
@@ -5431,9 +5451,16 @@ impl VM {
         this: Value,
         args: Vec<Value>,
         captured_vars: Vec<(String, Value)>,
-    ) -> Value {
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
         let id = self.next_generator_id;
         self.next_generator_id += 1;
+        // The prologue below runs *after* the generator object has taken
+        // ownership of the arguments, and the object's copies are the ones every
+        // later resume rebuilds the frame from.
+        let prologue_this = this.clone();
+        let prologue_args = args.clone();
+        let prologue_captured = captured_vars.clone();
         let mut gobj = crate::vm::object::GeneratorObject::new(id, func_id, args, this);
         gobj.captured_vars = captured_vars;
         // ES 14.4.11 / 9.1.13: the instance's prototype comes from
@@ -5449,7 +5476,101 @@ impl VM {
         }
         let value = Value::Object(Rc::new(RefCell::new(gobj)));
         self.generator_registry.insert(id, value.clone());
-        value
+
+        // ES 9.2.12 `FunctionDeclarationInstantiation` runs when the generator is
+        // *called*: `function* f([[x]]) {}` must throw `TypeError` out of
+        // `f([null])`, and a throwing default must reach the caller, not the first
+        // `next()`. Only the parameter prologue runs here — the lowering puts an
+        // `Opcode::PrologueEnd` barrier at its end and this parks the frame
+        // there. Running the *body* eagerly would be both wrong and a hazard:
+        // its first instruction may be a `yield` the caller should never see,
+        // and a body that iterates re-enters this function recursively.
+        self.run_generator_prologue(
+            &value,
+            func_id,
+            &prologue_this,
+            &prologue_args,
+            &prologue_captured,
+            module,
+        )?;
+        Ok(value)
+    }
+
+    /// Push a generator frame onto the stacks, positioned at its entry point.
+    ///
+    /// Shared by the eager parameter prologue (`create_generator`) and by the
+    /// first `next()`: the two have to agree on the frame layout down to the
+    /// control-stack trio, or a parked frame would resume into a different shape
+    /// than the one it was built with.
+    fn push_generator_frame(
+        &mut self,
+        func_id: u32,
+        this: &Value,
+        args: &[Value],
+        captured_vars: &[(String, Value)],
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        let Some(location) = module.symtab.get(&FunctionId::new(func_id)).copied() else {
+            return Err(RuntimeError::ReferenceError(format!(
+                "undefined function: {func_id}"
+            )));
+        };
+        for arg in args.iter().rev() {
+            self.state.push(arg.clone())?;
+        }
+        self.state.rbp = self.state.rsp;
+        self.state.enter_frame(args.len())?;
+        self.state.this_val = this.clone();
+        self.state.function_val = self.materialize_function(func_id);
+        for (name, value) in captured_vars {
+            let mut map = std::collections::HashMap::new();
+            map.insert(name.clone(), value.clone());
+            self.state.closure_var_stack.push(map);
+        }
+        self.state.pushc(self.state.closure_var_stack.len())?;
+        self.state.pushc(self.state.seh_stack.len())?;
+        self.state.pushc(self.resume_sentinel(module))?;
+        self.state.construct_stack.push(false);
+        self.state.new_target_stack.push(Value::Undefined);
+        self.state.jump(location);
+        Ok(())
+    }
+
+    /// Bind a freshly created generator's parameters, then park its frame.
+    ///
+    /// An error from the parameter prologue is returned to the *caller* — that
+    /// is the whole point of running it here (`function* f([[x]]) {}` called as
+    /// `f([null])` must throw, per ES 9.2.12).
+    fn run_generator_prologue(
+        &mut self,
+        gen_value: &Value,
+        func_id: u32,
+        this: &Value,
+        args: &[Value],
+        captured_vars: &[(String, Value)],
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        let saved = self.save_execution_state();
+        // Same depth bookkeeping as `generator_next`: the frame's own open
+        // delegates and closure maps are what the snapshot has to carry.
+        let delegate_depth = self.delegate_stack.len();
+        self.push_generator_frame(func_id, this, args, captured_vars, module)?;
+        let closure_depth = self.state.closure_var_stack.len();
+        self.running_generator_prologue = true;
+        let run = self.run_generator_frame(&saved, closure_depth, delegate_depth, module);
+        self.running_generator_prologue = false;
+        let run = run?;
+        // Parked at the barrier: the generator is still `suspendedStart` (its
+        // body has not run) but owns a frame whose pc sits just past the
+        // prologue, so `next()` continues there instead of rebuilding it.
+        if let Some(frame) = run.frame {
+            self.store_suspended_generator(
+                gen_value,
+                frame,
+                crate::vm::object::GeneratorState::SuspendedStart,
+            );
+        }
+        Ok(())
     }
 
     /// `gen.next([v])`: resume the body until the next `yield` or the return,
@@ -5493,6 +5614,38 @@ impl VM {
         }
 
         if state == crate::vm::object::GeneratorState::SuspendedStart {
+            // A generator whose *parameter* prologue already ran (at call time,
+            // see `create_generator`) parks with a frame in hand: the body still
+            // has not started, so this is still the first resume — but the frame
+            // exists and `next()` continues right after the barrier instead of
+            // building it again.
+            let parked = {
+                let Value::Object(obj_ref) = &gen_value else {
+                    return Err(RuntimeError::TypeError("not a generator".to_string()));
+                };
+                let mut gobj = obj_ref.borrow_mut();
+                match gobj
+                    .as_any_mut()
+                    .downcast_mut::<crate::vm::object::GeneratorObject>()
+                {
+                    Some(gobj) if gobj.suspended.is_some() => {
+                        gobj.state = crate::vm::object::GeneratorState::Executing;
+                        gobj.suspended.take()
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(frame) = parked {
+                let resume_pc = frame.pc;
+                self.restore_generator_frame(&frame, module)?;
+                // No value to deliver: nothing is waiting for `next(v)`'s
+                // argument, because the barrier is not a `yield`.
+                self.state.jump(resume_pc + 1);
+                let closure_depth = self.state.closure_var_stack.len();
+                let run =
+                    self.run_generator_frame(&saved, closure_depth, delegate_depth, module)?;
+                return Ok(self.finish_generator(&gen_value, run));
+            }
             // First resume: open a frame exactly like `invoke` does.
             let (func_id, args, this, captured_vars) = {
                 let Value::Object(obj_ref) = &gen_value else {
@@ -5513,26 +5666,7 @@ impl VM {
                     }
                 }
             };
-            let location = *module.symtab.get(&FunctionId::new(func_id)).unwrap();
-            let argc = args.len();
-            for arg in args.iter().rev() {
-                self.state.push(arg.clone())?;
-            }
-            self.state.rbp = self.state.rsp;
-            self.state.enter_frame(argc)?;
-            self.state.this_val = this;
-            self.state.function_val = self.materialize_function(func_id);
-            for (name, value) in &captured_vars {
-                let mut map = std::collections::HashMap::new();
-                map.insert(name.clone(), value.clone());
-                self.state.closure_var_stack.push(map);
-            }
-            self.state.pushc(self.state.closure_var_stack.len())?;
-            self.state.pushc(self.state.seh_stack.len())?;
-            self.state.pushc(self.resume_sentinel(module))?;
-            self.state.construct_stack.push(false);
-            self.state.new_target_stack.push(Value::Undefined);
-            self.state.jump(location);
+            self.push_generator_frame(func_id, &this, &args, &captured_vars, module)?;
         } else {
             // Resuming at a `yield`: put the frame slice back and hand the
             // sent value to the `Yield` that is waiting for it.
@@ -5705,7 +5839,11 @@ impl VM {
                         if !done {
                             // The delegate produced another value: the generator
                             // stays parked on it, right where it was.
-                            self.store_suspended_generator(&gen_value, frame);
+                            self.store_suspended_generator(
+                                &gen_value,
+                                frame,
+                                crate::vm::object::GeneratorState::SuspendedYield,
+                            );
                             return Ok(Self::iterator_result(value, false));
                         }
                         self.mark_generator_completed(&gen_value);
@@ -5826,7 +5964,11 @@ impl VM {
     ) -> Value {
         match (run.yielded, run.frame) {
             (Some(value), Some(frame)) => {
-                self.store_suspended_generator(gen_value, frame);
+                self.store_suspended_generator(
+                    gen_value,
+                    frame,
+                    crate::vm::object::GeneratorState::SuspendedYield,
+                );
                 Self::iterator_result(value, false)
             }
             _ => {
@@ -5836,10 +5978,17 @@ impl VM {
         }
     }
 
+    /// Park a generator frame.
+    ///
+    /// `state` is `SuspendedYield` after a `yield` and `SuspendedStart` when the
+    /// frame stopped at the parameter-prologue barrier: both own a resumable
+    /// frame (`next()` continues at `frame.pc + 1`), but only the former reports
+    /// a value.
     fn store_suspended_generator(
         &mut self,
         gen_value: &Value,
         frame: crate::vm::object::SuspendedFrame,
+        state: crate::vm::object::GeneratorState,
     ) {
         if let Value::Object(obj_ref) = gen_value {
             let mut gobj = obj_ref.borrow_mut();
@@ -5847,7 +5996,7 @@ impl VM {
                 .as_any_mut()
                 .downcast_mut::<crate::vm::object::GeneratorObject>()
             {
-                gobj.state = crate::vm::object::GeneratorState::SuspendedYield;
+                gobj.state = state;
                 gobj.suspended = Some(frame);
             }
         }

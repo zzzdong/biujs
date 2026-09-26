@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14399 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 464 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14487 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 468 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -206,7 +206,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B13** | M8-V1/V4 收口 | — | 覆盖率清单 + 三方文档对齐 |
 | **B14** | M5-C5 `Date`（含入册解锁） | 594 | B4 判定的落点；336 条纯算术 + 148 条 `Date.UTC` 不依赖外部数据，偏差见 §3.1 |
 | **B15** | M7-P7 解构赋值族（B4 侦察出的五族，按 1→3→2 拆批） | 974 | **B15a 已完成**（头部赋值模式，+177）、**B15b 已完成**（顺带挖出的"标签语句被整段丢弃"，+24），见 §6.1；族 3/2 与生成器参数债见 B15b 的残留 |
-| **B16** | M7-P8 `rest` 参数（全形态）+ `SUITES` 空条目造成的覆盖空洞 | 11 + | **已完成**，见 §6.1；生成器参数的"调用时绑定"仍在 B15c 残留 2 里 |
+| **B16** | M7-P8 `rest` 参数（全形态）+ `SUITES` 空条目造成的覆盖空洞 | 11 + | **已完成**，见 §6.1 |
+| **B17** | M7-P9 生成器参数的**调用时绑定**（`PrologueEnd` 屏障 + 帧泊车） | 39 + | **已完成**，见 §6.1；+88，零回退 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -717,6 +718,71 @@ function f(...a) { return a.length; }   // ReferenceError: undefined variable: a
    这块是生成器帧机制（本项目的地雷区），单独一批做并单独回归。
 2. rest 参数本身的语义边界（`no-alias-arguments` 等 11 条已全绿）没有已知缺口。
 3. B15b 残留 1（标签早错误）与 B4 侦察的族 2（默认值匿名函数的 NamedEvaluation）仍在队列。
+
+---
+
+#### B17 生成器参数的"调用时绑定" —— 已完成（2026-09-26）
+
+**起点**：通过 14399 / 18277（78.78%），失败 3878，跳过 8133。
+
+**根因**：生成器的参数绑定被推迟到第一次 `next()`（`generator_next` 的 `SuspendedStart` 分支才建帧），
+而 ES 9.2.12 `FunctionDeclarationInstantiation` 在**调用时**就完成。最小复现：
+
+```js
+function* f([[x]]) {}
+f([null]);          // node: 调用时抛 TypeError；本站：不抛（错误被推迟到 next()）
+```
+
+**改动**（这一批动的是生成器帧，所以先读透了挂起/恢复机制）：
+
+- **IR/字节码加一条屏障指令** `PrologueEnd`（无操作数无定义；`ssabuilder` 的两个 match 都有兜底分支，
+  只有 `rename_instruction` 需要补一个空 arm）；
+- **降级层**：`lower_function_inner` 在参数（含 rest 与 `arguments`）之后、函数体之前，为生成器发这条屏障；
+- **`create_generator` 改为 `Result`**：建完生成器对象后立即调 `run_generator_prologue` ——
+  建帧（新提取的 `push_generator_frame`，与首 `next()` 共用同一套帧布局）→ 打上
+  `running_generator_prologue` 标记 → 复用 `run_generator_frame` 跑到屏障 →
+  得到帧快照后以 **`SuspendedStart` + 帧** 泊车（`store_suspended_generator` 增加了状态参数）；
+- **屏障处理**：`Opcode::PrologueEnd` 只在 `running_generator_prologue` 为真时挂起，
+  手法与 `Yield` 完全一致（`generator_yielded` + `jump(instructions.len())`），**但不报告值**
+  ——生成器仍处于"尚未开始"，首 `next()` 从屏障之后继续；
+- **`generator_next`**：`SuspendedStart` 分支先看有没有泊好的帧，有就直接恢复并 `pc + 1` 继续，
+  没有才走原来的建帧路径。
+
+**关键设计点**（都写进了代码注释）：跑**仅参数区**，绝不跑函数体 —— 体里第一条指令可能就是调用方
+不该看见的 `yield`，而"体里迭代 ⇒ 重新进入本函数"正是原来那条"会无限递归"注释描述的事故。
+屏障让两者都不发生。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14399 | **14487** | **+88** |
+| 失败 | 3878 | 3790 | −88 |
+| 通过率 | 78.78% | **79.26%** | +0.48pp |
+| 单元 / feature / 护栏 | 190 / 464 / 7 | 190 / **468** / 7 | +4 条断言（`tests/features/generators.rs`） |
+
+逐套件核对：`language/statements/generators` 165 → **209**、`language/expressions/generators`
+176 → **220**，**其余全部持平（零回退）** —— 生成器帧的既有语义（`yield` / `return()` / `throw()` /
+`yield*` / `for-of` 关闭）都用一组与 node 逐项对比的探针复核过：
+
+```
+nested=TypeError | dflt=TypeError | noniter=TypeError | throwing-dflt=boom
+y1=1 y2=2 | done=true value=end | ret={"value":9,"done":true} | throw-in=thrown-in
+before=0 mid=1 after=2        ← 调用时只跑参数区，函数体仍未开始
+```
+
+**残留**
+
+1. **生成器的闭包捕获本来就是坏的**（与本批无关，复核时发现）：
+   ```js
+   function outer() { var secret = 41; function* g() { yield secret; yield secret + 1; } return g; }
+   var it = outer()();   // ReferenceError: undefined variable: secret
+   ```
+   这是"闭包是创建时值快照"那笔债的生成器版本（`SuspendedFrame::closure_maps` 的切片口径可疑：
+   `extract_generator_frame` 用的是推入帧内映射**之后**的深度）。要与数据模型债一起修。
+2. **解构非对象的报错文案难看**：现在是 `Cannot read properties of null (reading 'Symbol(…)')`，
+   类型对（`TypeError`，test262 只查类型）但文案应该来自 `RequireObjectCoercible`/`GetIterator`。
+3. 之后回到 **B4 侦察的族 2**（默认值匿名函数的 NamedEvaluation）与 **B15b 残留 1**（标签早错误）。
 
 ---
 

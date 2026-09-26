@@ -301,6 +301,12 @@ pub trait InstBuilder {
         dst
     }
 
+    /// Mark the end of a generator's parameter prologue (see
+    /// `Instruction::PrologueEnd`).
+    fn prologue_end(&mut self) {
+        self.emit(Instruction::PrologueEnd);
+    }
+
     /// Signal early exit to a protocol iterator (`IteratorClose`).
     /// `yield*`: the iterator is now pending on this frame.
     fn delegate_open(&mut self, iter: Value) {

@@ -341,6 +341,16 @@ pub enum Instruction {
         dst: Value,
         src: Value,
     },
+    /// End of a generator's parameter prologue (ES 9.2.12
+    /// `FunctionDeclarationInstantiation`).
+    ///
+    /// A generator function binds its parameters when it is **called**, not when
+    /// it is first resumed: `function* f([[x]]) {}` must throw `TypeError` from
+    /// `f([null])` itself, before the caller ever sees the generator object.
+    /// The VM therefore builds the frame at call time and stops at this
+    /// instruction, parking the frame until the first `next()` continues right
+    /// after it. Ordinary functions never carry it.
+    PrologueEnd,
     /// Rest parameter: collect arguments[from..] into a fresh array.
     MakeRest {
         dst: Value,
@@ -623,6 +633,7 @@ impl Instruction {
             Instruction::Halt { value } => (vec![], value.iter().cloned().collect()),
             Instruction::PushSeh { .. } => (vec![], vec![]),
             Instruction::PopSeh => (vec![], vec![]),
+            Instruction::PrologueEnd => (vec![], vec![]),
             Instruction::Throw { value, args } => {
                 let mut used = vec![*value];
                 used.extend(args.iter().cloned());
@@ -898,6 +909,7 @@ impl std::fmt::Display for Instruction {
                 Ok(())
             }
             Instruction::PopSeh => write!(f, "pop_seh"),
+            Instruction::PrologueEnd => write!(f, "prologue_end"),
             Instruction::Throw { value, args } => {
                 write!(f, "throw {value}")?;
                 if !args.is_empty() {

@@ -798,6 +798,8 @@ impl<'a> SSABuilder<'a> {
             }
             Instruction::PushSeh { .. } => {}
             Instruction::PopSeh => {}
+            // No operands, no definitions: nothing to rename.
+            Instruction::PrologueEnd => {}
             Instruction::Throw { value, args } => {
                 SSABuilder::rename_use(value, stacks);
                 for arg in args.iter_mut() {
