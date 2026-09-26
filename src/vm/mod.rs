@@ -1892,8 +1892,19 @@ impl VM {
                     return Ok(());
                 }
 
-                // All finally blocks executed, jump to target
-                self.state.jump_offset(offset);
+                // No `finally` to run anywhere on the way out: leave the frames
+                // being unwound and land on the trampoline directly.
+                //
+                // The operand is an **absolute** PC — codegen patches it from the
+                // block map precisely because `ResumeExc` (the finally path)
+                // reads the same value as an address. Jumping *relative* here
+                // landed past the last instruction and silently dropped
+                // everything left in the program; that was
+                // `for (x of y) { try { break; } catch (e) {} }`.
+                for _ in 0..seh_depth {
+                    self.state.seh_stack.pop();
+                }
+                self.state.jump(offset.max(0) as usize);
                 return Ok(());
             }
             Opcode::BrIf => {

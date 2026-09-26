@@ -1,4 +1,4 @@
-use crate::helpers::eval_number;
+use crate::helpers::{eval_number, eval_string};
 
 // ============================================================
 // if/else
@@ -658,5 +658,120 @@ fn break_inside_switch_targets_the_label_not_the_switch() {
              e"
         ),
         7.0
+    );
+}
+
+// ============================================================
+// Abrupt completion out of a `try` (break / continue / return)
+// ============================================================
+//
+// A `break`/`continue` inside a `try` has to leave the loop *and* the try. The
+// lowering models it as a `DelayedJump` to a trampoline, whose target is an
+// absolute PC (the finally path reads it the same way); the branch that had no
+// `finally` to run used a *relative* jump instead, so control landed past the
+// last instruction and everything left in the program was silently dropped.
+// (`Opcode::DelayedJump` also has to pop the records it unwinds.)
+
+#[test]
+fn break_inside_try_leaves_the_loop() {
+    // Without a `finally` — the case that used to fall off the end of the program.
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             for (var x of [1]) { try { log.push('a'); break; } catch (e) {} log.push('b'); }
+             log.push('c');
+             log.join(',')"
+        ),
+        "a,c"
+    );
+    // A `continue` must reach the next iteration, not the code after the try.
+    assert_eq!(
+        eval_string(
+            "var seen = [];
+             for (var y of [1, 2]) { try { seen.push('t' + y); continue; } catch (e) {} seen.push('x' + y); }
+             seen.join(',')"
+        ),
+        "t1,t2"
+    );
+}
+
+#[test]
+fn abrupt_exit_runs_the_finally_blocks() {
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             for (var x of [1, 2]) { try { log.push('t' + x); break; } finally { log.push('f' + x); } }
+             log.push('end');
+             log.join(',')"
+        ),
+        "t1,f1,end"
+    );
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             for (var y of [1, 2]) { try { log.push('t' + y); continue; } finally { log.push('f' + y); } }
+             log.push('end');
+             log.join(',')"
+        ),
+        "t1,f1,t2,f2,end"
+    );
+}
+
+#[test]
+fn labeled_break_and_nested_try_exit_correctly() {
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             outer: for (var a of [1]) { try { for (var b of [9]) { log.push('in'); break outer; } } catch (e) {} }
+             log.push('after');
+             log.join(',')"
+        ),
+        "in,after"
+    );
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             for (var c of [1]) { try { try { log.push('nest'); break; } catch (e) {} } catch (e2) {} }
+             log.push('after');
+             log.join(',')"
+        ),
+        "nest,after"
+    );
+}
+
+#[test]
+fn return_and_caught_throw_behave_inside_looping_try() {
+    assert_eq!(
+        eval_string(
+            "function f() { for (var x of [1]) { try { return 'ret'; } catch (e) {} } return 'fell'; }
+             f()"
+        ),
+        "ret"
+    );
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             for (var y of [1]) { try { log.push('a'); throw new Error('x'); } catch (err) { log.push('c'); } }
+             log.push('done');
+             log.join(',')"
+        ),
+        "a,c,done"
+    );
+}
+
+#[test]
+fn while_and_do_while_break_inside_try() {
+    assert_eq!(
+        eval_string(
+            "var log = [];
+             while (true) { try { log.push('w'); break; } catch (e) {} }
+             log.push('after');
+             log.join(',')"
+        ),
+        "w,after"
+    );
+    assert_eq!(
+        eval_number("var n = 0; do { try { n = n + 1; break; } catch (e) {} } while (n < 3); n"),
+        1.0
     );
 }

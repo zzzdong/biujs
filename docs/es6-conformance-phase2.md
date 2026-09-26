@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14549 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 473 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14555 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 478 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -209,7 +209,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B16** | M7-P8 `rest` 参数（全形态）+ `SUITES` 空条目造成的覆盖空洞 | 11 + | **已完成**，见 §6.1 |
 | **B17** | M7-P9 生成器参数的**调用时绑定**（`PrologueEnd` 屏障 + 帧泊车） | 39 + | **已完成**，见 §6.1；+88，零回退 |
 | **B18** | M7-P10 `var` 的**函数作用域与提升** + 块作用域遮蔽 | 60 + | **已完成**，见 §6.1；+62，2 处回退已逐条解释 |
-| **B19** | M7-P11 `try` 内 abrupt 完成（`break`/`continue` 跳出 `try`） | ? | **既有缺陷**（基线可复现），见 B18 记录的残留 1 |
+| **B19** | M7-P11 `try` 内 abrupt 完成（`break`/`continue` 跳出 `try`） | 6 + | **已完成**，见 §6.1；+6，零回退，并修回 B18 被它遮挡的 2 条用例 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -871,6 +871,68 @@ before=0 mid=1 after=2        ← 调用时只跑参数区，函数体仍未开�
 4. **闭包共享可变单元**（B18 起点想查的那件事）：`var` 捕获仍是创建时快照，
    `function m(){ var i = 0; return function () { i = i + 1; return i; }; }` 的 `m()()` 仍是 `1,1`
    （应为 `1,2`）；生成器的 `SuspendedFrame::closure_maps` 切片口径也在这条线索上。
+
+---
+
+#### B19 `try` 内的 abrupt 完成 —— 已完成（2026-09-26）
+
+**起点**：通过 14549 / 18277（79.60%），失败 3728，跳过 8133。
+
+**根因（两处，缺一不可）**
+
+1. **跳板块被当成死代码裁掉**。`break`/`continue` 在 `try` 里会发一条 `DelayedJump` 指向一个
+   trampoline 块，但 CFG 的连边只在 `try` **有 `finally`** 时才加（`pending_exits` 从 finally
+   连到跳板）。没有 finally 时跳板没有任何前驱 → codegen 整块裁掉 → 补丁后的目标地址指向指令流之外。
+2. **绝对地址被当成相对跳转**。`DelayedJump` 的操作数经 codegen 打补丁成**绝对 PC**（`ResumeExc`
+   的 finally 分支正是按地址消费它），但"没有 finally 要跑"的分支用的是 `jump_offset`（相对）。
+   于是控制流跳到了指令流末尾之外，程序直接"掉出末尾"—— 后面的语句一条都不执行，这也是
+   B18 的 `for-of/break-from-try`、`continue-from-try` 两条用例被它遮挡的方式。
+   同一分支还没有弹出被跳过的 SEH 记录（finally 分支由 `ResumeExc` 逐层弹，这里没人弹）。
+
+最小复现（**基线上同样失败**，不是 B18 引入的）：
+
+```js
+var log = [];
+for (var x of [1]) { try { log.push("a"); break; } catch (e) {} log.push("b"); }
+log.push("c");
+throw log.join(",");      // node: "a,c"；修前：返回 1（后面的语句根本没跑）
+```
+
+**改动**（`lowering/mod.rs` + `vm/mod.rs`）
+
+- `SehFrameInfo` 增加 `exit_edges: Vec<(发出块, 跳板)>`：`lower_loop_exit` 在登记 `pending_exits`
+  时一并记录发出块；`lower_try` 按 `finally_blk.unwrap_or(发出块) → 跳板` 连边 —— 有 finally 时仍
+  从 finally 连（数据流本来就经过它），没有时从发出块连。
+- `Opcode::DelayedJump` 的无 finally 分支改用绝对跳转 `state.jump(offset)`，并弹出
+  `seh_depth` 条 SEH 记录。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14549 | **14555** | **+6** |
+| 失败 | 3728 | 3722 | −6 |
+| 通过率 | 79.60% | **79.64%** | |
+| 单元 / feature / 护栏 | 190 / 473 / 7 | 190 / **478** / 7 | +5 条断言（`tests/features/control_flow.rs`） |
+
+逐套件：`language/statements/try` 140 → **144**、`language/statements/for-of` 570 → **572**
+（后者的 +2 正是 B18 记录里标为"既有缺陷所致"的那两条），**无逐套件回退** ——
+B18 遗留的 `class` −1（TDZ）之外再无回退。
+
+与 node 逐项对比过的形态（9 个，全部一致）：`break`/`continue` 出只有 catch 的 try、
+带 finally 的 break/continue（finally 都跑了）、标签 break 出 try、嵌套 try、`return` 出 try、
+try 内 throw 被 catch（循环继续），以及 while / do-while 里的 break。
+
+**残留**
+
+1. **TDZ**（`let`/`const`/类名绑定）：`for-of/dstr/*-put-let` 那 19 条"Expected a ReferenceError"
+   与 B18 遗留的 `class/name-binding/in-extends-expression-assigned` 同属一族，量最大、收益最直接。
+2. **per-iteration 绑定**（ES6 `CreatePerIterationEnvironment`）：循环头 `let` 的闭包应每轮一个新绑定
+   （`closure-per-iteration=2,2`，应为 `0,1`）。
+3. **闭包共享可变单元**：`var` 捕获仍是创建时快照；生成器 `SuspendedFrame::closure_maps` 的切片口径
+   也在这条线索上。
+4. `try` 里 `yield*` 与 delegate 的 abrupt 交互（B18 的 `*-from-try` 里 `yield-from-try` 已通过，
+   但更深的组合还没专门验证过）。
 
 ---
 

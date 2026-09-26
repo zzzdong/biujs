@@ -27,6 +27,15 @@ struct SehFrameInfo {
     /// real data flow (the finally block is what produces the values the
     /// trampoline observes).
     pending_exits: Vec<BlockId>,
+    /// `(emitting block, trampoline)` for every delayed exit out of this frame.
+    ///
+    /// A `break`/`continue` out of a `try` whose only handler is a `catch` has no
+    /// `finally` to run — the trampoline is entered straight from the block that
+    /// executed the jump. Recording the *source* is what makes that case
+    /// reachable: without an edge, codegen prunes the trampoline as dead and the
+    /// branch lands past the last instruction, which silently dropped everything
+    /// left in the program (`for (x of y) { try { break; } catch (e) {} }`).
+    exit_edges: Vec<(BlockId, BlockId)>,
 }
 
 /// Context for break/continue inside loops.
@@ -1360,9 +1369,11 @@ impl<'a> JSASTLower<'a> {
             let trampoline = self.create_block(format!("{label}_trampoline"));
             // Every `finally` frame being unwound leads here, so register the
             // trampoline on each of them (see `SehFrameInfo::pending_exits`).
+            let source = self.builder.current_block();
             let first = self.seh_frames.len().saturating_sub(seh_depth_to_pop);
             for frame in self.seh_frames.iter_mut().skip(first) {
                 frame.pending_exits.push(trampoline);
+                frame.exit_edges.push((source, trampoline));
             }
             self.builder.delayed_jump(trampoline, seh_depth_to_pop);
             self.builder.switch_to_block(trampoline);
@@ -1512,6 +1523,7 @@ impl<'a> JSASTLower<'a> {
         self.seh_frames.push(SehFrameInfo {
             finally_blk: if has_finally { Some(finally_blk) } else { None },
             pending_exits: Vec::new(),
+            exit_edges: Vec::new(),
         });
 
         self.builder.push_seh(seh_handler, seh_finally);
@@ -1538,12 +1550,16 @@ impl<'a> JSASTLower<'a> {
         // is entered once this try's `finally` has finished, so the finally
         // block is its real predecessor.
         if let Some(frame) = self.seh_frames.pop() {
-            if let Some(finally_blk) = frame.finally_blk {
-                for target in frame.pending_exits {
-                    self.builder
-                        .control_flow_graph_mut()
-                        .add_edge(finally_blk, target);
-                }
+            // With a `finally` the trampoline is entered once it has run; without
+            // one, straight from the block that executed the jump. Either way the
+            // edge has to exist — a trampoline with no predecessor is dead code
+            // and gets pruned, leaving the branch to fall off the end of the
+            // program (which silently swallowed everything after the loop).
+            for (from, target) in frame.exit_edges {
+                let source = frame.finally_blk.unwrap_or(from);
+                self.builder
+                    .control_flow_graph_mut()
+                    .add_edge(source, target);
             }
         }
         if !self.current_block_is_terminated() {
