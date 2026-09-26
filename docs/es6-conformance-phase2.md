@@ -1055,6 +1055,25 @@ GlobalEnvironmentRecord 结构（它有 **ObjectRecord + DeclarativeRecord 两�
 2. **NamedEvaluation**（B15b 侦察的第 2 族）：`*fn-name-*` 测试文件 **1056 个**，
    `dflt-*-elem-id-init-fn-name-{arrow,cls,cover,fn,gen}` 五族各 11 条 —— 规范要求
    `[x = function () {}] = []` 里的函数名取自绑定名。这是范围内失败里**最集中的一族**，排为 B22。
+
+   同批做的侦察（探针形状与 node 逐项对比）：**整族缺失**，连最普通的
+   `var f = function () {}` 都是 `<anonymous>`。七个位置全错、无一例外：
+
+   | 形状 | 现状 | node |
+   |------|------|------|
+   | `var f = function () {}` | `<anonymous>` | `f` |
+   | `[a = function () {}] = []` | `<anonymous>` | `a` |
+   | `({ o = function () {} } = {})` | `<anonymous>` | `o` |
+   | `function p(x = function () {}) {}` | `<anonymous>` | `x` |
+   | `[c = class {}] = []` | `<class>` | `c` |
+   | `[g = function* () {}] = []` | `<anonymous>` | `g` |
+   | `[arrow = () => {}] = []` | `""` | `arrow` |
+
+   落点：`bind_pattern` 的 `AssignmentPattern` 分支把默认值交给 `eval_default_on`
+   （`self.eval_default_on(&[is_undef], &ap.right, result.clone())`），**不带绑定名**；
+   `lower_variable_declaration` / 赋值表达式 / 形参绑定同样没有名字提示。
+   `lower_function_inner(Some(name), …)` 只设**自身**声明名，缺的是"给一个匿名表达式补名"
+   （`SetFunctionName`）这条原语 —— 一个 helper + 各位置传入名字提示即可。
 3. `let`/`const` 套件剩余的 `dstr/*` 失败几乎全是上面这条；此外 `engine panic: SuspendedYield
    without a frame`（`ary-ptrn-*-step-err`，20 条）是生成器债，与 B6 一起看。
 
