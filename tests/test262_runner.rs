@@ -211,15 +211,14 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 /// Map 204 / Set 383 / WeakMap 141 / WeakSet 85 / Promise 677 / Proxy 311 /
 /// Reflect 153 / TypedArray 2184.
 ///
-/// `Map` left this list with B2a and `Set` with B2b (both suites are in
-/// `SUITES`); the others stay gated until the feature exists.
+/// `Map` left this list with B2a, `Set` with B2b and the weak collections with
+/// B3 (all four suites are in `SUITES`); the others stay gated until the
+/// feature exists.
 const IN_SCOPE_PENDING: &[&str] = &[
 "Promise",
 "Proxy",
 "Reflect",
 "TypedArray",
-"WeakMap",
-"WeakSet",
 ];
 
 /// Every feature tag whose tests this engine currently cannot pass.
@@ -614,6 +613,8 @@ const SUITES: &[&str] = &[
     // same batch).
     "built-ins/Map",
     "built-ins/Set",
+    "built-ins/WeakMap",
+    "built-ins/WeakSet",
     "built-ins/Math",
     "built-ins/NativeErrors",
     "built-ins/Number",

@@ -9,11 +9,30 @@ use crate::vm::object::JSObject;
 pub struct SymbolData {
     pub description: Option<String>,
     pub id: u64,
+    /// True for `Symbol.for(name)` values, which live in the global registry.
+    ///
+    /// `CanBeHeldWeakly` (ES 24.2.1) accepts objects and *non-registered*
+    /// symbols only, so the weak collections have to be able to tell them
+    /// apart.
+    pub registered: bool,
 }
 
 impl SymbolData {
     pub fn new(description: Option<String>, id: u64) -> Self {
-        Self { description, id }
+        Self {
+            description,
+            id,
+            registered: false,
+        }
+    }
+
+    /// A symbol created by `Symbol.for` (registered in the global registry).
+    pub fn new_registered(description: Option<String>, id: u64) -> Self {
+        Self {
+            description,
+            id,
+            registered: true,
+        }
     }
 }
 

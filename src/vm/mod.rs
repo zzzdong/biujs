@@ -1351,6 +1351,12 @@ impl VM {
         if let Some(method) = name.strip_prefix(crate::builtins::SET_METHOD_PREFIX) {
             return self.set_method(&this, method, args, module);
         }
+        if let Some(method) = name.strip_prefix(crate::builtins::WEAKMAP_METHOD_PREFIX) {
+            return self.weakmap_method(&this, method, args, module);
+        }
+        if let Some(method) = name.strip_prefix(crate::builtins::WEAKSET_METHOD_PREFIX) {
+            return self.weakset_method(&this, method, args);
+        }
         // Generator methods: `gen.next(v)` resumes the body, `gen.return(v)` /
         // `gen.throw(e)` complete it, and `gen[Symbol.iterator]()` hands the
         // generator itself back.
@@ -3898,6 +3904,252 @@ impl VM {
         }
     }
 
+    /// `WeakMap.prototype` methods (ES 23.3.3) — pure, but dispatched here so
+    /// the receiver check is exact (`get`/`set`/`has`/`delete` are ordinary
+    /// property names elsewhere).
+    fn weakmap_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        // The receiver check happens inside each builtin (they share `as_weak_map`).
+        match method {
+            "set" => crate::builtins::weakmap_set(this, args),
+            "get" => crate::builtins::weakmap_get(this, args),
+            "has" => crate::builtins::weakmap_has(this, args),
+            "delete" => crate::builtins::weakmap_delete(this, args),
+            // `upsert` (ES2026): same shape as `Map`'s, on a weak key.
+            "getOrInsert" => {
+                let key = args.first().cloned().unwrap_or(Value::Undefined);
+                let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+                if !crate::builtins::can_be_held_weakly(&key) {
+                    return Err(RuntimeError::TypeError(
+                        "Invalid value used as weak map key".to_string(),
+                    ));
+                }
+                let Value::Object(obj_ref) = this else {
+                    return Err(RuntimeError::TypeError(
+                        "WeakMap.prototype.getOrInsert called on a non-object".to_string(),
+                    ));
+                };
+                if obj_ref.borrow().kind() != ObjectKind::WeakMap {
+                    return Err(RuntimeError::TypeError(
+                        "WeakMap.prototype.getOrInsert called on an incompatible receiver"
+                            .to_string(),
+                    ));
+                }
+                let mut borrowed = obj_ref.borrow_mut();
+                let map = borrowed
+                    .as_any_mut()
+                    .downcast_mut::<crate::vm::object::WeakMapObject>()
+                    .expect("kind checked above");
+                match map.get(&key) {
+                    Some(existing) => Ok(existing),
+                    None => {
+                        map.set(key, value.clone());
+                        Ok(value)
+                    }
+                }
+            }
+            "getOrInsertComputed" => {
+                let key = args.first().cloned().unwrap_or(Value::Undefined);
+                let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+                if !crate::builtins::can_be_held_weakly(&key) {
+                    return Err(RuntimeError::TypeError(
+                        "Invalid value used as weak map key".to_string(),
+                    ));
+                }
+                if !callback.is_callable() {
+                    return Err(RuntimeError::TypeError(
+                        "WeakMap.prototype.getOrInsertComputed callback is not a function"
+                            .to_string(),
+                    ));
+                }
+                let Value::Object(obj_ref) = this else {
+                    return Err(RuntimeError::TypeError(
+                        "WeakMap.prototype.getOrInsertComputed called on a non-object"
+                            .to_string(),
+                    ));
+                };
+                if obj_ref.borrow().kind() != ObjectKind::WeakMap {
+                    return Err(RuntimeError::TypeError(
+                        "WeakMap.prototype.getOrInsertComputed called on an incompatible receiver"
+                            .to_string(),
+                    ));
+                }
+                let existing = obj_ref
+                    .borrow()
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::WeakMapObject>()
+                    .and_then(|map| map.get(&key));
+                if let Some(existing) = existing {
+                    return Ok(existing);
+                }
+                let value = self.invoke(
+                    &callback,
+                    Value::Undefined,
+                    std::slice::from_ref(&key),
+                    module,
+                )?;
+                let mut borrowed = obj_ref.borrow_mut();
+                borrowed
+                    .as_any_mut()
+                    .downcast_mut::<crate::vm::object::WeakMapObject>()
+                    .expect("kind checked above")
+                    .set(key, value.clone());
+                Ok(value)
+            }
+            _ => Err(RuntimeError::TypeError(format!(
+                "WeakMap.prototype.{method} is not implemented"
+            ))),
+        }
+    }
+
+    /// `WeakSet.prototype` methods (ES 23.4.3).
+    fn weakset_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        match method {
+            "add" => crate::builtins::weakset_add(this, args),
+            "has" => crate::builtins::weakset_has(this, args),
+            "delete" => crate::builtins::weakset_delete(this, args),
+            _ => Err(RuntimeError::TypeError(format!(
+                "WeakSet.prototype.{method} is not implemented"
+            ))),
+        }
+    }
+
+    /// `new WeakMap([iterable])` (ES 23.3.1.1): same shape as `map_construct`,
+    /// with the object-key rule enforced by the adder.
+    fn weakmap_construct(
+        &mut self,
+        constructor_val: &Value,
+        args: &[Value],
+        new_target: Option<&Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let proto = self.prototype_from_constructor(constructor_val, new_target);
+        let prototype = match &proto {
+            Some(Value::Object(p)) => Some(Rc::clone(p)),
+            _ => Some(Rc::clone(&self.builtins.weakmap_prototype)),
+        };
+        let map_val = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::WeakMapObject::new(prototype),
+        )));
+        let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+        if !matches!(iterable, Value::Undefined | Value::Null) {
+            let iter = self.make_iterator(iterable, module)?;
+            // `adder = Get(map, "set")` — a patched `set` is honoured.
+            let adder = match self.get_member(&map_val, &PropertyKey::from_str("set"), module) {
+                Ok(adder) => adder,
+                Err(err) => {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(err);
+                }
+            };
+            if !adder.is_callable() {
+                self.iterator_close(iter, None, true, module)?;
+                return Err(RuntimeError::TypeError(
+                    "WeakMap constructor: 'set' is not callable".to_string(),
+                ));
+            }
+            loop {
+                let (item, done) = match self.iterator_next(iter.clone(), None, module) {
+                    Ok(step) => step,
+                    Err(err) => {
+                        self.iterator_close(iter, None, true, module)?;
+                        return Err(err);
+                    }
+                };
+                if done {
+                    break;
+                }
+                if !item.is_object() {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(RuntimeError::TypeError(
+                        "WeakMap constructor: iterator value is not an entry object".to_string(),
+                    ));
+                }
+                let key = match self.get_member(&item, &PropertyKey::from_str("0"), module) {
+                    Ok(key) => key,
+                    Err(err) => {
+                        self.iterator_close(iter, None, true, module)?;
+                        return Err(err);
+                    }
+                };
+                let value = match self.get_member(&item, &PropertyKey::from_str("1"), module) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.iterator_close(iter, None, true, module)?;
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = self.invoke(&adder, map_val.clone(), &[key, value], module) {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(map_val)
+    }
+
+    /// `new WeakSet([iterable])` (ES 23.4.1.1).
+    fn weakset_construct(
+        &mut self,
+        constructor_val: &Value,
+        args: &[Value],
+        new_target: Option<&Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let proto = self.prototype_from_constructor(constructor_val, new_target);
+        let prototype = match &proto {
+            Some(Value::Object(p)) => Some(Rc::clone(p)),
+            _ => Some(Rc::clone(&self.builtins.weakset_prototype)),
+        };
+        let set_val = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::WeakSetObject::new(prototype),
+        )));
+        let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+        if !matches!(iterable, Value::Undefined | Value::Null) {
+            let iter = self.make_iterator(iterable, module)?;
+            let adder = match self.get_member(&set_val, &PropertyKey::from_str("add"), module) {
+                Ok(adder) => adder,
+                Err(err) => {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(err);
+                }
+            };
+            if !adder.is_callable() {
+                self.iterator_close(iter, None, true, module)?;
+                return Err(RuntimeError::TypeError(
+                    "WeakSet constructor: 'add' is not callable".to_string(),
+                ));
+            }
+            loop {
+                let (value, done) = match self.iterator_next(iter.clone(), None, module) {
+                    Ok(step) => step,
+                    Err(err) => {
+                        self.iterator_close(iter, None, true, module)?;
+                        return Err(err);
+                    }
+                };
+                if done {
+                    break;
+                }
+                if let Err(err) = self.invoke(&adder, set_val.clone(), &[value], module) {
+                    self.iterator_close(iter, None, true, module)?;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(set_val)
+    }
+
     /// ES 24.2.3.1 `GetSetRecord(obj)`: the `{ size, has, keys }` shape a
     /// set-like argument must expose, validated in the spec's order.
     fn get_set_record(
@@ -6170,6 +6422,12 @@ impl VM {
         }
         if name == "Set" {
             return self.set_construct(constructor_val, args, new_target, module);
+        }
+        if name == "WeakMap" {
+            return self.weakmap_construct(constructor_val, args, new_target, module);
+        }
+        if name == "WeakSet" {
+            return self.weakset_construct(constructor_val, args, new_target, module);
         }
 
         // ES 9.1.14 `GetPrototypeFromConstructor`: `newTarget.prototype` when

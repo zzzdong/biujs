@@ -162,7 +162,8 @@ pub fn symbol_for(args: &[Value]) -> Result<Value, RuntimeError> {
 
         // Create new symbol and register it
         let id = SYMBOL_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let symbol_data = SymbolData::new(Some(key.clone()), id);
+        // A registered symbol: it may not be used as a weak-collection key.
+        let symbol_data = SymbolData::new_registered(Some(key.clone()), id);
         let symbol = Value::Symbol(Rc::new(symbol_data));
         register_symbol_value(&symbol);
 

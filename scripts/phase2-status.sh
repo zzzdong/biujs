@@ -107,7 +107,10 @@ echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 # 8143 → 8149（B2b）：`built-ins/Set` 入册，自带 26 条门控用例进表；`Set` 解锁
 # 又让 20 条本来被"Set"这个子串顺带跳过的用例（`WeakSet` 之外的）转为执行 ——
 # 其中 Map 套件 +12 条，其余在 language/*。
-EXPECTED_SKIPPED=8149
+# 8149 → 8133（B3）：`built-ins/WeakMap`/`WeakSet` 入册（各带 9 + 5 条门控），
+# 两个特性名从 IN_SCOPE_PENDING 摘掉后，先前被它们顺带跳过、分散在已入册套件里的
+# 30 条用例转为执行。
+EXPECTED_SKIPPED=8133
 if [ "$SKIPPED" != "$EXPECTED_SKIPPED" ]; then
   echo "  !! 跳过数从 $EXPECTED_SKIPPED 变为 $SKIPPED —— 跳过表被改动了。"
   echo "     请确认这是有意的（计划书 §2.2：交付特性时必须同批解锁），并更新本脚本的 EXPECTED_SKIPPED。"

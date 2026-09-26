@@ -9,6 +9,7 @@ mod number;
 mod object;
 mod set;
 mod string;
+mod weak;
 mod symbol;
 
 use std::cell::RefCell;
@@ -45,6 +46,10 @@ pub use object::{OBJECT_TO_STRING_NATIVE, object_constructor, object_prototype_t
 pub use set::{
     SET_SIZE_NATIVE, SET_SPECIES_NATIVE, register_set_prototype, set_add, set_clear, set_delete,
     set_has, set_size,
+};
+pub use weak::{
+    can_be_held_weakly, register_weakmap_prototype, register_weakset_prototype, weakmap_delete,
+    weakmap_get, weakmap_has, weakmap_set, weakset_add, weakset_delete, weakset_has,
 };
 
 // ─────────────────────────────────────────────────────────
@@ -330,6 +335,8 @@ pub struct Builtins {
     pub symbol_prototype: Rc<RefCell<dyn JSObject>>,
     pub map_prototype: Rc<RefCell<dyn JSObject>>,
     pub set_prototype: Rc<RefCell<dyn JSObject>>,
+    pub weakmap_prototype: Rc<RefCell<dyn JSObject>>,
+    pub weakset_prototype: Rc<RefCell<dyn JSObject>>,
 }
 
 impl Builtins {
@@ -350,6 +357,8 @@ impl Builtins {
         let symbol_proto = new_proto(Some(Rc::clone(&object_proto)), "Symbol");
         let map_proto = new_proto(Some(Rc::clone(&object_proto)), "Map");
         let set_proto = new_proto(Some(Rc::clone(&object_proto)), "Set");
+        let weakmap_proto = new_proto(Some(Rc::clone(&object_proto)), "WeakMap");
+        let weakset_proto = new_proto(Some(Rc::clone(&object_proto)), "WeakSet");
 
         // Needed before any built-in function object is created: every one of
         // them inherits from `Function.prototype`.
@@ -375,6 +384,8 @@ impl Builtins {
             symbol_prototype: symbol_proto,
             map_prototype: map_proto,
             set_prototype: set_proto,
+            weakmap_prototype: weakmap_proto,
+            weakset_prototype: weakset_proto,
         }
     }
 
@@ -630,6 +641,23 @@ impl Builtins {
         }
         globals.insert("Set".to_string(), set_fn_val);
 
+        // `WeakMap` / `WeakSet` (ES 23.3 / 23.4): four and three methods
+        // respectively, no `size`, no iteration. The constructors are the VM's
+        // (`new WeakMap(iterable)` drives the iteration protocol).
+        let weakmap_fn_val =
+            Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("WeakMap"))));
+        weak::register_weakmap_prototype(&self.weakmap_prototype);
+        Self::link_constructor_prototype(&weakmap_fn_val, &self.weakmap_prototype);
+        register_wrapper_prototype("WeakMap", Rc::clone(&self.weakmap_prototype));
+        globals.insert("WeakMap".to_string(), weakmap_fn_val);
+
+        let weakset_fn_val =
+            Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("WeakSet"))));
+        weak::register_weakset_prototype(&self.weakset_prototype);
+        Self::link_constructor_prototype(&weakset_fn_val, &self.weakset_prototype);
+        register_wrapper_prototype("WeakSet", Rc::clone(&self.weakset_prototype));
+        globals.insert("WeakSet".to_string(), weakset_fn_val);
+
         // Well-known symbols (ES6 §19.4.2): `Symbol.iterator` is required by
         // the iteration protocol; `toPrimitive` / `toStringTag` / `hasInstance`
         // are honoured by `ToPrimitive`, `Object.prototype.toString` and
@@ -805,6 +833,9 @@ pub fn call_native(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         "Set" => Err(RuntimeError::TypeError(
             "Constructor Set requires 'new'".to_string(),
         )),
+        "WeakMap" | "WeakSet" => Err(RuntimeError::TypeError(format!(
+            "Constructor {name} requires 'new'"
+        ))),
         // ES `isNaN` / `isFinite` coerce their argument with ToNumber first.
         "isNaN" => Ok(Value::Bool(
             args.first().map(|v| v.to_number().is_nan()).unwrap_or(true),
@@ -1377,6 +1408,27 @@ pub const PROTO_METHOD_PREFIX: &str = "__proto_method__";
 /// method came from.
 pub const MAP_METHOD_PREFIX: &str = "__map_method__";
 pub const SET_METHOD_PREFIX: &str = "__set_method__";
+/// Same idea for the two weak collections (ES 23.3.3 / 23.4.3). They have
+/// fewer methods and no iterator, but `get`/`set`/`add`/`has`/`delete` are
+/// still names that exist on other objects.
+pub const WEAKMAP_METHOD_PREFIX: &str = "__weakmap_method__";
+pub const WEAKSET_METHOD_PREFIX: &str = "__weakset_method__";
+
+/// Install the `Symbol.toStringTag` of a collection prototype
+/// (`Map.prototype[Symbol.toStringTag] === "Map"`, ES 23.1.3.14 & friends).
+pub fn define_string_tag(proto: &Rc<RefCell<dyn JSObject>>, tag: &str) {
+    let _ = proto.borrow_mut().define_property(
+        to_string_tag_symbol_key(),
+        PropertyDescriptor {
+            value: Value::string(tag),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            getter: None,
+            setter: None,
+        },
+    );
+}
 
 /// Register a VM-implemented prototype method under `prefix`.
 ///
@@ -1419,6 +1471,8 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         .unwrap_or(registered_name);
     let name = name.strip_prefix(MAP_METHOD_PREFIX).unwrap_or(name);
     let name = name.strip_prefix(SET_METHOD_PREFIX).unwrap_or(name);
+    let name = name.strip_prefix(WEAKMAP_METHOD_PREFIX).unwrap_or(name);
+    let name = name.strip_prefix(WEAKSET_METHOD_PREFIX).unwrap_or(name);
     match name {
         // ── Constructors ──
         "Object" | "Array" | "Boolean" | "Number" | "String" | "Function" | "Error"
@@ -1462,7 +1516,7 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         "search" | "match" | "localeCompare" => 1,
         // ── Map (ES 23.1): `Map.length` is 0, and these are the only
         // prototype methods whose arity is not 0 by default ──
-        "Map" | "Set" => 0,
+        "Map" | "Set" | "WeakMap" | "WeakSet" => 0,
         "Map.groupBy" => 2,
         "get" | "has" | "delete" | "add" => 1,
         // `set-methods` operators each take the set-like argument.

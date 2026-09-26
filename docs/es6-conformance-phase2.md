@@ -10,13 +10,13 @@
 
 | 指标 | 数值 | 说明 |
 |------|------|------|
-| test262 执行 | 18024 | runner 实际跑的数（B2a 起含 `built-ins/Map`，B2b 起含 `built-ins/Set`） |
-| 通过 | **13943** | 主指标（B2b 后） |
-| 失败 | 4081 | 其中约 3400 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
-| 跳过 | 8149 | 范围外 / G3 排除项 + 已入册套件自己的 feature 门控（`Map` 30 条 + `Set` 26 条） |
-| 通过率 | 77.36% | 参考值 |
+| test262 执行 | 18266 | runner 实际跑的数（B2/B3 起含 `Map`/`Set`/`WeakMap`/`WeakSet`） |
+| 通过 | **14183** | 主指标（B3 后） |
+| 失败 | 4083 | 其中约 3400 条由 ES6 范围内特性驱动，约 640 条涉及范围外特性 |
+| 跳过 | 8133 | 范围外 / G3 排除项 + 已入册套件自己的 feature 门控 |
+| 通过率 | 77.65% | 参考值 |
 | 单元测试 | 190 全绿 | |
-| feature 集成测试 | 32 个文件 / 442 用例全绿 | |
+| feature 集成测试 | 33 个文件 / 448 用例全绿 | |
 | 全量耗时 | 2m50s | B1 的协议化 spread 带来的上升，见 §6.1 |
 | runner 覆盖面 | 25586 / 53568 个测试文件（**47%**） | 见 §2.3 |
 
@@ -153,7 +153,7 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | **B1** ✅ | M7-P3 的 spread 走 `GetIterator`（含 `ArrayPushSpread` 重写） | +21 | **已完成**，见 §6.1；顺带修好 `@@iterator === values` 与 `values/keys/entries` 的接收者校验 |
 | **B2a** ✅ | M5-C1 前半：`Map`（含入册解锁） | 204（入册后执行 162） | **已完成**，见 §6.1；套件通过率 95.68%，A3 的 ≥80% 达标 |
 | **B2b** ✅ | M5-C1 后半：`Set`（含 `set-methods` 七个算子） | 383 | **已完成**，见 §6.1；套件通过率 94.40%，A3 的 ≥80% 达标 |
-| **B3** | M5-C2 `WeakMap`/`WeakSet` | 226 | 与 B2 同构，可顺带 |
+| **B3** ✅ | M5-C2 `WeakMap`/`WeakSet` | 226 | **已完成**，见 §6.1；两套件 99.24% / 98.75%，A3 的 ≥80% 达标 |
 | **B4** | M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策 | — | 把 KPI 的杂音清掉，再动大件 |
 | **B5a** ✅ | M7-P4 前半：数组 `length` 的错误种类（应为 RangeError） | +32 | **已完成**，见 §6.1 |
 | **B5b** ✅ | M7-P4 后半：`defineProperty` 的 TypeError 缺口、六个完整性方法、数组 `length` 的下取整 | **+118**（净） | **已完成**，见 §6.1；含一条**已解释的** `built-ins/Array` −11（strict-only 所致，见 §6.1 末） |
@@ -405,6 +405,48 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
   - 1 条 `set.js` 等全局对象（顶层 `this`）。
 - `WeakMap` / `WeakSet` 仍未开工（B3）。它们可以完全复用本批的 `MAP_METHOD_PREFIX`/`SET_METHOD_PREFIX` 套路，但**只有 `get`/`set`/`has`/`delete` 四个方法**（无 `size`、无迭代器），`Rc` 下"弱"引用退化为强引用这一点要按 §8 登记偏差。
 
+#### B3 `WeakMap` / `WeakSet` —— 已完成（2026-09-26）
+
+**起点**：通过 13943 / 18024（77.36%）。
+
+**交付**：两个特性名从 `IN_SCOPE_PENDING` 摘掉，`built-ins/WeakMap` 与 `built-ins/WeakSet` 加进 `SUITES`。`WeakMap` **131 / 132 = 99.24%**、`WeakSet` **79 / 80 = 98.75%**（各只剩 1 条 `weakmap.js` / `weakset.js`，卡在全局对象）。
+
+**改动**（比 B2a/B2b 小得多，因为完全复用了它们的存储与派发套路）
+
+| 层 | 内容 |
+|----|------|
+| `vm/object.rs` | `WeakMapObject` / `WeakSetObject`：内部各自包一个 `MapObject` / `SetObject`，`kind()` 与 `class_name()` 覆盖成 `WeakMap`/`WeakSet`，其余 20 个 `JSObject` 方法由一个 `delegate_collection_object!` 宏转发 |
+| `builtins/weak.rs`（新） | 四个 / 三个方法 + `CanBeHeldWeakly` 键规则；两个原型各注册 `Symbol.toStringTag`（顺手抽了 `define_string_tag` 助手） |
+| `builtins/mod.rs` | `WEAKMAP_METHOD_PREFIX` / `WEAKSET_METHOD_PREFIX`、两个原型字段与装配、arity |
+| `vm/mod.rs` | `weakmap_method` / `weakset_method`（前缀派发 + 精确接收者检查）、`weakmap_construct` / `weakset_construct`（`GetIterator` + `Get(map,"set")`/`Get(set,"add")` 后 `Call`，任一 abrupt 先 `IteratorClose`）、`WeakMap.prototype.getOrInsert` / `getOrInsertComputed`（`upsert` 提案） |
+| `vm/value.rs` | `SymbolData` 加 `registered` 标志（`Symbol.for` 造出来的符号带 `true`） |
+| `tests/` | `tests/features/weak_collections.rs`（6 组断言）+ runner 的解锁/入册 |
+
+**两个规范细节（都踩到了）**
+
+1. **`CanBeHeldWeakly` 接受对象与"非注册 Symbol"**（ES 24.2.1）。最初只认对象，结果 9 条 Symbol 键用例直接失败（`WeakMap` 的 `*symbol-key*` 一族、`WeakSet` 的 `adds-symbol-element`）。同时又不能放宽到底：`Symbol.for('x')` 是**注册**符号，永久可达，规范禁止把它当弱键 —— 这要求 `SymbolData` 记住自己是不是注册出来的（原来没有这个信息）。
+2. **`set`/`add` 抛错，但 `get`/`has`/`delete` 对非法键必须安静**（分别给 `undefined`/`false`/`false`）。这一条把“键规则”拆成了两个方向，不能一把梭。
+
+**效果**
+
+| 指标 | 起点 | 本批后 |
+|------|------|--------|
+| 全量通过 | 13943（77.36%） | **14183**（77.65%） |
+| 失败 | 4081 | **4083** |
+| 执行 / 跳过 | 18024 / 8149 | 18266 / 8133 |
+| `built-ins/WeakMap` | 未入册 | **131 / 132 = 99.24%** |
+| `built-ins/WeakSet` | 未入册 | **79 / 80 = 98.75%** |
+| `built-ins/Map` | 167（+ 新解锁） | **180 / 187 = 96.26%** |
+| `built-ins/Set` | 337 / 357 | **344 / 364 = 94.51%** |
+| `language/statements/class` | 1116 | **1122** |
+| 其余 | — | `Object`+2、`expressions/class`+2 |
+
+净 **+240**，**逐套件零回退**。单元 190 全绿；features 442 → **448**（新增 `tests/features/weak_collections.rs`，6 组）。
+
+**偏差登记（§8 已更新）**：条目存储在 `Rc` 里，**键不可达时不会被回收** —— "弱"这一点在本引擎不可观察。其余可观察面（键规则、无 `size`/无 `@@iterator`/无 `clear`、`get`/`has`/`delete` 的安静回答、构造器走迭代协议）都按规范实现。
+
+**残留**：两个套件各剩 1 条 `weakmap.js` / `weakset.js`，都只是 `verifyProperty(this, 'WeakMap', …)` —— 卡在**全局对象**（顶层 `this` 是 `undefined`）。
+
 ---
 
 ## 7. 验证与回归策略（本阶段增补）
@@ -427,7 +469,7 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | **`TypedArray` 同质但量大（2184）** | 中 | 用生成式 feature 用例覆盖 11 个视图 × 操作矩阵 |
 | **度量口径再次漂移** | 中 | §2.1 的三个数字并列写进报告；范围判定变更必须同时改 §3 与 runner |
 | **旧债被误当新问题重复排查** | 中 | §5 各任务的"来源"列直接指向旧文档条目；本阶段所有新结论只写进本文件 |
-| `Rc` 下 `WeakMap`/`WeakSet` 不是真弱引用 | 低 | 明确登记偏差，不假装支持 |
+| `Rc` 下 `WeakMap`/`WeakSet` 不是真弱引用 | 低 | **已登记**（B3）：条目不会被回收，其余可观察面（对象/Symbol 键规则、无 `size`/无迭代/无 `clear`）都按规范实现 |
 
 ---
 

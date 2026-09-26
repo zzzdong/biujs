@@ -67,5 +67,7 @@ mod string_es6;
 mod symbol_test;
 #[path = "features/variables.rs"]
 mod variables;
+#[path = "features/weak_collections.rs"]
+mod weak_collections;
 #[path = "features/well_known_symbols.rs"]
 mod well_known_symbols;

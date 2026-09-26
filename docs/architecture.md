@@ -108,9 +108,10 @@
 | `GeneratorObject`（`:1890`） | `state`、`args`、`this`、`suspended: Option<SuspendedFrame>` |
 | `MapObject`（B2a） | `entries: Vec<Option<(Value, Value)>>`（插入序；`None` 是删除留下的墓碑）、`properties`、`prototype` |
 | `SetObject`（B2b） | `entries: Vec<Option<Value>>`（同上，插入序 + 墓碑） |
+| `WeakMapObject` / `WeakSetObject`（B3） | 各自包一个 `MapObject` / `SetObject`（宏转发 20 个 `JSObject` 方法），只覆盖 `kind`/`class_name`；条目不会被回收（§8 偏差） |
 | `NativeIteratorObject`（`iterator.rs:100`） | 迭代器状态（`Map` 变体见 `NativeIteratorState`） |
 
-- `PropertyKey`（`property.rs:5`）= `Str(Rc<String>) | Symbol(u64)`；`PropertyDescriptor:45`；`ObjectKind:99`（20 个变体，`Map`/`Set` 已实现，`WeakMap`/`WeakSet`/`Promise`/`Proxy` 等**仍是占位**）。
+- `PropertyKey`（`property.rs:5`）= `Str(Rc<String>) | Symbol(u64)`；`PropertyDescriptor:45`；`ObjectKind:99`（20 个变体，`Map`/`Set`/`WeakMap`/`WeakSet` 已实现，`Promise`/`Proxy`/`TypedArray` 等**仍是占位**）。
 - `prototype.rs`：`find_descriptor:83` / `internal_get:36` / `internal_set:110` / `internal_has_property:183` / `internal_delete:212`。**错误类型是 `String`**（见地雷 5）。
 
 ### 2.7 内置对象层
@@ -139,7 +140,7 @@
 
 ### 3.1 新增一个集合类型（Map / Set / WeakMap / TypedArray）的改动清单
 
-`Map`（B2a）与 `Set`（B2b）已落地，下面是"照着做 `WeakMap`/`WeakSet`"时的落点，**以及 B2a/B2b 实际踩到的坑**（比清单本身值钱）：
+四个集合类型都已落地（B2a `Map`、B2b `Set`、B3 两个弱集合），下面是"照着做 `Promise`/`Proxy`/`TypedArray`"时的落点，**以及集合批次实际踩到的坑**（比清单本身值钱）：
 
 1. `vm/object.rs`：新增 `SetObject { entries: Vec<Option<Value>>, ... }`，`impl JSObject`。
    - 插入序用 `Vec` 保序，查找走 `SameValueZero`（`same_value_zero()` 已抽好放在 `MapObject` 旁边）。**别用 `HashMap` 直接当存储**：`SameValueZero` 与 `Hash` 在 `-0`/`NaN` 上不一致，且要保序。
@@ -155,6 +156,8 @@
    - 还要检查 `CallMethod` 的数组回调拦截（`try_array_callback_method`）不会把新类型吞掉（Map 的 `forEach` 就中过这一枪）。
 6. `tests/test262_runner.rs`：从 `IN_SCOPE_PENDING` 删掉特性名 + 把套件加进 `SUITES`（§2.2）。**删之前先查 `is_unsupported` 的 `contains` 匹配**：`"Array.prototype.flatMap".contains("Map")` 为真，B2a 因此"顺带"放进池里 20 条未实现的用例。
 7. `tests/features/`：至少覆盖 插入序 / `SameValueZero`（`-0`、`NaN`）/ `size` / 迭代 / 迭代期间的增删 / `new T(iterable)`。**注意本引擎的闭包是创建时值快照**：计数器不能写在闭包里，只能往捕获的数组里 `push`（`state.i += 1` 会报 `Cannot create property 'i' on number`）。
+
+**弱集合（B3）的两条额外规则**：`CanBeHeldWeakly` 只接受对象与**非注册** Symbol（`Symbol.for` 出来的不行，所以 `SymbolData` 带 `registered` 标志）；`set`/`add` 对非法键抛 TypeError，而 `get`/`has`/`delete` 必须安静作答。
 
 ---
 

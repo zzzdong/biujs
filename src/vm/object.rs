@@ -1665,6 +1665,10 @@ impl NativeFunctionObject {
             method.to_string()
         } else if let Some(method) = self.name.strip_prefix(crate::builtins::SET_METHOD_PREFIX) {
             method.to_string()
+        } else if let Some(method) = self.name.strip_prefix(crate::builtins::WEAKMAP_METHOD_PREFIX) {
+            method.to_string()
+        } else if let Some(method) = self.name.strip_prefix(crate::builtins::WEAKSET_METHOD_PREFIX) {
+            method.to_string()
         } else if self.name == crate::builtins::MAP_SIZE_NATIVE
             || self.name == crate::builtins::SET_SIZE_NATIVE
         {
@@ -2272,6 +2276,175 @@ impl JSObject for MapObject {
         "Map"
     }
 }
+
+// ─────────────────────────────────────────────────────────
+// WeakMapObject / WeakSetObject — `WeakMap` / `WeakSet` (ES 23.3, 23.4)
+// ─────────────────────────────────────────────────────────
+
+/// `WeakMap` instance.
+///
+/// **Registered deviation (plan §8)**: the engine holds values in `Rc`, so
+/// entries are not collected when the key becomes unreachable — the "weak" part
+/// is not observable here. What *is* implemented is everything else the spec
+/// pins: object-only keys, no `size`, no iteration, no `clear`, and the
+/// `get`/`has`/`delete` non-object answers.
+#[derive(Debug)]
+pub struct WeakMapObject {
+    inner: MapObject,
+}
+
+impl WeakMapObject {
+    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        Self {
+            inner: MapObject::new(prototype),
+        }
+    }
+
+    pub fn get(&self, key: &Value) -> Option<Value> {
+        self.inner.get(key)
+    }
+
+    /// Returns the map so `set` can chain. The caller has already checked that
+    /// `key` is an object (ES 23.3.3.5 step 3).
+    pub fn set(&mut self, key: Value, value: Value) {
+        self.inner.set(key, value);
+    }
+
+    pub fn has(&self, key: &Value) -> bool {
+        self.inner.has(key)
+    }
+
+    pub fn delete(&mut self, key: &Value) -> bool {
+        self.inner.delete(key)
+    }
+}
+
+macro_rules! delegate_collection_object {
+    ($ty:ty, $inner:ident, $kind:expr, $class:expr) => {
+        impl JSObject for $ty {
+            fn kind(&self) -> ObjectKind {
+                $kind
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+
+            fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+                self.$inner.property_get(key)
+            }
+
+            fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+                self.$inner.property_set(key, value)
+            }
+
+            fn define_property(
+                &mut self,
+                key: PropertyKey,
+                desc: PropertyDescriptor,
+            ) -> Result<bool, String> {
+                self.$inner.define_property(key, desc)
+            }
+
+            fn property_delete(&mut self, key: &PropertyKey) -> bool {
+                self.$inner.property_delete(key)
+            }
+
+            fn has_property(&self, key: &PropertyKey) -> bool {
+                self.$inner.has_property(key)
+            }
+
+            fn own_keys(&self) -> Vec<PropertyKey> {
+                self.$inner.own_keys()
+            }
+
+            fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+                self.$inner.get_prototype()
+            }
+
+            fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+                self.$inner.set_prototype(proto);
+            }
+
+            fn is_extensible(&self) -> bool {
+                self.$inner.is_extensible()
+            }
+
+            fn prevent_extensions(&mut self) {
+                self.$inner.prevent_extensions();
+            }
+
+            fn is_frozen(&self) -> bool {
+                self.$inner.is_frozen()
+            }
+
+            fn freeze(&mut self) {
+                self.$inner.freeze();
+            }
+
+            fn is_sealed(&self) -> bool {
+                self.$inner.is_sealed()
+            }
+
+            fn seal(&mut self) {
+                self.$inner.seal();
+            }
+
+            fn type_of(&self) -> &'static str {
+                "object"
+            }
+
+            fn class_name(&self) -> &'static str {
+                $class
+            }
+        }
+    };
+}
+
+delegate_collection_object!(
+    WeakMapObject,
+    inner,
+    ObjectKind::WeakMap,
+    "WeakMap"
+);
+
+/// `WeakSet` instance — same deviation note as [`WeakMapObject`].
+#[derive(Debug)]
+pub struct WeakSetObject {
+    inner: SetObject,
+}
+
+impl WeakSetObject {
+    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        Self {
+            inner: SetObject::new(prototype),
+        }
+    }
+
+    /// The caller has already checked that `value` is an object.
+    pub fn add(&mut self, value: Value) {
+        self.inner.add(value);
+    }
+
+    pub fn has(&self, value: &Value) -> bool {
+        self.inner.has(value)
+    }
+
+    pub fn delete(&mut self, value: &Value) -> bool {
+        self.inner.delete(value)
+    }
+}
+
+delegate_collection_object!(
+    WeakSetObject,
+    inner,
+    ObjectKind::WeakSet,
+    "WeakSet"
+);
 
 // ─────────────────────────────────────────────────────────
 // SetObject — `Set` instances (ES 23.2)
