@@ -22,12 +22,157 @@
 //!
 //! Tests requiring features biujs does not implement are *skipped* rather than
 //! counted as failures, so the pass rate reflects real capability.
+//!
+//! ## Guards (a runaway test must fail, not hang the run)
+//!
+//! Three limits, each catching a different failure mode. All of them turn into
+//! an ordinary test *failure* with a recognisable message — the runner never
+//! aborts the process, because that would throw away every result collected so
+//! far (it used to happen: one runaway allocation under `ulimit -v` killed the
+//! whole run).
+//!
+//! | Guard | Env var | Default | Catches |
+//! |-------|---------|---------|---------|
+//! | steps | `TEST262_STEP_LIMIT` (0 = off) | `DEFAULT_STEP_LIMIT` | hot infinite loops |
+//! | clock | `TEST262_TIMEOUT_MS` (0 = off) | `10000` | slow loops, native stalls |
+//! | heap | `TEST262_MEMORY_MB` (0 = off) | `256` MiB **per test** | runaway allocation |
+//!
+//! The heap budget is a per-test *delta* (armed against the live heap when the
+//! test starts), because the harness itself holds hundreds of megabytes of
+//! parsed tests; see `memory_allowance` for the measurement that forced this.
+//!
+//! `TEST262_TIMINGS=1` prints the slowest tests, which is how a sane default for
+//! the clock guard gets chosen instead of guessed.
 
 use biujs::{CompileError, Compiler, RuntimeError, VM, Value};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use test262_harness::{Flag, Harness, Phase, Test};
+
+// ─────────────────────────────────────────────────────────
+// Memory guard
+// ─────────────────────────────────────────────────────────
+
+/// A `System` allocator that watches how much memory is *live* and flags the
+/// engine when the budget is crossed.
+///
+/// It deliberately does not fail the allocation: `GlobalAlloc` has no way to
+/// report an error, so the only alternatives would be aborting (kills the run's
+/// results) or returning null (UB in Rust). Flagging instead lets the running
+/// test fail with a `RangeError` while the harness stays alive — and because the
+/// flag is cleared at the start of every `VM::run`, a single runaway test cannot
+/// poison the rest of the suite.
+struct BudgetAllocator {
+    live: AtomicUsize,
+}
+
+impl BudgetAllocator {
+    const fn new() -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Absolute live-bytes ceiling the allocator compares against, armed per test
+/// by `guarded_vm` (`usize::MAX` = no ceiling).
+///
+/// The allocator itself never touches the environment: it runs on every
+/// allocation, and `env::var` allocates (see `guarded_vm` for why that matters).
+static BUDGET_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+unsafe impl GlobalAlloc for BudgetAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let live = self.live.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+        if live > BUDGET_BYTES.load(Ordering::Relaxed) {
+            biujs::vm::note_memory_pressure();
+        }
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.live.fetch_sub(layout.size(), Ordering::Relaxed);
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: BudgetAllocator = BudgetAllocator::new();
+
+/// Live bytes right now (reported with the timings, to make a leak visible).
+fn live_bytes() -> usize {
+    ALLOCATOR.live.load(Ordering::Relaxed)
+}
+
+// ─────────────────────────────────────────────────────────
+// Per-test guards
+// ─────────────────────────────────────────────────────────
+
+/// Heap a *single test* may allocate on top of what the harness already holds,
+/// from `TEST262_MEMORY_MB` (default 256 MiB, `0` = off).
+///
+/// The budget is deliberately a per-test *delta*, not an absolute process cap:
+/// the harness keeps every parsed test around, so an absolute cap fails whichever
+/// test happens to run when the total crosses the line. Measured with an
+/// absolute 1536 MiB cap: 57 failures spread across `Array`, `Math`,
+/// `identifiers`, `String` … — all of them tests allocating a few kilobytes,
+/// blamed for the harness's own hundreds of megabytes. What is worth flagging is
+/// "this one test allocated 256 MiB", which is what a delta measures.
+fn memory_allowance() -> usize {
+    static ALLOWANCE: OnceLock<usize> = OnceLock::new();
+    *ALLOWANCE.get_or_init(|| {
+        let mb: usize = std::env::var("TEST262_MEMORY_MB")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(256);
+        if mb == 0 {
+            usize::MAX
+        } else {
+            // Leave room for the constant overhead by saturating, not wrapping.
+            mb * 1024 * 1024
+        }
+    })
+}
+
+/// The VM every test runs in, carrying the three guards from the table above.
+fn guarded_vm() -> VM {
+    static STEP_LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    static TIMEOUT: OnceLock<Option<Duration>> = OnceLock::new();
+
+    // Read once and reuse: `env::var` per test would cost more than the guards.
+    let limit = *STEP_LIMIT.get_or_init(|| match std::env::var("TEST262_STEP_LIMIT") {
+        // An explicit 0 means "no limit" — useful when hunting a hot loop.
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(biujs::vm::DEFAULT_STEP_LIMIT),
+        },
+        Err(_) => Some(biujs::vm::DEFAULT_STEP_LIMIT),
+    });
+    let timeout = *TIMEOUT.get_or_init(|| {
+        let ms: u64 = std::env::var("TEST262_TIMEOUT_MS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(10_000);
+        if ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(ms))
+        }
+    });
+
+    // Arm the heap guard relative to *now*, i.e. to this test's start.
+    BUDGET_BYTES.store(
+        live_bytes().saturating_add(memory_allowance()),
+        Ordering::Relaxed,
+    );
+
+    VM::new().with_step_limit(limit).with_timeout(timeout)
+}
 
 // ─────────────────────────────────────────────────────────
 // Paths / harness loading
@@ -356,7 +501,7 @@ fn run_test(test: &Test) -> Result<(), String> {
         // ── Positive test: the program must run to completion ──
         None => match compiled {
             Ok(module) => {
-                let mut vm = VM::new();
+                let mut vm = guarded_vm();
                 vm.run(&module).map(|_| ()).map_err(|e| e.to_string())
             }
             Err(err) => Err(format!("Compilation error: {err}")),
@@ -393,7 +538,7 @@ fn run_test(test: &Test) -> Result<(), String> {
                         }
                     }
                     Ok(module) => {
-                        let mut vm = VM::new();
+                        let mut vm = guarded_vm();
                         match vm.run(&module) {
                             Err(err) => {
                                 let actual: Option<String> = match &err {
@@ -435,14 +580,36 @@ struct SuiteResult {
     passed: u32,
     skipped: u32,
     failures: Vec<(String, String)>,
+    /// Per-test wall-clock time, kept only when `TEST262_TIMINGS` is set.
+    timings: Vec<(Duration, String)>,
+}
+
+/// Classify a failure message produced by one of the three guards.
+///
+/// The counts are reported next to the total: a suite whose failures are mostly
+/// "step limit exceeded" is a different problem from one whose failures are
+/// wrong values, and the difference decides whether a lower budget (fast signal)
+/// or an engine fix is wanted.
+fn guard_kind(reason: &str) -> Option<&'static str> {
+    if reason.contains("step limit exceeded") {
+        Some("step-limit")
+    } else if reason.contains("execution timeout exceeded") {
+        Some("timeout")
+    } else if reason.contains("memory budget exceeded") {
+        Some("memory")
+    } else {
+        None
+    }
 }
 
 fn run_suite(subdir: &str) -> SuiteResult {
+    let collect_timings = std::env::var("TEST262_TIMINGS").is_ok();
     let mut result = SuiteResult {
         total: 0,
         passed: 0,
         skipped: 0,
         failures: Vec::new(),
+        timings: Vec::new(),
     };
 
     let path = test262_root().join(subdir);
@@ -491,6 +658,7 @@ fn run_suite(subdir: &str) -> SuiteResult {
 
         // An engine bug may panic (index out of bounds, unwrap, …). Catch it so
         // one broken test cannot abort the whole conformance run.
+        let started = Instant::now();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_test(&test)))
             .unwrap_or_else(|payload| {
                 let msg = payload
@@ -500,6 +668,16 @@ fn run_suite(subdir: &str) -> SuiteResult {
                     .unwrap_or_else(|| "panic".to_string());
                 Err(format!("engine panic: {msg}"))
             });
+        if collect_timings {
+            let elapsed = started.elapsed();
+            // Flag the guard hits in the timing list too: "slow *and* caught by
+            // the clock" is the combination worth looking at first.
+            let label = match guard_kind(outcome.as_ref().err().map_or("", |e| e.as_str())) {
+                Some(kind) => format!("{id}  [{kind}]"),
+                None => id.clone(),
+            };
+            result.timings.push((elapsed, label));
+        }
 
         match outcome {
             Ok(()) => result.passed += 1,
@@ -671,6 +849,9 @@ fn test262_report() {
     let mut skipped = 0u32;
     let mut failed = 0u32;
     let mut rows: Vec<(String, u32, u32, u32)> = Vec::new();
+    let mut guards: HashMap<&'static str, u32> = HashMap::new();
+    let mut slowest: Vec<(Duration, String)> = Vec::new();
+    let suite_clock = Instant::now();
 
     for suite in SUITES {
         if !filters.is_empty() && !filters.iter().any(|f| suite.contains(f)) {
@@ -681,6 +862,16 @@ fn test262_report() {
         passed += r.passed;
         skipped += r.skipped;
         failed += r.failures.len() as u32;
+        for (_, reason) in &r.failures {
+            if let Some(kind) = guard_kind(reason) {
+                *guards.entry(kind).or_insert(0) += 1;
+            }
+        }
+        if !r.timings.is_empty() {
+            slowest.extend(r.timings.iter().cloned());
+            slowest.sort_by(|a, b| b.0.cmp(&a.0));
+            slowest.truncate(10);
+        }
         // Print progress as we go: a hard abort (e.g. allocation failure) in a
         // later suite would otherwise lose all information about earlier ones.
         println!(
@@ -746,5 +937,27 @@ fn test262_report() {
         passed,
         total - skipped
     );
+
+    // The guards exist so that a runaway test becomes a reported failure. Say
+    // how often each of them fired, otherwise "failed 3906" hides the fact that
+    // part of it is the harness protecting itself rather than a spec mismatch.
+    println!(
+        "guards: timeout {}, step-limit {}, memory {}   \
+         (TEST262_TIMEOUT_MS / TEST262_STEP_LIMIT / TEST262_MEMORY_MB, 0 = off)",
+        guards.get("timeout").copied().unwrap_or(0),
+        guards.get("step-limit").copied().unwrap_or(0),
+        guards.get("memory").copied().unwrap_or(0),
+    );
+
+    if !slowest.is_empty() {
+        println!(
+            "\n-- slowest tests (wall clock; whole run {:.1}s, live heap {:.0} MiB) --",
+            suite_clock.elapsed().as_secs_f64(),
+            live_bytes() as f64 / (1024.0 * 1024.0)
+        );
+        for (elapsed, id) in &slowest {
+            println!("  {:>8.2}s  {}", elapsed.as_secs_f64(), id);
+        }
+    }
     println!("=================================================");
 }

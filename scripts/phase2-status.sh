@@ -16,7 +16,18 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 SNAP="docs/phase2-status.tsv"
-MEM_LIMIT_KB=6000000          # §6.5：全量回归一律带内存上限
+MEM_LIMIT_KB=6000000          # §6.5：全量回归一律带内存上限（OS 侧的硬兜底）
+# 三层护栏（见 tests/test262_runner.rs 顶部）：每条都由 runner 变成一条**普通失败**，
+# 而不是让进程挂死或被杀（后者会丢掉整轮结果）。
+#   TEST262_TIMEOUT_MS  单条用例的墙钟预算（0 = 关）
+#   TEST262_STEP_LIMIT  单条用例的指令预算（0 = 关）
+#   TEST262_MEMORY_MB   单条用例的增量上限（0 = 关）
+: "${TEST262_TIMEOUT_MS:=15000}"   # 实测第 10 慢的用例 2.2s（更慢的 9 条基线里本已失败）
+: "${TEST262_STEP_LIMIT:=0}"        # 0 交给 runner 用 DEFAULT_STEP_LIMIT
+: "${TEST262_MEMORY_MB:=256}"        # 实测 64MiB 阈值下只有 9 条越线，且都本已失败
+# 整轮再套一层硬超时：护栏本身出问题时，至少不让脚本无限等下去。
+: "${TEST262_HARD_TIMEOUT:=1200}"
+export TEST262_TIMEOUT_MS TEST262_STEP_LIMIT TEST262_MEMORY_MB
 UPDATE=0
 QUICK=0
 for arg in "$@"; do
@@ -61,19 +72,35 @@ if ! cargo test --release --test features 2>&1 | tee "$TMP/features.txt" | grep 
 fi
 grep -q "test result: ok" "$TMP/features.txt" || { echo "feature 测试有失败。" >&2; exit 1; }
 
+# ── 3b. 护栏测试（§7.2：超时 / 步数 / 堆预算）────────────────────────────────
+echo
+echo "== 护栏测试（超时 / 步数 / 堆预算）=="
+if ! cargo test --release --test guards 2>&1 | tee "$TMP/guards.txt" | grep -E "^test result"; then
+  echo "护栏测试失败，停止。" >&2
+  exit 1
+fi
+grep -q "test result: ok" "$TMP/guards.txt" || { echo "护栏测试有失败。" >&2; exit 1; }
+
 if [ "$QUICK" = "1" ]; then
   echo
   echo "--quick：跳过全量回归。"
   exit 0
 fi
-
 # ── 4. 全量 test262 ────────────────────────────────────────────────────────
 echo
 echo "== 全量 test262（约 3 分钟，内存上限 ${MEM_LIMIT_KB}KB）=="
+echo "   护栏：单例 ${TEST262_TIMEOUT_MS}ms / ${TEST262_STEP_LIMIT:-默认} 步 / 堆 ${TEST262_MEMORY_MB}MB，整轮硬超时 ${TEST262_HARD_TIMEOUT}s"
 ( ulimit -v "$MEM_LIMIT_KB"
-  TEST262_FAILURES=0 cargo test --release --test test262_runner -- --nocapture ) > "$TMP/full.txt" 2>&1
+  timeout --signal=TERM "$TEST262_HARD_TIMEOUT" \
+    env TEST262_FAILURES=0 cargo test --release --test test262_runner -- --nocapture ) > "$TMP/full.txt" 2>&1
 RUN_STATUS=$?
 
+if [ "$RUN_STATUS" = "124" ] || [ "$RUN_STATUS" = "143" ]; then
+  echo "全量回归超过整轮硬超时 ${TEST262_HARD_TIMEOUT}s 被中止。" >&2
+  echo "先看卡在哪个用例：TEST262_TIMINGS=1 复跑看最慢的十条，或 BIUJS_TEST262_TRACE=1 看最后一行。" >&2
+  tail -20 "$TMP/full.txt" >&2
+  exit 1
+fi
 if ! grep -q "^TOTAL" "$TMP/full.txt"; then
   echo "全量回归没有跑完（进程可能被内存上限打断或崩溃）。" >&2
   echo "最后 20 行：" >&2
@@ -91,7 +118,7 @@ awk '/^suite[[:space:]]+passed/{f=1; next} /^-{10,}/{f=0} f && NF>=4 {print $1"\
 # ── 5. 头条数字 ────────────────────────────────────────────────────────────
 echo
 hr
-grep -E "^(TOTAL|pass rate)" "$TMP/full.txt" | sed 's/^/  /'
+grep -E "^(TOTAL|pass rate|guards)" "$TMP/full.txt" | sed 's/^/  /'
 TOTAL_LINE="$(grep '^TOTAL' "$TMP/full.txt" | head -1)"
 EXECUTED=$(echo "$TOTAL_LINE" | awk '{print $2+$4}')
 PASSED=$(echo "$TOTAL_LINE" | awk '{print $2}')

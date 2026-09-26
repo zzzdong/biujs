@@ -14,6 +14,8 @@ pub use value::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::builtins::Builtins;
 use crate::vm::iterator::iterator_symbol_key;
@@ -33,6 +35,66 @@ const MAX_CALL_DEPTH: usize = 512;
 /// Default instruction budget for a `run`. A runaway `while` loop therefore
 /// reports an error instead of spinning forever. `None` disables the budget.
 pub const DEFAULT_STEP_LIMIT: u64 = 20_000_000;
+
+/// How many instructions may pass between two polls of the wall-clock and
+/// memory guards. `Instant::now()` costs orders of magnitude more than a
+/// bytecode step, so polling every step would tax every test; a runaway loop
+/// still gets stopped after at most this many instructions.
+const GUARD_CHECK_INTERVAL: u64 = 4096;
+
+/// Set by a host-side allocation hook when a soft memory budget is crossed.
+///
+/// The engine never aborts the process on its own: a `GlobalAlloc` cannot
+/// report failure, so the runner installs an allocator that *flags* the
+/// overshoot and the VM turns the flag into an ordinary `RangeError` for the
+/// running test (`VM::run` clears it on entry, so one bad test cannot poison
+/// the next). Without this, a runaway allocation either got killed by the
+/// OS/`ulimit` — losing the whole run's results — or paged the machine.
+static MEMORY_PRESSURE: AtomicBool = AtomicBool::new(false);
+
+/// Flag that the host's memory budget has been crossed (see `MEMORY_PRESSURE`).
+pub fn note_memory_pressure() {
+    MEMORY_PRESSURE.store(true, Ordering::Relaxed);
+}
+
+/// Whether the host reported memory pressure since the current `run` started.
+pub fn memory_pressure() -> bool {
+    MEMORY_PRESSURE.load(Ordering::Relaxed)
+}
+
+/// Clear the memory-pressure flag. `VM::run` does this on entry.
+pub fn clear_memory_pressure() {
+    MEMORY_PRESSURE.store(false, Ordering::Relaxed);
+}
+
+/// Which guard ended the current `run`.
+///
+/// The answer is *sticky*: once the clock or the heap budget is spent, every
+/// later instruction fails with the same error instead of re-evaluating the
+/// guard. Otherwise a test that catches the guard's `RangeError` in JS — common
+/// in test262, where `assert.throws` and `try/finally` abound — would keep
+/// running (and, for the heap guard, keep allocating) until the *step* budget
+/// ran out as well: the failure then names the wrong culprit, and a tiny budget
+/// turned a 0.3 s suite into a multi-minute one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GuardFired {
+    Timeout,
+    Memory,
+}
+
+impl GuardFired {
+    fn message(self, budget: Option<Duration>) -> String {
+        match self {
+            GuardFired::Timeout => format!(
+                "execution timeout exceeded after {} ms (possible infinite loop)",
+                budget.map_or(0, |d| d.as_millis())
+            ),
+            GuardFired::Memory => {
+                "memory budget exceeded (possible runaway allocation)".to_string()
+            }
+        }
+    }
+}
 
 /// Prefix of the synthetic name given to bound-function wrappers.
 const BOUND_PREFIX: &str = "__bound__";
@@ -103,6 +165,14 @@ pub struct VM {
     step_limit: Option<u64>,
     /// Instructions executed so far in the current run.
     steps: u64,
+    /// Wall-clock budget for the current run (`None` = unlimited).
+    timeout: Option<Duration>,
+    /// Instant the current run must finish by (`None` = no clock guard).
+    deadline: Option<Instant>,
+    /// Step count at which the clock / memory guards are polled next.
+    next_guard_check: u64,
+    /// Sticky guard failure for the current run (see `GuardFired`).
+    guard_fired: Option<GuardFired>,
     /// Bound functions created by `Function.prototype.bind`, keyed by a
     /// synthetic id that is embedded in the wrapper's name.
     bound_functions: HashMap<u32, BoundFunction>,
@@ -171,6 +241,10 @@ impl VM {
             func_objs: HashMap::new(),
             step_limit: Some(DEFAULT_STEP_LIMIT),
             steps: 0,
+            timeout: None,
+            deadline: None,
+            next_guard_check: GUARD_CHECK_INTERVAL,
+            guard_fired: None,
             bound_functions: HashMap::new(),
             next_bound_id: 0,
             invoke_boundaries: Vec::new(),
@@ -186,6 +260,18 @@ impl VM {
         self
     }
 
+    /// Builder-style override of the wall-clock budget.
+    ///
+    /// A *counted* budget (steps) and a *timed* one catch different runaways:
+    /// a loop that is slow because each iteration does real work still burns
+    /// steps fast, but a test that blocks in a long native routine does not.
+    /// This is the guard a test harness needs — without it a hung test simply
+    /// never returns and the whole run has to be killed by hand.
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// Execute a bytecode module and return the result
     pub fn run(&mut self, module: &Module) -> Result<Value, RuntimeError> {
         self.state = State::new();
@@ -195,6 +281,14 @@ impl VM {
         self.next_bound_id = 0;
         self.invoke_boundaries.clear();
         self.steps = 0;
+        self.next_guard_check = GUARD_CHECK_INTERVAL;
+        self.guard_fired = None;
+        // The clock guard is armed per `run`, not per `VM`: a host reuses the
+        // VM across tests, and each test should get the full budget.
+        self.deadline = self.timeout.map(|budget| Instant::now() + budget);
+        // A flag left over from `run` *preparation* (harness setup, the previous
+        // test's teardown) must not be blamed on the program about to run.
+        clear_memory_pressure();
         // Re-register builtins into the fresh state
         self.builtins.register(&mut self.state.globals);
 
@@ -255,12 +349,32 @@ impl VM {
             Some(i) => i.clone(),
             None => return Ok(false),
         };
+        // A spent guard ends the run for good: JS may catch the `RangeError`,
+        // but the next instruction fails with it again, so the test cannot
+        // crawl back into the loop the guard just stopped.
+        if let Some(fired) = self.guard_fired {
+            return Err(RuntimeError::RangeError(fired.message(self.timeout)));
+        }
         self.steps += 1;
         if let Some(limit) = self.step_limit {
             if self.steps > limit {
                 return Err(RuntimeError::RangeError(
                     "execution step limit exceeded (possible infinite loop)".to_string(),
                 ));
+            }
+        }
+        if self.steps >= self.next_guard_check {
+            self.next_guard_check = self.steps + GUARD_CHECK_INTERVAL;
+            // The host's allocator crosses its budget *during* a step, so the
+            // check has to live in the interpreter loop: there is nowhere else
+            // to notice it before the process is killed.
+            if memory_pressure() {
+                self.guard_fired = Some(GuardFired::Memory);
+            } else if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.guard_fired = Some(GuardFired::Timeout);
+            }
+            if let Some(fired) = self.guard_fired {
+                return Err(RuntimeError::RangeError(fired.message(self.timeout)));
             }
         }
         let Bytecode {

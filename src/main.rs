@@ -1,6 +1,24 @@
 use biujs::Compiler;
 use biujs::VM;
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
+
+/// A VM carrying the wall-clock guard, whose budget comes from
+/// `BIUJS_TIMEOUT_MS` (0 = no limit) and defaults to `fallback_ms`.
+///
+/// `VM::run` arms the deadline on every call, so one VM can serve a whole REPL
+/// session without the budget leaking between lines.
+fn configured_vm(fallback_ms: u64) -> VM {
+    let ms: u64 = std::env::var("BIUJS_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(fallback_ms);
+    if ms == 0 {
+        VM::new()
+    } else {
+        VM::new().with_timeout(Some(Duration::from_millis(ms)))
+    }
+}
 
 fn main() {
     env_logger::init();
@@ -36,7 +54,11 @@ fn main() {
             eprintln!("{module}");
         }
 
-        let mut vm = VM::new();
+        // A counted step budget does not bound *wall-clock* time: a single step
+        // can sit in a native routine for a long while. The timed guard is what
+        // keeps `biujs runaway.js` from hanging the caller forever;
+        // `BIUJS_TIMEOUT_MS=0` turns it off for genuinely long-running scripts.
+        let mut vm = configured_vm(30_000);
         match vm.run(&module) {
             Ok(result) => println!("{result}"),
             Err(err) => {
@@ -57,7 +79,9 @@ fn main() {
     let mut handle = stdout.lock();
 
     let mut compiler = Compiler::new();
-    let mut vm = VM::new();
+    // The REPL gets its own (shorter) budget: a typed-in infinite loop should
+    // come back with an error, not swallow the session.
+    let mut vm = configured_vm(10_000);
 
     loop {
         write!(handle, ">>> ").unwrap();

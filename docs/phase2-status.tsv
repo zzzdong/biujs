@@ -1,7 +1,7 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
 # 最近更新：2026-09-26
-language/statements/for-of	386	44	321
+language/statements/for-of	563	44	144
 language/statements/generators	165	14	87
 language/expressions/generators	176	18	96
 language/expressions/yield	40	3	20

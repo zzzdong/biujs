@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14183 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature 测试 | 190 / 448 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14360 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 454 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -205,6 +205,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B12** | M5-C3 `Promise`（先定微任务调度点） | 677 | 需新机制，放最后 |
 | **B13** | M8-V1/V4 收口 | — | 覆盖率清单 + 三方文档对齐 |
 | **B14** | M5-C5 `Date`（含入册解锁） | 594 | B4 判定的落点；336 条纯算术 + 148 条 `Date.UTC` 不依赖外部数据，偏差见 §3.1 |
+| **B15** | M7-P7 解构赋值族（B4 侦察出的五族，按 1→3→2 拆批） | 974 | **B15a 已完成**（头部赋值模式，+177），见 §6.1；余下四族见该批的残留 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -549,6 +550,60 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 
 ---
 
+#### B15a `for-of`/`for-in` 头部的赋值模式 —— 已完成（2026-09-26）
+
+**起点**：通过 14183 / 18266（77.65%），失败 4083，跳过 8133。
+
+**根因**：`bind_for_of_left` 只处理了 `VariableDeclaration`、`AssignmentTargetIdentifier` 与两个成员表达式；
+`ArrayAssignmentTarget` / `ObjectAssignmentTarget`（即"头部是模式"的 `AssignmentPattern`）落进 `_ =>` 分支，
+只打一条 `log::warn!`。于是 `for ([a, b] of …)` 的循环体**带着全部仍是 `undefined` 的目标**跑：
+`language/statements/for-of/dstr` 那 138 条 "Expected SameValue(«undefined», «2»)" 与 35 条
+"Expected a Test262Error to be thrown"（测试自己的断言根本没被喂到值）都是它。
+
+最小复现（修复前）：
+
+```js
+var v; for ([v] of [[2]]) {}   // v 仍是 undefined（node: 2）
+var w; for (var [w] of [[2]]) { w = w + 1; }   // 声明形式一直是好的
+```
+
+**改动**：两行 —— 两个分支改调已经在用的 `bind_array_assignment_target` / `bind_object_assignment_target`
+（与 `[a, b] = arr`、`({x} = obj)` 完全同一条路径，因此默认值、省略元素、rest、嵌套、成员目标、
+以及"模式提前结束要 `IteratorClose`"的义务都是现成的，没有第二套语义）。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14183 | **14360** | **+177** |
+| 失败 | 4083 | 3906 | −177 |
+| 通过率 | 77.65% | **78.62%** | +0.97pp |
+| 单元 / feature | 190 / 448 | 190 / **454** | +6 条断言（新文件 `tests/features/destructuring.rs`） |
+
+逐套件核对（`./scripts/phase2-status.sh`）：只有 `language/statements/for-of` 变化（386 → 563），
+**其余全部持平，无一条新失败**（对 177 条修好的用例做了路径级 diff，`comm -13` 为空）。
+
+**同批附带的工具改动**：三层执行护栏（§7.1）。第一批全量回归里那条幽灵用例
+（`Set/prototype/symmetricDifference/set-like-class-mutation.js`）单条烧 60s，最坏的一次把 3 分钟的全量
+拖成 15 分钟；现在墙钟（15s）/ 步数 / 堆增量（256MiB）三层都变成**普通失败**，`tests/guards.rs` 7 条
+断言覆盖护栏自身。定稿后逐套件核对仍为零回退（TOTAL 14360 与关掉护栏时一致）。
+
+**残留**（下一批的输入）
+
+- `language/statements/for-of` 还剩 **144** 条，最大的族：`ary-ptrn-*` 21、`obj-ptrn-*` 15、`elem-trlg-*` 10、
+  `rest-non-*` 7、`close-via-*` 7、`label-from-*` 6、`rest-iter-*` 5、`prop-elem-*` 5、`id-init-*` 5、`elem-iter-*` 5。
+  其中 `rest-non-*`（rest 目标不可迭代/为 null 应抛 TypeError）与 `close-via-*`（break/return/label 引发的 `IteratorClose`）
+  是成体系的语义，建议下一片先看这两族。
+- 同一批还验证过一个**不是**缺口的现象：`for (x of it) { break; }` 的 `IteratorClose` 是好的
+  （`return()` 确实被调用），别被探针骗了。
+- **探针方法学**：本批的自测脚本被闭包捕获债干扰 —— `function counter(){ var i = 0; return function () { return i++; }; }`
+  三次调用返回 `1,1,1`（应为 `0,1,2`），凡是"闭包内可变状态"驱动的探针都会给出假结论
+  （本项目已有多次：iterator 计数器、`return()` 计数器）。**结论一律以 test262 的路径级 diff 为准**。
+- §6.1 的侦察里余下四族仍在队列：3（解构 `null`/`undefined` 不抛 TypeError）、2（默认值匿名函数的 NamedEvaluation）、
+  4（迭代器/rest）、5（对象模式）。
+
+---
+
 ---
 
 ## 7. 验证与回归策略（本阶段增补）
@@ -558,6 +613,44 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 1. **零回退带逐套件核对**。全量通过数不低于上一提交是必要不充分条件 —— 新语义可能同时修好 A 与弄坏 B。每次提交前用脚本对比逐套件通过数，出现下降必须解释或回退。
 2. **范围外杂音单列**。报告里 RegExp / ES2022 公开字段等**不可能通过**的失败要单独成列，否则 M7 的"清零"目标不可测（M8-V3）。
 3. **崩溃优先于失败**。引擎里的无界递归/栈溢出会以 SIGABRT 打断整轮回归且不留线索（已发生过一次）。`BIUJS_TEST262_TRACE=1` 逐条打印测试路径是标准排查手段；任何新批次的第一次全量回归都要留意进程是否走完全程。
+4. **挂死同样优先于失败**。三层执行护栏（§7.1）把"跑不完"变成"一条失败"，并且让全量耗时不再取决于有没有撞上无界循环。
+
+### 7.1 三层执行护栏（2026-09-26 落地）
+
+第 3 条的下半句是"挂死同样优先于失败"。实测那条幽灵用例
+（`built-ins/Set/prototype/symmetricDifference/set-like-class-mutation.js`）单条烧 60s ——
+最坏的一次全量因此从 3 分钟变成 15 分钟，而它在失败明细里只占一行，很容易被当成"正常的慢"。
+
+| 护栏 | 环境变量（0 = 关） | 默认 | 抓什么 |
+|------|-------------------|------|--------|
+| 步数 | `TEST262_STEP_LIMIT` | `DEFAULT_STEP_LIMIT`（2×10^7） | 热循环 |
+| 墙钟 | `TEST262_TIMEOUT_MS` | `15000` | 慢循环、native 卡顿 |
+| 堆 | `TEST262_MEMORY_MB` | `256`（**单条用例增量**） | 失控分配 |
+
+四条踩出来的规矩：
+
+1. **护栏触发后必须"粘住"**。JS 能 `catch` 到那个 `RangeError`（test262 里遍地是
+   `assert.throws` / `try`），不粘住的话用例会从刚被拦下的循环里爬回去，把步数预算也烧光 ——
+   最后报出来的元凶还是错的。`GuardFired` 就是为此存在的。
+2. **堆预算是"增量"而不是进程绝对上限**。套件自己持有几百 MB 已解析的测试，绝对阈值会把
+   套件的内存算到当时正在跑的那条用例头上：实测误伤 **49 条**，分散在
+   `Array` / `Math` / `identifiers` / `String` 等互不相关的套件里。改成"以用例开始时存活字节为基线"
+   后误伤 **0 条**（14360 = 关掉护栏时的 14360）。
+3. **分配器里不能读环境变量**。`env::var` 自己会分配内存 → 分配器重入；
+   `OnceLock::get_or_init` 重入会死锁，表现是"设了 `TEST262_MEMORY_MB` 就一行输出都没有地卡住"。
+   现在预算由 runner 在用例开始前写进原子变量，分配器只读原子。
+4. **护栏本身要有测试**（`tests/guards.rs`，独立二进制 + 自带分配器）：三条各自触发、可关闭、
+   每次 `run` 重新计时与清标志、"被 catch 后不能继续跑"。它内部用一把互斥锁串行化 ——
+   堆预算与标志是进程级的，`cargo test` 默认多线程会互相污染（实测过一个用例报"内存超预算"、
+   另一个报"成功"）。
+
+定稿实测（2026-09-26，18k 用例）：
+
+```
+TOTAL 14360 / 8133 / 3906          ← 与关掉护栏时逐套件一致（零误伤）
+guards: timeout 1, step-limit 0, memory 8    ← 9 条越线用例在基线里本已失败
+最慢用例 15.00s（被墙钟截断，原本 60s+）
+```
 
 ---
 

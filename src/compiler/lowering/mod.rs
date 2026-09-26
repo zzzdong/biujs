@@ -877,6 +877,19 @@ impl<'a> JSASTLower<'a> {
                 self.builder
                     .set_property(object, member.property.name.as_str(), item);
             }
+            // A *pattern* head (`for ([a, b] of …)`, the `AssignmentPattern`
+            // goal) is an assignment, not a binding: it writes to targets that
+            // already exist, with the ordinary destructuring rules (defaults,
+            // rest, holes) and no declaration. These two arms used to fall into
+            // the catch-all and merely log — the loop body then ran with every
+            // target still `undefined`, which is what made the whole
+            // `language/*/{for-of,dstr}` assignment family fail.
+            ForStatementLeft::ArrayAssignmentTarget(target) => {
+                self.bind_array_assignment_target(target, item);
+            }
+            ForStatementLeft::ObjectAssignmentTarget(target) => {
+                self.bind_object_assignment_target(target, item);
+            }
             _ => {
                 log::warn!("unimplemented for-of/for-in assignment target");
             }
