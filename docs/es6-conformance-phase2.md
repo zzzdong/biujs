@@ -64,7 +64,7 @@
 | `built-ins/WeakMap` | 141 | 69 | 72 |
 | `built-ins/WeakSet` | 85 | 23 | 62 |
 | **合计** | **4920** | 3370 | 1550 |
-| `built-ins/Date` | 594 | —（不在 `SUITES`） | — |
+| `built-ins/Date` | 594 | —（B14 入册；§3.1 已判"实现"） | — |
 
 runner 未枚举的其余部分（`language/expressions` 11095、`language/statements` 9337 等）绝大多数是**已在 SUITES 中按子目录覆盖**的父目录，还有 `built-ins/Temporal` 4603、`built-ins/RegExp` 1879、`built-ins/Iterator` 514、`language/module-code` 755 属范围外。**M8-V1 负责把这份清单补全并写明每一条的理由。**
 
@@ -76,10 +76,49 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 
 | 项 | 判定 | 理由 |
 |----|------|------|
-| `Date`（594） | **待决** → M8-V2 | 第一阶段 §1.2 写"在（ES5 但属必备）"，实际 0 开工也 0 度量。本阶段**必须**给出"实现"或"降级"的结论，不允许继续悬空 |
-| RegExp 驱动的失败（`String/prototype` 的 `replace`/`match`/`search`/`split` 合计 145，`Array` 侧若干） | **不计入 M7 的 KPI** | 引擎无正则实现（第一阶段已判范围外）。但这批测试**仍在执行并计入失败**，需要 M8-V3 在报告里单独扣除或补进跳过表 —— 否则 M7 的"清零"目标永远达不到 |
+| `Date`（594） | **在范围，实现**（批次 **B14**） | 第一阶段 §1.2 已判"ES5 但属必备"，M8-V2 的结论见下 |
+| RegExp 驱动的失败 | **报告单列，不动跳过表** | 引擎无正则实现（第一阶段已判范围外），但实测只有 100 条纯粹因它失败，且它们同时依赖范围内特性（§3.1） |
 | `Promise` | 在范围 | 需要先定微任务调度点（§5 M5-C3） |
 | `Proxy` / `Reflect` | 在范围 | 依赖的 `[[Get]]`/`[[Set]]`/`[[DefineOwnProperty]]` 已成型，可以开工 |
+
+### 3.1 KPI 归类（M8-V3 结论，2026-09-26 实测）
+
+A1（"范围内失败 ≤ 800"）只有在把范围外失败摘出来之后才可测。归类脚本
+`scripts/kpi-noise.py` 对全量输出做一次分桶，可随时复跑：
+
+```sh
+ulimit -v 6000000
+TEST262_FAILURES=99999 cargo test --release --test test262_runner -- --nocapture > /tmp/full.txt
+python3 scripts/kpi-noise.py /tmp/full.txt
+```
+
+2026-09-26（4083 条失败）的结果：
+
+| 桶 | 条数 | 占比 | 判据（脚本里的规则） |
+|----|------|------|----------------------|
+| **范围内真实缺口** | **3807** | 93.2% | 其余全部 |
+| RegExp 驱动 | 100 | 2.4% | 测试源码里出现正则字面量或 `RegExp`/`.exec(`/`.test(`/`Symbol.match` 等 |
+| 后 ES6 的 API | 176 | 4.3% | 测试直接调用引擎**完全没有**的 API：`Object.fromEntries`(24)、`Object.groupBy`(14)、`Object.getOwnPropertyDescriptors`(12)、`Array.prototype.toSpliced/toSorted/toReversed/findLast/flat`(55)、`Math.sumPrecise`(8)、`BigInt(`(50) 等 |
+| 读不到源码 | 0 | — | 路径解析失败（脚本自身的 bug 信号） |
+
+两条**必须写在报告里**的口径说明：
+
+1. **`class-fields-public` / `class-static-fields-public`（489 条）留在"范围内"桶里**，不单列扣除。
+   它们的失败与 `destructuring-binding`、`computed-property-names`、`generators` 等范围内特性共存
+   （§3 的纪律：跳掉会埋掉真实覆盖）。脚本单独打印这个数量，供报告加脚注。
+2. **不动跳过表**。RegExp 与后 ES6 的 API 都是"这个测试永远不可能通过"的**充分**条件，却不是**必要**条件：
+   同样的失败里有相当一部分（例如 `set-methods` 的 19 条）真实原因是范围内的债（闭包捕获、全局对象）。
+   把它们整目录跳掉，数字会好看，A1 反而不可测。因此 §3 的这条判定是"报告单列"，不是"补进跳过表"。
+
+**M8-V2 `Date` 的结论：实现（不降级）**，作为独立批次 B14 排入计划：
+
+- 594 个测试里 336 个是纯算术（`prototype/get*` 144 + `prototype/set*` 192），148 个是 `Date.UTC`，
+  即**不需要外部数据**就能正确实现（`MakeDay`/`MakeTime`/`MakeDate` 都是闭式算法）；
+- 需要外部数据的两块按"登记偏差"处理（§8）：**无时区数据库** → 本地时间等于 UTC、
+  `getTimezoneOffset()` 返回 0；**无 locale 数据** → `toLocale*` 退回默认格式
+  （与 `Number`/`String` 的 `toLocale*` 现状一致）；
+- `Date.parse` 只承诺 ISO-8601（`toISOString` 的输出一定能解析回来），其余格式返回 `NaN`。
+- 验收按 A7：套件入册后通过率 ≥ 50%。
 
 ---
 
@@ -89,15 +128,15 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 
 | # | 验收项 | 当前 | 目标 |
 |---|--------|------|------|
-| A1 | M7 范围内失败 | 3622 | ≤ 800（RegExp 驱动部分按 §3 扣除后计入） |
+| A1 | M7 范围内失败 | 3807（§3.1 归类后） | ≤ 800（RegExp 驱动与后 ES6 API 按 §3.1 扣除后计入） |
 | A2 | M7 的六个任务包（§5） | 0/6 | 6/6 有交付记录且各自验收达标 |
-| A3 | `Map` / `Set` / `WeakMap` / `WeakSet` | 0% | 各自套件通过率 ≥ 80%，且已入册解锁 |
+| A3 | `Map` / `Set` / `WeakMap` / `WeakSet` | ✅ 96.3% / 94.5% / 99.2% / 98.8%（B2a–B3 已入册解锁） | 各自套件通过率 ≥ 80%，且已入册解锁 |
 | A4 | `Proxy` / `Reflect` | 0% | 各自套件通过率 ≥ 50%（依赖内部方法，允许更低） |
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
-| A7 | `Date` | 悬空 | 结论落地（实现则 ≥ 50%，降级则写进范围外栏） |
-| A8 | 计划内通过数 | 13264 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature 测试 | 190 / 417 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
+| A8 | 计划内通过数 | 14183 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature 测试 | 190 / 448 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -154,7 +193,7 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | **B2a** ✅ | M5-C1 前半：`Map`（含入册解锁） | 204（入册后执行 162） | **已完成**，见 §6.1；套件通过率 95.68%，A3 的 ≥80% 达标 |
 | **B2b** ✅ | M5-C1 后半：`Set`（含 `set-methods` 七个算子） | 383 | **已完成**，见 §6.1；套件通过率 94.40%，A3 的 ≥80% 达标 |
 | **B3** ✅ | M5-C2 `WeakMap`/`WeakSet` | 226 | **已完成**，见 §6.1；两套件 99.24% / 98.75%，A3 的 ≥80% 达标 |
-| **B4** | M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策 | — | 把 KPI 的杂音清掉，再动大件 |
+| **B4** ✅ | M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策 | — | **已完成**，见 §6.1 与 §3.1：归类脚本 `scripts/kpi-noise.py`（3807 / 100 / 176），`Date` 判"实现" |
 | **B5a** ✅ | M7-P4 前半：数组 `length` 的错误种类（应为 RangeError） | +32 | **已完成**，见 §6.1 |
 | **B5b** ✅ | M7-P4 后半：`defineProperty` 的 TypeError 缺口、六个完整性方法、数组 `length` 的下取整 | **+118**（净） | **已完成**，见 §6.1；含一条**已解释的** `built-ins/Array` −11（strict-only 所致，见 §6.1 末） |
 | **B6** | M7-P6 生成器剩余 + M7-P5 数据模型三债 | 203 + — | 债不还，后面的用例会持续被它误导 |
@@ -165,6 +204,7 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 | **B11** | M6-T2 `TypedArray` + `TypedArrayConstructors` | 2184 | 同质、可批量 |
 | **B12** | M5-C3 `Promise`（先定微任务调度点） | 677 | 需新机制，放最后 |
 | **B13** | M8-V1/V4 收口 | — | 覆盖率清单 + 三方文档对齐 |
+| **B14** | M5-C5 `Date`（含入册解锁） | 594 | B4 判定的落点；336 条纯算术 + 148 条 `Date.UTC` 不依赖外部数据，偏差见 §3.1 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -446,6 +486,49 @@ runner 未枚举的其余部分（`language/expressions` 11095、`language/state
 **偏差登记（§8 已更新）**：条目存储在 `Rc` 里，**键不可达时不会被回收** —— "弱"这一点在本引擎不可观察。其余可观察面（键规则、无 `size`/无 `@@iterator`/无 `clear`、`get`/`has`/`delete` 的安静回答、构造器走迭代协议）都按规范实现。
 
 **残留**：两个套件各剩 1 条 `weakmap.js` / `weakset.js`，都只是 `verifyProperty(this, 'WeakMap', …)` —— 卡在**全局对象**（顶层 `this` 是 `undefined`）。
+
+#### B4 KPI 归类（M8-V3）与 `Date` 决策（M8-V2）—— 已完成（2026-09-26）
+
+**起点**：通过 14183 / 18266，失败 4083。
+
+**这一批不改引擎**，只回答两个悬空的问题，让 A1/A7 从"无法测量"变成"可测量、已判定"。
+
+**1. 分类（M8-V3）**：新增 `scripts/kpi-noise.py`，对全量输出做分桶，可复跑：
+
+```
+4083 条失败 = 3807 范围内真实缺口（93.2%）+ 100 RegExp 驱动（2.4%）+ 176 后 ES6 API（4.3%）
+```
+
+- 脚本读**测试源码**而不是靠猜：正则字面量 / `RegExp` / `.exec(` / `.test(` / `Symbol.match` 等出现即判 RegExp 驱动；
+  直接调用引擎完全没有的 API（`Object.fromEntries` 24、`Object.groupBy` 14、`Object.getOwnPropertyDescriptors` 12、
+  `toSpliced`/`toSorted`/`toReversed`/`findLast`/`flat` 55、`Math.sumPrecise` 8、`BigInt(` 50 …）判后 ES6。
+  规则与局限写在脚本头部（例如"这个测试能不能在没有正则引擎的情况下通过"，而不是"唯一根因是什么"）。
+- 结论是**报告单列，不动跳过表**：这两类都只是"永远不可能通过"的充分条件，不是必要条件 ——
+  同一批失败里有相当一部分（`set-methods` 的 19 条就是）真实原因是范围内的债（闭包捕获、全局对象），
+  整目录跳掉会让数字变好而 A1 不可测。这与 §3 里 `class-fields-public` 的纪律一致。
+- `class-fields-public` / `class-static-fields-public`（489 条）**留在范围内桶里**，脚本单独打印计数供报告加脚注。
+- 附带产出：失败用例的 feature 标签分布（前几名：`destructuring-binding` 974、`generators` 611、
+  `class-fields-public` 368、`default-parameters` 317、`class` 294、`computed-property-names` 193、`Symbol.iterator` 182）。
+  这张表直接指出下一批该往哪打：**解构 + 生成器 + class 元素**三族占了范围内失败的一半以上。
+
+**2. `Date`（M8-V2）**：判定**实现，不降级**，落点排成新批次 **B14**（§6 批次表）。
+
+- 依据：594 个测试里 336 个是纯算术（`prototype/get*` 144 + `prototype/set*` 192），148 个是 `Date.UTC` ——
+  `MakeDay`/`MakeTime`/`MakeDate` 都是闭式算法，不需要时区库；真正依赖外部数据的只有格式化与解析两小块。
+- 登记偏差（§8）：无时区数据库 → 本地时间 == UTC、`getTimezoneOffset()` 恒为 0；无 locale 数据 →
+  `toLocale*` 退回默认格式；`Date.parse` 只承诺 ISO-8601，其余格式 `NaN`。
+- 验收按 A7：入册后套件通过率 ≥ 50%。
+
+**效果**：文档状态变更（§3/§3.1/A1/A3/A7/A8/A9/§6 批次表），**引擎与数字不变**（14183 / 18266，跳过 8133，逐套件无回退）。
+
+**残留**
+
+- B14（`Date`）与 B6（生成器 + 数据模型三债）都在排队；§3.1 的标签分布说明**解构（974）/ 生成器（611）/ class 元素（489）**
+  是范围内失败最大的三块，B6 之后建议优先按这个顺序拆批，而不是按计划书原来的 B7/B8 顺序。
+- 归类脚本的分桶是启发式：`BigInt(` 50 条里可能混着"只是提到 BigInt"的用例；`regexp` 桶也包含"正则 + 真实缺口"的混合用例。
+  §3.1 已写明这个局限；如果 A1 要作为完成判据，先用它做**减法**、再由人工抽查 20 条确认。
+
+---
 
 ---
 

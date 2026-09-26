@@ -21,6 +21,14 @@ echo 'console.log' > /dev/null; printf 'var a=[1,2]; a.map(function(x){return x*
 BIUJS_DUMP=1 ./target/release/biujs /tmp/t.js   # 打印字节码（看帧布局时必用）
 ```
 
+KPI 归类（把"范围内真实缺口"和范围外杂音分开，A1 的测量口径见计划书 §3.1）：
+
+```sh
+ulimit -v 6000000
+TEST262_FAILURES=99999 cargo test --release --test test262_runner -- --nocapture > /tmp/full.txt
+python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 176 后 ES6（2026-09-26）
+```
+
 全量一致性回归（约 3 分钟，**必须带内存上限**）：
 
 ```sh
@@ -51,10 +59,10 @@ BIUJS_DUMP=1 ./target/release/biujs /tmp/t.js   # 打印字节码（看帧布局
 | runner 覆盖面 | 25586 / 53568 个测试文件（47%）——**未覆盖里约 4920 条属承诺的 M5/M6** |
 | 基线快照 | `phase2-status.tsv`（`scripts/phase2-status.sh` 生成的逐套件表） |
 
-**已完成**：M0 → M4（语法、内置对象、JSON、生成器与迭代协议）；阶段二的 B0（度量铺底）、B1（spread 走 `GetIterator`）、B5a（数组 `length` 的错误种类）、B5b（Object 描述符长尾 + 六个完整性方法）、B2a（`Map` 180/187）、B2b（`Set` 344/364，含 `set-methods` 七算子）、B3（`WeakMap` 131/132、`WeakSet` 79/80）。
+**已完成**：M0 → M4（语法、内置对象、JSON、生成器与迭代协议）；阶段二的 B0（度量铺底）、B1（spread 走 `GetIterator`）、B5a（数组 `length` 的错误种类）、B5b（Object 描述符长尾 + 六个完整性方法）、B2a（`Map` 180/187）、B2b（`Set` 344/364，含 `set-methods` 七算子）、B3（`WeakMap` 131/132、`WeakSet` 79/80）、B4（KPI 归类脚本 + `Date` 判"实现"→ B14）。
 
-**下一步**（计划书 §6 的批次表）：**B4**（M8-V3 RegExp 失败归类 + M8-V2 `Date` 决策，把 KPI 杂音清掉）或 **B6**（M7-P6 生成器剩余 + M7-P5 数据模型三债 —— 后者现在被反复提及，是好几族失败的最后一块拼图）。
-另有四条已定位、量不小的独立根因，可与 B3 并行挑选：
+**下一步**（计划书 §6 的批次表）：**B6**（M7-P5/P6：生成器剩余 + 数据模型三债）。§3.1 的标签分布给出了更精确的优先级 —— 范围内失败里 **解构 974 / 生成器 611 / class 元素 489** 三族占了一半以上，建议按这个顺序拆，而不是按原来的 B7/B8 顺序。`Date` 已判"实现"，落点 B14。
+另有四条已定位、量不小的独立根因，可与 B6 并行挑选：
 
 - **`Array.from` 不走迭代协议**（`builtins/array.rs::array_from` 只按 `length` + 索引取快照）。ES6 范围内，`built-ins/Array/from` 有 30 条同源失败，也是 `Map.groupBy` 那 4 条失败的最后一环。修它要上移 VM（要 `GetMethod(@@iterator)` 与 `next()`）。**注意先看闭包债**：那一族里有多条用例靠"闭包内自增外部标量"驱动迭代器，改完协议它们会从"快速失败"变成撞步数上限（实测 `Set` 的同类用例就是这样）。
 - **缺全局对象**：脚本顶层的 `this` 是 `undefined`（`State::this_val` 初值），全局变量又活在 `State::globals` 的 `HashMap` 里 —— 这不是一行修得掉的：`this` 要真的拥有属性，全局读写就得改走对象 + 原型链。实测仅 `built-ins/Object` 里就有 40+ 条失败是被它拖住的（`var global = this` 一类写法）。
