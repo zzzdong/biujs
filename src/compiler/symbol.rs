@@ -30,6 +30,38 @@ impl<T> SymbolTable<T> {
             .insert(name.into(), value);
     }
 
+    /// Insert into a specific scope, counting from the outermost.
+    ///
+    /// `var` bindings belong to the enclosing *function* (or the script), not to
+    /// the block they appear in, so a declaration inside `{ … }` has to be
+    /// recorded in a scope that outlives the block.
+    pub fn insert_at(&mut self, scope_index: usize, name: impl Into<String>, value: T) {
+        if let Some(scope) = self.scopes.get_mut(scope_index) {
+            scope.variables.insert(name.into(), value);
+        }
+    }
+
+    /// Scope index the name resolves in (innermost wins), or `None`.
+    pub fn lookup_depth(&self, name: &str) -> Option<usize> {
+        self.scopes
+            .iter()
+            .rposition(|scope| scope.variables.contains_key(name))
+    }
+
+    /// Look a name up in one specific scope, counting from the outermost.
+    ///
+    /// Used for `var`: the binding belongs to the function scope and must be
+    /// found there even while an inner block is open (and even when an unrelated
+    /// block-local `let` shares the name).
+    pub fn lookup_at(&self, scope_index: usize, name: &str) -> Option<&T> {
+        self.scopes.get(scope_index).and_then(|s| s.variables.get(name))
+    }
+
+    /// Number of nested scopes currently open.
+    pub fn scope_count(&self) -> usize {
+        self.scopes.len()
+    }
+
     pub fn enter_scope(&mut self) {
         self.scopes.push(Scope::<T>::new());
     }

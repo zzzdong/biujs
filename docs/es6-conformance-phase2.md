@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14487 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 468 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14549 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 473 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -208,6 +208,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B15** | M7-P7 解构赋值族（B4 侦察出的五族，按 1→3→2 拆批） | 974 | **B15a 已完成**（头部赋值模式，+177）、**B15b 已完成**（顺带挖出的"标签语句被整段丢弃"，+24），见 §6.1；族 3/2 与生成器参数债见 B15b 的残留 |
 | **B16** | M7-P8 `rest` 参数（全形态）+ `SUITES` 空条目造成的覆盖空洞 | 11 + | **已完成**，见 §6.1 |
 | **B17** | M7-P9 生成器参数的**调用时绑定**（`PrologueEnd` 屏障 + 帧泊车） | 39 + | **已完成**，见 §6.1；+88，零回退 |
+| **B18** | M7-P10 `var` 的**函数作用域与提升** + 块作用域遮蔽 | 60 + | **已完成**，见 §6.1；+62，2 处回退已逐条解释 |
+| **B19** | M7-P11 `try` 内 abrupt 完成（`break`/`continue` 跳出 `try`） | ? | **既有缺陷**（基线可复现），见 B18 记录的残留 1 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -783,6 +785,92 @@ before=0 mid=1 after=2        ← 调用时只跑参数区，函数体仍未开�
 2. **解构非对象的报错文案难看**：现在是 `Cannot read properties of null (reading 'Symbol(…)')`，
    类型对（`TypeError`，test262 只查类型）但文案应该来自 `RequireObjectCoercible`/`GetIterator`。
 3. 之后回到 **B4 侦察的族 2**（默认值匿名函数的 NamedEvaluation）与 **B15b 残留 1**（标签早错误）。
+
+---
+
+#### B18 `var` 的函数作用域与提升 —— 已完成（2026-09-26）
+
+**起点**：通过 14487 / 18277（79.26%），失败 3790，跳过 8133。
+
+**怎么发现的**：B17 之后按残留继续查"生成器闭包捕获"，先用探针描形状，结果第一行就撞上另一个根因：
+
+```js
+{ var a = 1; }   a;      // node: 1；修前：ReferenceError: undefined variable: a
+```
+
+**根因（三个独立缺陷）**
+
+1. **`var` 被当成块作用域**：`lower_variable_declaration` 走的是 `SymbolTable::insert`（当前块），
+   块一结束名字就没了。`var` 属于**函数**（脚本则是全局），必须落到函数作用域。
+2. **没有前置提升**：`var` 声明语句执行前名字应当已存在（值是 `undefined`），
+   `typeof later; var later = 1` 才是 `undefined` 而不是 `ReferenceError`。
+3. **块内遮蔽脚本级名字失效**：`lower_identifier` 只要名字在 `global_names` 里就走 `LoadEnv`，
+   于是 `let x = 1; { let x = 2; }` 里块内读到的仍然是外层那个 1。
+
+另外顺带发现：循环头的 `let`/`const` 会泄漏到循环之外（`for (let i …) {} typeof i` → `number`）。
+
+**改动**（`symbol.rs` + `lowering/mod.rs`）
+
+- `SymbolTable`: 新增 `insert_at(scope_index, …)`、`lookup_at`、`lookup_depth`、`scope_count`；
+- 降级器新增 `var_scope`（该函数的作用域层）与 `var_binding`（当前是否在绑定一个 `var` 模式）、
+  `publishes_as_global()`（脚本级 `var` 即使在块里也必须发布进全局环境 —— 少发布一次而读取仍走
+  `LoadEnv`，就是 `for (var [c = 23] = [undefined]; …)` 读出 `undefined` 的原因）；
+- `lower_variable_declaration` 按 `decl.kind` 分流：`var` 进 `var_scope`，`let`/`const` 留在当前块；
+- 新增 `hoist_var_bindings` + 语句级收集器 `collect_var_names`/`collect_binding_names`
+  （递归进块/if/循环/try/switch/标签，**不**进嵌套函数），在 `lower_program` 与
+  `lower_function_inner` 各调一次；
+- **已提升的 `var` 声明必须复用同一个槽位**（不能为同一个名字再 `alloc` 一个值）：两个独立的 SSA 值
+  会让块后的读取落到一个分支从未喂过的 phi 上 —— `{ var a = 1; } a` 会变成 `undefined`；
+- 循环头加作用域（`for`/`for-of`/`for-in`），`bind_for_of_left` 的 `var` 分支改走同一套 `var` 路径；
+- `lower_identifier` 的全局环境快路径加条件：只有当**解析到的绑定就是脚本作用域那一层**时才走，
+  否则读寄存器（修遮蔽）。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14487 | **14549** | **+62** |
+| 失败 | 3790 | 3728 | −62 |
+| 通过率 | 79.26% | **79.60%** | +0.34pp |
+| 单元 / feature / 护栏 | 190 / 468 / 7 | 190 / **473** / 7 | +5 条断言（`tests/features/variables.rs`） |
+
+提升的套件（18 个）：`while` 18→25、`for` 318→326、`do-while` 19→26、`variable` 123→131、
+`try` 135→140、`String` 609→617、`for-in` 75→77、`let` 111→113、`const` 108→110、`assignment` 388→390、
+`function` 317→319、`types` 91→92、`block` 11→12、`continue` 18→19、`Array` 1941→1943、
+`Object` 2762→2764、`Map` 181→182、`Boolean` 26→27。
+
+**逐套件核对：2 处回退，逐条解释（§7.1 要求）**
+
+1. `language/statements/for-of` 571 → 570：新增 2 条失败（`break-from-try`、`continue-from-try`）、
+   新修好 1 条（`head-let-destructuring`）。**底层是一个既有缺陷** —— "从 `try` 内 `break` 跳出"在
+   *基线*上就是坏的，与本批无关：
+
+   ```js
+   var log = [];
+   for (var x of [1]) { try { log.push("a"); break; } catch (e) {} log.push("b"); }
+   log.push("c");
+   throw log.join(",");      // node: "a,c"；基线：返回 1（跳到脚本外面，后面的语句根本没跑）
+   ```
+
+   用 stashed 基线二进制跑同一段也是错的（已确认）。`var` 提升改变了槽位/寄存器分配之后，
+   这两条 test262 用例才踩上它。**这不是"接受的回退"，而是下一批 B19 的目标。**
+2. `language/statements/class` 1122 → 1121：`name-binding/in-extends-expression-assigned`
+   （`var x = (class x extends x {});` 期望 `ReferenceError`，现在给 `TypeError`）。
+   原因是 `var` 提升让外层 `x` 变成"已声明但未初始化"，而规范在这里靠**类名绑定的 TDZ** 抛
+   `ReferenceError` —— 引擎还没有 TDZ。修 TDZ 会一并修好 `let`/`const` 的 TDZ 族
+   （`for-of/dstr/*-put-let` 那 19 条"Expected a ReferenceError"同源）。
+
+**残留**（下一批的输入）
+
+1. **B19：`try` 内 abrupt 完成**（上面第 1 条）。控制流/SEH 的正确性问题，优先级最高：
+   最小复现在基线上就失败，且它正遮挡 B18 的 2 条用例。
+2. **TDZ**（`let`/`const`/类名绑定）：`for-of` 套件里 19 条"Expected a ReferenceError"、
+   `*-put-let`/`*-put-const` 一族、以及上面的 class 用例都指向它。
+3. **per-iteration 绑定**（ES6 `CreatePerIterationEnvironment`）：循环头 `let` 的闭包应当每轮
+   一个新绑定（`closure-per-iteration=2,2`，应为 `0,1`）。B18 只做到"不泄漏"，没做"每轮新绑定"。
+4. **闭包共享可变单元**（B18 起点想查的那件事）：`var` 捕获仍是创建时快照，
+   `function m(){ var i = 0; return function () { i = i + 1; return i; }; }` 的 `m()()` 仍是 `1,1`
+   （应为 `1,2`）；生成器的 `SuspendedFrame::closure_maps` 切片口径也在这条线索上。
 
 ---
 

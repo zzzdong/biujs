@@ -77,6 +77,108 @@ enum MemberKey {
     Dynamic(Value),
 }
 
+/// ES `VarDeclaredNames` for a statement list: every name a `var` (or `for (var
+/// …)`) declares, at any depth of *statements*.
+///
+/// Nested functions are deliberately not descended into: their `var`s belong to
+/// their own scope. (`var` inside a nested *block* does not, which is the whole
+/// point of hoisting this list to the function scope.)
+fn collect_var_names(stmts: &[Statement<'_>], out: &mut Vec<String>) {
+    for stmt in stmts {
+        collect_var_names_from_statement(stmt, out);
+    }
+}
+
+fn collect_var_names_from_declaration(decl: &VariableDeclaration<'_>, out: &mut Vec<String>) {
+    if decl.kind != VariableDeclarationKind::Var {
+        return;
+    }
+    for declarator in &decl.declarations {
+        collect_binding_names(&declarator.id, out);
+    }
+}
+
+fn collect_var_names_from_statement(stmt: &Statement<'_>, out: &mut Vec<String>) {
+    match stmt {
+        Statement::VariableDeclaration(decl) => collect_var_names_from_declaration(decl, out),
+        Statement::BlockStatement(block) => collect_var_names(&block.body, out),
+        Statement::IfStatement(if_stmt) => {
+            collect_var_names_from_statement(&if_stmt.consequent, out);
+            if let Some(alternate) = &if_stmt.alternate {
+                collect_var_names_from_statement(alternate, out);
+            }
+        }
+        Statement::WhileStatement(while_stmt) => {
+            collect_var_names_from_statement(&while_stmt.body, out)
+        }
+        Statement::DoWhileStatement(do_while) => {
+            collect_var_names_from_statement(&do_while.body, out)
+        }
+        Statement::ForStatement(for_stmt) => {
+            if let Some(ForStatementInit::VariableDeclaration(decl)) = &for_stmt.init {
+                collect_var_names_from_declaration(decl, out);
+            }
+            collect_var_names_from_statement(&for_stmt.body, out);
+        }
+        Statement::ForOfStatement(for_of) => {
+            if let ForStatementLeft::VariableDeclaration(decl) = &for_of.left {
+                collect_var_names_from_declaration(decl, out);
+            }
+            collect_var_names_from_statement(&for_of.body, out);
+        }
+        Statement::ForInStatement(for_in) => {
+            if let ForStatementLeft::VariableDeclaration(decl) = &for_in.left {
+                collect_var_names_from_declaration(decl, out);
+            }
+            collect_var_names_from_statement(&for_in.body, out);
+        }
+        Statement::SwitchStatement(switch) => {
+            for case in &switch.cases {
+                collect_var_names(&case.consequent, out);
+            }
+        }
+        Statement::TryStatement(try_stmt) => {
+            collect_var_names(&try_stmt.block.body, out);
+            if let Some(handler) = &try_stmt.handler {
+                collect_var_names(&handler.body.body, out);
+            }
+            if let Some(finalizer) = &try_stmt.finalizer {
+                collect_var_names(&finalizer.body, out);
+            }
+        }
+        Statement::LabeledStatement(labeled) => {
+            collect_var_names_from_statement(&labeled.body, out)
+        }
+        // Function/class declarations are their own scope, and expression
+        // statements cannot declare a `var`.
+        _ => {}
+    }
+}
+
+/// Every identifier a binding pattern declares (`var [a, {b: c}] = …`).
+fn collect_binding_names(pattern: &BindingPattern<'_>, out: &mut Vec<String>) {
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => out.push(id.name.to_string()),
+        BindingPattern::AssignmentPattern(ap) => collect_binding_names(&ap.left, out),
+        BindingPattern::ObjectPattern(op) => {
+            for prop in &op.properties {
+                collect_binding_names(&prop.value, out);
+            }
+            if let Some(rest) = &op.rest {
+                collect_binding_names(&rest.argument, out);
+            }
+        }
+        BindingPattern::ArrayPattern(ap) => {
+            for element in ap.elements.iter().flatten() {
+                collect_binding_names(element, out);
+            }
+            if let Some(rest) = &ap.rest {
+                collect_binding_names(&rest.argument, out);
+            }
+        }
+    }
+}
+
 /// Whether `stmt` is an iteration statement, i.e. the only kind of body a label
 /// can attach a `continue` target to (ES `IsLabelledFunction` / the early error
 /// for `continue`).
@@ -125,6 +227,12 @@ pub struct JSASTLower<'a> {
     is_script: bool,
     /// Nesting depth of block/catch scopes; 0 means "directly in script scope".
     scope_depth: usize,
+    /// Scope level `var` bindings belong to: the enclosing *function* (or the
+    /// script), never the block the declaration appears in.
+    var_scope: usize,
+    /// Set while a `var` declarator's pattern is being bound, so its names land in
+    /// `var_scope` rather than in the current block scope.
+    var_binding: bool,
     /// One entry per open `try` statement (parallel to `seh_depth`).
     seh_frames: Vec<SehFrameInfo>,
     /// Names published into the global environment by this (script) lowerer.
@@ -133,6 +241,10 @@ pub struct JSASTLower<'a> {
 
 impl<'a> JSASTLower<'a> {
     pub fn new(builder: &'a mut dyn InstBuilder, symbols: SymbolTable<Variable>) -> Self {
+        // The innermost scope of the incoming table is where this function's
+        // parameters and `var`s live (a nested function gets a *clone* of the
+        // outer table, with the captured names removed).
+        let var_scope = symbols.scope_count().saturating_sub(1);
         Self {
             builder,
             symbols,
@@ -143,6 +255,8 @@ impl<'a> JSASTLower<'a> {
             arrow_this_var: None,
             is_script: false,
             scope_depth: 0,
+            var_scope,
+            var_binding: false,
             seh_frames: Vec::new(),
             global_names: std::collections::HashSet::new(),
         }
@@ -158,6 +272,37 @@ impl<'a> JSASTLower<'a> {
     /// Whether a binding declared right here becomes a script-level global.
     fn at_script_scope(&self) -> bool {
         self.is_script && self.scope_depth == 0
+    }
+
+    /// Whether a `var` binding belongs to the script's own scope (so it must also
+    /// be published into the global environment). A `var` inside a *block* at
+    /// script level still creates a global: `{ var a = 1; } a` is 1.
+    fn at_script_var_scope(&self) -> bool {
+        self.is_script && self.var_scope == 0
+    }
+
+    /// Whether a binding right here is published into the global environment.
+    ///
+    /// A script-scope `var` counts even when it sits inside a block or a loop
+    /// head (a loop opens a scope, which would otherwise switch the publish off
+    /// while the *read* still went through `LoadEnv` — that is how
+    /// `for (var [c = 23] = [undefined]; …)` ended up reading `undefined`).
+    fn publishes_as_global(&self) -> bool {
+        if self.var_binding {
+            self.at_script_var_scope()
+        } else {
+            self.at_script_scope()
+        }
+    }
+
+    /// Record a binding, honouring `var`'s function scope.
+    fn insert_binding(&mut self, name: &str, variable: Variable) {
+        if self.var_binding {
+            self.symbols
+                .insert_at(self.var_scope, name.to_string(), variable);
+        } else {
+            self.symbols.insert(name.to_string(), variable);
+        }
     }
 
     /// Publish `name -> value` into the global environment (script scope only).
@@ -190,6 +335,10 @@ impl<'a> JSASTLower<'a> {
         let entry = self.create_block("main");
         self.builder.switch_to_block(entry);
         self.builder.set_entry(entry);
+
+        // `var` names exist from the start of the script, even when their
+        // declaration sits in a block that has not run yet.
+        self.hoist_var_bindings(&program.body);
 
         // Now assign hoisted functions (we have a current block)
         for (name, func_val) in hoisted_funcs {
@@ -651,6 +800,12 @@ impl<'a> JSASTLower<'a> {
     }
 
     fn lower_variable_declaration(&mut self, decl: &VariableDeclaration<'_>) {
+        // `var` is function-scoped: its names must reach the enclosing function's
+        // scope even when the declaration sits inside a block, and they are
+        // *hoisted* (see `hoist_var_bindings`), so this statement only assigns.
+        let is_var = decl.kind == VariableDeclarationKind::Var;
+        let previous = self.var_binding;
+        self.var_binding = is_var;
         for declarator in &decl.declarations {
             let name = self.binding_pattern_name(&declarator.id);
 
@@ -660,24 +815,65 @@ impl<'a> JSASTLower<'a> {
             };
 
             if let BindingPattern::BindingIdentifier(_) = &declarator.id {
-                let dst = self.builder.alloc();
+                // A hoisted `var` already owns a slot: assign into it instead of
+                // allocating a second value for the same name. Two independent
+                // definitions of one variable is exactly what made the read after
+                // a block resolve through a phi that the branch never fed —
+                // `{ var a = 1; } a` returned `undefined`.
+                let hoisted = if is_var {
+                    self.symbols.lookup_at(self.var_scope, &name).copied()
+                } else {
+                    None
+                };
+                let dst = match hoisted {
+                    Some(var) => var.0,
+                    None => self.builder.alloc(),
+                };
                 if let Some(value) = value {
                     self.builder.assign(dst, value);
-                    if self.at_script_scope() {
+                    if is_var && self.at_script_var_scope() || !is_var && self.at_script_scope() {
                         self.define_global(&name, value);
                     }
-                } else if self.at_script_scope() {
-                    // `let x;` — publish the (undefined) binding so nested
-                    // reads resolve to undefined instead of ReferenceError.
+                } else if (is_var && self.at_script_var_scope())
+                    || (!is_var && self.at_script_scope())
+                {
+                    // `var x;` / `let x;` — publish the (undefined) binding so
+                    // nested reads resolve to undefined instead of ReferenceError.
                     self.define_global(&name, Value::Primitive(Primitive::Undefined));
                 }
                 // else: dst stays as default (undefined)
-                self.symbols.insert(name, Variable::new(dst));
+                if hoisted.is_none() {
+                    self.insert_binding(&name, Variable::new(dst));
+                }
             } else if let Some(value) = value {
                 // Destructuring declaration: `[a, b] = value` / `{x} = value`.
                 self.bind_pattern(&declarator.id, value, true);
             } else {
                 log::warn!("destructuring declaration without initializer");
+            }
+        }
+        self.var_binding = previous;
+    }
+
+    /// Declare every `var` of `stmts` — *recursively, but never inside a nested
+    /// function* — as an `undefined` binding of the current function scope.
+    ///
+    /// ES `VarDeclaredNames`/`VarScopedDeclarations`: a `var` exists from the
+    /// moment its function starts, so `typeof x` before `var x = 1` is
+    /// `"undefined"` rather than a `ReferenceError`, and a declaration nested in
+    /// a block is visible after that block.
+    fn hoist_var_bindings(&mut self, stmts: &[Statement<'_>]) {
+        let mut names = Vec::new();
+        collect_var_names(stmts, &mut names);
+        for name in names {
+            if self.symbols.lookup(&name).is_none() {
+                let dst = self.builder.alloc();
+                self.builder
+                    .assign(dst, Value::Primitive(Primitive::Undefined));
+                self.insert_binding(&name, Variable::new(dst));
+                if self.at_script_var_scope() {
+                    self.define_global(&name, Value::Primitive(Primitive::Undefined));
+                }
             }
         }
     }
@@ -831,6 +1027,12 @@ impl<'a> JSASTLower<'a> {
         self.builder.br_if(has_next, body_blk, close_blk);
 
         self.builder.switch_to_block(body_blk);
+        // The head's bindings are scoped to the loop (see `lower_for`).
+        self.symbols.enter_scope();
+        self.scope_depth += 1;
+        // The head's bindings are scoped to the loop (see `lower_for`).
+        self.symbols.enter_scope();
+        self.scope_depth += 1;
         self.bind_for_of_left(&for_of.left, item);
         self.lower_statement(&for_of.body);
         if !self.current_block_is_terminated() {
@@ -842,6 +1044,8 @@ impl<'a> JSASTLower<'a> {
         self.builder.iterator_close(it);
         self.builder.jump(after_blk);
         self.builder.switch_to_block(after_blk);
+        self.scope_depth -= 1;
+        self.symbols.leave_scope();
     }
 
     /// `for (lhs in rhs) body` — desugared to for-of over `Object.keys(rhs)`.
@@ -868,6 +1072,9 @@ impl<'a> JSASTLower<'a> {
         self.builder.br_if(has_next, body_blk, close_blk);
 
         self.builder.switch_to_block(body_blk);
+        // The head's bindings are scoped to the loop (see `lower_for`).
+        self.symbols.enter_scope();
+        self.scope_depth += 1;
         self.bind_for_of_left(&for_in.left, item);
         self.lower_statement(&for_in.body);
         if !self.current_block_is_terminated() {
@@ -879,6 +1086,8 @@ impl<'a> JSASTLower<'a> {
         self.builder.iterator_close(it);
         self.builder.jump(after_blk);
         self.builder.switch_to_block(after_blk);
+        self.scope_depth -= 1;
+        self.symbols.leave_scope();
     }
 
     /// Bind the `left` of a for-of/for-in head to `item`.
@@ -893,13 +1102,23 @@ impl<'a> JSASTLower<'a> {
                     // the real bindings undeclared — every leaf read was a
                     // ReferenceError. The simple identifier keeps its direct
                     // slot so the hot path is unchanged.
+                    // A `var` head binding outlives the head's own scope (which
+                    // `lower_for_of` opens around the loop), so it goes through
+                    // the same `var`-scope path as a `var` declaration.
+                    let is_var = decl.kind == VariableDeclarationKind::Var;
+                    let previous = self.var_binding;
+                    self.var_binding = is_var;
                     if let BindingPattern::BindingIdentifier(id) = &declarator.id {
                         let dst = self.builder.alloc();
                         self.builder.assign(dst, item.clone());
-                        self.symbols.insert(id.name.to_string(), Variable::new(dst));
+                        self.insert_binding(id.name.as_str(), Variable::new(dst));
+                        if is_var && self.publishes_as_global() {
+                            self.define_global(id.name.as_str(), item.clone());
+                        }
                     } else {
                         self.bind_pattern(&declarator.id, item.clone(), true);
                     }
+                    self.var_binding = previous;
                 }
             }
             ForStatementLeft::AssignmentTargetIdentifier(ident) => {
@@ -1051,6 +1270,13 @@ impl<'a> JSASTLower<'a> {
 
     fn lower_for(&mut self, for_stmt: &ForStatement<'_>) {
         // ForStatement in oxc: for (init; test; update) body
+        //
+        // The head's `let`/`const` bindings own a scope that encloses the body
+        // but not the loop's exit: `for (let i = 0; …) {}` must not leave `i`
+        // visible afterwards. (Per-iteration bindings for closures — the ES6
+        // `CreatePerIterationEnvironment` step — are still missing.)
+        self.symbols.enter_scope();
+        self.scope_depth += 1;
         let cond_blk = self.create_block("for_cond");
         let body_blk = self.create_block("for_body");
         let update_blk = self.create_block("for_update");
@@ -1099,6 +1325,8 @@ impl<'a> JSASTLower<'a> {
 
         self.leave_loop_context();
         self.builder.switch_to_block(after_blk);
+        self.scope_depth -= 1;
+        self.symbols.leave_scope();
     }
 
     fn lower_block_stmt(&mut self, block: &BlockStatement<'_>) {
@@ -1483,8 +1711,12 @@ impl<'a> JSASTLower<'a> {
         if let Some(var) = self.symbols.lookup(ident.name.as_str()) {
             // Script-scope globals live in the global environment and can be
             // written by *any* function (or via `window.x` style access), so a
-            // cached register copy would go stale. Re-read them with LoadEnv.
-            if self.global_names.contains(ident.name.as_str()) {
+            // cached register copy would go stale. Re-read them with LoadEnv —
+            // but only when the binding that resolved *is* the script-scope one:
+            // a block declaring `let x` shadows it, and reading through the
+            // environment there gave the outer value (`{ let x = 2; }` read 1).
+            let is_script_binding = self.symbols.lookup_depth(ident.name.as_str()) == Some(0);
+            if is_script_binding && self.global_names.contains(ident.name.as_str()) {
                 return self.builder.load_external_variable(ident.name.to_string());
             }
             var.0
@@ -2606,6 +2838,9 @@ impl<'a> JSASTLower<'a> {
             func_lower.builder.prologue_end();
         }
 
+        // `var` bindings of this function, hoisted out of every nested block.
+        func_lower.hoist_var_bindings(&body.statements);
+
         // First pass: collect nested function declarations for hoisting
         let mut hoisted_funcs: Vec<(String, Value)> = Vec::new();
         for stmt in &body.statements {
@@ -2761,8 +2996,8 @@ impl<'a> JSASTLower<'a> {
     fn bind_pattern(&mut self, pattern: &BindingPattern<'_>, value: Value, publish_global: bool) {
         match pattern {
             BindingPattern::BindingIdentifier(id) => {
-                self.symbols.insert(id.name.to_string(), Variable::new(value));
-                if publish_global && self.at_script_scope() {
+                self.insert_binding(id.name.as_str(), Variable::new(value));
+                if publish_global && self.publishes_as_global() {
                     self.builder
                         .store_external_variable(id.name.to_string(), value.clone());
                     self.global_names.insert(id.name.to_string());
