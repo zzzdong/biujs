@@ -528,6 +528,25 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 - 归类脚本的分桶是启发式：`BigInt(` 50 条里可能混着"只是提到 BigInt"的用例；`regexp` 桶也包含"正则 + 真实缺口"的混合用例。
   §3.1 已写明这个局限；如果 A1 要作为完成判据，先用它做**减法**、再由人工抽查 20 条确认。
 
+**下一批的侦察（2026-09-26，同批完成）**：把"解构 974"当成一个根因是错的，实测至少五族，得拆开打：
+
+1. **`for`/`for-of` 头部的"赋值模式"完全不赋值**（声明形式正常）—— 单条最小复现：
+   ```js
+   var v; for ([v] of [[2]]) {}   // v 仍是 undefined（node: 2）
+   var w; for (var [w] of [[2]]) { }   // 正常
+   ```
+   落点在降级层 `bind_for_of_left`（`ForStatementLeft` 的赋值目标分支），是这五族里最便宜的一族。
+2. **默认值位置上的匿名函数没有推断 `name`**：`dflt-*-elem-id-init-fn-name-{arrow,cls,cover,fn,gen}` 全族
+   （预期 `"arrow"`/`"cls"`/`"cover"`/`"fn"`/`"gen"`，实际 `""`/`"<anonymous>"`/`"<class>"`）。规范要求
+   `[x = function () {}] = []` 里的函数名取自绑定名（NamedEvaluation）。
+3. **解构 `null`/`undefined` 不抛 `TypeError`**：`dflt-ary-ptrn-elem-ary-val-null` 一族。
+4. **迭代器/rest 语义**：`array-elem-iter-*`(16)、`ary-ptrn-rest-*`(23)。
+5. **对象模式**：`obj-ptrn-*`(62+76) + `obj-prop-elem`(24) + `obj-id-init`(21)。
+
+`dstr` 之外，同一个 for-of 目录里还有 41 条"应抛 TypeError 却没抛"、35 条"应抛 Test262Error 却没抛"
+（多为测试自己 `throw` 的断言没被执行到，即上面的第 1 族把断言整段跳过了）。**建议按 1 → 3 → 2 的顺序拆批**：
+先修最窄、最容易验证的头部赋值模式，再看非对象解构的 abrupt 检查，最后处理 NamedEvaluation。
+
 ---
 
 ---
