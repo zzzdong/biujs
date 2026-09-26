@@ -96,3 +96,89 @@ fn an_inner_binding_shadows_the_script_scope_one() {
         21.0
     );
 }
+
+// ============================================================
+// Temporal dead zone (`let` / `const` / class name)
+// ============================================================
+//
+// A `let`/`const` binding exists from the moment its scope is entered but only
+// *holds a value* once its declaration has been evaluated. Reading or writing it
+// in that window is a `ReferenceError`, not `undefined`. The lowering now
+// pre-binds those names per scope and marks them uninitialized, so the name
+// shadows any outer one (instead of falling through to the global environment)
+// and every access site can raise.
+
+#[test]
+fn reading_a_binding_before_its_declaration_throws() {
+    // `typeof` does not save you: the binding exists, it just has no value yet.
+    assert_eq!(
+        eval_string("function f() { { try { return 't:' + typeof w; } catch (e) { return e.name; } let w = 1; } } f()"),
+        "ReferenceError"
+    );
+    // A block-level `let` shadows the outer name even while uninitialized, so the
+    // inner read must not fall back to the outer value.
+    assert_eq!(
+        eval_string("function f() { let v = 1; { try { return 'read:' + v; } catch (e) { return e.name; } let v = 2; } } f()"),
+        "ReferenceError"
+    );
+}
+
+#[test]
+fn writing_a_binding_before_its_declaration_throws() {
+    // Plain assignment, compound assignment and `++` all read-modify-write.
+    assert_eq!(
+        eval_string("function f() { try { u = 3; return 'no-throw'; } catch (e) { return e.name; } let u; } f()"),
+        "ReferenceError"
+    );
+    assert_eq!(
+        eval_string("function f() { try { u += 3; return 'no-throw'; } catch (e) { return e.name; } let u = 1; } f()"),
+        "ReferenceError"
+    );
+    assert_eq!(
+        eval_string("function f() { try { u++; return 'no-throw'; } catch (e) { return e.name; } let u = 1; } f()"),
+        "ReferenceError"
+    );
+    // The shape test262 uses for the destructuring target: the `let` is declared
+    // *after* the loop that assigns to it.
+    assert_eq!(
+        eval_string(
+            "var counter = 0;
+             function f() {
+               try { for ({ x } of [{}]) { counter += 1; } counter += 1; return 'no-throw'; }
+               catch (e) { return e.name; }
+               let x;
+             }
+             var seen = f();
+             seen + '/' + counter"
+        ),
+        "ReferenceError/0"
+    );
+}
+
+#[test]
+fn a_binding_is_usable_once_its_declaration_ran() {
+    assert_eq!(eval_number("function f() { let t; t = 4; return t; } f()"), 4.0);
+    assert_eq!(eval_number("function f() { const c = 5; return c; } f()"), 5.0);
+    assert_eq!(
+        eval_number("function f() { let a = 1; { let a = 2; return a; } } f()"),
+        2.0
+    );
+    assert_eq!(eval_number("var n = 0; { let n = 7; } n"), 0.0);
+}
+
+#[test]
+fn a_class_name_is_in_its_own_dead_zone() {
+    // ES 15.7.14: the class's own name is bound before the heritage is evaluated,
+    // so `extends` reading it raises — it must not read the outer `var` instead.
+    assert_eq!(
+        eval_string("try { var q = (class q extends q {}); } catch (e) { e.name; }"),
+        "ReferenceError"
+    );
+    // An ordinary class is unaffected.
+    assert_eq!(eval_number("class Ok { m() { return 1; } } new Ok().m()"), 1.0);
+    assert_eq!(eval_string("class Named {} typeof Named"), "function");
+    assert_eq!(
+        eval_number("class Base { v() { return 2; } } class Sub extends Base {} new Sub().v()"),
+        2.0
+    );
+}

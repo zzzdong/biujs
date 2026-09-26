@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14555 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 478 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14564 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 482 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -210,6 +210,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B17** | M7-P9 生成器参数的**调用时绑定**（`PrologueEnd` 屏障 + 帧泊车） | 39 + | **已完成**，见 §6.1；+88，零回退 |
 | **B18** | M7-P10 `var` 的**函数作用域与提升** + 块作用域遮蔽 | 60 + | **已完成**，见 §6.1；+62，2 处回退已逐条解释 |
 | **B19** | M7-P11 `try` 内 abrupt 完成（`break`/`continue` 跳出 `try`） | 6 + | **已完成**，见 §6.1；+6，零回退，并修回 B18 被它遮挡的 2 条用例 |
+| **B20** | M7-P12 TDZ（`let`/`const`/类名绑定的"已绑定但未初始化"窗口） | 20 + | **已完成**，见 §6.1；+9，零回退，修回 B18 遗留的 class 用例 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -933,6 +934,62 @@ try 内 throw 被 catch（循环继续），以及 while / do-while 里的 break
    也在这条线索上。
 4. `try` 里 `yield*` 与 delegate 的 abrupt 交互（B18 的 `*-from-try` 里 `yield-from-try` 已通过，
    但更深的组合还没专门验证过）。
+
+---
+
+#### B20 TDZ：`let`/`const`/类名的"已绑定但未初始化"窗口 —— 已完成（2026-09-26）
+
+**起点**：通过 14555 / 18277（79.64%），失败 3722，跳过 8133。
+
+**根因**：`let`/`const` 只有在其**声明语句被降级时**才进入符号表，于是声明之前的读取解析到外层
+（或全局环境）拿到 `undefined` —— 既不抛 `ReferenceError`，也不遮蔽外层同名绑定。类名同理：
+`class x extends x {}` 的 heritage 读到的是外层那个 `var x`（B18 提升后是 `undefined`），于是报
+`TypeError` 而不是规范要求的 `ReferenceError`。
+
+规范里这段窗口叫 TDZ：绑定**存在**（所以它遮蔽外层同名），只是还没有值，读写都要抛 `ReferenceError`。
+
+**改动**（`symbol.rs` + `lowering/mod.rs`）
+
+- `Variable` 从 `Variable(slot)` 变成 `{ slot, initialized }`，`Variable::uninitialized` 表示在死区；
+  `SymbolTable<Variable>::mark_initialized` 结束这个窗口；
+- 每个作用域入口**预声明**本层的 `let`/`const`（脚本、函数、块、循环头）：`hoist_lexical_bindings`
+  + 收集器 `collect_lexical_names`（不进嵌套块 —— 每块自己预声明）；
+- 读取（`lower_identifier`）、写入（`store_into_identifier`）、普通/复合赋值、`++`/`--`
+  四处检查 `initialized`，否则发 `throw ReferenceError`；
+- 类名走**独立作用域**：`lower_class` 在求值 heritage 之前把类名绑为未初始化，类构好之后标记并弹栈 ——
+  这样它既遮蔽外层同名（关键：`var q = class q extends q {}`），窗口又覆盖 heritage 与类体。
+
+两个必须记的细节（都是踩过的）：预声明与"复用已声明槽位"的查名**只能查当前层**。用整条作用域链查会把
+块级 `let` 当成"外层已有同名"而跳过预声明，接着声明又去复用外层的槽位 —— 结果 B18 刚修好的
+`let x = 1; { let x = 2; }` 又变回 1（`shadow=1`）。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14555 | **14564** | **+9** |
+| 失败 | 3722 | 3713 | −9 |
+| 通过率 | 79.64% | **79.68%** | |
+| 单元 / feature / 护栏 | 190 / 478 / 7 | 190 / **482** / 7 | +4 条断言（`tests/features/variables.rs`） |
+
+逐套件：`for-of` 572 → **576**、`assignment` 390 → **394**、`class` 1121 → **1122**
+（最后这 +1 正是 B18 记录里标为"需要 TDZ"的 `name-binding/in-extends-expression-assigned`），
+**无逐套件回退**。
+
+与 node 逐项对比过的形状（8 个，全部一致）：块内 `typeof` / 读取 / 赋值 / `+=` / `++` 命中死区、
+遮蔽时读内层未初始化的名字、`{ x } = …` 赋给后面才声明的 `let`（test262 用的形状）、声明之后正常、
+`class q extends q {}`、普通类与 `extends` 正常。
+
+**残留**
+
+1. **跨函数的脚本级 `let` TDZ**：`let y` 在脚本层，某个函数在其声明前读 `y` —— 本站给 `undefined`，
+   规范要求 `ReferenceError`。原因是脚本级 `let` 被发布成了全局环境里的属性，闭包经 `LoadEnv`
+   读到的是那个属性，没有死区信息。真正的修法是把"脚本声明记录"与"全局对象"分开 —— 属于数据模型债，
+   量不小，建议与闭包共享单元一起做。
+2. **per-iteration 绑定**（ES6 `CreatePerIterationEnvironment`）：循环头 `let` 的闭包应每轮一个新绑定
+   （`closure-per-iteration=2,2`，应为 `0,1`）。
+3. **闭包共享可变单元**：`var` 捕获仍是创建时快照；生成器 `SuspendedFrame::closure_maps` 切片口径
+   也在这条线索上。第 1 条做完之后这两条会一起顺。
 
 ---
 

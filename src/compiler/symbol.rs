@@ -79,6 +79,18 @@ impl<T> SymbolTable<T> {
     }
 }
 
+impl SymbolTable<crate::compiler::lowering::Variable> {
+    /// Mark the binding of `name` as initialized (end of its temporal dead zone).
+    pub fn mark_initialized(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(binding) = scope.variables.get_mut(name) {
+                binding.initialized = true;
+                return;
+            }
+        }
+    }
+}
+
 impl<T: Clone> Clone for SymbolTable<T> {
     fn clone(&self) -> Self {
         SymbolTable {

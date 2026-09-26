@@ -9,11 +9,34 @@ use crate::compiler::symbol::SymbolTable;
 
 /// Wraps a Value so it can be stored in the symbol table.
 #[derive(Debug, Clone, Copy)]
-pub struct Variable(pub Value);
+pub struct Variable {
+    /// The binding's storage location.
+    pub slot: Value,
+    /// `false` while the binding exists but has not been *initialized*.
+    ///
+    /// That window is the temporal dead zone: a `let`/`const` (or a class's own
+    /// name) is bound when its scope is entered but only initialized when its
+    /// declaration is evaluated. Reading or writing it there is a
+    /// `ReferenceError`, not `undefined` — the binding is there, it just has no
+    /// value yet.
+    pub initialized: bool,
+}
 
 impl Variable {
+    /// A binding that already holds its value (`var`, parameters, …).
     pub fn new(addr: Value) -> Variable {
-        Variable(addr)
+        Variable {
+            slot: addr,
+            initialized: true,
+        }
+    }
+
+    /// A binding in its temporal dead zone.
+    pub fn uninitialized(addr: Value) -> Variable {
+        Variable {
+            slot: addr,
+            initialized: false,
+        }
     }
 }
 
@@ -84,6 +107,26 @@ struct LabelContext {
 enum MemberKey {
     Static(String),
     Dynamic(Value),
+}
+
+/// Every `let`/`const` declared directly in a statement list.
+///
+/// Nested blocks are *not* descended into: each block is its own scope and
+/// pre-declares its own bindings (via `lower_block_stmt`). Nested functions are
+/// skipped for the same reason as in `collect_var_names`.
+fn collect_lexical_names(stmts: &[Statement<'_>], out: &mut Vec<String>) {
+    for stmt in stmts {
+        if let Statement::VariableDeclaration(decl) = stmt {
+            if decl.kind == VariableDeclarationKind::Var {
+                continue;
+            }
+            for declarator in &decl.declarations {
+                collect_binding_names(&declarator.id, out);
+            }
+        }
+        // A `for (let …)` head is lowered while the head's own scope is open, so
+        // it pre-declares the names itself; the loop body is a block.
+    }
 }
 
 /// ES `VarDeclaredNames` for a statement list: every name a `var` (or `for (var
@@ -164,7 +207,7 @@ fn collect_var_names_from_statement(stmt: &Statement<'_>, out: &mut Vec<String>)
     }
 }
 
-/// Every identifier a binding pattern declares (`var [a, {b: c}] = …`).
+    /// Every identifier a binding pattern declares (`var [a, {b: c}] = …`).
 fn collect_binding_names(pattern: &BindingPattern<'_>, out: &mut Vec<String>) {
     match pattern {
         BindingPattern::BindingIdentifier(id) => out.push(id.name.to_string()),
@@ -290,6 +333,11 @@ impl<'a> JSASTLower<'a> {
         self.is_script && self.var_scope == 0
     }
 
+    /// Index of the innermost open scope.
+    fn current_scope(&self) -> usize {
+        self.symbols.scope_count().saturating_sub(1)
+    }
+
     /// Whether a binding right here is published into the global environment.
     ///
     /// A script-scope `var` counts even when it sits inside a block or a loop
@@ -302,6 +350,20 @@ impl<'a> JSASTLower<'a> {
         } else {
             self.at_script_scope()
         }
+    }
+
+    /// Throw the `ReferenceError` the temporal dead zone raises, and return an
+    /// `undefined` value so the expression that read the binding still has one.
+    fn throw_tdz(&mut self, name: &str) -> Value {
+        let message = self.builder.load_constant(crate::bytecode::Constant::String(
+            std::sync::Arc::new(format!("Cannot access '{name}' before initialization")),
+        ));
+        let ctor = self
+            .builder
+            .load_external_variable("ReferenceError".to_string());
+        let error = self.builder.new_(ctor, vec![message]);
+        self.builder.throw_value(error);
+        Value::Primitive(Primitive::Undefined)
     }
 
     /// Record a binding, honouring `var`'s function scope.
@@ -348,6 +410,9 @@ impl<'a> JSASTLower<'a> {
         // `var` names exist from the start of the script, even when their
         // declaration sits in a block that has not run yet.
         self.hoist_var_bindings(&program.body);
+        // The same for the script scope's own `let`/`const` — in their dead zone
+        // until their declaration runs.
+        self.hoist_lexical_bindings(&program.body);
 
         // Now assign hoisted functions (we have a current block)
         for (name, func_val) in hoisted_funcs {
@@ -442,12 +507,22 @@ impl<'a> JSASTLower<'a> {
     fn lower_class_declaration(&mut self, class: &Class<'_>) {
         let class_val = self.lower_class(class);
         if let Some(id) = &class.id {
-            let dst = self.builder.alloc();
+            // `lower_class` already bound this name (uninitialized, so the
+            // heritage could not read it): write into that same slot instead of
+            // allocating a second one for the same binding.
+            let existing = self.symbols.lookup(id.name.as_str()).copied();
+            let dst = match existing {
+                Some(var) => var.slot,
+                None => self.builder.alloc(),
+            };
             self.builder.assign(dst, class_val);
             if self.at_script_scope() {
                 self.define_global(&id.name.to_string(), class_val);
             }
-            self.symbols.insert(id.name.to_string(), Variable::new(dst));
+            self.symbols.mark_initialized(id.name.as_str());
+            if existing.is_none() {
+                self.symbols.insert(id.name.to_string(), Variable::new(dst));
+            }
         }
     }
 
@@ -544,6 +619,25 @@ impl<'a> JSASTLower<'a> {
         // A constructor of a class with `extends` is "derived": `this` starts
         // uninitialized and only `super()` binds it (ES 9.2.2).
         let has_heritage = class.super_class.is_some();
+        // ES 15.7.14 `ClassDefinitionEvaluation` steps 2–3: the class's own name
+        // is bound *before* the heritage expression is evaluated, and it starts
+        // uninitialized. That is why `class x extends x {}` raises a
+        // `ReferenceError` (the binding is in its temporal dead zone) rather than
+        // reading whatever the enclosing scope happens to have — which is exactly
+        // what `assert.throws(ReferenceError, …)` checks.
+        // The name goes in a scope of its own: it has to *shadow* an outer binding
+        // of the same name (`var q = class q extends q {}` must not read the outer
+        // `q`), and that scope stays open for the rest of the definition so the
+        // body can see the name too.
+        let has_own_name = class.id.is_some();
+        if has_own_name {
+            self.symbols.enter_scope();
+            let dst = self.builder.alloc();
+            self.builder
+                .assign(dst, Value::Primitive(Primitive::Undefined));
+            self.symbols
+                .insert(class_name.clone(), Variable::uninitialized(dst));
+        }
         let proto = match &class.super_class {
             Some(super_expr) => {
                 let parent = self.lower_expression(super_expr);
@@ -616,6 +710,12 @@ impl<'a> JSASTLower<'a> {
         //    the prototype) exist *before* the body members, which is why a
         //    computed `['constructor']` member can overwrite the back-reference
         //    and why `prototype` comes first in property order.
+        // The class value exists now, so its own name has left the dead zone; the
+        // scope that held it ends with the definition.
+        if has_own_name {
+            self.symbols.mark_initialized(&class_name);
+            self.symbols.leave_scope();
+        }
         let func_obj = self.builder.make_func_obj(constructor_id);
         let proto_desc = self.data_descriptor(proto, true, false, false);
         self.define_property_named(func_obj, "prototype", proto_desc);
@@ -832,10 +932,13 @@ impl<'a> JSASTLower<'a> {
                 let hoisted = if is_var {
                     self.symbols.lookup_at(self.var_scope, &name).copied()
                 } else {
-                    None
+                    // Only a binding of *this* block: reusing the outer one would
+                    // turn a shadowing declaration into a write to the outer
+                    // variable (and leave the block-local name unbound).
+                    self.symbols.lookup_at(self.current_scope(), &name).copied()
                 };
                 let dst = match hoisted {
-                    Some(var) => var.0,
+                    Some(var) => var.slot,
                     None => self.builder.alloc(),
                 };
                 if let Some(value) = value {
@@ -851,8 +954,9 @@ impl<'a> JSASTLower<'a> {
                     self.define_global(&name, Value::Primitive(Primitive::Undefined));
                 }
                 // else: dst stays as default (undefined)
-                if hoisted.is_none() {
-                    self.insert_binding(&name, Variable::new(dst));
+                match hoisted {
+                    Some(_) => self.symbols.mark_initialized(&name),
+                    None => self.insert_binding(&name, Variable::new(dst)),
                 }
             } else if let Some(value) = value {
                 // Destructuring declaration: `[a, b] = value` / `{x} = value`.
@@ -862,6 +966,30 @@ impl<'a> JSASTLower<'a> {
             }
         }
         self.var_binding = previous;
+    }
+
+    /// Bind every `let`/`const` declared directly in `stmts` as an
+    /// *uninitialized* binding of the **current** scope.
+    ///
+    /// This is what makes the temporal dead zone observable: the name resolves
+    /// (so an outer or global binding of the same name is shadowed) but reading or
+    /// writing it before its declaration is evaluated raises a `ReferenceError`
+    /// instead of quietly yielding `undefined`.
+    fn hoist_lexical_bindings(&mut self, stmts: &[Statement<'_>]) {
+        let mut names = Vec::new();
+        collect_lexical_names(stmts, &mut names);
+        for name in names {
+            // The *current* scope only: a block-level `let` must shadow an outer
+            // binding of the same name, so the outer one must not count as "this
+            // name is already declared here".
+            if self.symbols.lookup_at(self.current_scope(), &name).is_none() {
+                let dst = self.builder.alloc();
+                self.builder
+                    .assign(dst, Value::Primitive(Primitive::Undefined));
+                self.symbols
+                    .insert(name.clone(), Variable::uninitialized(dst));
+            }
+        }
     }
 
     /// Declare every `var` of `stmts` — *recursively, but never inside a nested
@@ -1133,7 +1261,7 @@ impl<'a> JSASTLower<'a> {
             ForStatementLeft::AssignmentTargetIdentifier(ident) => {
                 match self.symbols.lookup(ident.name.as_str()) {
                     Some(var) => {
-                        self.builder.assign(var.0, item);
+                        self.builder.assign(var.slot, item);
                         self.sync_global(ident.name.as_str(), item);
                     }
                     None => {
@@ -1286,6 +1414,21 @@ impl<'a> JSASTLower<'a> {
         // `CreatePerIterationEnvironment` step — are still missing.)
         self.symbols.enter_scope();
         self.scope_depth += 1;
+        if let Some(ForStatementInit::VariableDeclaration(decl)) = &for_stmt.init {
+            if decl.kind != VariableDeclarationKind::Var {
+                for declarator in &decl.declarations {
+                    let mut names = Vec::new();
+                    collect_binding_names(&declarator.id, &mut names);
+                    for name in names {
+                        let dst = self.builder.alloc();
+                        self.builder
+                            .assign(dst, Value::Primitive(Primitive::Undefined));
+                        self.symbols
+                            .insert(name.clone(), Variable::uninitialized(dst));
+                    }
+                }
+            }
+        }
         let cond_blk = self.create_block("for_cond");
         let body_blk = self.create_block("for_body");
         let update_blk = self.create_block("for_update");
@@ -1341,6 +1484,9 @@ impl<'a> JSASTLower<'a> {
     fn lower_block_stmt(&mut self, block: &BlockStatement<'_>) {
         self.symbols.enter_scope();
         self.scope_depth += 1;
+        // `let`/`const` of this block are bound (but uninitialized) from the
+        // moment the block is entered.
+        self.hoist_lexical_bindings(&block.body);
         for stmt in &block.body {
             self.lower_statement(stmt);
             if self.current_block_is_terminated() {
@@ -1725,6 +1871,12 @@ impl<'a> JSASTLower<'a> {
         }
 
         if let Some(var) = self.symbols.lookup(ident.name.as_str()) {
+            // The binding exists but has not been initialized yet — the temporal
+            // dead zone. The name *is* shadowing whatever the outer scope has, so
+            // this must not fall through to the environment.
+            if !var.initialized {
+                return self.throw_tdz(ident.name.as_str());
+            }
             // Script-scope globals live in the global environment and can be
             // written by *any* function (or via `window.x` style access), so a
             // cached register copy would go stale. Re-read them with LoadEnv —
@@ -1735,7 +1887,7 @@ impl<'a> JSASTLower<'a> {
             if is_script_binding && self.global_names.contains(ident.name.as_str()) {
                 return self.builder.load_external_variable(ident.name.to_string());
             }
-            var.0
+            var.slot
         } else {
             // Try loading as external/global variable
             self.builder.load_external_variable(ident.name.to_string())
@@ -1889,8 +2041,11 @@ impl<'a> JSASTLower<'a> {
                     return if update.prefix { new_val } else { old_num };
                 }
                 match self.symbols.lookup(ident.name.as_str()) {
+                    // `x++` reads *and* writes, so a dead-zone binding fails here
+                    // as well.
+                    Some(var) if !var.initialized => self.throw_tdz(ident.name.as_str()),
                     Some(var) => {
-                        let current = var.0;
+                        let current = var.slot;
                         let (old_num, new_val) = self.lower_update_step(current, op);
                         self.builder.assign(current, new_val);
                         self.sync_global(&ident.name.to_string(), new_val);
@@ -2058,8 +2213,12 @@ impl<'a> JSASTLower<'a> {
                     return value;
                 }
                 match self.symbols.lookup(ident.name.as_str()) {
+                    // Writing into a binding that is still in its dead zone is a
+                    // ReferenceError, not a silent assignment (`store_into_ident
+                    // ifier` covers the destructuring target, this the plain one).
+                    Some(var) if !var.initialized => self.throw_tdz(ident.name.as_str()),
                     Some(var) => {
-                        let current = var.0;
+                        let current = var.slot;
                         let rhs = self.lower_expression(&assign.right);
                         let value = self
                             .compound_binop(assign.operator, current, rhs)
@@ -2608,7 +2767,7 @@ impl<'a> JSASTLower<'a> {
                     .make_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
                         String::from(*name),
                     )));
-                let value = var.0;
+                let value = var.slot;
                 self.builder.closure_var(name_const, value);
             }
         }
@@ -2856,6 +3015,9 @@ impl<'a> JSASTLower<'a> {
 
         // `var` bindings of this function, hoisted out of every nested block.
         func_lower.hoist_var_bindings(&body.statements);
+        // The function scope's own `let`/`const`, in their dead zone until their
+        // declaration is evaluated.
+        func_lower.hoist_lexical_bindings(&body.statements);
 
         // First pass: collect nested function declarations for hoisting
         let mut hoisted_funcs: Vec<(String, Value)> = Vec::new();
@@ -3483,8 +3645,15 @@ impl<'a> JSASTLower<'a> {
             return;
         }
         match self.symbols.lookup(name) {
+            Some(var) if !var.initialized => {
+                // Writing into a binding that is still in its dead zone (the
+                // `let x;` declared *after* the loop the write happens in) is a
+                // `ReferenceError` as well, not a silent assignment.
+                self.throw_tdz(name);
+            }
             Some(var) => {
-                self.builder.assign(var.0, value);
+                let slot = var.slot;
+                self.builder.assign(slot, value);
                 self.sync_global(name, value);
             }
             None => self.builder.store_external_variable(name.to_string(), value),
