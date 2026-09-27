@@ -2944,66 +2944,6 @@ impl<'a> JSASTLower<'a> {
         object
     }
 
-    /// Names a nested function body reads from the enclosing scopes: every
-    /// referenced identifier the body does not declare itself (parameters
-    /// included).
-    ///
-    /// This is what decides *what* to capture — the arrow path always did this,
-    /// while `function` expressions and declarations captured nothing at all.
-    fn free_idents_of_function(
-        &self,
-        params: &FormalParameters<'_>,
-        body: &FunctionBody<'_>,
-    ) -> Vec<String> {
-        let mut declared: std::collections::HashSet<String> = params
-            .items
-            .iter()
-            .map(|p| self.binding_pattern_name(&p.pattern))
-            .collect();
-        // `arguments` belongs to the function itself (ES 10.2.5 creates it in the
-        // function's own environment), so it is never an outer variable — treating
-        // it as one dropped the function's own binding and every
-        // `arguments[i]` read became `ReferenceError: undefined variable`.
-        declared.insert("arguments".to_string());
-        let mut referenced = std::collections::HashSet::new();
-        self.collect_free_idents_from_body(body, &mut referenced, &mut declared);
-        referenced
-            .into_iter()
-            .filter(|name| !declared.contains(*name))
-            .map(String::from)
-            .collect()
-    }
-
-    /// Push one `ClosureVar` per captured name that is visible here, so the
-    /// `Make*FuncObj` that follows can attach them to the new function object.
-    fn emit_closure_vars(&mut self, captured_names: &[String]) {
-        for name in captured_names {
-            // *Environment-backed* names must not be captured. A script-scope
-            // `var` (the global object) or `let`/`const`/`class` (the script's
-            // declarative record) is already shared between the enclosing code
-            // and the closure: both sides read and write it through
-            // `LoadEnv`/`StoreEnv`, and a capture would freeze a *copy* at
-            // closure-creation time. That is not a cosmetic difference — with it,
-            // the overwhelmingly common test shape
-            // `var callCount = 0; var f = function () { callCount += 1; };`
-            // reported 0 instead of 1.
-            if self.global_names.contains(name.as_str())
-                || self.script_lexical.contains(name.as_str())
-            {
-                continue;
-            }
-            if let Some(var) = self.symbols.lookup(name.as_str()) {
-                let name_const = self
-                    .builder
-                    .make_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
-                        name.clone(),
-                    )));
-                let value = var.slot;
-                self.builder.closure_var(name_const, value);
-            }
-        }
-    }
-
     fn lower_arrow_function(&mut self, arrow: &ArrowFunctionExpression<'_>) -> Value {
         // An anonymous arrow's `name` is the empty string (ES 14.2.16); name
         // inference from the assignment target is not implemented.
