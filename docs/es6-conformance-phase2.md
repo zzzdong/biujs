@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15204 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 487 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15306 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 488 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1259,6 +1259,59 @@ GlobalEnvironmentRecord 结构（它有 **ObjectRecord + DeclarativeRecord 两�
    本批只处理了"抛出后收尾"。
 2. `class` 两套件里剩下的主要是**私有字段**（`#x`、`#m() {}`）与**早期错误**（36 条
    `Expected a SyntaxError`：重复 `constructor`、`#x` 重名、`super` 用在字段初始化器等）。
+
+---
+
+#### B25 `Array.prototype` 的泛型（array-like）语义 —— 已完成（2026-09-27）
+
+**起点**：通过 15204 / 18277（83.19%），失败 3073，跳过 8133。
+
+**背景**：`Array.prototype.<m>.call(x, …)` 有 **1215** 个测试文件，其中 123 条当前失败。
+泛型机制（`array_like_entries`）本来就在 VM 里，三个细节让它在这条路径上不生效：
+
+1. **`length` 用 `internal_get` 读**，不触发原型链上的**访问器**。于是
+   `Array.prototype.indexOf.call(new Con(), true)`（构造器的 prototype 定义 `get length()`）看到的
+   长度是 0，`entries` 直接是空的。
+2. **`receiver_is_array_like` 只认对象**（字符串除外）。原始值接收者（`reduce.call(false, …)`）被判成
+   "不是 array-like" 而落到只认真数组的 builtin。
+3. **回调的第三个参数传的是原始接收者**，而规范要求 `O` —— `ToObject(this value)`。
+   测试正是用 `obj instanceof Boolean` 检查这一点。
+
+**改动（三处）**：`length` 改走完整的 `[[Get]]`（`get_member`）；`receiver_is_array_like` 对原始值先
+`ToObject` 再判；回调第三个参数改用 `callback_receiver`（`reduce` 分支自己那一处也一并改）。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15204 | **15306** | **+102** |
+| 失败 | 3073 | 2971 | −102 |
+| 通过率 | 83.19% | **83.74%** | +0.55pp |
+| 单元 / feature / 护栏 | 190 / 487 / 7 | 190 / **488** / 7 | +1 用例（6 条断言） |
+
+逐套件：`built-ins/Array` 1943 → 2045，**其余持平、无回退**。
+
+与 node 逐项对比 5 个形状全部一致：自有 `length` 的 array-like、**继承的 `length` 访问器**、
+`Boolean.prototype` 上的元素与长度、`forEach`/`map` 的 array-like 迭代、字符串接收者
+（`Array.prototype.indexOf.call('ab', 'b')` 仍是子串语义 1，而不是逐字符扫描 0）。
+
+**三条踩出来的规矩**
+
+1. **`internal_get` 与 `[[Get]]` 不是一回事**：前者不走访问器（也不走完整的原型链语义），
+   在"读用户可见的属性"处用它，症状是"数组看起来是空的"。凡是按规范算法读属性，都该走
+   `get_member`。
+2. **`ToObject` 是算法的一部分**，不只是"防御性包装"：原始值接收者要经过它才有 `length`/索引，
+   回调看到的第三个参数也必须是它。
+3. **同一个语义有多条调用路径**（`CallMethod` 快路径 / `invoke` → `call_native_by_name` /
+   builtin 层）。修一条不代表修了全部：这次的 `reduce` 分支就自带了第二处回调调用，
+   漏掉它则 probe 只对一半。
+
+**残留**（下一批的输入）
+
+1. `Array.prototype` 类里剩下的失败以**其余方法**为主（`sort` 33、`flat` 18、`splice` 13 等，
+   其中 `flat`/`toSpliced` 是后 ES6）；`length` 的 `ToLength` 细节（`-0`、超长 `2^53-1`）仍需逐条核对。
+2. `language/expressions/arrow-function/dstr/*`（115 条）——多为**闭包捕获债**（计数器不动），
+   与生成器 `closure_maps` 同一处机制。
 
 ---
 

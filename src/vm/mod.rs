@@ -206,7 +206,24 @@ impl VM {
         if receiver_is_string(val) {
             return false;
         }
-        match val {
+        // Primitive receivers count too: they are boxed by ToObject, and the
+        // wrapper's prototype may carry the `length` *and* the index properties
+        // (`Boolean.prototype.length = 1` is exactly how
+        // `Array.prototype.reduce.call(false, cb, 1)` is set up to have one
+        // element).
+        let boxed;
+        let target = match val {
+            Value::Object(_) | Value::Function(_) => val,
+            Value::Undefined | Value::Null => return false,
+            other => {
+                boxed = crate::builtins::to_object(other).ok();
+                match &boxed {
+                    Some(value) => value,
+                    None => return false,
+                }
+            }
+        };
+        match target {
             Value::Object(obj_ref) => crate::vm::prototype::internal_has_property(
                 Rc::clone(obj_ref),
                 &PropertyKey::from_str("length"),
@@ -3518,12 +3535,12 @@ impl VM {
             return Ok(Vec::new());
         };
         let obj = Rc::clone(obj_ref);
-        let len_value = crate::vm::prototype::internal_get(
-            Rc::clone(&obj),
-            &PropertyKey::from_str("length"),
-            None,
-        )
-        .map_err(RuntimeError::from_property_error)?;
+        // The full `[[Get]]`: `length` may live on the prototype chain *and* be
+        // an accessor (`Array.prototype.indexOf.call(instance)` where the
+        // constructor's prototype defines `get length()`). Reading it with
+        // `internal_get` skipped the accessor, so those receivers looked
+        // zero-length and every element was skipped.
+        let len_value = self.get_member(target, &PropertyKey::from_str("length"), module)?;
         // ToLength: clamp negatives to 0 and cap the allocation, which keeps a
         // bogus `length` from trying to materialize billions of slots.
         let len = len_value.to_number();
@@ -4845,6 +4862,14 @@ impl VM {
         // Second argument is `thisArg`: undefined means "call with undefined
         // `this`" (only relevant for non-strict callbacks, but observable).
         let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+        // The callback's third argument is `O` — `ToObject(this value)` — not the
+        // primitive receiver itself: `Array.prototype.reduce.call(false, cb, 1)`
+        // is asserted with `obj instanceof Boolean`, which is only true for the
+        // wrapper.
+        let callback_receiver = match receiver {
+            Value::Object(_) | Value::Function(_) => receiver.clone(),
+            other => crate::builtins::to_object(other).unwrap_or_else(|_| other.clone()),
+        };
         let call = |vm: &mut Self,
                     cb: &Value,
                     elem: &Value,
@@ -4856,7 +4881,7 @@ impl VM {
                 &[
                     elem.clone(),
                     Value::Number(index as f64),
-                    receiver.clone(),
+                    callback_receiver.clone(),
                 ],
                 module,
             )
@@ -5068,7 +5093,7 @@ impl VM {
                     acc = self.invoke(
                         &callback,
                         Value::Undefined,
-                        &[acc, element, Value::Number(i as f64), receiver.clone()],
+                        &[acc, element, Value::Number(i as f64), callback_receiver.clone()],
                         module,
                     )?;
                 }

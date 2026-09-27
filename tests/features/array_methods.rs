@@ -359,3 +359,52 @@ fn absurd_lengths_do_not_allocate() {
            return o[Math.pow(2, 53) - 2] === v; })()"
     ));
 }
+
+#[test]
+fn array_prototype_methods_accept_array_likes() {
+    // ES: every one of these starts with `ToObject(this value)` and then reads
+    // `length` (through `[[Get]]`, so an inherited accessor counts) and the
+    // elements (`[[Get]]`, so inherited ones count too).
+    assert_eq!(
+        eval_number("Array.prototype.indexOf.call({ length: 2, 1: 'b' }, 'b')"),
+        1.0
+    );
+    assert_eq!(
+        eval_number(
+            "var proto = {};
+             Object.defineProperty(proto, 'length', { get: function () { return 2; }, configurable: true });
+             var Con = function () {}; Con.prototype = proto;
+             var o = new Con(); o[1] = true;
+             Array.prototype.indexOf.call(o, true)"
+        ),
+        1.0
+    );
+    assert_eq!(
+        eval_string(
+            "Array.prototype.map.call({ length: 2, 0: 1, 1: 2 }, function (x) { return x * 2; }).join(',')"
+        ),
+        "2,4"
+    );
+    assert_eq!(
+        eval_string(
+            "var seen = [];
+             Array.prototype.forEach.call({ length: 2, 0: 'a', 1: 'b' }, function (v, i) { seen.push(i + ':' + v); });
+             seen.join(',')"
+        ),
+        "0:a,1:b"
+    );
+    // The callback's third argument is `O`, the *boxed* receiver:
+    // `Array.prototype.reduce.call(false, cb, 1)` is checked with
+    // `obj instanceof Boolean`. (`Boolean.prototype.length = 1` is what gives
+    // the wrapper its single element.)
+    assert_eq!(
+        eval_bool(
+            "Boolean.prototype[0] = true;
+             Boolean.prototype.length = 1;
+             Array.prototype.reduce.call(false, function (p, c, i, o) { return o instanceof Boolean; }, 1)"
+        ),
+        true
+    );
+    // … but a string receiver keeps its own substring semantics.
+    assert_eq!(eval_number("Array.prototype.indexOf.call('ab', 'b')"), 1.0);
+}

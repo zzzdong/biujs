@@ -87,7 +87,7 @@ language/literals/string	67	6	0
 language/computed-property-names	40	0	8
 language/identifiers	202	66	0
 language/types	92	10	11
-built-ins/Array	1943	277	861
+built-ins/Array	2045	277	759
 built-ins/Boolean	27	8	16
 built-ins/Error	38	19	36
 built-ins/Function	192	191	126
