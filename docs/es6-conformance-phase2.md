@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15558 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 494 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15568 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 495 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1780,6 +1780,35 @@ ToPrimitive**。
 **下一批**：`Promise` + 微任务队列 + `async/await`（B30 排的第三项，唯一要动执行模型的）。
 之后的小面一批：`globalThis`、`flatMap`、`e.stack`、elision 应为洞、TypedArray、
 `Proxy`/`Reflect`、`matchAll`、函数式 replacer、二元算术的 ToPrimitive。
+
+---
+
+#### B33 小面一批 —— 已完成（2026-09-28）
+
+**为什么先做这个**：`Promise` 是 B30 排的第三项，但它要动执行模型。整轮 OOM 修好之后，
+被它挡回来的那块应当立刻回到位，顺带把几个"用得上且便宜"的面补掉。
+
+| 改动 | 说明 |
+|------|------|
+| **二元算术的 ToPrimitive** | `-` `*` `/` `%` 与 `Pow` 一致，先 ToPrimitive(hint number)。B31 补过又撤回（当时整轮会 OOM），现在整轮分块跑、峰值下来了，重新落地。`date1 - date2`、`new Number(5) - 2`、`{valueOf(){…}} - 1` 从此正确 |
+| `Array.prototype.flatMap` | 回调由 VM 派发（与 `map`/`filter` 同一条通路），注册之外还要把方法名加进 `CALLBACK_METHODS` —— 否则报 `unknown prototype method` |
+| `console.time` / `timeEnd` | 宿主计时器，标签存在 thread-local 里（跨一次宿主会话，不是 per-VM 状态） |
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15558 | **15568** | **+10** |
+| 失败 | 2719 | 2709 | −10 |
+| 通过率 | 85.12% | **85.18%** | +0.06pp |
+| 单元 / feature / 护栏 | 190 / 494 / 7 | 190 / **495** / 7 | +1 用例（10 条断言） |
+
+5 个套件提升、**零回退**：`expressions/{subtraction,multiplication,division,modulus}` 各 +2、
+`built-ins/Array` +2。
+
+**下一批**：`Promise` + 微任务队列 + `async/await`（唯一要动执行模型的）。之后的小面：
+`globalThis`、`e.stack`（字节码里没有行列信息，只能给函数名）、elision 应为洞、`matchAll`、
+函数式 replacer、TypedArray、`Proxy`/`Reflect`。
 
 ---
 

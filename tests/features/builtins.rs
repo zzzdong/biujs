@@ -557,12 +557,12 @@ fn date_is_usable_for_everyday_time_handling() {
         "{\"d\":\"1970-01-01T00:00:00.000Z\"}"
     );
 
-    // Comparing Dates works through `valueOf`. NOTE: `a - b` on *objects* is
-    // still a gap — binary arithmetic does not run ToPrimitive, so it answers
-    // NaN (recorded as a B31 residual).
+    // Dates take part in arithmetic: `-` is ToNumeric, which starts with
+    // ToPrimitive(hint number) — that is what makes sorting by subtraction work.
+    assert_eq!(eval_number("new Date(300) - new Date(100)"), 200.0);
     assert_eq!(
         eval_string(
-            "[new Date(300), new Date(100)].sort(function (a, b) { return a.valueOf() - b.valueOf(); })\n             .map(function (d) { return d.getTime(); }).join(',')"
+            "[new Date(300), new Date(100)].sort(function (a, b) { return a - b; })\n             .map(function (d) { return d.getTime(); }).join(',')"
         ),
         "100,300"
     );
@@ -614,4 +614,36 @@ fn regular_expressions_work_for_everyday_patterns() {
     assert_eq!(eval_string("'Doe, John'.replace(/(\\w+), (\\w+)/, '$2 $1')"), "John Doe");
     // … while a plain string argument still takes the string path.
     assert_eq!(eval_string("'a1b2'.replace('1', '#')"), "a#b2");
+}
+
+#[test]
+fn objects_take_part_in_arithmetic_and_arrays_flat_map() {
+    // Binary arithmetic runs ToNumeric, which starts with ToPrimitive(hint
+    // number) — without it every object operand collapses to NaN.
+    assert_eq!(eval_number("new Date(300) - new Date(100)"), 200.0);
+    assert_eq!(eval_number("new Number(5) - 2"), 3.0);
+    assert_eq!(eval_number("new Number(3) * 2"), 6.0);
+    assert_eq!(eval_number("'6' - 1"), 5.0);
+    assert_eq!(
+        eval_number("(function () { var o = { valueOf: function () { return 10; } }; return o - 1; })()"),
+        9.0
+    );
+
+    // `flatMap` maps and flattens one level; a non-array result is appended.
+    assert_eq!(
+        eval_string("JSON.stringify([1, 2].flatMap(function (x) { return [x, x * 2]; }))"),
+        "[1,2,2,4]"
+    );
+    assert_eq!(
+        eval_string("JSON.stringify([1, 2].flatMap(function (x) { return x + 1; }))"),
+        "[2,3]"
+    );
+    assert_eq!(
+        eval_string("JSON.stringify(['ab cd'].flatMap(function (s) { return s.split(' '); }))"),
+        "[\"ab\",\"cd\"]"
+    );
+
+    // `console.time` / `timeEnd` are host additions; they answer `undefined`.
+    assert_eq!(eval_string("typeof console.time"), "function");
+    assert_eq!(eval_string("String(console.timeEnd('never-started'))"), "undefined");
 }

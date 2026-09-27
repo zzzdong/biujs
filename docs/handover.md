@@ -56,9 +56,9 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 
 | 指标 | 数值 |
 |------|------|
-| test262 执行 / 通过 / 失败 / 跳过 | 18277 / **15558** / 2719 / 8133 |
-| 通过率 | 85.12%（参考值；分母口径见计划书 §2.1） |
-| 单元 / feature / 护栏测试 | 190 / 494 / 7，全绿 |
+| test262 执行 / 通过 / 失败 / 跳过 | 18277 / **15568** / 2709 / 8133 |
+| 通过率 | 85.18%（参考值；分母口径见计划书 §2.1） |
+| 单元 / feature / 护栏测试 | 190 / 495 / 7，全绿 |
 | 全量耗时 | 约 3m（三层护栏封顶：单例 15s 墙钟、2×10^7 指令、256MiB 堆增量） |
 | runner 覆盖面 | 25586 / 53568 个测试文件（47%）——**未覆盖里约 4920 条属承诺的 M5/M6** |
 | 基线快照 | `phase2-status.tsv`（`scripts/phase2-status.sh` 生成的逐套件表） |
@@ -68,7 +68,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 `toISOString`/`toString` 等，本地时区走 `chrono`；test262 计数 +0，因为 `built-ins/Date` 不在
 curated 清单里）、B32（`RegExp`：字面量此前是 `undefined`；新增 `MakeRegExp` 指令、`RegExpObject`、
 `test/exec/toString` 与正则感知的 `match/search/replace/split`，本地时区之外新增 `regex` 依赖，
-+74 —— 3 个套件提升、零回退）。
++74 —— 3 个套件提升、零回退）、B33（小面一批：二元算术的 ToPrimitive、
+`Array.prototype.flatMap`、`console.time/timeEnd`，+10 —— 5 个套件提升、零回退）。
 
 **已完成**：整轮验证的 OOM 已修（见下）。
 

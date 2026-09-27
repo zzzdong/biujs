@@ -2224,27 +2224,47 @@ impl VM {
                 self.set_value(operands[0], value)?;
             }
             Opcode::Subx => {
+                // ToNumeric starts with ToPrimitive(hint number), as `Pow`
+                // already did: without it an object operand (`date1 - date2`, a
+                // boxed Number) collapses to NaN.
                 let lhs = self.get_value(operands[1])?;
                 let rhs = self.get_value(operands[2])?;
-                let value = lhs - rhs;
+                let lprim = self.to_primitive(&lhs, "number", module)?;
+                let rprim = self.to_primitive(&rhs, "number", module)?;
+                let value = lprim - rprim;
                 self.set_value(operands[0], value)?;
             }
             Opcode::Mulx => {
+                // ToNumeric starts with ToPrimitive(hint number), as `Pow`
+                // already did: without it an object operand (`date1 - date2`, a
+                // boxed Number) collapses to NaN.
                 let lhs = self.get_value(operands[1])?;
                 let rhs = self.get_value(operands[2])?;
-                let value = lhs * rhs;
+                let lprim = self.to_primitive(&lhs, "number", module)?;
+                let rprim = self.to_primitive(&rhs, "number", module)?;
+                let value = lprim * rprim;
                 self.set_value(operands[0], value)?;
             }
             Opcode::Divx => {
+                // ToNumeric starts with ToPrimitive(hint number), as `Pow`
+                // already did: without it an object operand (`date1 - date2`, a
+                // boxed Number) collapses to NaN.
                 let lhs = self.get_value(operands[1])?;
                 let rhs = self.get_value(operands[2])?;
-                let value = lhs / rhs;
+                let lprim = self.to_primitive(&lhs, "number", module)?;
+                let rprim = self.to_primitive(&rhs, "number", module)?;
+                let value = lprim / rprim;
                 self.set_value(operands[0], value)?;
             }
             Opcode::Remx => {
+                // ToNumeric starts with ToPrimitive(hint number), as `Pow`
+                // already did: without it an object operand (`date1 - date2`, a
+                // boxed Number) collapses to NaN.
                 let lhs = self.get_value(operands[1])?;
                 let rhs = self.get_value(operands[2])?;
-                let value = lhs % rhs;
+                let lprim = self.to_primitive(&lhs, "number", module)?;
+                let rprim = self.to_primitive(&rhs, "number", module)?;
+                let value = lprim % rprim;
                 self.set_value(operands[0], value)?;
             }
             Opcode::Pow => {
@@ -4892,6 +4912,7 @@ impl VM {
             "reduceRight",
             "find",
             "findIndex",
+            "flatMap",
             "sort",
             // No callback, but they need the generic array-like element list:
             // `Array.prototype.indexOf.call({length: 2, 0: 'a'}, 'a')`.
@@ -5075,6 +5096,52 @@ impl VM {
                     }
                     Some(target) => {
                         for (i, v) in values {
+                            self.set_member(
+                                &target,
+                                PropertyKey::from_str(&i.to_string()),
+                                v,
+                                module,
+                            )?;
+                        }
+                        target
+                    }
+                }))
+            }
+            "flatMap" => {
+                // Map, then flatten one level (ES 23.1.3.?): a mapped value that
+                // is an array contributes its elements, anything else is
+                // appended as-is. This is the same `call` plumbing `map` uses.
+                let species = self.array_species_create(receiver, 0, module)?;
+                let mut values: Vec<Value> = Vec::new();
+                for (i, e) in entries.iter().enumerate() {
+                    if let Some(e) = e {
+                        let mapped = call(self, &callback, e, i)?;
+                        let mut flattened = false;
+                        if let Value::Object(obj_ref) = &mapped {
+                            if obj_ref.borrow().kind() == ObjectKind::Array {
+                                let borrowed = obj_ref.borrow();
+                                if let Some(arr) = borrowed
+                                    .as_any()
+                                    .downcast_ref::<crate::vm::object::ArrayObject>()
+                                {
+                                    for k in 0..arr.len() {
+                                        if let Some(v) = arr.get(k) {
+                                            values.push(v.clone());
+                                        }
+                                    }
+                                    flattened = true;
+                                }
+                            }
+                        }
+                        if !flattened {
+                            values.push(mapped);
+                        }
+                    }
+                }
+                Ok(Some(match species {
+                    None => crate::vm::object::new_array_object_from_vec(values),
+                    Some(target) => {
+                        for (i, v) in values.into_iter().enumerate() {
                             self.set_member(
                                 &target,
                                 PropertyKey::from_str(&i.to_string()),

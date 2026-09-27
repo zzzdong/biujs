@@ -30,6 +30,13 @@ pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "toString", |this, _args| array_to_string(this));
     set_prototype_method(proto, "at", |this, args| array_at(this, args));
     set_prototype_method(proto, "flat", |this, args| array_flat(this, args));
+    // `flatMap` needs to call back into JS, so the VM dispatches it (next to
+    // `map` / `filter`); this registration is what makes the name resolvable.
+    set_prototype_method(proto, "flatMap", |_this, _args| {
+        Err(RuntimeError::InternalError(
+            "Array.prototype.flatMap is dispatched by the VM".to_string(),
+        ))
+    });
     set_prototype_method(proto, "copyWithin", |this, args| {
         array_copy_within(this, args)
     });

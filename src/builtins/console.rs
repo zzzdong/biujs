@@ -21,7 +21,19 @@ use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
 /// The methods the object exposes.
-const METHODS: &[&str] = &["log", "info", "debug", "trace", "warn", "error"];
+const METHODS: &[&str] = &[
+    "log", "info", "debug", "trace", "warn", "error", "time", "timeEnd",
+];
+
+/// Labels handed to `console.time`, with the instant they were started.
+///
+/// Module-level (process-wide) on purpose: a timer is a debugging aid spanning
+/// one host session, not per-VM state — the same reason `console` itself is a
+/// host object rather than an ES one.
+thread_local! {
+    static TIMERS: std::cell::RefCell<std::collections::HashMap<String, std::time::Instant>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
 
 /// Build the `console` object: a plain namespace object (not a constructor).
 pub fn create_console_object() -> Value {
@@ -47,6 +59,25 @@ pub fn create_console_object() -> Value {
 /// Dispatch a `console.<method>` call. Each method prints its arguments joined
 /// by a space and answers `undefined`.
 pub fn call_console_method(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+    match name {
+        "time" => {
+            let label = args.first().map(|v| v.to_js_string()).unwrap_or_else(|| "default".to_string());
+            TIMERS.with(|timers| {
+                timers.borrow_mut().insert(label, std::time::Instant::now());
+            });
+            return Ok(Value::Undefined);
+        }
+        "timeEnd" => {
+            let label = args.first().map(|v| v.to_js_string()).unwrap_or_else(|| "default".to_string());
+            let started = TIMERS.with(|timers| timers.borrow_mut().remove(&label));
+            match started {
+                Some(instant) => println!("{label}: {:.3}ms", instant.elapsed().as_secs_f64() * 1000.0),
+                None => eprintln!("Timer '{label}' does not exist"),
+            }
+            return Ok(Value::Undefined);
+        }
+        _ => {}
+    }
     if !METHODS.contains(&name) {
         return Err(RuntimeError::TypeError(format!(
             "console.{name} is not a function"

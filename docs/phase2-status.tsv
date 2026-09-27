@@ -22,7 +22,7 @@ language/expressions/comma	4	2	0
 language/expressions/complement	0	0	0
 language/expressions/conditional	19	3	0
 language/expressions/delete	38	5	26
-language/expressions/division	33	9	3
+language/expressions/division	35	9	1
 language/expressions/does-not-equals	27	10	1
 language/expressions/equals	34	10	3
 language/expressions/exponentiation	34	7	3
@@ -39,8 +39,8 @@ language/expressions/logical-and	16	2	0
 language/expressions/logical-not	15	4	0
 language/expressions/logical-or	16	2	0
 language/expressions/member	0	0	0
-language/expressions/modulus	30	7	3
-language/expressions/multiplication	31	6	3
+language/expressions/modulus	32	7	1
+language/expressions/multiplication	33	6	1
 language/expressions/new	46	3	10
 language/expressions/new.target	10	3	1
 language/expressions/object	698	418	54
@@ -52,7 +52,7 @@ language/expressions/property-accessors	13	4	4
 language/expressions/right-shift	27	7	3
 language/expressions/strict-does-not-equals	20	10	0
 language/expressions/strict-equals	20	10	0
-language/expressions/subtraction	29	6	3
+language/expressions/subtraction	31	6	1
 language/expressions/this	1	4	1
 language/expressions/typeof	7	7	2
 language/expressions/unary-minus	10	3	1
@@ -87,7 +87,7 @@ language/identifiers	202	66	0
 language/types	92	10	11
 built-ins/Array/prototype/Symbol.iterator	0	1	0
 built-ins/String/prototype/Symbol.iterator	4	1	1
-built-ins/Array	2056	277	748
+built-ins/Array	2058	277	746
 built-ins/Boolean	27	8	16
 built-ins/Error	38	19	36
 built-ins/Function	192	191	126
