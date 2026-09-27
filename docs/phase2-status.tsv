@@ -18,7 +18,7 @@ language/expressions/bitwise-not	11	3	2
 language/expressions/bitwise-or	20	7	3
 language/expressions/bitwise-xor	20	7	3
 language/expressions/call	54	19	19
-language/expressions/class	1048	2745	266
+language/expressions/class	1166	2745	148
 language/expressions/coalesce	21	2	1
 language/expressions/comma	4	2	0
 language/expressions/complement	0	0	0
@@ -64,7 +64,7 @@ language/expressions/void	8	1	0
 language/expressions/arrow-function	181	22	140
 language/statements/block	12	7	2
 language/statements/break	18	2	0
-language/statements/class	1171	2863	333
+language/statements/class	1297	2863	207
 language/statements/const	119	5	12
 language/statements/continue	19	5	0
 language/statements/do-while	26	10	0

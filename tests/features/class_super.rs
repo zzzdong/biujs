@@ -301,3 +301,66 @@ fn return_override_typeerror_is_not_catchable_inside_the_constructor() {
         "TypeError"
     );
 }
+
+#[test]
+fn instance_fields_land_on_every_instance_at_construction() {
+    // A class with no explicit constructor still runs its fields — the default
+    // constructor is what used to drop them entirely.
+    assert_eq!(eval_number("class K { f = 1; } new K().f"), 1.0);
+    assert_eq!(eval_number("class K { [\"g\"] = 2; } new K().g"), 2.0);
+    assert_eq!(
+        eval_string("class K { x; } String(Object.keys(new K()).join(','))"),
+        "x"
+    );
+
+    // Fields evaluate in source order, before the constructor body, and can read
+    // the ones that came before them.
+    assert_eq!(
+        eval_string(
+            "class K { a = 1; b = this.a + 1; constructor() { this.order = this.b; } }
+             var k = new K(); k.a + '/' + k.b + '/' + k.order"
+        ),
+        "1/2/2"
+    );
+
+    // They are own properties of the instance, not of the prototype.
+    assert_eq!(
+        eval_bool("class K { f = 1; } (new K()).hasOwnProperty('f')"),
+        true
+    );
+    assert_eq!(eval_bool("class K { f = 1; } K.prototype.hasOwnProperty('f')"), false);
+
+    // A derived class initializes them as soon as `super()` returns …
+    assert_eq!(
+        eval_number(
+            "class B { constructor(v) { this.v = v; } }
+             class D extends B { d = this.v + 1; constructor(v) { super(v); } }
+             new D(4).d"
+        ),
+        5.0
+    );
+    // … including when the constructor is the implicit `constructor(...args) {
+    // super(...args); }`.
+    assert_eq!(
+        eval_number(
+            "class B { constructor(v) { this.v = v; } }
+             class D extends B { d = 2; }
+             new D(1).d"
+        ),
+        2.0
+    );
+
+    // A computed key is a runtime value (it used to be filed under the source
+    // text of the key expression).
+    assert_eq!(
+        eval_number("var k = 'kk'; class K { [k] = 5; } new K().kk"),
+        5.0
+    );
+    // An arrow field captures the instance's `this`, and a function field takes
+    // the field name (NamedEvaluation).
+    assert_eq!(eval_bool("class K { f = () => this; } new K().f() instanceof K"), true);
+    assert_eq!(
+        eval_string("class K { f = function () {}; } new K().f.name"),
+        "f"
+    );
+}

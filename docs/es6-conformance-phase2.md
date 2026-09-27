@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14838 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 484 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15082 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 485 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1137,6 +1137,71 @@ GlobalEnvironmentRecord 结构（它有 **ObjectRecord + DeclarativeRecord 两�
    `"[desc]"`；现在这两类都没有提示（`SetFunctionName` 只认字符串）。
 3. 形参、解构默认值、对象字面量都已覆盖；`for`/`for-of` 头部与 `class` 方法体里剩下的失败
    回到 B15b 侦察的其余族（迭代器/rest 语义、对象模式长尾）。
+
+---
+
+#### B23 实例类字段 —— 已完成（2026-09-27）
+
+**起点**：通过 14838 / 18277（81.18%），失败 3439，跳过 8133。
+
+**根因**：字段初始化代码**只发给"有显式构造器"的类**。`lower_class` 给显式构造器传了
+`instance_fields`，但**没有显式构造器时**它自己手搓的那个默认构造器（`constructor(...args) { super(...args); }`）
+压根没拿到字段列表 —— `class K { f = 1 }` 因此一行字段代码都不执行，`new K().f` 是 `undefined`。
+另外三处：
+
+1. **派生类的字段被放在 `super()` 之前**：`this` 还没初始化，直接抛
+   `ReferenceError: Must call super constructor in derived class before accessing 'this'`。
+   规范里 `InitializeInstanceElements` 在 `super()` **返回后**才跑。
+2. **默认构造器的符号表没做"外部绑定改走环境"**：`JSASTLower::new(&mut func_builder, symbols)`
+   直接克隆外层表，于是字段里的脚本级 `var`（`class K { [key] = 1 }` 的 `key`）读到的是
+   *外层帧的寄存器* —— 键成了某个无关对象，属性落成 `"[object Object]"`。
+3. **计算键落在源码文本上**：`[key]` 之前走 `property_key_to_string`（AST 文本），
+   于是 `k.kk` 是 `undefined` 而 `k.key` 是 1。
+
+**设计**
+
+| 改动 | 作用 |
+|------|------|
+| `emit_instance_field_inits(fields)` | 字段安装抽成方法：`lower_member_key` 求键（静态/计算统一）+ NamedEvaluation 提示 + `set_member` |
+| `statement_calls_super(stmt)` | 派生类的发射点：语句里出现（直接包含）`super(...)` 就在其后安装字段 |
+| 默认构造器分流 | 基类：体前安装；派生类：隐式 `super(...args)` 之后安装 |
+| `nested_function_symbols(captured)` | 把 `lower_function_inner` 里那段"剔除环境绑定"抽出来，默认构造器**同源复用** |
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14838 | **15082** | **+244** |
+| 失败 | 3439 | 3195 | −244 |
+| 通过率 | 81.18% | **82.52%** | +1.34pp |
+| 单元 / feature / 护栏 | 190 / 484 / 7 | 190 / **485** / 7 | +1 用例（10 条断言） |
+
+逐套件：`language/statements/class` 1171 → 1297、`language/expressions/class` 1048 → 1166，
+**其余持平、无回退**。
+
+与 node 逐项对比 12 个形状，**11 个一致**：字段顺序与 `this` 互引、无初始值字段（`undefined` 且
+可枚举）、自有属性 vs 原型、描述符 `writable/enumerable/configurable` 全 true、派生类（显式
+`super` 与隐式默认构造器）、箭头字段捕获实例 `this`、函数字段取字段名、静态字段不受影响、
+`for` 里 `Object.keys` 顺序。唯一的差异是**计算键被按实例重复求值**（`key-evals=2`，应为 1）。
+
+**四条踩出来的规矩**
+
+1. **"有显式构造器"和"没有"是两条产生路径**，任何挂在构造器上的语义（字段、`arguments`、
+   参数绑定）都要在两条路径上都接一遍 —— 默认构造器是手搓的，最容易漏。
+2. **派生类的 `this` 在 `super()` 之前不可碰**：字段安装点必须跟着 `super()` 走，
+   否则不是"字段没装"而是直接抛错（更响、也更难看出是同一件事）。
+3. **手搓的嵌套函数也要用同一套作用域规则**：默认构造器克隆了裸符号表，字段里的脚本级 `var`
+   读到外层寄存器，表现为"键变成 `[object Object]`"——症状离根因很远。现在统一走
+   `nested_function_symbols`。
+4. **计算键是运行时值**：退回源码文本能"看起来装上"，但属性名是错的。
+
+**残留**（下一批的输入）
+
+1. **计算键应在类定义时求值一次**（`CreateClassFieldDefinitions`）：现在按实例重复求值。
+   要修得把键值存到运行时（隐藏数组或闭包捕获）—— 与"字段初始化器看不见构造器形参"是同一类
+   "字段有自己的作用域与时刻"的问题。
+2. **私有字段**（`#x`，`class-fields-private`）：完全未做，是 `class` 两套件里剩下的主要一块。
+3. `super()` 埋在更大表达式里时，字段的发射点仍是旧行为（会跟着第一个含 `super` 的语句走）。
 
 ---
 

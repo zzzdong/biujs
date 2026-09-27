@@ -288,6 +288,33 @@ fn target_hint_name(target: &AssignmentTarget<'_>) -> Option<String> {
     }
 }
 
+/// Whether `stmt` is (or directly contains) a `super(...)` call.
+///
+/// A derived constructor's instance fields become initializable the moment
+/// `super()` returns, so the emission point is the statement that called it.
+/// `super();` is the shape that matters, with `{ super(); }` and `if (c) super();`
+/// worth covering; a `super()` buried inside a larger expression keeps the old
+/// (approximate) behaviour rather than silently skipping the fields.
+fn statement_calls_super(stmt: &Statement<'_>) -> bool {
+    match stmt {
+        Statement::ExpressionStatement(expr_stmt) => {
+            matches!(
+                &expr_stmt.expression,
+                Expression::CallExpression(call) if matches!(&call.callee, Expression::Super(_))
+            )
+        }
+        Statement::BlockStatement(block) => block.body.iter().any(statement_calls_super),
+        Statement::IfStatement(if_stmt) => {
+            statement_calls_super(&if_stmt.consequent)
+                || if_stmt
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alt| statement_calls_super(alt))
+        }
+        _ => false,
+    }
+}
+
 /// Debug name for a class member function (`C.m`, `C.[computed]`).
 fn member_display_name(class_name: &str, key: &MemberKey) -> String {
     match key {
@@ -754,7 +781,12 @@ impl<'a> JSASTLower<'a> {
             };
             let func_id = self.builder.module_mut().declare_function(func_sig.clone());
             let mut func = IrFunction::new(func_id, func_sig);
-            let symbols = self.symbols.clone();
+            // Same scope rules as any other nested function: a script-level `var`
+            // read here must go through the environment. Cloning the raw table
+            // made a field's computed key (`class K { [key] = 1 }`) read the
+            // *outer frame's register* — the key came out as some unrelated
+            // object and the property landed under "[object Object]".
+            let symbols = self.nested_function_symbols(&[]);
             let mut func_builder = FunctionBuilder::new(self.builder.module_mut(), &mut func);
             let mut func_lower = JSASTLower::new(&mut func_builder, symbols);
             let entry = func_lower.create_block("default_ctor");
@@ -766,6 +798,13 @@ impl<'a> JSASTLower<'a> {
                 func_lower
                     .builder
                     .call_super(parent, Value::Primitive(Primitive::Undefined), argv);
+                // A derived default constructor is `constructor(...args) {
+                // super(...args); }`, so the fields land after the implicit
+                // super call — before it, `this` is still uninitialized.
+                func_lower.emit_instance_field_inits(&instance_fields);
+            } else {
+                // Base class: no `super()`, so the fields go first.
+                func_lower.emit_instance_field_inits(&instance_fields);
             }
             func_lower.builder.return_(None);
             func_lower
@@ -1103,6 +1142,59 @@ impl<'a> JSASTLower<'a> {
                     self.define_global(&name, Value::Primitive(Primitive::Undefined));
                 }
             }
+        }
+    }
+
+    /// The symbol table a nested function starts from.
+    ///
+    /// Bindings that live in the *environment* are removed so the name falls
+    /// through to `LoadEnv`: the register that carries them belongs to the outer
+    /// frame, and reading it here would read a foreign value (or, after SSA
+    /// renaming, an arbitrary one). That covers captured names, script-scope
+    /// `var`s (the global object), and script-scope `let`/`const`/`class`
+    /// (the script's declarative record — whose pre-bound register is an
+    /// `uninitialized` marker that must never leak into a method, or every class
+    /// method reading its own class name would look like a dead-zone read).
+    fn nested_function_symbols(&self, captured_names: &[String]) -> SymbolTable<Variable> {
+        let mut symbols = self.symbols.clone();
+        for name in captured_names {
+            symbols.remove(name);
+        }
+        for name in &self.global_names {
+            symbols.remove(name);
+        }
+        for name in &self.script_lexical {
+            symbols.remove(name);
+        }
+        symbols
+    }
+
+    /// Install the class's instance fields on `this`, in source order.
+    ///
+    /// Called from the constructor (base classes: before the body; derived
+    /// classes: right after `super()`), and — for a class without an explicit
+    /// constructor — from the default one that `lower_class` builds. That last
+    /// call is what used to be missing entirely: `class K { f = 1 }` never ran
+    /// any field code, so `new K().f` was `undefined`.
+    fn emit_instance_field_inits(&mut self, fields: &[&PropertyDefinition<'_>]) {
+        for field in fields {
+            let this = self.builder.load_this();
+            // Static and computed keys both go through `lower_member_key`: a
+            // computed key is a runtime value (`class K { [k] = 1 }` used to be
+            // filed under the *source text* of the key, so `k.kk` was undefined
+            // while `k.key` was 1).
+            let key = self.lower_member_key(&field.key, field.computed);
+            // ES `NamedEvaluation`: `f = function () {}` names the function after
+            // the field, exactly like an object literal property.
+            let hint = match &key {
+                MemberKey::Static(name) => self.name_hint(Some(name.clone())),
+                MemberKey::Dynamic(value) => Some(value.clone()),
+            };
+            let value = match &field.value {
+                Some(init) => self.lower_expression_named(init, hint),
+                None => Value::Primitive(Primitive::Undefined),
+            };
+            self.set_member(this, &key, value);
         }
     }
 
@@ -3066,32 +3158,7 @@ impl<'a> JSASTLower<'a> {
 
         let mut func = IrFunction::new(func_id, func_sig);
 
-        // Clone outer symbols but exclude captured names so they fall through to LoadEnv
-        let mut symbols = self.symbols.clone();
-        for name in captured_names {
-            symbols.remove(name);
-        }
-        // Script-scope bindings live in the global environment. They must NOT be
-        // carried into the nested function's symbol table: the corresponding IR
-        // variable belongs to the *outer* frame's register file, so using it here
-        // would read a foreign (or, after SSA renaming, an arbitrary) value.
-        if !self.global_names.is_empty() {
-            for name in &self.global_names {
-                symbols.remove(name);
-            }
-        }
-        // Script-scope `let`/`const`/`class` are read through the environment
-        // too — the script's *declarative record* is the truth, and it is what
-        // carries their dead zone. The script's own table keeps a pre-bound
-        // register so that a read before the declaration can be rejected at
-        // compile time, but that copy is `uninitialized` on purpose and must
-        // never leak into a nested function: a method reading its class name
-        // (`class C { m() { return C; } }`) used to trip over it — the binding
-        // looked like a dead-zone read even though the class was long since
-        // defined.
-        for name in &self.script_lexical {
-            symbols.remove(name);
-        }
+        let symbols = self.nested_function_symbols(captured_names);
 
         let mut func_builder = FunctionBuilder::new(self.builder.module_mut(), &mut func);
         let mut func_lower = JSASTLower::new(&mut func_builder, symbols);
@@ -3206,35 +3273,12 @@ impl<'a> JSASTLower<'a> {
                 .insert(func_name.clone(), Variable::new(dst));
         }
 
-        // Instance fields (`x = 1` in a class body) are initialized at the start
-        // of the constructor. For a derived class the spec places them right
-        // after `super()`; emitting them first is close enough for the common
-        // case and keeps the lowering local.
-        for field in instance_fields {
-            let this = func_lower.builder.load_this();
-            let value = match &field.value {
-                Some(init) => func_lower.lower_expression(init),
-                None => Value::Primitive(Primitive::Undefined),
-            };
-            match &field.key {
-                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
-                    func_lower
-                        .builder
-                        .set_property(this, id.name.as_str(), value);
-                }
-                oxc_ast::ast::PropertyKey::StringLiteral(lit) => {
-                    func_lower
-                        .builder
-                        .set_property(this, lit.value.as_str(), value);
-                }
-                _ => {
-                    // Computed or numeric key: fall back to its string form.
-                    let key_name = func_lower.property_key_to_string(&field.key);
-                    func_lower
-                        .builder
-                        .set_property(this, key_name.as_str(), value);
-                }
-            }
+        // Instance fields (`x = 1` in a class body) are initialized before the
+        // constructor body runs — but a *derived* class's fields may not touch
+        // `this` until `super()` has run, so there they are emitted at the super
+        // call instead (see `statement_calls_super`).
+        if !is_derived_ctor {
+            func_lower.emit_instance_field_inits(instance_fields);
         }
 
         // Lower body statements (skip nested function declarations, already hoisted)
@@ -3259,6 +3303,12 @@ impl<'a> JSASTLower<'a> {
                     continue;
                 }
                 func_lower.lower_statement(stmt);
+                // ES `InitializeInstanceElements` runs as soon as `super()`
+                // returns: that is the only point where a derived class's fields
+                // may be installed.
+                if is_derived_ctor && statement_calls_super(stmt) {
+                    func_lower.emit_instance_field_inits(instance_fields);
+                }
             }
 
             // Ensure function has a return
