@@ -1370,6 +1370,79 @@ for (let i = 0; i < 3; i = i + 1) fns.push(function () { return i; });          
 
 ---
 
+#### B27 设计稿：共享 cell（待执行）—— 2026-09-27
+
+B26 的侦察给出了三层根因与顺序建议；这份稿子是**动手前**的接口约定，避免边写边试。
+
+**目标契约**：闭包与它的外层对同一个函数级绑定**读写同一处存储**。等价地：一条绑定只要可能
+"活得比栈帧久"（被内层函数引用），它的值就必须放在 cell 里，两侧都通过 cell 访问。
+
+**1. cell 的表示**
+
+一个"单值盒子"，用户代码看不见（cell 只存在于闭包捕获表与寄存器里，从不作为 JS 值逃逸）：
+
+- `LoadCell(cell)` = `PropertyGet(cell, "__cell__")`
+- `StoreCell(cell, v)` = `PropertySet(cell, "__cell__", v)`
+
+不新增 `Value` 变体、不新增指令 —— 复用现成的属性读写；将来若要静态可查，再换成
+`ObjectKind::Cell`。**注意**：cell 的键必须在任何用户可见枚举中不可达（本引擎的 cell 不逃逸，
+所以普通对象即可）。
+
+**2. 哪些名字需要 cell（预扫描）**
+
+在降级一个函数体**之前**，先收集"本函数体内任意嵌套闭包（箭头/函数表达式/函数声明）引用到的
+自由标识符"（`collect_free_idents_from_body` 已经能算单个函数的自由标识符，需要加一层遍历
+所有嵌套函数节点的走查）。落在**本函数作用域内**的那些名字 → 该绑定为 cell-backed。
+
+必须预扫描而不能"边降级边升级"：外层函数体的指令在那之前就可能已经发过（读的是裸寄存器），
+事后升级只会让前后不一致（B26 实测过 −94 的形态）。
+
+**3. 降级侧的接入点**
+
+| 位置 | 变化 |
+|------|------|
+| `Variable` | 加 `cell: bool` 字段 |
+| 绑定的**创建**（`var` 提升、参数绑定、`let`/`const` 声明、解构绑定、函数声明名） | cell-backed 时先 `make_object()` 再 `StoreCell(初始值)`，寄存器里存 **cell** 而不是值 |
+| `lower_identifier` | cell-backed 时读 cell：`LoadCell(寄存器)` |
+| `store_into_identifier` / `lower_assignment` 的三处标识符目标 / `bind_pattern` 的初始化 | cell-backed 时写 cell：`StoreCell(寄存器, 值)` |
+| `emit_closure_vars` | cell-backed 的名字传 **cell**；环境绑定（脚本 `var`/脚本词法）继续**跳过**（它们本来就共享：`LoadEnv`/`StoreEnv`） |
+| 内层函数读/写捕获名 | 读：`LoadCell(LoadEnv(name))`；写：`StoreCell(LoadEnv(name), v)`（`LoadEnv` 现在给的是 cell） |
+
+`initialized`（TDZ）语义不变：cell 存在 ≠ 已初始化，读未初始化的 cell 仍抛 `ReferenceError`。
+
+**4. 顺序与陷阱（B18/B20/B21 的教训）**
+
+- cell 必须在**绑定点**分配，且闭包必须在之后创建（`ClosureVar` 传的是 cell 的寄存器值，天然满足）。
+- 跨块传值仍要走槽位（B18）：不要把"另一个块里定义的 cell 寄存器"直接当操作数（phi 无人喂）。
+- 提升的**函数声明**（B26 第 3 层）：它的闭包在函数体执行前创建 —— cell 之后这条自然成立，
+  因为创建时传的是 cell 本身而不是当时的值。
+- 与 B21 的脚本声明记录**同构**：最终模型统一成"活过栈帧的绑定 = cell"，
+  脚本层已经是（`script_env` 的槽位），函数层是本批要补的。
+
+**5. 落地前的门禁（B26 未解的回归）**
+
+B26 把第 1 层按快照接上时，`expressions/function` 掉了 94，退回后仍有 **16 条**
+`Cannot read properties of undefined (reading 'Symbol(…))`（参数默认值 + 解构）没能定位。
+**本批动工前必须先复现并定位这 16 条**（候选方向：函数表达式现在走显式 `MakeFuncObj` 的时机、
+新建对象与记忆化对象在 `prototype`/标识上的差异、以及 `eval_default_on` 里默认值求值的
+块与 phi 形态）。带着未知回归动大改，事后无法判断是谁弄坏的。
+
+**6. 验证方案（固定）**
+
+```
+probe A  function counter(){var i=0;return function(){i=i+1;return i;}}       → 1,2,3
+probe B  function counter(){var i=5;return function(){return i;}}             → 5（读）
+probe C  function outer(){var n=1;function inner(){return n;} return inner()+n;} → 2（含提升声明）
+probe D  for (let i=0;i<3;i=i+1) fns.push(function(){return i;})              → 0,1,2
+probe E  var c=function(){var n=0;return {inc:function(){n=n+1;},get:function(){return n;}};}
+```
+再加**路径级 diff**：把 `language/expressions/function`、`language/statements/function`、
+`language/expressions/arrow-function`、`language/statements/for`、`language/statements/let`
+五套件在"改动前/改动后"各跑一次，用 `comm` 对比失败清单（只允许"修好"方向的变化），
+最后全量确认零回退。
+
+---
+
 ---
 
 ---
