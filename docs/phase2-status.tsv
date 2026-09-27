@@ -1,9 +1,9 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
 # 最近更新：2026-09-27
-language/statements/for-of	603	44	104
-language/statements/generators	221	14	31
-language/expressions/generators	235	18	37
+language/statements/for-of	609	44	98
+language/statements/generators	225	14	27
+language/expressions/generators	239	18	33
 language/expressions/yield	40	3	20
 language/statements/for-in	77	22	16
 language/destructuring	15	3	1
@@ -18,7 +18,7 @@ language/expressions/bitwise-not	11	3	2
 language/expressions/bitwise-or	20	7	3
 language/expressions/bitwise-xor	20	7	3
 language/expressions/call	54	19	19
-language/expressions/class	1166	2745	148
+language/expressions/class	1198	2745	116
 language/expressions/coalesce	21	2	1
 language/expressions/comma	4	2	0
 language/expressions/complement	0	0	0
@@ -28,7 +28,7 @@ language/expressions/division	33	9	3
 language/expressions/does-not-equals	27	10	1
 language/expressions/equals	34	10	3
 language/expressions/exponentiation	34	7	3
-language/expressions/function	214	26	24
+language/expressions/function	218	26	20
 language/expressions/greater-than	38	9	2
 language/expressions/greater-than-or-equal	27	7	9
 language/expressions/grouping	5	1	3
@@ -45,7 +45,7 @@ language/expressions/modulus	30	7	3
 language/expressions/multiplication	31	6	3
 language/expressions/new	35	3	21
 language/expressions/new.target	10	3	1
-language/expressions/object	677	418	75
+language/expressions/object	690	418	62
 language/expressions/postfix-decrement	25	5	7
 language/expressions/postfix-increment	26	5	7
 language/expressions/prefix-decrement	22	5	7
@@ -61,24 +61,24 @@ language/expressions/unary-minus	10	3	1
 language/expressions/unary-plus	12	3	2
 language/expressions/unsigned-right-shift	25	7	13
 language/expressions/void	8	1	0
-language/expressions/arrow-function	181	22	140
+language/expressions/arrow-function	185	22	136
 language/statements/block	12	7	2
 language/statements/break	18	2	0
-language/statements/class	1297	2863	207
-language/statements/const	119	5	12
+language/statements/class	1334	2863	170
+language/statements/const	121	5	10
 language/statements/continue	19	5	0
 language/statements/do-while	26	10	0
 language/statements/empty	1	1	0
 language/statements/expression	1	2	0
-language/statements/for	344	19	22
-language/statements/function	331	79	41
+language/statements/for	350	19	16
+language/statements/function	335	79	37
 language/statements/if	47	22	0
-language/statements/let	123	6	16
+language/statements/let	125	6	14
 language/statements/return	4	1	11
 language/statements/switch	49	56	6
 language/statements/throw	13	1	0
-language/statements/try	150	22	29
-language/statements/variable	140	21	17
+language/statements/try	152	22	27
+language/statements/variable	142	21	15
 language/statements/while	25	13	0
 language/literals/boolean	4	0	0
 language/literals/null	2	1	0

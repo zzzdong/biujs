@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15082 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 485 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15204 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 487 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1202,6 +1202,63 @@ GlobalEnvironmentRecord 结构（它有 **ObjectRecord + DeclarativeRecord 两�
    "字段有自己的作用域与时刻"的问题。
 2. **私有字段**（`#x`，`class-fields-private`）：完全未做，是 `class` 两套件里剩下的主要一块。
 3. `super()` 埋在更大表达式里时，字段的发射点仍是旧行为（会跟着第一个含 `super` 的语句走）。
+
+---
+
+#### B24 生成器的两处生命周期漏洞 —— 已完成（2026-09-27）
+
+**起点**：通过 15082 / 18277（82.52%），失败 3195，跳过 8133。
+
+**根因一：方法调用路径漏了"生成器"判定。** `Call` 指令、`invoke`、`New` 都检查
+`module.generators`，但 `CallMethod` 的尾部自己搭帧（`enter_frame` + `jump`），**没有**这个检查 ——
+于是 `class C { *m() {} }` 的 `new C().m()` 会**立即执行生成器体**：它的 `Ret` 返回进了*调用者的*帧，
+整个模块因此提前结束（脚本的返回值成了那个生成器对象），`it.next()` 是 `undefined`。
+这是 `class` 两套件里最大的一块：32 条 `engine panic` + 56 条 `Cannot read properties of undefined
+(reading 'value')`。
+
+**根因二：抛出后的生成器没有收尾。** 生成器体让异常逃出时，几处 `run_generator_frame(...)?` 直接
+`?` 返回，`finish_generator` 没跑 —— 生成器停在 `Executing` 状态。之后任何 `next()` 都会落到
+"resume at a yield" 分支，而那里没有挂起的帧，`expect("SuspendedYield without a frame")`
+**直接 abort 整个进程**（不是一条失败）。触发它的是 test262 里极常见的一行：
+`iter.next()` 抛错之后测试再调一次 `iter.next()`。
+
+**改动（两处，约 20 行）**
+
+| 改动 | 作用 |
+|------|------|
+| `CallMethod` 尾部先查 `callable_func_id(...)` + `module.generators` | 生成器方法只建对象，和 `Call`/`invoke` 一致 |
+| `run_generator_frame_or_complete(...)` | 帧里逃出异常时把生成器标记为 Completed（参数前导那条路径单独处理） |
+| 兜底 | `expect("SuspendedYield without a frame")` → `TypeError`，异常不再升级成进程 abort |
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15082 | **15204** | **+122** |
+| 失败 | 3195 | 3073 | −122 |
+| 通过率 | 82.52% | **83.19%** | +0.67pp |
+| 单元 / feature / 护栏 | 190 / 485 / 7 | 190 / **487** / 7 | +2 用例（8 条断言） |
+
+14 个套件提升、**零回退**：`statements/class` +37、`expressions/class` +32、`expressions/object` +13、
+`for-of` +6、`for` +6、`function` +4、`generators` +4、`variable` +2、`try` +2、`let` +2、`const` +2、
+`expressions/function` +4、`expressions/generators` +4、`arrow-function` +4。
+
+**两条踩出来的规矩**
+
+1. **"哪个调用路径"比"什么函数"更容易漏**：同一件事（生成器只建对象）在 `Call`/`invoke`/`New` 里
+   都做了，唯独方法调用自己搭帧的那一段没做。新增任何"自己搭帧"的调用路径，都要先问一遍
+   "生成器怎么办、箭头函数的 `this` 怎么办、捕获变量怎么办" —— 最后干脆把取 `func_id` 抽成
+   `callable_func_id` 复用。
+2. **`expect` 只该用在"真的不可能"上**：生成器状态机在这里并不可靠（抛出路径会漏状态），
+   一个 `expect` 就把"一条测试失败"变成"整轮回归 abort"。凡是能从外部数据（生成器状态）推出来的
+   条件，都该给一条普通的错误路径。
+
+**残留**（下一批的输入）
+
+1. 生成器与 **`try`/`finally` + `yield`** 的交互（`delegate_stack`、`generator_return`）仍是细活；
+   本批只处理了"抛出后收尾"。
+2. `class` 两套件里剩下的主要是**私有字段**（`#x`、`#m() {}`）与**早期错误**（36 条
+   `Expected a SyntaxError`：重复 `constructor`、`#x` 重名、`super` 用在字段初始化器等）。
 
 ---
 

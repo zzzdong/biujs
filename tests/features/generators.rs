@@ -649,3 +649,60 @@ fn bound_parameters_are_visible_to_the_body() {
         "1,9"
     );
 }
+
+#[test]
+fn a_generator_reached_as_a_method_still_builds_a_generator() {
+    // Calling a generator *method* only builds the generator object; the body
+    // runs at the first `next()`. The method call path used to run it eagerly,
+    // so the body's `ret` returned into the caller's frame.
+    assert_eq!(
+        eval_number("class C { *m() { yield 1; } } new C().m().next().value"),
+        1.0
+    );
+    assert_eq!(
+        eval_number("({ *m() { yield 2; } }).m().next().value"),
+        2.0
+    );
+    assert_eq!(
+        eval_number("class C { static *s() { yield 3; } } C.s().next().value"),
+        3.0
+    );
+    assert_eq!(
+        eval_string("class C { *m() { yield 1; yield 2; } } [...new C().m()].join(',')"),
+        "1,2"
+    );
+    // Destructured parameters of a generator method bind at call time.
+    assert_eq!(
+        eval_number("class C { *m([a]) { yield a; } } new C().m([9]).next().value"),
+        9.0
+    );
+}
+
+#[test]
+fn a_generator_that_threw_is_completed() {
+    // A body that lets an exception escape is finished for good: further
+    // `next()` calls answer `{ value: undefined, done: true }` instead of
+    // resuming a dead frame (which used to abort the whole process).
+    assert_eq!(
+        eval_bool(
+            "function* g() { throw new Error('x'); }
+             var it = g();
+             try { it.next(); } catch (e) {}
+             it.next().done"
+        ),
+        true
+    );
+    assert_eq!(
+        eval_bool(
+            "function* g() { throw new Error('x'); }
+             var it = g();
+             try { it.next(); } catch (e) {}
+             it.next().value === undefined"
+        ),
+        true
+    );
+    assert_eq!(
+        eval_bool("function* g() { yield 1; } var it = g(); it.next(); it.next().done"),
+        true
+    );
+}

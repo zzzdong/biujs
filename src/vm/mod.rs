@@ -723,6 +723,23 @@ impl VM {
     /// 1. runs native built-ins directly (no bytecode frame), and
     /// 2. for bytecode functions pushes a fresh frame, drives a nested execution
     ///    loop until the callee returns, then restores the caller's context.
+    /// The bytecode function behind a callee, in either spelling
+    /// (`Value::Function(id)` or the boxed `FunctionObject`).
+    ///
+    /// Call paths that build the callee frame themselves need this to ask
+    /// "is this a generator?" the same way `invoke` does.
+    fn callable_func_id(&self, callee: &Value) -> Option<u32> {
+        match callee {
+            Value::Function(id) => Some(*id),
+            Value::Object(obj_ref) => obj_ref
+                .borrow()
+                .as_any()
+                .downcast_ref::<FunctionObject>()
+                .map(|func_obj| func_obj.func_id),
+            _ => None,
+        }
+    }
+
     pub fn invoke(
         &mut self,
         callee: &Value,
@@ -2861,6 +2878,29 @@ impl VM {
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
                     return Ok(());
+                }
+
+                // `function*` reached as a *method* (`class C { *m() {} }`,
+                // `obj.m` where `m` is a generator): build the generator object
+                // instead of running the body, exactly like the `Call` opcode
+                // and `invoke` do. Without this the body ran in the *caller's*
+                // frame: its `Ret` returned to the top level, so the module
+                // itself produced a generator object as its result and
+                // `it.next()` was `undefined` — which is what made every
+                // `class { *m() {} }` test fail.
+                if let Some(id) = self.callable_func_id(&method_val) {
+                    if module.generators.contains(&id) {
+                        let gobj = self.create_generator(
+                            id,
+                            obj_val.clone(),
+                            args.clone(),
+                            Vec::new(),
+                            module,
+                        )?;
+                        self.state.set_register(Register::Rv, gobj)?;
+                        self.state.jump_offset(1);
+                        return Ok(());
+                    }
                 }
 
                 match method_val {
@@ -5628,7 +5668,16 @@ impl VM {
         self.running_generator_prologue = true;
         let run = self.run_generator_frame(&saved, closure_depth, delegate_depth, module);
         self.running_generator_prologue = false;
-        let run = run?;
+        // A parameter binding that threw leaves the generator finished: without
+        // this, a later `next()` on it panicked (see
+        // `run_generator_frame_or_complete`).
+        let run = match run {
+            Ok(run) => run,
+            Err(err) => {
+                self.mark_generator_completed(gen_value);
+                return Err(err);
+            }
+        };
         // Parked at the barrier: the generator is still `suspendedStart` (its
         // body has not run) but owns a frame whose pc sits just past the
         // prologue, so `next()` continues there instead of rebuilding it.
@@ -5711,8 +5760,13 @@ impl VM {
                 // argument, because the barrier is not a `yield`.
                 self.state.jump(resume_pc + 1);
                 let closure_depth = self.state.closure_var_stack.len();
-                let run =
-                    self.run_generator_frame(&saved, closure_depth, delegate_depth, module)?;
+                let run = self.run_generator_frame_or_complete(
+                    &saved,
+                    closure_depth,
+                    delegate_depth,
+                    &gen_value,
+                    module,
+                )?;
                 return Ok(self.finish_generator(&gen_value, run));
             }
             // First resume: open a frame exactly like `invoke` does.
@@ -5749,9 +5803,20 @@ impl VM {
                     .downcast_mut::<crate::vm::object::GeneratorObject>()
                     .unwrap();
                 gobj.state = crate::vm::object::GeneratorState::Executing;
-                gobj.suspended
-                    .take()
-                    .expect("SuspendedYield without a frame")
+                match gobj.suspended.take() {
+                    Some(frame) => frame,
+                    None => {
+                        // Unreachable through the spec's own state machine, but a
+                        // panic here aborts the entire run — keep it local to the
+                        // test instead. (`next()` on a *completed* generator is
+                        // answered above; this one is running.)
+                        gobj.state = crate::vm::object::GeneratorState::Completed;
+                        drop(gobj);
+                        return Err(RuntimeError::TypeError(
+                            "generator is already running".to_string(),
+                        ));
+                    }
+                }
             };
             let resume_pc = frame.pc;
             self.restore_generator_frame(&frame, module)?;
@@ -5768,7 +5833,13 @@ impl VM {
         }
 
         let closure_depth = self.state.closure_var_stack.len();
-        let run = self.run_generator_frame(&saved, closure_depth, delegate_depth, module)?;
+        let run = self.run_generator_frame_or_complete(
+            &saved,
+            closure_depth,
+            delegate_depth,
+            &gen_value,
+            module,
+        )?;
         Ok(self.finish_generator(&gen_value, run))
     }
 
@@ -5871,7 +5942,13 @@ impl VM {
                     self.state.jump(pc);
                 }
                 let closure_depth = self.state.closure_var_stack.len();
-                let run = self.run_generator_frame(&saved, closure_depth, delegate_depth, module)?;
+                let run = self.run_generator_frame_or_complete(
+                    &saved,
+                    closure_depth,
+                    delegate_depth,
+                    &gen_value,
+                    module,
+                )?;
                 match run.yielded {
                     // A `finally` that yields keeps the generator alive.
                     Some(_) => Ok(self.finish_generator(&gen_value, run)),
@@ -5925,8 +6002,13 @@ impl VM {
                 match self.handle_throw(reason) {
                     Ok(()) => {
                         let closure_depth = self.state.closure_var_stack.len();
-                        let run = self
-                            .run_generator_frame(&saved, closure_depth, delegate_depth, module)?;
+                        let run = self.run_generator_frame_or_complete(
+                            &saved,
+                            closure_depth,
+                            delegate_depth,
+                            &gen_value,
+                            module,
+                        )?;
                         Ok(self.finish_generator(&gen_value, run))
                     }
                     Err(err) => {
@@ -6026,6 +6108,31 @@ impl VM {
     }
 
     /// Report what a finished run means for the generator object.
+    /// Run a generator frame, marking the generator **completed** if the body
+    /// lets an exception escape.
+    ///
+    /// The `?` alone is not enough: a generator whose body threw is finished for
+    /// good, and leaving it in `Executing` made the *next* `next()` fall into the
+    /// "resume at a yield" path with no suspended frame — which hit
+    /// `expect("SuspendedYield without a frame")` and **aborted the whole run**
+    /// instead of failing one test.
+    fn run_generator_frame_or_complete(
+        &mut self,
+        saved: &SavedExecutionState,
+        closure_depth: usize,
+        delegate_depth: usize,
+        gen_value: &Value,
+        module: &Module,
+    ) -> Result<GeneratorRunOutcome, RuntimeError> {
+        match self.run_generator_frame(saved, closure_depth, delegate_depth, module) {
+            Ok(run) => Ok(run),
+            Err(err) => {
+                self.mark_generator_completed(gen_value);
+                Err(err)
+            }
+        }
+    }
+
     fn finish_generator(
         &mut self,
         gen_value: &Value,
