@@ -1,5 +1,6 @@
 mod array;
 mod boolean;
+mod console;
 mod error;
 mod function;
 mod json;
@@ -228,6 +229,63 @@ fn to_length_from(n: f64) -> u64 {
 }
 
 /// `parseInt(string, radix)` — parses a leading integer in the given radix.
+/// `encodeURI` / `encodeURIComponent` (ES 19.2.6.?) — percent-encoding of the
+/// UTF-8 bytes, keeping the unescaped set the spec lists for each function.
+fn global_encode_uri(args: &[Value], whole_uri: bool) -> Result<Value, RuntimeError> {
+    let s = args.first().map(|v| v.to_js_string()).unwrap_or_default();
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')')
+            || (whole_uri && matches!(b, b';' | b',' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b'#'));
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    Ok(Value::string(&out))
+}
+
+/// `decodeURI` / `decodeURIComponent` — the inverse. A malformed escape is a
+/// URIError per the spec; the engine has no `URIError` variant of
+/// `RuntimeError`, so the error object is built and thrown as a value.
+fn global_decode_uri(args: &[Value], _whole_uri: bool) -> Result<Value, RuntimeError> {
+    let s = args.first().map(|v| v.to_js_string()).unwrap_or_default();
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return uri_error("URI malformed");
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            match (hi, lo) {
+                (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+                _ => return uri_error("URI malformed"),
+            }
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    match String::from_utf8(out) {
+        Ok(text) => Ok(Value::string(&text)),
+        Err(_) => uri_error("URI malformed"),
+    }
+}
+
+fn uri_error(message: &str) -> Result<Value, RuntimeError> {
+    let err = error::error_constructor(
+        error::ErrorType::URIError,
+        &[Value::string(message)],
+    )?;
+    Err(RuntimeError::Thrown(err))
+}
+
 pub fn global_parse_int(args: &[Value]) -> Result<Value, RuntimeError> {
     let Some(input) = args.first() else {
         return Ok(Value::Number(f64::NAN));
@@ -708,11 +766,26 @@ impl Builtins {
 
         // `Math` — a plain namespace object of numeric helpers.
         globals.insert("Math".to_string(), math::create_math_object());
+        // `console` — a host object, not part of ES, but the one thing a script
+        // cannot do without: without it the only way to observe a value is to
+        // `throw` it.
+        globals.insert("console".to_string(), console::create_console_object());
         globals.insert("JSON".to_string(), json::register_json());
 
         // Global convenience functions (they are plain functions, not
         // constructors, so they have no `prototype` slot).
-        for name in ["isNaN", "isFinite", "parseInt", "parseFloat"] {
+        for name in [
+            "isNaN",
+            "isFinite",
+            "parseInt",
+            "parseFloat",
+            // URI handling (ES 19.2.6): everyday scripts encode query strings
+            // and paths, and the engine had no way to do either.
+            "encodeURI",
+            "encodeURIComponent",
+            "decodeURI",
+            "decodeURIComponent",
+        ] {
             globals.insert(
                 name.to_string(),
                 Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(name)))),
@@ -816,6 +889,10 @@ pub fn call_native(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         "URIError" => error::error_constructor(error::ErrorType::URIError, args),
         "EvalError" => error::error_constructor(error::ErrorType::EvalError, args),
         "parseInt" => global_parse_int(args),
+        "encodeURIComponent" => global_encode_uri(args, false),
+        "encodeURI" => global_encode_uri(args, true),
+        "decodeURIComponent" => global_decode_uri(args, false),
+        "decodeURI" => global_decode_uri(args, true),
         "parseFloat" => global_parse_float(args),
         "Boolean" => boolean::boolean_constructor(args),
         "Number" => number::number_constructor(args),
@@ -854,6 +931,10 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
     if let Some(method) = name.strip_prefix("Math.") {
         return math::call_math_method(method, args);
     }
+    // `console` is dispatched the same way (see `console.rs` for why it exists).
+    if let Some(method) = name.strip_prefix("console.") {
+        return console::call_console_method(method, args);
+    }
     match name {
         "Number.isNaN" => number::number_is_nan(args),
         "Number.isFinite" => number::number_is_finite(args),
@@ -889,6 +970,7 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
                 })
                 .unwrap_or(f64::NAN),
         )),
+        "Object.fromEntries" => object::object_from_entries(args),
         "Object.keys" => object::object_keys(args),
         "Object.values" => object::object_values(args),
         "Object.entries" => object::object_entries(args),
@@ -992,6 +1074,9 @@ pub fn call_prototype_method(
         "padEnd" => string::string_pad(obj, args, false),
         "codePointAt" => string::string_code_point_at(obj, args),
         // `at` exists on both Array.prototype and String.prototype.
+        "replace" => string::string_replace(obj, args, false),
+        "replaceAll" => string::string_replace(obj, args, true),
+        "flat" => array::array_flat(obj, args),
         "at" => {
             if string_prototype_receiver(obj) {
                 string::string_at(obj, args)

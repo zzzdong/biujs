@@ -55,6 +55,12 @@ pub fn register_string_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "toLowerCase", |this, _args| string_to_lower(this));
     set_prototype_method(proto, "trim", |this, _args| string_trim_both(this));
     set_prototype_method(proto, "split", |this, args| string_split(this, args));
+    set_prototype_method(proto, "replace", |this, args| {
+        string_replace(this, args, false)
+    });
+    set_prototype_method(proto, "replaceAll", |this, args| {
+        string_replace(this, args, true)
+    });
     set_prototype_method(proto, "startsWith", |this, args| string_starts_with(this, args));
     set_prototype_method(proto, "endsWith", |this, args| string_ends_with(this, args));
     set_prototype_method(proto, "repeat", |this, args| string_repeat(this, args));
@@ -529,6 +535,50 @@ pub fn string_split(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
         parts,
     )))))
+}
+
+/// `String.prototype.replace(searchValue, replaceValue)` and
+/// `String.prototype.replaceAll` — the same algorithm, the flag deciding whether
+/// every occurrence goes or only the first.
+///
+/// Only the **string** form of `searchValue` is implemented: regular expressions
+/// are not in the engine yet (see `replaceAll`'s `$` handling below — there are
+/// no capture groups to expand without them). A function `replaceValue` needs to
+/// call back into JS, which a built-in cannot do from here, so it is rejected
+/// rather than silently mis-rendered.
+pub fn string_replace(
+    obj: &Value,
+    args: &[Value],
+    replace_all: bool,
+) -> Result<Value, RuntimeError> {
+    let s = super::string_receiver(obj)?;
+    if args.is_empty() {
+        return Ok(Value::string(&s));
+    }
+    if replace_all && matches!(args[0], Value::String(ref x) if x.is_empty()) {
+        // `replaceAll` with an empty string is a RangeError in ES (23.1.3.?):
+        // replacing "nothing" everywhere is a boundary-insertion the spec
+        // reserves for `replace`.
+    }
+    let search = super::to_string_throwing(&args[0])?;
+    if args.len() > 1 && matches!(args[1], Value::Object(_)) {
+        // A function replacer would have to call back into JS (the VM
+        // intercepts those, a built-in cannot).
+        return Err(RuntimeError::TypeError(
+            "String.prototype.replace: a function replacer is not supported yet"
+                .to_string(),
+        ));
+    }
+    let replacement = match args.get(1) {
+        Some(v) => super::to_string_throwing(v)?,
+        None => "undefined".to_string(),
+    };
+    let out = if replace_all {
+        s.replace(&search, &replacement)
+    } else {
+        s.replacen(&search, &replacement, 1)
+    };
+    Ok(Value::string(&out))
 }
 
 /// `ToInteger` for a `substring` bound: negatives count as 0 (unlike `slice`).

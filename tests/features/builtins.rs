@@ -473,3 +473,46 @@ fn array_splice_inserts() {
     "#;
     assert_eq!(eval_string(js), "1,2,3,4");
 }
+
+#[test]
+fn everyday_surface_that_had_no_way_to_be_used() {
+    // `console` is a host object, not ES — but without it the only way to
+    // observe a value is to `throw` it, which is what made the engine unusable
+    // for everyday scripts.
+    assert_eq!(eval_string("typeof console"), "object");
+    assert_eq!(eval_string("typeof console.log"), "function");
+    assert_eq!(eval_string("typeof console.error"), "function");
+    // Logging answers `undefined` and prints (stdout for log/info, stderr for
+    // warn/error), so it composes with the rest of a script.
+    assert_eq!(eval_string("String(console.log(1))"), "undefined");
+
+    // `String.prototype.replace` / `replaceAll` with a string pattern: the shape
+    // everyday string handling is built on (regular expressions are still absent).
+    assert_eq!(eval_string("'aab'.replace('a', 'c')"), "cab");
+    assert_eq!(eval_string("'aab'.replaceAll('a', 'c')"), "ccb");
+    assert_eq!(eval_string("'abc'.replace('', '-')"), "-abc");
+
+    // `Array.prototype.flat`: the depth test is per element, so the default
+    // depth of 1 spreads one level only.
+    assert_eq!(eval_string("JSON.stringify([1, [2, [3]]].flat())"), "[1,2,[3]]");
+    assert_eq!(eval_string("JSON.stringify([1, [2, [3]]].flat(2))"), "[1,2,3]");
+
+    // `Object.fromEntries` is the inverse of `Object.entries`.
+    assert_eq!(
+        eval_string("JSON.stringify(Object.fromEntries([['a', 1], ['b', 2]]))"),
+        "{\"a\":1,\"b\":2}"
+    );
+    assert_eq!(eval_number("Object.fromEntries([['a', 7]]).a"), 7.0);
+
+    // URI handling: percent-encoding of UTF-8, with the spec's per-function
+    // unescaped sets (`/` survives `encodeURI`, not `encodeURIComponent`).
+    assert_eq!(eval_string("encodeURIComponent('a b')"), "a%20b");
+    assert_eq!(eval_string("encodeURIComponent('a/b')"), "a%2Fb");
+    assert_eq!(eval_string("encodeURI('http://a.b/c?d=1#e')"), "http://a.b/c?d=1#e");
+    assert_eq!(eval_string("decodeURIComponent('a%20b')"), "a b");
+    // A malformed escape is a URIError.
+    assert_eq!(
+        eval_string("try { decodeURIComponent('%zz'); } catch (e) { e.name; }"),
+        "URIError"
+    );
+}

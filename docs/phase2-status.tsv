@@ -87,7 +87,7 @@ language/literals/string	67	6	0
 language/computed-property-names	40	0	8
 language/identifiers	202	66	0
 language/types	92	10	11
-built-ins/Array	2045	277	759
+built-ins/Array	2056	277	748
 built-ins/Boolean	27	8	16
 built-ins/Error	38	19	36
 built-ins/Function	192	191	126
@@ -99,6 +99,6 @@ built-ins/WeakSet	79	5	1
 built-ins/Math	270	37	20
 built-ins/NativeErrors	68	12	14
 built-ins/Number	189	53	98
-built-ins/Object	2777	295	339
-built-ins/String	617	216	390
+built-ins/Object	2784	295	332
+built-ins/String	631	216	376
 built-ins/Symbol	54	27	17

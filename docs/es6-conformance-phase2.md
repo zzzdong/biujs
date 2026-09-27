@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15452 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 491 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15484 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 492 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1603,6 +1603,66 @@ C.m([]).next();
    先怀疑**另一个**没被保存/恢复的模式状态（`generator_yielded` / `generator_yield_pc` /
    `delegate_stack` 深度）。
 2. 写那半的闭包债（共享 cell）与提升函数声明的捕获，仍未动。
+
+---
+
+#### B30 转向「广度」—— 日常可用性（已完成，2026-09-28）
+
+**方向调整**：此前十几批都是"就着一族 test262 往深里啃"。本批起改为**先铺面**：把日常脚本真正会
+用到的表面补齐，让引擎能拿来写东西，而不是只对测试集好看。第一步是**实测**一份覆盖清单（不靠
+文档，直接对着二进制问），再按「日常频率 ÷ 实现成本」排序。
+
+**实测清单**（`typeof` + 方法探测，逐项跑出来的）
+
+- **语言层**：`let/const/var`、class（实例/静态字段、getter、extends）、箭头、模板串、解构
+  （数组/对象 + 默认值）、spread/rest（调用/数组/对象）、`for...of`（数组与 Map/Set）、生成器、
+  `??`、`**`、计算键、getter/setter、`?.` —— 都在。**两处缺口**：带标签的模板串（`tag\`a${1}b\``
+  返回 `null`）与 **`async/await`（能解析，但没有作业队列，语义未落地）**。
+- **内建层**：Object（含 `keys/values/entries/assign/create/freeze/…`）、Array（除 `flat/flatMap`
+  外常用方法齐）、String（除 `replace/match/search` 外齐）、Number、Boolean、Math（ES6 全）、
+  JSON、Map/Set（含 ES2024 集合运算）、WeakMap/WeakSet、Symbol（含 well-known）、Error 家族、
+  Function（call/apply/bind）。
+- **没有的（这才是日常的拦路石）**：`console`、`Date`、`RegExp`、`Promise`、`globalThis`、
+  `ArrayBuffer`/TypedArray、`Proxy`/`Reflect`、`encodeURI*`、模块系统、`e.stack`。
+  `Intl` 判为范围外。
+
+**本批改动**（挑"用得上且便宜"的四个面）
+
+| 新增 | 说明 |
+|------|------|
+| `console.log/info/debug/trace/warn/error` | 宿主对象。之前**唯一的输出手段是 `throw`** —— 这一条就让日常脚本从"没法用"变成能用。字符串按原样打印、对象回落到 `JSON.stringify`；`warn/error` 走 stderr |
+| `String.prototype.replace` / `replaceAll` | 仅**字符串**模式（正则还没进引擎）；函数式 replacer 明确报错而不是静默错渲染 |
+| `Array.prototype.flat` | 深度判定**逐个元素**做（在入口判 `depth == 0` 会让 `flat()` 退化成 `flat(0)`）；洞被跳过 |
+| `Object.fromEntries` | `Object.entries` 的逆；非对象条目是 TypeError |
+| `encodeURI` / `encodeURIComponent` / `decodeURI` / `decodeURIComponent` | UTF-8 百分号编码，两套 unescaped 集合；畸形转义抛 URIError（用 `RuntimeError::Thrown` 构造真正的 URIError 值） |
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15452 | **15484** | **+32** |
+| 失败 | 2825 | 2793 | −32 |
+| 通过率 | 84.54% | **84.70%** | +0.16pp |
+| 单元 / feature / 护栏 | 190 / 491 / 7 | 190 / **492** / 7 | +1 用例（13 条断言） |
+
+3 个套件提升、**零回退**：`built-ins/String` +14、`built-ins/Array` +11、`built-ins/Object` +7。
+
+**下一批（按同一把尺子排序）**
+
+1. **`Date`** —— `Date.now()`、`new Date(...)`、getter/setter、`toISOString`。日常脚本里出现频率
+   仅次于字符串处理，且是独立的一个 builtin 文件（不需要动 VM）。**推荐下一个做它。**
+2. **`RegExp`** —— 顺带把 `String.prototype.replace/match/search/split` 的正则形式、`matchAll`
+   接上。需要一处正则实现（可考虑引入 `regex` crate 做模式编译）。
+3. **`Promise` + 微任务队列 + `async/await`** —— 需要一个作业队列（VM 侧），是三块里唯一要动
+   执行模型的。
+4. **小面一批**：`globalThis`（要有真正的全局对象，现全局是个 `HashMap`，脚本层 `this` 也因此
+   不是全局对象）、`Array.prototype.flatMap`（回调要 VM 拦截，与 `map`/`filter` 同机制）、
+   `e.stack`、数组字面量的 elision 应为**洞**（现在落成 `undefined`，于是 `[1,,2].flat()` 是
+   `[1,null,2]` 而 node 是 `[1,2]`）、`ArrayBuffer`/TypedArray、`Proxy`/`Reflect`。
+
+**一条规矩**：新增原型方法是**两处**（`set_prototype_method` 注册 + `call_prototype_method` 的
+裸名分发）—— `set_prototype_method` 的闭包参数是 `_f`，**不会被调用**，只看名字。忘了第二处会静
+默变成 `undefined`。
 
 ---
 

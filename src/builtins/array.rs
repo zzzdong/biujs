@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use crate::RuntimeError;
 use crate::vm::object::{ArrayObject, JSObject};
+use crate::vm::property::ObjectKind;
 use crate::vm::property::PropertyKey;
 use crate::vm::value::Value;
 
@@ -28,6 +29,7 @@ pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "fill", |this, args| array_fill(this, args));
     set_prototype_method(proto, "toString", |this, _args| array_to_string(this));
     set_prototype_method(proto, "at", |this, args| array_at(this, args));
+    set_prototype_method(proto, "flat", |this, args| array_flat(this, args));
     set_prototype_method(proto, "copyWithin", |this, args| {
         array_copy_within(this, args)
     });
@@ -925,6 +927,54 @@ pub fn array_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
         }
     }
     Ok(Value::Object(Rc::new(RefCell::new(result))))
+}
+
+/// `Array.prototype.flat([depth])` (ES 23.1.3.?) — depth defaults to 1, and
+/// holes are *skipped* rather than materialised as `undefined` (they are not
+/// elements, so there is nothing to flatten).
+///
+/// `flatMap` is deliberately absent: its callback would have to call back into
+/// JS, which only the VM can do.
+pub fn array_flat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    to_object(obj)?;
+    let depth = match args.first() {
+        None => 1usize,
+        Some(v) => {
+            let n = v.to_number();
+            if n.is_nan() || n <= 0.0 {
+                0usize
+            } else if n.is_infinite() {
+                usize::MAX
+            } else {
+                n.floor() as usize
+            }
+        }
+    };
+    let mut out: Vec<Value> = Vec::new();
+    flatten_into(&mut out, obj, depth);
+    Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(out)))))
+}
+
+/// ES `FlattenIntoArray`: the depth test happens **per element**, not on entry —
+/// an array element is spread while `depth > 0`, and only then do its own items
+/// get `depth - 1`. (Checking `depth == 0` on entry instead would keep the
+/// element whole and make `flat()` behave like `flat(0)`.)
+fn flatten_into(out: &mut Vec<Value>, value: &Value, depth: usize) {
+    let len = generic_length(value);
+    for i in 0..len {
+        // A hole is not an element, so `flat` drops it.
+        if !generic_has(value, i) {
+            continue;
+        }
+        let element = generic_get(value, i);
+        let is_array =
+            matches!(element, Value::Object(ref o) if o.borrow().kind() == ObjectKind::Array);
+        if is_array && depth > 0 {
+            flatten_into(out, &element, depth - 1);
+        } else {
+            out.push(element);
+        }
+    }
 }
 
 /// `Array.prototype.concat(...items)` (ES 23.1.3.1).

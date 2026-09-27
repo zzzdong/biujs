@@ -1,6 +1,6 @@
 use crate::RuntimeError;
 use crate::vm::property::PropertyDescriptor;
-use crate::vm::object::{JSObject, new_array_object_from_vec};
+use crate::vm::object::{JSObject, OrdinaryObject, new_array_object_from_vec};
 use crate::vm::property::PropertyKey;
 use crate::vm::value::Value;
 use std::cell::RefCell;
@@ -121,6 +121,49 @@ pub fn object_entries(args: &[Value]) -> Result<Value, RuntimeError> {
         })
         .collect();
     Ok(new_array_object_from_vec(entries))
+}
+
+/// `Object.fromEntries(iterable)` (ES 20.1.2.5) — the inverse of
+/// `Object.entries`: each entry contributes one own property.
+///
+/// Entries are read through the generic property path, so array-likes and
+/// iterators materialised as objects work too; a non-object entry is a
+/// TypeError, as in the spec.
+pub fn object_from_entries(args: &[Value]) -> Result<Value, RuntimeError> {
+    let iterable = match args.first() {
+        Some(v) => v,
+        None => {
+            return Err(RuntimeError::TypeError(
+                "Object.fromEntries requires at least 1 argument".to_string(),
+            ))
+        }
+    };
+    let keys = to_object_string_keys(iterable)?;
+    let mut result = OrdinaryObject::new();
+    let zero = PropertyKey::from_str("0");
+    let one = PropertyKey::from_str("1");
+    for k in &keys {
+        let entry = to_object_get(iterable, k);
+        if !matches!(entry, Value::Object(_)) {
+            return Err(RuntimeError::TypeError(
+                "Object.fromEntries: entry is not an object".to_string(),
+            ));
+        }
+        let key = to_object_get(&entry, &zero);
+        let value = to_object_get(&entry, &one);
+        let _ = result.define_property(
+            PropertyKey::from_str(&key.to_js_string()),
+            PropertyDescriptor {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+                getter: None,
+                setter: None,
+            },
+        );
+    }
+    Ok(Value::Object(Rc::new(RefCell::new(result))))
 }
 
 pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
