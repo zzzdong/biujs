@@ -316,3 +316,35 @@ fn rest_parameter_survives_call_and_apply() {
         "changed/also"
     );
 }
+
+#[test]
+fn an_anonymous_function_takes_the_name_of_what_it_is_assigned_to() {
+    // ES `NamedEvaluation`: the *binding* names an anonymous function …
+    assert_eq!(eval_string("var f = function () {}; f.name"), "f");
+    assert_eq!(eval_string("let l = () => {}; l.name"), "l");
+    assert_eq!(eval_string("const c = class {}; c.name"), "c");
+    // … and so does an assignment target.
+    assert_eq!(eval_string("var a; a = function () {}; a.name"), "a");
+    // … and a property key, including a computed one.
+    assert_eq!(eval_string("({ m: function () {} }).m.name"), "m");
+    assert_eq!(eval_string("({ m() {} }).m.name"), "m");
+    assert_eq!(eval_string("({ ['k' + 1]: function () {} }).k1.name"), "k1");
+
+    // A *named* function expression keeps its own name — that one is not a
+    // NamedEvaluation site.
+    assert_eq!(eval_string("var g = function inner() {}; g.name"), "inner");
+
+    // A default value names the function after its target, in every pattern
+    // position (`[a = fn] = []`, `({ o = fn } = {})`, `function p(x = fn) {}`).
+    assert_eq!(eval_string("var a; [a = function () {}] = []; a.name"), "a");
+    assert_eq!(eval_string("var o; ({ o = function () {} } = {}); o.name"), "o");
+    assert_eq!(
+        eval_string("function p(x = function () {}) { return x.name; } p()"),
+        "x"
+    );
+
+    // With nothing to borrow a name from, it stays the empty string — not a
+    // `<anonymous>` placeholder.
+    assert_eq!(eval_string("(function () {}).name"), "");
+    assert_eq!(eval_string("(class {}).name"), "");
+}

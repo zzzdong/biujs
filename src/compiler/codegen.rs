@@ -169,6 +169,12 @@ impl Codegen {
                         self.codes
                             .push(Bytecode::double(Opcode::InitLexical, name, value));
                     }
+                    Instruction::SetFunctionName { func, name } => {
+                        let func = self.gen_operand(func);
+                        let name = self.gen_operand(name);
+                        self.codes
+                            .push(Bytecode::double(Opcode::SetFunctionName, func, name));
+                    }
                     Instruction::LoadEnv { dst, name } => {
                         let dst = self.gen_operand(dst);
                         self.codes

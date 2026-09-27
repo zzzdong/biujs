@@ -202,6 +202,18 @@ pub enum Instruction {
     DeclareLexical {
         name: Value,
     },
+    /// ES `SetFunctionName`: (re)define the `name` own property of a function or
+    /// class object that has just been created.
+    ///
+    /// **NamedEvaluation** is what makes `var f = function () {}` answer `"f"`
+    /// for `f.name`, and what names the default in `[g = function () {}] = []`.
+    /// It is an instruction rather than a compile-time rename because the name is
+    /// not always known statically: `{ [k]: function () {} }` takes it from the
+    /// runtime key (the caller `ToString`s it first).
+    SetFunctionName {
+        func: Value,
+        name: Value,
+    },
     /// Initialize a script-scope lexical binding — the one write the temporal
     /// dead zone permits.
     ///
@@ -533,6 +545,7 @@ impl Instruction {
             Instruction::LoadArg { dst, .. } => (vec![*dst], vec![]),
             Instruction::LoadConst { dst, .. } => (vec![*dst], vec![]),
             Instruction::DeclareLexical { name } => (vec![], vec![*name]),
+            Instruction::SetFunctionName { func, name } => (vec![], vec![*func, *name]),
             Instruction::InitLexical { name, value } => (vec![], vec![*name, *value]),
             Instruction::LoadEnv { dst, .. } => (vec![*dst], vec![]),
             Instruction::Move { dst, src } => (vec![*dst], vec![*src]),
@@ -705,6 +718,9 @@ impl std::fmt::Display for Instruction {
                 write!(f, "{dst} = load_const {src}")
             }
             Instruction::DeclareLexical { name } => write!(f, "declare_lexical {name}"),
+            Instruction::SetFunctionName { func, name } => {
+                write!(f, "set_function_name {func}, {name}")
+            }
             Instruction::InitLexical { name, value } => {
                 write!(f, "init_lexical {name}, {value}")
             }

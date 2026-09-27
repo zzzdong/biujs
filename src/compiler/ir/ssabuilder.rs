@@ -811,6 +811,10 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_use(name, stacks);
                 SSABuilder::rename_use(value, stacks);
             }
+            Instruction::SetFunctionName { func, name } => {
+                SSABuilder::rename_use(func, stacks);
+                SSABuilder::rename_use(name, stacks);
+            }
             // No operands, no definitions: nothing to rename.
             Instruction::PrologueEnd => {}
             Instruction::Throw { value, args } => {

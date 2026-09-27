@@ -255,6 +255,39 @@ fn is_iteration_statement(stmt: &Statement<'_>) -> bool {
     )
 }
 
+/// Whether `expr` is one of the forms ES **NamedEvaluation** renames: an
+/// anonymous function, an arrow, or an anonymous class.
+///
+/// A *named* function expression keeps its own name (`var f = function g() {}`
+/// is `g`), and an already-computed value has nothing to rename — so everything
+/// else is left alone.
+fn is_anonymous_function_expression(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::FunctionExpression(func) => func.id.is_none(),
+        Expression::ArrowFunctionExpression(_) => true,
+        Expression::ClassExpression(class) => class.id.is_none(),
+        _ => false,
+    }
+}
+
+/// The name a *binding* target lends to an anonymous function in its default:
+/// `[f = function () {}] = []` names it `f`. `None` for a nested pattern.
+fn pattern_hint_name(pattern: &BindingPattern<'_>) -> Option<String> {
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+        _ => None,
+    }
+}
+
+/// Same for an *assignment* target (`[f = function () {}] = []` in statement
+/// position). `None` for a member target, which has no name to lend.
+fn target_hint_name(target: &AssignmentTarget<'_>) -> Option<String> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
+        _ => None,
+    }
+}
+
 /// Debug name for a class member function (`C.m`, `C.[computed]`).
 fn member_display_name(class_name: &str, key: &MemberKey) -> String {
     match key {
@@ -685,13 +718,18 @@ impl<'a> JSASTLower<'a> {
         // 3. Build the constructor function (only a non-computed `constructor`
         //    member counts as one; `['constructor']() {}` is an ordinary
         //    prototype method).
+        //
+        // An anonymous class expression is unnamed — ES creates its constructor
+        // with `""` — while a named class takes the binding name. NamedEvaluation
+        // may replace it later; that is how `var C = class {}` answers `"C"`.
+        let ctor_name = class.id.as_ref().map(|_| class_name.clone());
         let mut constructor_id = None;
         for member in &members {
             if let Member::Constructor(func) = member {
                 // `C.name` is the class name (ES 14.5.14 ClassDefinitionEvaluation
                 // sets the constructor's name to the binding identifier).
                 constructor_id = Some(self.lower_function_inner(
-                    Some(class_name.clone()),
+                    ctor_name.clone(),
                     &func.params,
                     func.body.as_ref().unwrap(),
                     None,
@@ -706,7 +744,7 @@ impl<'a> JSASTLower<'a> {
 
         // 4. If no constructor, create a default one
         let constructor_id = constructor_id.unwrap_or_else(|| {
-            let func_sig = FuncSignature::new(class_name.clone(), vec![]);
+            let func_sig = FuncSignature::new(ctor_name.clone().unwrap_or_default(), vec![]);
             // The default constructor of a derived class forwards every
             // argument: `constructor(...args) { super(...args); }` (ES 14.5.15).
             let func_sig = if has_heritage {
@@ -950,8 +988,11 @@ impl<'a> JSASTLower<'a> {
         for declarator in &decl.declarations {
             let name = self.binding_pattern_name(&declarator.id);
 
+            // ES `NamedEvaluation`: `var f = function () {}` names the function
+            // `f` — for a *simple* binding only, and only for the anonymous forms.
+            let hint = self.name_hint(pattern_hint_name(&declarator.id));
             let value = match &declarator.init {
-                Some(init) => Some(self.lower_expression(init)),
+                Some(init) => Some(self.lower_expression_named(init, hint)),
                 None => None,
             };
 
@@ -1911,6 +1952,45 @@ impl<'a> JSASTLower<'a> {
         Value::Primitive(Primitive::Boolean(lit.value))
     }
 
+    /// The hint for `x = <anonymous fn>`: only a plain assignment names it, and
+    /// only after the identifier target (`x += function () {}` is not a
+    /// NamedEvaluation site).
+    fn assignment_name_hint(
+        &mut self,
+        assign: &AssignmentExpression<'_>,
+        name: &str,
+    ) -> Option<Value> {
+        if assign.operator == AssignmentOperator::Assign {
+            self.name_hint(Some(name.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// A name hint as a *value* (a loaded constant), ready for the `name`
+    /// operand of `SetFunctionName` — that operand is read like any other value,
+    /// so a bare `Value::Constant` there would be an immediate at run time.
+    fn name_hint(&mut self, name: Option<String>) -> Option<Value> {
+        name.map(|name| self.builder.load_constant(name.into()))
+    }
+
+    /// Lower `expr`, applying **NamedEvaluation** when the caller knows the
+    /// binding or property name it is being assigned to.
+    ///
+    /// Only the anonymous forms take the hint (see
+    /// `is_anonymous_function_expression`); `hint` is `None` when the target
+    /// cannot lend a name (a member target, a nested pattern, a compound
+    /// assignment).
+    fn lower_expression_named(&mut self, expr: &Expression<'_>, hint: Option<Value>) -> Value {
+        let value = self.lower_expression(expr);
+        if let Some(hint) = hint {
+            if is_anonymous_function_expression(expr) {
+                self.builder.set_function_name(value.clone(), hint);
+            }
+        }
+        value
+    }
+
     fn lower_identifier(&mut self, ident: &IdentifierReference<'_>) -> Value {
         // Handle special identifiers
         match ident.name.as_str() {
@@ -2248,7 +2328,8 @@ impl<'a> JSASTLower<'a> {
                 // Writes go through StoreEnv and reads (for compound ops) via a
                 // fresh LoadEnv, so nested functions observe the same value.
                 if self.global_names.contains(ident.name.as_str()) {
-                    let rhs = self.lower_expression(&assign.right);
+                    let hint = self.assignment_name_hint(assign, ident.name.as_str());
+                    let rhs = self.lower_expression_named(&assign.right, hint);
                     let value = if assign.operator == AssignmentOperator::Assign {
                         rhs
                     } else {
@@ -2269,7 +2350,8 @@ impl<'a> JSASTLower<'a> {
                     Some(var) if !var.initialized => self.throw_tdz(ident.name.as_str()),
                     Some(var) => {
                         let current = var.slot;
-                        let rhs = self.lower_expression(&assign.right);
+                        let hint = self.assignment_name_hint(assign, ident.name.as_str());
+                        let rhs = self.lower_expression_named(&assign.right, hint);
                         let value = self
                             .compound_binop(assign.operator, current, rhs)
                             .unwrap_or(rhs);
@@ -2280,7 +2362,8 @@ impl<'a> JSASTLower<'a> {
                     None => {
                         // Assignment to an undeclared (or environment-backed)
                         // name: read-modify-write through the global environment.
-                        let rhs = self.lower_expression(&assign.right);
+                        let hint = self.assignment_name_hint(assign, ident.name.as_str());
+                        let rhs = self.lower_expression_named(&assign.right, hint);
                         let value = if assign.operator == AssignmentOperator::Assign {
                             rhs
                         } else {
@@ -2739,7 +2822,17 @@ impl<'a> JSASTLower<'a> {
                             self.define_member(object, &key, desc);
                         }
                         PropertyKind::Init => {
-                            let value = self.lower_expression(&p.value);
+                            // ES 12.2.6.8: `{ m: function () {} }` names the
+                            // function after the key. A computed key needs no
+                            // conversion here — `lower_member_key` already ran
+                            // `ToPropertyKey` on it, and doing it twice would run
+                            // the key's `toString` twice (`{ [k1]: fn }` pushed its
+                            // log entry twice).
+                            let hint = match &key {
+                                MemberKey::Static(name) => self.name_hint(Some(name.clone())),
+                                MemberKey::Dynamic(value) => Some(value.clone()),
+                            };
+                            let value = self.lower_expression_named(&p.value, hint);
                             let value = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(value, super_proto.clone())
@@ -2828,15 +2921,16 @@ impl<'a> JSASTLower<'a> {
     }
 
     fn lower_function_expr(&mut self, func: &Function<'_>) -> Value {
-        let name = func
-            .id
-            .as_ref()
-            .map(|id| id.name.to_string())
-            .unwrap_or_else(|| "<anonymous>".to_string());
+        // An anonymous function expression has an **empty** name: ES 15.2.3
+        // creates it with `""`, and only a later `SetFunctionName` (inferred from
+        // the binding it lands in) gives it one. `None` is what the signature
+        // carries for that — `func_info` turns it back into `""`, because the
+        // `name` property must be `""`, not a placeholder like `<anonymous>`.
+        let name = func.id.as_ref().map(|id| id.name.to_string());
 
         if let Some(body) = &func.body {
             self.lower_function_inner(
-                Some(name),
+                name,
                 &func.params,
                 body,
                 None,
@@ -3034,7 +3128,9 @@ impl<'a> JSASTLower<'a> {
                 func_lower.builder.br_if(is_undef, default_blk, merge_blk);
 
                 func_lower.builder.switch_to_block(default_blk);
-                let default_val = func_lower.lower_expression(init);
+                // `function f(x = function () {}) {}` names the function `x`.
+                let hint = func_lower.name_hint(pattern_hint_name(&param.pattern));
+                let default_val = func_lower.lower_expression_named(init, hint);
                 func_lower.builder.assign(arg, default_val);
                 func_lower.builder.jump(merge_blk);
 
@@ -3252,7 +3348,8 @@ impl<'a> JSASTLower<'a> {
                 let is_undef = self
                     .builder
                     .binop(Opcode::StrictEqual, result.clone(), undefined);
-                let default_val = self.eval_default_on(&[is_undef], &ap.right, result.clone());
+                let hint = self.name_hint(pattern_hint_name(&ap.left));
+                let default_val = self.eval_default_on(&[is_undef], &ap.right, result.clone(), hint);
                 self.bind_pattern(&ap.left, default_val, publish_global);
             }
             BindingPattern::ObjectPattern(op) => {
@@ -3356,7 +3453,9 @@ impl<'a> JSASTLower<'a> {
                     .binop(Opcode::StrictEqual, result.clone(), undefined);
                 let no_next = self.builder.unaryop(Opcode::Not, has_next);
                 let missing = self.builder.binop(Opcode::BitOr, no_next, is_undef);
-                let default_val = self.eval_default_on(&[missing], &ap.right, result.clone());
+                let hint = self.name_hint(pattern_hint_name(&ap.left));
+                let default_val =
+                    self.eval_default_on(&[missing], &ap.right, result.clone(), hint);
                 self.bind_pattern(&ap.left, default_val, publish_global);
             }
             other => self.bind_pattern(other, item, publish_global),
@@ -3370,6 +3469,7 @@ impl<'a> JSASTLower<'a> {
         conds: &[Value],
         default_expr: &Expression<'_>,
         result: Value,
+        name_hint: Option<Value>,
     ) -> Value {
         let default_blk = self.create_block("destr_default");
         let merge_blk = self.create_block("destr_merge");
@@ -3388,7 +3488,9 @@ impl<'a> JSASTLower<'a> {
         }
 
         self.builder.switch_to_block(default_blk);
-        let default_val = self.lower_expression(default_expr);
+        // `[f = function () {}] = []` names the function `f`: the default is a
+        // NamedEvaluation site, so the *target* name travels down with it.
+        let default_val = self.lower_expression_named(default_expr, name_hint);
         self.builder.assign(result.clone(), default_val);
         self.builder.jump(merge_blk);
 
@@ -3592,8 +3694,10 @@ impl<'a> JSASTLower<'a> {
                             let is_undef = self
                                 .builder
                                 .binop(Opcode::StrictEqual, result.clone(), undefined);
+                            // `{ a = function () {} } = {}` names it `a`.
+                            let hint = self.name_hint(Some(name.clone()));
                             let default_val =
-                                self.eval_default_on(&[is_undef], init, result.clone());
+                                self.eval_default_on(&[is_undef], init, result.clone(), hint);
                             self.store_into_identifier(&name, default_val);
                         }
                         None => self.store_into_identifier(&name, prop_val),
@@ -3618,8 +3722,9 @@ impl<'a> JSASTLower<'a> {
                             let is_undef = self
                                 .builder
                                 .binop(Opcode::StrictEqual, result.clone(), undefined);
+                            let hint = self.name_hint(target_hint_name(&d.binding));
                             let default_val =
-                                self.eval_default_on(&[is_undef], &d.init, result.clone());
+                                self.eval_default_on(&[is_undef], &d.init, result.clone(), hint);
                             self.bind_assignment_target(&d.binding, default_val);
                         }
                         other => self.bind_assignment_target_maybe(other, prop_val),
@@ -3652,7 +3757,9 @@ impl<'a> JSASTLower<'a> {
                     .binop(Opcode::StrictEqual, result.clone(), undefined);
                 let no_next = self.builder.unaryop(Opcode::Not, has_next);
                 let missing = self.builder.binop(Opcode::BitOr, no_next, is_undef);
-                let default_val = self.eval_default_on(&[missing], &d.init, result.clone());
+                let hint = self.name_hint(target_hint_name(&d.binding));
+                let default_val =
+                    self.eval_default_on(&[missing], &d.init, result.clone(), hint);
                 self.bind_assignment_target(&d.binding, default_val);
             }
             other => self.bind_assignment_target_maybe(other, item),
@@ -3673,7 +3780,9 @@ impl<'a> JSASTLower<'a> {
                 let is_undef = self
                     .builder
                     .binop(Opcode::StrictEqual, result.clone(), undefined);
-                let default_val = self.eval_default_on(&[is_undef], &d.init, result.clone());
+                let hint = self.name_hint(target_hint_name(&d.binding));
+                let default_val =
+                    self.eval_default_on(&[is_undef], &d.init, result.clone(), hint);
                 self.bind_assignment_target(&d.binding, default_val);
             }
             AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(ident) => {

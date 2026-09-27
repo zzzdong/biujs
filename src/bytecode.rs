@@ -150,6 +150,9 @@ pub enum Opcode {
     /// init_lexical name, value — initialize a script-scope lexical binding
     /// (the declaration; the only write the dead zone allows)
     InitLexical,
+    /// set_function_name func, name — give a just-created function/class object
+    /// its name (NamedEvaluation)
+    SetFunctionName,
     /// load_env dst, name
     LoadEnv,
     /// halt
@@ -358,6 +361,7 @@ impl fmt::Display for Opcode {
             Opcode::Ret => write!(f, "ret"),
             Opcode::LoadConst => write!(f, "load_const"),
             Opcode::DeclareLexical => write!(f, "declare_lexical"),
+            Opcode::SetFunctionName => write!(f, "set_function_name"),
             Opcode::InitLexical => write!(f, "init_lexical"),
             Opcode::LoadEnv => write!(f, "load_env"),
             Opcode::Mov => write!(f, "mov"),

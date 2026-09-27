@@ -338,6 +338,36 @@ impl VM {
 
     /// Coerce a value that is about to be used as an object into a `Value::Object`
     /// where possible (currently: bare function references).
+    /// ES `SetFunctionName(fn, name)` — redefine the `name` own property
+    /// `{ writable: false, enumerable: false, configurable: true }`.
+    ///
+    /// Only functions and classes have a `name` to set, and the lowering emits
+    /// this instruction only for the anonymous function/class forms, so anything
+    /// else is left untouched. Redefinition is legal because the spec makes
+    /// `name` configurable — that is what lets `SetFunctionName` work at all.
+    fn set_function_name(&mut self, func: &Value, name: &str) {
+        let obj_val = self.as_object_value(func);
+        if let Value::Object(obj_ref) = obj_val {
+            let mut borrowed = obj_ref.borrow_mut();
+            if borrowed.kind() != ObjectKind::Function {
+                return;
+            }
+            borrowed
+                .define_property(
+                    crate::vm::property::PropertyKey::from_str("name"),
+                    crate::vm::property::PropertyDescriptor {
+                        value: Value::string(name),
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        getter: None,
+                        setter: None,
+                    },
+                )
+                .ok();
+        }
+    }
+
     fn as_object_value(&mut self, val: &Value) -> Value {
         match val {
             Value::Function(id) => self.materialize_function(*id),
@@ -2018,6 +2048,13 @@ impl VM {
                 // is allowed even though a plain `StoreEnv` to an uninitialized
                 // binding would throw.
                 self.state.script_env.insert(name, Some(value));
+            }
+            Opcode::SetFunctionName => {
+                let func = self.get_value(operands[0])?;
+                let name = self.get_value(operands[1])?;
+                if let Value::String(text) = &name {
+                    self.set_function_name(&func, text);
+                }
             }
             Opcode::LoadEnv => {
                 let name_index = operands[1].as_immd();

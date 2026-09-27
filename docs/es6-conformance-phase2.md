@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 14567 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 483 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 14838 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 484 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -212,7 +212,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B19** | M7-P11 `try` 内 abrupt 完成（`break`/`continue` 跳出 `try`） | 6 + | **已完成**，见 §6.1；+6，零回退，并修回 B18 被它遮挡的 2 条用例 |
 | **B20** | M7-P12 TDZ（`let`/`const`/类名绑定的"已绑定但未初始化"窗口） | 20 + | **已完成**，见 §6.1；+9，零回退，修回 B18 遗留的 class 用例 |
 | **B21** | M7-P13 脚本**声明记录**与全局对象分离（数据模型债第一件） | 3 + | **已完成**，见 §6.1：+3，零回退；B20 残留 1 落地，闭包从此看到脚本级 `let` 的**活**绑定 |
-| **B22** | M7-P14 NamedEvaluation（默认值上的匿名函数取绑定名） | 1056 | 下一批：`*fn-name-*` 测试文件 1056 个，`dflt-*-elem-id-init-fn-name-*` 五族各 11 条 |
+| **B22** | M7-P14 NamedEvaluation（匿名函数/类取绑定名） | 1056 | **已完成**，见 §6.1：**+271，零回退**，15 个套件提升 |
 
 **每批的固定动作**：三级验证（`tests/features/` 新断言 → 目标套件定向跑 → 带内存上限的全量回归）→ 逐套件核对**零回退** → 更新本文档的批次状态 → 提交。
 
@@ -1076,6 +1076,67 @@ GlobalEnvironmentRecord 结构（它有 **ObjectRecord + DeclarativeRecord 两�
    （`SetFunctionName`）这条原语 —— 一个 helper + 各位置传入名字提示即可。
 3. `let`/`const` 套件剩余的 `dstr/*` 失败几乎全是上面这条；此外 `engine panic: SuspendedYield
    without a frame`（`ary-ptrn-*-step-err`，20 条）是生成器债，与 B6 一起看。
+
+---
+
+#### B22 NamedEvaluation —— 已完成（2026-09-27）
+
+**起点**：通过 14567 / 18277（79.70%），失败 3710，跳过 8133。
+
+**根因**：**整族缺失**。ES `NamedEvaluation` 要求匿名的函数/类在"落进一个有名字的地方"时取那个名字
+（`var f = function () {}` 的函数名是 `f`），而引擎从不这样做：`lower_function_inner(Some(name), …)`
+只设*自身*声明名，没有任何"给匿名表达式补名"的原语。七个位置全错：变量初始化、解构默认值
+（`[a = function () {}] = []`）、对象模式默认值、形参默认值、赋值表达式、对象字面量属性值、类表达式。
+另外匿名函数/类的 `name` 被填成占位名 `<anonymous>` / `<class>`，而规范要求**空串**。
+
+**设计**
+
+| 机制 | 作用 |
+|------|------|
+| `SetFunctionName` 指令 | (re)define 函数/类对象的 `name` 自有属性（`configurable: true` 正是规范允许这么做的原因） |
+| `lower_expression_named(expr, hint)` | 只有**匿名形态**吃这个名字提示（具名函数表达式保留自己的名字），`hint` 为 `None` 时不做事 |
+| `name_hint(Option<String>)` | 提示以**值**（`load_constant`）传递，因为计算键的名字要到运行时才知道 |
+
+接线共 10 处：变量声明、`bind_pattern` 的两处 `AssignmentPattern`、赋值模式的三处
+`AssignmentTargetWithDefault`、形参默认值、赋值表达式的三处标识符目标、对象字面量的 `Init` 属性。
+名字提示只在"目标能借出名字"时给出（标识符、静态键）；成员目标、嵌套模式、复合赋值都给 `None`。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 14567 | **14838** | **+271** |
+| 失败 | 3710 | 3439 | −271 |
+| 通过率 | 79.70% | **81.18%** | +1.48pp |
+| 单元 / feature / 护栏 | 190 / 483 / 7 | 190 / **484** / 7 | +1 用例（12 条断言） |
+
+15 个套件提升、**零回退**：`class` +49、`expressions/class` +49、`for-of` +27、`expressions/object` +26、
+`for` +18、`generators`（表达式侧）+15、`expressions/function` +13、`assignment` +13、
+`function` +12、`generators` +12、`variable` +9、`let` +9、`const` +9、`try` +6、`arrow-function` +4。
+`guards` 计数 3 + 8 全部落在基线里本已失败的用例上（任何套件都没有下降，所以它们不可能是原先通过的）。
+
+**四条踩出来的规矩**
+
+1. **`SetFunctionName` 的 `name` 操作数是*值*，不是立即数**。名字提示用 `make_constant` 造出来的是
+   `Value::Constant`，codegen 当立即数发出去，运行时立刻报
+   `cannot load value from immediate operand` —— 必须 `load_constant` 落到寄存器。
+2. **计算键不能再次 `ToString`**。`lower_member_key` 已经做过 `ToPropertyKey`；提示里再来一次会让键的
+   `toString` 跑两遍（feature 测试当场抓住 `k1,k1,k2,k2:123`，应为 `k1,k2:123`）。
+3. **匿名函数/类的 `name` 是空串**，不是 `<anonymous>` / `<class>` 占位名。占位名来自
+   `func_info` 用 `Name::to_string()`（Display 的兜底）取值；现在语义值走 `unwrap_or_default()`，
+   调试输出仍保留占位名（两者本来就该分开）。
+4. **隐式默认构造器也要分流**：`class {}` 的 `constructor() {}` 是引擎自己造的，它同样得按匿名/具名
+   决定是否叫 `<class>`（漏了这一处，`(class {}).name` 依旧是 `<class>`）。
+
+**残留**（下一批的输入）
+
+1. **实例类字段整族缺失**（本批顺带确认）：`class K { f = 1; }` 之后 `new K().f` 是 `undefined`，
+   `f = function () {}` / 箭头同理。静态字段是好的（`K.s` 能读到）。这正是 §3 里登记的
+   `class-fields-public` 债（489 条），而它同时挡着 `fn-name` 族里"字段值取字段名"的一批。
+2. **accessor 与 symbol 键的名字**：`get m` / `set m` 的 `name` 应分别带前缀，`{ [sym]: fn }` 应得
+   `"[desc]"`；现在这两类都没有提示（`SetFunctionName` 只认字符串）。
+3. 形参、解构默认值、对象字面量都已覆盖；`for`/`for-of` 头部与 `class` 方法体里剩下的失败
+   回到 B15b 侦察的其余族（迭代器/rest 语义、对象模式长尾）。
 
 ---
 

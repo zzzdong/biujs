@@ -88,7 +88,12 @@ impl Compiler {
         for func in &unit.functions {
             func_info.insert(
                 func.id.as_usize() as u32,
-                (func.signature.name.to_string(), func.signature.arity),
+                (
+                    // An anonymous function's `name` property is `""`, not the
+                    // placeholder the *debug* `Display` of `Name` prints.
+                    func.signature.name.0.clone().unwrap_or_default(),
+                    func.signature.arity,
+                ),
             );
             if func.signature.is_generator {
                 generators.insert(func.id.as_usize() as u32);

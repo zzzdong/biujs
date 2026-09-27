@@ -182,6 +182,12 @@ pub trait InstBuilder {
         self.emit(Instruction::InitLexical { name, value });
     }
 
+    /// Give a function/class object its name (see `Instruction::SetFunctionName`).
+    /// `name` is used as-is, so it has to be a string already.
+    fn set_function_name(&mut self, func: Value, name: Value) {
+        self.emit(Instruction::SetFunctionName { func, name });
+    }
+
     fn load_external_variable(&mut self, name: String) -> Value {
         let result = self.alloc();
 
