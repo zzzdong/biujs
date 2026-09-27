@@ -1219,7 +1219,8 @@ GlobalEnvironmentRecord 结构（它有 **ObjectRecord + DeclarativeRecord 两�
 **根因二：抛出后的生成器没有收尾。** 生成器体让异常逃出时，几处 `run_generator_frame(...)?` 直接
 `?` 返回，`finish_generator` 没跑 —— 生成器停在 `Executing` 状态。之后任何 `next()` 都会落到
 "resume at a yield" 分支，而那里没有挂起的帧，`expect("SuspendedYield without a frame")`
-**直接 abort 整个进程**（不是一条失败）。触发它的是 test262 里极常见的一行：
+**直接 abort 进程**（CLI 里就是整轮结束；runner 里被 `catch_unwind` 兜成一条 `engine panic:` 失败 ——
+B25 的审计确认当前全量里已无 `engine panic`）。触发它的是 test262 里极常见的一行：
 `iter.next()` 抛错之后测试再调一次 `iter.next()`。
 
 **改动（两处，约 20 行）**
