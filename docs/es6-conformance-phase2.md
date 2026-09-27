@@ -1316,6 +1316,57 @@ B25 的审计确认当前全量里已无 `engine panic`）。触发它的是 tes
 
 ---
 
+#### B26 侦察：闭包捕获的现状与下一步 —— 未提交（2026-09-27）
+
+本批**没有代码落地**（见下文的"为什么回退"），但把"闭包共享可变单元"这团债拆清楚了，
+下一批可以直接按这份结论开工。
+
+**症状**（都能一条命令复现）
+
+```js
+function counter() { var i = 5; return function () { return i; }; }  counter()()      // 引擎: undefined（node: 5）
+function counter() { var i = 0; return function () { i = i + 1; return i; }; }        // 引擎: 0,0,0（node: 1,2,3）
+function outer() { var n = 1; function inner() { return n; } return inner() + n; }    // 引擎: NaN（node: 2）
+for (let i = 0; i < 3; i = i + 1) fns.push(function () { return i; });                // 引擎: 2,2,2（node: 0,1,2）
+```
+
+**根因分三层，代价递增**
+
+1. **函数表达式与函数声明根本不捕获**（最容易，也是最大的一块）。捕获只有箭头那条路径做了：
+   `lower_arrow_function` 算自由标识符 → 发 `ClosureVar` → `MakeArrowFuncObj` 收集。
+   而 `lower_function_expr` 传 `&[]`、返回裸 `Value::Function`（靠 `as_object_value` 惰性物化，
+   物化走的是按 `func_id` 记忆化的 `materialize_function`，**根本不带捕获**）；
+   `collect_function_declaration` 同样传 `&[]`。VM 侧 `Opcode::MakeFuncObj` 也没有
+   `MakeArrowFuncObj` 那段"收 `ClosureVar`"的代码。
+   → 修法已探明：算自由标识符 + `emit_closure_vars` + 显式 `make_func_obj`（有捕获时**新建**对象，
+   不能复用记忆化的那个）；VM 侧把收集逻辑抽成 `take_pending_captured_vars` 给两条路径共用。
+2. **捕获是"创建时快照"，不是共享单元**。即使第 1 层修好，`i = i + 1` 写的仍是内层那份拷贝
+   （实测 `counter=0,0,0`：内层读到 0、写进自己的 map，外层寄存器纹丝不动）。
+   真正的修法是**共享可变单元**：被捕获的绑定在**两侧**都变成 `cell`（`LoadCell`/`StoreCell`），
+   与 B21 给脚本层做的"声明记录"同构 —— 区别只是作用域从脚本换成函数。
+3. **函数声明连"共享单元"都救不了**：它的闭包在**外层函数体执行之前**（提升时）创建，
+   而规范要求它捕获的是*绑定*不是*值*。快照模型在这里必错（会冻结声明前的值），
+   必须等第 2 层的 cell 落地。
+
+**为什么这一批回退了**：把第 1 层按"箭头同款"接上之后，`arrow-function` +27，
+但 `expressions/function` **−94**、`statements/function` −10。做减法的过程中修掉两个真实错误
+（脚本级 `var`/`let` 等**环境绑定不该被捕获** —— 快照会冻结副本，而
+`var callCount = 0; var f = function () { callCount += 1; }` 是 test262 里最常见的形状；
+`arguments` 不该被当成外部自由变量 —— 否则函数自己的 `arguments` 绑定被剔掉），
+但剩余 −19 的根因（16 条 `Cannot read properties of undefined (reading 'Symbol(...)')`
+集中在**参数默认值 + 解构**）没能在本轮定位。按"零回退"纪律，本批**全部回退**，
+工作区停在 B25 的良好状态（15306 / 82.74%… 见 A8）。
+
+**下一批的建议顺序**
+
+1. 先做第 2 层（**共享 cell**）：它同时解决 `counter` 的写、`for (let …)` 的 per-iteration 绑定、
+   以及生成器 `SuspendedFrame::closure_maps` 的切片口径 —— 这三条本来就是同一处机制。
+2. 第 1 层（函数表达式/声明的捕获）作为 cell 的接线一起做，**不要**单独上快照版本：
+   那只会把"读到 undefined"换成"读到创建时的旧值"，而且会像本批一样碰到 −94 那类回归。
+3. 第 3 层（提升的函数声明的捕获时机）在第 2 层之后自然成立。
+
+---
+
 ---
 
 ---

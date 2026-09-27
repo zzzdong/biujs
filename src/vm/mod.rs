@@ -327,6 +327,55 @@ impl VM {
     ///
     /// The mapping is memoized for the lifetime of a `run` so that `F.prototype`
     /// and any properties hung off the function object remain observable.
+    /// Pop the pending `ClosureVar` entries for the function object being
+    /// created, in the order the lowering emitted them.
+    ///
+    /// `ClosureVar` pushes one-entry maps; an empty map is the boundary that
+    /// says "the current frame's captures start here" (pushed when a function
+    /// frame opens), so the walk stops there and never steals an outer frame's
+    /// captures.
+    fn take_pending_captured_vars(&mut self) -> Vec<(String, Value)> {
+        let mut captured_vars: Vec<(String, Value)> = Vec::new();
+        while let Some(vars) = self.state.closure_var_stack.last() {
+            if vars.is_empty() {
+                break;
+            }
+            let entry = self.state.closure_var_stack.pop().unwrap();
+            for (k, v) in entry {
+                captured_vars.push((k, v));
+            }
+        }
+        captured_vars
+    }
+
+    /// A fresh (never memoized) function object carrying `captured_vars`.
+    ///
+    /// Only used when a `function` expression actually captures something: the
+    /// memoized object (`materialize_function`) is keyed by `func_id` and stands
+    /// for "the" object of a declaration, which cannot carry per-evaluation
+    /// captures.
+    fn make_capturing_function_object(
+        &mut self,
+        func_id: u32,
+        captured_vars: Vec<(String, Value)>,
+    ) -> Value {
+        let (name, arity) = self
+            .current_module_info
+            .as_ref()
+            .and_then(|info| info.get(&func_id))
+            .cloned()
+            .unwrap_or((String::new(), 0));
+        let obj = crate::vm::object::new_function_object(func_id, &name, arity);
+        if let Value::Object(ref obj_ref) = obj {
+            let mut borrowed = obj_ref.borrow_mut();
+            borrowed.set_prototype(Some(Rc::clone(&self.builtins.function_prototype)));
+            if let Some(func_obj) = borrowed.as_any_mut().downcast_mut::<FunctionObject>() {
+                func_obj.captured_vars = captured_vars;
+            }
+        }
+        obj
+    }
+
     fn materialize_function(&mut self, id: u32) -> Value {
         if let Some(v) = self.func_objs.get(&id) {
             return v.clone();
@@ -3228,7 +3277,20 @@ impl VM {
                         ));
                     }
                 };
-                let obj_val = self.materialize_function(func_id);
+                // A `function` expression captures its enclosing scope exactly
+                // like an arrow does (the lowering pushes one `ClosureVar` per
+                // free variable). Without this the inner function's reads fell
+                // through to the environment and answered `undefined`, which is
+                // what made every `counter()`-style closure test report `1,1,1`.
+                let captured_vars = self.take_pending_captured_vars();
+                let obj_val = if captured_vars.is_empty() {
+                    self.materialize_function(func_id)
+                } else {
+                    // Its *own* object: `materialize_function` memoizes by
+                    // `func_id`, so two evaluations of one expression inside a
+                    // loop would otherwise share (and overwrite) one capture set.
+                    self.make_capturing_function_object(func_id, captured_vars)
+                };
                 self.set_value(operands[0], obj_val)?;
             }
             Opcode::MakeArrowFuncObj => {
@@ -3247,20 +3309,7 @@ impl VM {
                     v if v.is_undefined() => self.state.this_val.clone(),
                     v => v,
                 };
-                // Collect all pending captured variables from closure_var_stack
-                // The variables were pushed by ClosureVar instructions in order
-                let mut captured_vars: Vec<(String, Value)> = Vec::new();
-                while let Some(vars) = self.state.closure_var_stack.last() {
-                    if vars.is_empty() {
-                        break;
-                    }
-                    // Pop the outermost entry (most recently pushed group)
-                    let entry = self.state.closure_var_stack.pop().unwrap();
-                    // Insert at front to maintain original order
-                    for (k, v) in entry {
-                        captured_vars.push((k, v));
-                    }
-                }
+                let captured_vars = self.take_pending_captured_vars();
                 // An arrow has no `[[Construct]]`: it inherits `new.target` from
                 // the frame that created it, so capture that value here (the
                 // same create-time snapshot rule used for `this`).
