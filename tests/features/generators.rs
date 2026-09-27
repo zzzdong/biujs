@@ -729,3 +729,53 @@ fn a_generator_in_its_boxed_spelling_only_builds_the_object() {
         3.0
     );
 }
+
+#[test]
+fn a_generator_prologue_inside_a_parameter_default_is_re_entrant() {
+    // Creating a generator runs only its *parameter* prologue. A default that
+    // itself creates a generator (`[[,] = g()]`) used to clobber the
+    // "in a prologue" flag on the way out, so the outer method's barrier was
+    // ignored: the body ran during creation and again at the first `next()`.
+    assert_eq!(
+        eval_number(
+            "var cc = 0;
+             function* g() { yield; }
+             var o = { *m([[,] = g()]) { cc = cc + 1; } };
+             var it = o.m([]);
+             cc"
+        ),
+        0.0
+    );
+    assert_eq!(
+        eval_number(
+            "var cc = 0;
+             function* g() { yield; }
+             var o = { *m([[,] = g()]) { cc = cc + 1; } };
+             o.m([]).next();
+             cc"
+        ),
+        1.0
+    );
+    // The default's generator is advanced by exactly one step and left open.
+    assert_eq!(
+        eval_string(
+            "var first = 0, second = 0;
+             function* g() { first += 1; yield; second += 1; }
+             var C = class { static *m([[,] = g()]) {} };
+             C.m([]).next();
+             first + '/' + second"
+        ),
+        "1/0"
+    );
+    // The same through an instance method.
+    assert_eq!(
+        eval_number(
+            "var cc = 0;
+             function* g() { yield; }
+             class C { *m([[,] = g()]) { cc = cc + 1; } }
+             new C().m([]).next();
+             cc"
+        ),
+        1.0
+    );
+}

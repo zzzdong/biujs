@@ -5763,9 +5763,16 @@ impl VM {
         let delegate_depth = self.delegate_stack.len();
         self.push_generator_frame(func_id, this, args, captured_vars, module)?;
         let closure_depth = self.state.closure_var_stack.len();
+        // Save and *restore*: a parameter default may create another generator
+        // (`function* g() {…}` called as `[[,] = g()]`), and that nested prologue
+        // used to clear this flag on its way out. The outer method's `PrologueEnd`
+        // then found it `false` and did nothing — the whole body ran *during*
+        // creation, and the first `next()` ran it a second time
+        // (`class C { static *m([[,] = g()]) { cc += 1; } }` reported `cc=2`).
+        let outer_prologue_flag = self.running_generator_prologue;
         self.running_generator_prologue = true;
         let run = self.run_generator_frame(&saved, closure_depth, delegate_depth, module);
-        self.running_generator_prologue = false;
+        self.running_generator_prologue = outer_prologue_flag;
         // A parameter binding that threw leaves the generator finished: without
         // this, a later `next()` on it panicked (see
         // `run_generator_frame_or_complete`).

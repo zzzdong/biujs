@@ -1,9 +1,9 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
-# 最近更新：2026-09-27
+# 最近更新：2026-09-28
 language/statements/for-of	612	44	95
-language/statements/generators	226	14	26
-language/expressions/generators	240	18	32
+language/statements/generators	232	14	20
+language/expressions/generators	246	18	26
 language/expressions/yield	40	3	20
 language/statements/for-in	78	22	15
 language/destructuring	15	3	1
@@ -18,7 +18,7 @@ language/expressions/bitwise-not	11	3	2
 language/expressions/bitwise-or	20	7	3
 language/expressions/bitwise-xor	20	7	3
 language/expressions/call	55	19	18
-language/expressions/class	1206	2745	108
+language/expressions/class	1218	2745	96
 language/expressions/coalesce	21	2	1
 language/expressions/comma	4	2	0
 language/expressions/complement	0	0	0
@@ -45,7 +45,7 @@ language/expressions/modulus	30	7	3
 language/expressions/multiplication	31	6	3
 language/expressions/new	46	3	10
 language/expressions/new.target	10	3	1
-language/expressions/object	692	418	60
+language/expressions/object	698	418	54
 language/expressions/postfix-decrement	25	5	7
 language/expressions/postfix-increment	26	5	7
 language/expressions/prefix-decrement	22	5	7
@@ -64,7 +64,7 @@ language/expressions/void	8	1	0
 language/expressions/arrow-function	218	22	103
 language/statements/block	12	7	2
 language/statements/break	18	2	0
-language/statements/class	1342	2863	162
+language/statements/class	1354	2863	150
 language/statements/const	122	5	9
 language/statements/continue	19	5	0
 language/statements/do-while	26	10	0
