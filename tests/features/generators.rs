@@ -706,3 +706,26 @@ fn a_generator_that_threw_is_completed() {
         true
     );
 }
+
+#[test]
+fn a_generator_in_its_boxed_spelling_only_builds_the_object() {
+    // Calling a generator function expression materialized by `MakeFuncObj` — or
+    // a generator method taken off its object — must only build the generator,
+    // exactly like the bare `Value::Function` spelling does.
+    assert_eq!(
+        eval_number("var it = (function* () { yield 1; })(); it.next().value"),
+        1.0
+    );
+    assert_eq!(
+        eval_number("var f = function* () { yield 2; }; f().next().value"),
+        2.0
+    );
+    assert_eq!(
+        eval_number(
+            "class C { *m() { yield 3; } }
+             var g = C.prototype.m;
+             g.call(new C()).next().value"
+        ),
+        3.0
+    );
+}

@@ -1938,6 +1938,30 @@ impl VM {
                             let captured_vars = func_obj.captured_vars.clone();
                             drop(borrowed);
 
+                            // `function*` in its *boxed* spelling: a generator
+                            // method taken off its object (`var g = C.prototype.m; g()`),
+                            // or a generator function expression materialized by
+                            // `MakeFuncObj`. Like the bare arm above and
+                            // `invoke`, this only builds the generator object —
+                            // running the body here executed it eagerly and
+                            // returned its (empty) `rv`, so
+                            // `var it = (function* () {})()` was `undefined` and
+                            // every parameter pattern that iterated it died with
+                            // `GetMethod(undefined, @@iterator)`.
+                            if module.generators.contains(&id) {
+                                let args = self.collect_call_args(arg_count)?;
+                                let gobj = self.create_generator(
+                                    id,
+                                    captured_this.unwrap_or(Value::Undefined),
+                                    args,
+                                    captured_vars,
+                                    module,
+                                )?;
+                                self.state.set_register(Register::Rv, gobj)?;
+                                self.state.jump_offset(1);
+                                return Ok(());
+                            }
+
                             self.state.enter_frame(arg_count)?;
                             self.state.this_val = captured_this.unwrap_or(Value::Undefined);
                             self.state.function_val = Value::Object(Rc::clone(&obj_ref));

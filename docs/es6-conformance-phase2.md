@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15306 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 488 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15410 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 490 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1465,6 +1465,64 @@ probe E  var c=function(){var n=0;return {inc:function(){n=n+1;},get:function(){
 `language/expressions/arrow-function`、`language/statements/for`、`language/statements/let`
 五套件在"改动前/改动后"各跑一次，用 `comm` 对比失败清单（只允许"修好"方向的变化），
 最后全量确认零回退。
+
+---
+
+#### B28 闭包捕获第一层 + 装箱 callee 的生成器判定 —— 已完成（2026-09-27）
+
+**起点**：通过 15306 / 18277（83.74%），失败 2971，跳过 8133。
+
+这一批是 B27 设计稿"门禁"清掉之后的第 1 层落地，两个根因：
+
+**根因一：装箱 callee 的调用路径漏了生成器判定**（B26/B27 门禁的真凶）。
+
+`Opcode::Call` 的 `Value::Function(id)` 分支有 `module.generators` 检查，而**`Value::Object`
+分支没有** —— 于是"生成器被物化成对象"之后再调用，生成器体会**立即执行**、返回它（通常为空）的
+`rv`。触发这条路径有两种现成写法：`var f = function* () {}; f()`（`MakeFuncObj` 物化）与
+**从对象上取下生成器方法**（`var g = C.prototype.m;`）—— 与 B24 修的 `CallMethod` 是同一类漏洞，
+只是换了个分支。
+
+**定位过程有意思**：最初以为触发点在 harness（"只有装载 harness 才复现"），于是把
+`sta.js + assert.js + 用例`拼成一个脚本脱离 runner 复现，结果发现**只拼 stub 就复现** ——
+真正的条件是把用例二分出来的：`f(iter)` 里那个 `iter` 是生成器对象，而 `typeof iter` 本身就是
+`undefined`。也就是说不是"实参丢失"，是**生成器对象根本没造出来**。
+
+**根因二：函数表达式不捕获**（B26 三层根因的第 1 层，门禁清掉后安全落地）。
+
+`lower_function_expr` 传 `&[]` 并返回裸 `Value::Function`（惰性物化走按 `func_id` 记忆化的
+`materialize_function`，不带捕获）。现在：算自由标识符 → 发 `ClosureVar` → 显式 `make_func_obj`
+（有捕获时**新建**对象，不复用记忆化的那个）。落地时带上了 B26 摸出来的两条修正：
+**环境绑定（脚本 `var` / 脚本词法）跳过捕获**（它们本来就共享，捕获只会冻结副本 —— 这条差了
+−94），**`arguments` 不算外部自由变量**（否则函数自己的绑定被剔掉）。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15306 | **15410** | **+104** |
+| 失败 | 2971 | 2867 | −104 |
+| 通过率 | 83.74% | **84.31%** | +0.57pp |
+| 单元 / feature / 护栏 | 190 / 488 / 7 | 190 / **490** / 7 | +2 用例（7 条断言） |
+
+**21 个套件提升、零回退**，最大的几个：`expressions/arrow-function` +33、`expressions/new` +11、
+`statements/class` +8、`expressions/class` +8、`statements/function` +7、`statements/let` +6、
+`for-of` +3、`generators`（两套件）+2、`expressions/function` +2。`guards` 里 timeout 由 3 升到 7
+（逐套件无一下降，说明新增的 4 条都是基线里本已失败的用例）。
+
+**两条经验**
+
+1. **"只在 X 下复现"要先怀疑复现成本身**：`sta.js + assert.js + 用例` 这条拼装没有把 runner 的
+   全部行为带进来，反而误导了一轮；把依赖剥离到"stub + 用例"才看见真条件。**最小化复现比猜测
+   harness 里哪个结构更有效**。
+2. **同一个语义的每个"自己搭帧"分支都要问一遍生成器**（B24 的规矩在 `Value::Object` 上再应验一次）。
+   本批之后，`Opcode::Call` 的两个分支、`CallMethod`、`invoke`、`CallSpread` 都对生成器一致了。
+
+**残留**（下一批的输入）
+
+1. **写**的那一半仍是债：`function counter() { var i = 0; return function () { i = i + 1; return i; }; }`
+   仍是 `0,0,0` —— 需要 B27 设计稿里的**共享 cell**（读那半已经好了）。
+2. **提升的函数声明**仍不捕获（快照模型在它身上必错，等 cell）。
+3. `statements/function` 剩下的 30 条集中在 `dstr/*` 与参数默认值族。
 
 ---
 

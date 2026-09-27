@@ -348,3 +348,33 @@ fn an_anonymous_function_takes_the_name_of_what_it_is_assigned_to() {
     assert_eq!(eval_string("(function () {}).name"), "");
     assert_eq!(eval_string("(class {}).name"), "");
 }
+
+#[test]
+fn a_function_expression_captures_its_enclosing_scope() {
+    // `function` expressions now capture like arrows do: the inner function sees
+    // the outer binding instead of falling through to the environment.
+    assert_eq!(
+        eval_number("function counter() { var i = 5; return function () { return i; }; } counter()()"),
+        5.0
+    );
+    assert_eq!(
+        eval_number("function outer() { var n = 1; return function () { return n + 1; }; } outer()()"),
+        2.0
+    );
+    // Each evaluation captures its own copy.
+    assert_eq!(
+        eval_string(
+            "function mk(v) { return function () { return v; }; }
+             var a = mk(1), b = mk(2);
+             a() + ',' + b()"
+        ),
+        "1,2"
+    );
+    // A *script-scope* binding is not captured — it already lives in the
+    // environment, and both sides read/write it there. Capturing it would freeze
+    // a copy (the single most common test262 shape reported 0 instead of 1).
+    assert_eq!(
+        eval_number("var callCount = 0; var f = function () { callCount = callCount + 1; }; f(); callCount"),
+        1.0
+    );
+}
