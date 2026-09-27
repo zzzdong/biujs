@@ -1524,6 +1524,29 @@ probe E  var c=function(){var n=0;return {inc:function(){n=n+1;},get:function(){
 2. **提升的函数声明**仍不捕获（快照模型在它身上必错，等 cell）。
 3. `statements/function` 剩下的 30 条集中在 `dstr/*` 与参数默认值族。
 
+**B28 之后的下一批候选（本轮的侦察结果）**
+
+`class` 两套件剩 270 条，构成：`dstr` 88、`elements` 74、`builtin-objects` 19、`definition` 17。
+`elements` 里最大的一块（36 条 `Expected a SyntaxError but got a ReferenceError`）全部是
+`*-indirect-eval-*` / `*-eval-*` 用例 —— 需要 `eval`，**范围外**，不要再花时间。
+
+`dstr` 的 88 条集中在**生成器方法的形参**（`gen-meth-static-*` 28、`gen-meth-dflt-*` 16、
+`meth-static-dflt-*` 8 …）。已定位到一个**可复现的独立缺陷**：
+
+```js
+var first = 0, second = 0, cc = 0;
+function* g() { first += 1; yield; second += 1; }
+var C = class { static *m([[,] = g()]) { cc = cc + 1; } };
+C.m([]).next();
+// node: cc=1 first=1 second=0     引擎: cc=2 first=2 second=0   ← 生成器体与默认值各跑了两次
+```
+
+已排除（都正确，不要再从这些方向找）：无参的类/对象/静态生成器方法、普通生成器函数、
+方法 + 简单形参、方法 + 默认值形参、方法 + 数组模式形参。触发需要
+**"嵌套模式里的默认值，且该默认值调用一个生成器"** 这个组合。
+下一批从"这条最小复现为什么跑两遍"入手（怀疑点：生成器方法的*参数前导*与 `PrologueEnd`
+屏障在这条组合上被越过；B17 的前导语义在方法路径上可能只对简单默认值成立）。
+
 ---
 
 ---
