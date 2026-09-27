@@ -87,45 +87,74 @@ if [ "$QUICK" = "1" ]; then
   exit 0
 fi
 # ── 4. 全量 test262 ────────────────────────────────────────────────────────
+# 分两块跑（language / built-ins），每块一个进程。
+#
+# 为什么：单个进程跑完 101 个套件会把峰值顶到内存上限，进程被 OOM 杀掉
+# （`memory allocation … failed` + SIGABRT）。分块后每块结束进程即退出，内存随之
+# 释放。诊断过程见计划书 B31：两个进程各跑一半都正常、逐套件数字与整轮基线逐位
+# 相同，合起来才 OOM —— 所以这是峰值问题，不是某条用例吃内存。
 echo
-echo "== 全量 test262（约 3 分钟，内存上限 ${MEM_LIMIT_KB}KB）=="
-echo "   护栏：单例 ${TEST262_TIMEOUT_MS}ms / ${TEST262_STEP_LIMIT:-默认} 步 / 堆 ${TEST262_MEMORY_MB}MB，整轮硬超时 ${TEST262_HARD_TIMEOUT}s"
-( ulimit -v "$MEM_LIMIT_KB"
-  timeout --signal=TERM "$TEST262_HARD_TIMEOUT" \
-    env TEST262_FAILURES=0 cargo test --release --test test262_runner -- --nocapture ) > "$TMP/full.txt" 2>&1
-RUN_STATUS=$?
+echo "== 全量 test262（分两块跑；每块内存上限 ${MEM_LIMIT_KB}KB）=="
+echo "   护栏：单例 ${TEST262_TIMEOUT_MS}ms / ${TEST262_STEP_LIMIT:-默认} 步 / 堆 ${TEST262_MEMORY_MB}MB，每块硬超时 ${TEST262_HARD_TIMEOUT}s"
+echo "   分块：language（84 个套件）+ built-ins（17 个套件）"
 
-if [ "$RUN_STATUS" = "124" ] || [ "$RUN_STATUS" = "143" ]; then
-  echo "全量回归超过整轮硬超时 ${TEST262_HARD_TIMEOUT}s 被中止。" >&2
-  echo "先看卡在哪个用例：TEST262_TIMINGS=1 复跑看最慢的十条，或 BIUJS_TEST262_TRACE=1 看最后一行。" >&2
-  tail -20 "$TMP/full.txt" >&2
-  exit 1
-fi
-if ! grep -q "^TOTAL" "$TMP/full.txt"; then
-  echo "全量回归没有跑完（进程可能被内存上限打断或崩溃）。" >&2
-  echo "最后 20 行：" >&2
-  tail -20 "$TMP/full.txt" >&2
-  exit 1
-fi
-if [ "$RUN_STATUS" != "0" ]; then
-  echo "test262_runner 退出码 $RUN_STATUS，但摘要已生成 —— 请检查是否有套件报告失败以外的异常。" >&2
-fi
+CHUNKS="language built-ins"
+RUN_STATUS=0
+CHUNK_FILES=""
+for CHUNK in $CHUNKS; do
+  OUT="$TMP/full-$CHUNK.txt"
+  CHUNK_FILES="$CHUNK_FILES $OUT"
+  ( ulimit -v "$MEM_LIMIT_KB"
+    timeout --signal=TERM "$TEST262_HARD_TIMEOUT" \
+      env TEST262_FAILURES=0 TEST262_SUITES="$CHUNK" cargo test --release --test test262_runner -- --nocapture ) > "$OUT" 2>&1
+  STATUS=$?
+  if [ "$STATUS" = "124" ] || [ "$STATUS" = "143" ]; then
+    echo "块 $CHUNK 超过硬超时 ${TEST262_HARD_TIMEOUT}s 被中止。" >&2
+    echo "先看卡在哪个用例：TEST262_TIMINGS=1 复跑看最慢的十条，或 BIUJS_TEST262_TRACE=1 看最后一行。" >&2
+    tail -20 "$TMP/full-$CHUNK.txt" >&2
+    exit 1
+  fi
+  if ! grep -q "^TOTAL" "$TMP/full-$CHUNK.txt"; then
+    echo "块 $CHUNK 没有跑完（进程可能被内存上限打断或崩溃）。" >&2
+    echo "最后 20 行：" >&2
+    tail -20 "$TMP/full-$CHUNK.txt" >&2
+    exit 1
+  fi
+  if [ "$STATUS" != "0" ]; then
+    echo "块 $CHUNK 的 test262_runner 退出码 $STATUS，但摘要已生成 —— 请检查是否有套件报告失败以外的异常。" >&2
+    RUN_STATUS="$STATUS"
+  fi
+done
+# 后面的 grep 仍按整轮输出处理：把两块拼起来。
+cat $CHUNK_FILES > "$TMP/full.txt"
 
-# 摘要表 → TSV（表头下面到分隔线之间的行）
+# 摘要表 → TSV（表头下面到分隔线之间的行）。两块的行直接合起来即为整轮。
 awk '/^suite[[:space:]]+passed/{f=1; next} /^-{10,}/{f=0} f && NF>=4 {print $1"\t"$2"\t"$3"\t"$4}' \
-  "$TMP/full.txt" > "$TMP/new.tsv"
+  $CHUNK_FILES > "$TMP/new.tsv"
 
-# ── 5. 头条数字 ────────────────────────────────────────────────────────────
+# 头条数字：整轮 = 两块之和（每块的 TOTAL 只统计自己那部分套件）。
+SUMS="$(awk '/^[[:space:]]*TOTAL[[:space:]]/{p+=$2; s+=$3; f+=$4} END{print p+0, s+0, f+0}' \
+  $CHUNK_FILES)"
+PASSED="$(echo "$SUMS" | awk '{print $1}')"
+SKIPPED="$(echo "$SUMS" | awk '{print $2}')"
+FAILED="$(echo "$SUMS" | awk '{print $3}')"
+EXECUTED=$((PASSED + FAILED))
+RATE="$(awk -v p="$PASSED" -v e="$EXECUTED" 'BEGIN{printf "%.2f", (e ? p * 100 / e : 0)}')"
+GUARD_SUMS="$(awk '/^[[:space:]]*guards:/{gsub(/,/, ""); for (i = 1; i <= NF; i++) {
+                     if ($i == "timeout") t += $(i+1);
+                     else if ($i == "step-limit") s += $(i+1);
+                     else if ($i == "memory") m += $(i+1);
+                   }} END{print t+0, s+0, m+0}' \
+  $CHUNK_FILES)"
 echo
 hr
-grep -E "^(TOTAL|pass rate|guards)" "$TMP/full.txt" | sed 's/^/  /'
-TOTAL_LINE="$(grep '^TOTAL' "$TMP/full.txt" | head -1)"
-EXECUTED=$(echo "$TOTAL_LINE" | awk '{print $2+$4}')
-PASSED=$(echo "$TOTAL_LINE" | awk '{print $2}')
-SKIPPED=$(echo "$TOTAL_LINE" | awk '{print $3}')
-FAILED=$(echo "$TOTAL_LINE" | awk '{print $4}')
+printf '  TOTAL                                              %s    %s    %s\n' "$PASSED" "$SKIPPED" "$FAILED"
+echo "  pass rate over executed tests: ${RATE}% (${PASSED} / ${EXECUTED})"
+printf '  guards: timeout %s, step-limit %s, memory %s   (TEST262_TIMEOUT_MS / TEST262_STEP_LIMIT / TEST262_MEMORY_MB, 0 = off)\n' \
+  $(echo "$GUARD_SUMS" | awk '{print $1}') $(echo "$GUARD_SUMS" | awk '{print $2}') $(echo "$GUARD_SUMS" | awk '{print $3}')
 echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 
+# ── 5. 头条数字 ────────────────────────────────────────────────────────────
 # 跳过数是个"不变量"：表里只剩范围外/G3 排除项时它应当稳定。
 # 它变了意味着有人动了跳过表 —— 那必须是一次有意的、写进 §6.2 的决定。
 # 8109 → 8143（B2a）：`built-ins/Map` 入册，套件自带的 42 条 feature 门控用例
