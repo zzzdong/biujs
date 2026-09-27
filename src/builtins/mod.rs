@@ -1,6 +1,7 @@
 mod array;
 mod boolean;
 mod console;
+mod date;
 mod error;
 mod function;
 mod json;
@@ -25,6 +26,7 @@ use crate::vm::value::Value;
 pub use crate::vm::ObjectKind;
 
 pub use array::{ARRAY_SPECIES_NATIVE, array_constructor, validate_array_length};
+pub use date::date_construct_value;
 pub use boolean::boolean_constructor;
 pub use error::{
     ErrorType, create_error_object, error_constructor, runtime_error_to_js_error,
@@ -395,6 +397,7 @@ pub struct Builtins {
     pub set_prototype: Rc<RefCell<dyn JSObject>>,
     pub weakmap_prototype: Rc<RefCell<dyn JSObject>>,
     pub weakset_prototype: Rc<RefCell<dyn JSObject>>,
+    pub date_prototype: Rc<RefCell<dyn JSObject>>,
 }
 
 impl Builtins {
@@ -417,6 +420,7 @@ impl Builtins {
         let set_proto = new_proto(Some(Rc::clone(&object_proto)), "Set");
         let weakmap_proto = new_proto(Some(Rc::clone(&object_proto)), "WeakMap");
         let weakset_proto = new_proto(Some(Rc::clone(&object_proto)), "WeakSet");
+        let date_proto = new_proto(Some(Rc::clone(&object_proto)), "Date");
 
         // Needed before any built-in function object is created: every one of
         // them inherits from `Function.prototype`.
@@ -444,6 +448,7 @@ impl Builtins {
             set_prototype: set_proto,
             weakmap_prototype: weakmap_proto,
             weakset_prototype: weakset_proto,
+            date_prototype: date_proto,
         }
     }
 
@@ -770,6 +775,17 @@ impl Builtins {
         // cannot do without: without it the only way to observe a value is to
         // `throw` it.
         globals.insert("console".to_string(), console::create_console_object());
+
+        // `Date`: everyday scripts need wall-clock time. `new Date(...)` builds
+        // the object in the VM (`Date()` without `new` answers a *string*, so
+        // the two cannot share `call_native`).
+        let date_fn_val =
+            Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("Date"))));
+        date::register_date_prototype(&self.date_prototype);
+        date::register_date_statics(&date_fn_val);
+        Self::link_constructor_prototype(&date_fn_val, &self.date_prototype);
+        register_wrapper_prototype("Date", Rc::clone(&self.date_prototype));
+        globals.insert("Date".to_string(), date_fn_val);
         globals.insert("JSON".to_string(), json::register_json());
 
         // Global convenience functions (they are plain functions, not
@@ -888,6 +904,9 @@ pub fn call_native(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         "SyntaxError" => error::error_constructor(error::ErrorType::SyntaxError, args),
         "URIError" => error::error_constructor(error::ErrorType::URIError, args),
         "EvalError" => error::error_constructor(error::ErrorType::EvalError, args),
+        // `Date()` without `new` returns a *string* (ES 21.4.2.1); `new Date()`
+        // goes through `VM::date_construct` instead.
+        "Date" => date::date_as_function(args),
         "parseInt" => global_parse_int(args),
         "encodeURIComponent" => global_encode_uri(args, false),
         "encodeURI" => global_encode_uri(args, true),
@@ -970,6 +989,9 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
                 })
                 .unwrap_or(f64::NAN),
         )),
+        "Date.now" => date::date_now(args),
+        "Date.parse" => date::date_parse(args),
+        "Date.UTC" => date::date_utc(args),
         "Object.fromEntries" => object::object_from_entries(args),
         "Object.keys" => object::object_keys(args),
         "Object.values" => object::object_values(args),
@@ -1034,17 +1056,63 @@ pub fn call_prototype_method(
         "toString" if matches!(obj, Value::Number(_)) => {
             number::number_to_string_with_radix(obj, args)
         }
-        "toString" => dispatch_to_string(obj),
+        "toString" => {
+            // A Date overrides `toString` (and `toLocaleString`), and these two
+            // names are on every object — so the receiver decides.
+            if date::is_date_receiver(obj) {
+                date::date_to_string(obj, args)
+            } else {
+                dispatch_to_string(obj)
+            }
+        }
         // `Object.prototype.toLocaleString` delegates to `toString`
         // (ES 20.1.3.5); Array/Number inherit the same entry.
         // ES 20.1.3.5: unlike `Object.prototype.toString`, whose prologue
         // special-cases `undefined`/`null` into `[[object Undefined]]` /
         // `[[object Null]]`, `toLocaleString` starts with `ToObject(this)`.
         "toLocaleString" => {
+            if date::is_date_receiver(obj) {
+                return date::date_to_string(obj, args);
+            }
             require_object_coercible(obj)?;
             dispatch_to_string(obj)
         }
-        "valueOf" => dispatch_value_of(obj),
+        "valueOf" => {
+            if date::is_date_receiver(obj) {
+                date::date_value_of(obj)
+            } else {
+                dispatch_value_of(obj)
+            }
+        }
+        "getTime" => date::date_value_of(obj),
+        "toISOString" => date::date_to_iso_string(obj),
+        "toJSON" => date::date_to_json(obj),
+        "toDateString" => date::date_to_date_string(obj),
+        "toTimeString" => date::date_to_time_string(obj),
+        "toUTCString" => date::date_to_utc_string(obj),
+        // No locale data: the `toLocale*` forms are their spec-shaped defaults.
+        "toLocaleDateString" => date::date_to_date_string(obj),
+        "toLocaleTimeString" => date::date_to_time_string(obj),
+        "getFullYear" => date::date_component(obj, 0, false),
+        "getMonth" => date::date_component(obj, 1, false),
+        "getDate" => date::date_component(obj, 2, false),
+        "getDay" => date::date_component(obj, 3, false),
+        "getHours" => date::date_component(obj, 4, false),
+        "getMinutes" => date::date_component(obj, 5, false),
+        "getSeconds" => date::date_component(obj, 6, false),
+        "getMilliseconds" => date::date_component(obj, 7, false),
+        "getTimezoneOffset" => date::date_timezone_offset(obj),
+        "getUTCFullYear" => date::date_component(obj, 0, true),
+        "getUTCMonth" => date::date_component(obj, 1, true),
+        "getUTCDate" => date::date_component(obj, 2, true),
+        "getUTCDay" => date::date_component(obj, 3, true),
+        "getUTCHours" => date::date_component(obj, 4, true),
+        "getUTCMinutes" => date::date_component(obj, 5, true),
+        "getUTCSeconds" => date::date_component(obj, 6, true),
+        "setTime" => date::date_set_time(obj, args),
+        "setFullYear" => date::date_set_full_year(obj, args),
+        "setMonth" => date::date_set_month(obj, args),
+        "setDate" => date::date_set_date(obj, args),
         // Map / Set prototype methods are deliberately *not* in this table:
         // `get`, `has`, `delete`, … are ordinary property names on any other
         // object (`{ get: function () { … } }`), and `Map.prototype.has` is not

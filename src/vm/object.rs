@@ -2073,6 +2073,101 @@ fn map_key(key: Value) -> Value {
 /// start skipping entries as soon as an earlier one was deleted (the vector
 /// shifts left). `clear` is the only operation that drops the tombstones.
 #[derive(Debug)]
+/// A `Date` instance: an ordinary object plus the `[[DateValue]]` internal slot
+/// (ES 21.4.1.1) — milliseconds since the Unix epoch, `NaN` for *Invalid Date*.
+///
+/// The slot has to live on a dedicated type: `OrdinaryObject` has no internal
+/// slots, and keeping it in a property would make it observable
+/// (`Object.getOwnPropertyNames(new Date())` must be empty).
+pub struct DateObject {
+    /// `[[DateValue]]`: ms since epoch in UTC, `NaN` when invalid.
+    pub time_value: f64,
+    base: OrdinaryObject,
+}
+
+impl DateObject {
+    pub fn new(time_value: f64, prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        let mut base = OrdinaryObject::with_class_name("Date");
+        base.set_prototype(prototype);
+        Self { time_value, base }
+    }
+
+    /// `[[DateValue]]` as an `i64` of milliseconds, or `None` when invalid.
+    pub fn millis(&self) -> Option<i64> {
+        if self.time_value.is_nan() {
+            return None;
+        }
+        Some(self.time_value as i64)
+    }
+}
+
+impl JSObject for DateObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Date
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    // Everything below is the ordinary object behaviour, delegated: a Date has
+    // no exotic properties, only an internal slot.
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        self.base.property_get(key)
+    }
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        self.base.property_set(key, value)
+    }
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        self.base.define_property(key, descriptor)
+    }
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        self.base.property_delete(key)
+    }
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        self.base.has_property(key)
+    }
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.base.own_keys()
+    }
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.base.get_prototype()
+    }
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.base.set_prototype(proto)
+    }
+    fn is_extensible(&self) -> bool {
+        self.base.is_extensible()
+    }
+    fn prevent_extensions(&mut self) {
+        self.base.prevent_extensions()
+    }
+    fn is_frozen(&self) -> bool {
+        self.base.is_frozen()
+    }
+    fn freeze(&mut self) {
+        self.base.freeze()
+    }
+    fn is_sealed(&self) -> bool {
+        self.base.is_sealed()
+    }
+    fn seal(&mut self) {
+        self.base.seal()
+    }
+    fn class_name(&self) -> &'static str {
+        "Date"
+    }
+}
+
+#[derive(Debug)]
 pub struct MapObject {
     entries: Vec<Option<(Value, Value)>>,
     properties: PropertyTable,

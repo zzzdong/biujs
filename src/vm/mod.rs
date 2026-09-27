@@ -6973,6 +6973,13 @@ impl VM {
         if name == "WeakSet" {
             return self.weakset_construct(constructor_val, args, new_target, module);
         }
+        // `new Date(...)` builds the object itself: `Date()` without `new`
+        // answers a *string*, so `call_native` cannot serve both
+        // (ES 21.4.2.1 vs 21.4.3.1).
+        if name == "Date" {
+            let proto = self.prototype_from_constructor(constructor_val, new_target);
+            return crate::builtins::date_construct_value(args, proto);
+        }
 
         // ES 9.1.14 `GetPrototypeFromConstructor`: `newTarget.prototype` when
         // it is an object, otherwise the constructor's own `prototype` — which

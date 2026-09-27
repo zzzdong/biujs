@@ -516,3 +516,63 @@ fn everyday_surface_that_had_no_way_to_be_used() {
         "URIError"
     );
 }
+
+#[test]
+fn date_is_usable_for_everyday_time_handling() {
+    // Construction: time value, components, and a parsed string.
+    assert_eq!(eval_string("typeof new Date()"), "object");
+    assert_eq!(
+        eval_string("Object.prototype.toString.call(new Date())"),
+        "[object Date]"
+    );
+    assert_eq!(
+        eval_string("new Date(0).toISOString()"),
+        "1970-01-01T00:00:00.000Z"
+    );
+    assert_eq!(eval_number("new Date(2020, 0, 2, 3, 4, 5, 6).getFullYear()"), 2020.0);
+    assert_eq!(eval_number("new Date(2020, 0, 2, 3, 4, 5, 6).getMonth()"), 0.0);
+    assert_eq!(eval_number("new Date(2020, 0, 2, 3, 4, 5, 6).getDate()"), 2.0);
+    assert_eq!(eval_number("new Date(2020, 0, 2, 3, 4, 5, 6).getHours()"), 3.0);
+    assert_eq!(
+        eval_number("new Date(2020, 0, 2, 3, 4, 5, 6).getMilliseconds()"),
+        6.0
+    );
+    // A year below 100 is offset by 1900 (ES 21.4.1.1).
+    assert_eq!(eval_number("new Date(90, 0, 1).getFullYear()"), 1990.0);
+
+    // Statics.
+    assert_eq!(eval_number("Date.parse('2020-01-02T03:04:05Z')"), 1577934245000.0);
+    assert_eq!(eval_number("Date.UTC(2020, 0, 2)"), 1577923200000.0);
+    assert_eq!(eval_string("typeof Date.now()"), "number");
+    // `Date()` without `new` answers a string (ES 21.4.2.1).
+    assert_eq!(eval_string("typeof Date()"), "string");
+
+    // An unparsable string is the Invalid Date: `getTime` is NaN and `toString`
+    // says so, while `toJSON` answers `null` so `JSON.stringify` survives it.
+    assert_eq!(eval_string("new Date('nope').toString()"), "Invalid Date");
+    assert_eq!(eval_string("String(new Date('nope').getTime())"), "NaN");
+    assert_eq!(eval_string("JSON.stringify(new Date('nope'))"), "null");
+    assert_eq!(
+        eval_string("JSON.stringify({ d: new Date(0) })"),
+        "{\"d\":\"1970-01-01T00:00:00.000Z\"}"
+    );
+
+    // Comparing Dates works through `valueOf`. NOTE: `a - b` on *objects* is
+    // still a gap — binary arithmetic does not run ToPrimitive, so it answers
+    // NaN (recorded as a B31 residual).
+    assert_eq!(
+        eval_string(
+            "[new Date(300), new Date(100)].sort(function (a, b) { return a.valueOf() - b.valueOf(); })\n             .map(function (d) { return d.getTime(); }).join(',')"
+        ),
+        "100,300"
+    );
+
+    // Setters keep the time and answer the new time value.
+    assert_eq!(eval_number("new Date(0).setTime(5000)"), 5000.0);
+    assert_eq!(
+        eval_number(
+            "(function () { var d = new Date(0); d.setFullYear(2020); return d.getFullYear(); })()"
+        ),
+        2020.0
+    );
+}

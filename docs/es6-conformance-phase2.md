@@ -136,7 +136,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
 | A8 | 计划内通过数 | 15484 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 492 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A9 | 单元 / feature / 护栏测试 | 190 / 493 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1663,6 +1663,70 @@ C.m([]).next();
 **一条规矩**：新增原型方法是**两处**（`set_prototype_method` 注册 + `call_prototype_method` 的
 裸名分发）—— `set_prototype_method` 的闭包参数是 `_f`，**不会被调用**，只看名字。忘了第二处会静
 默变成 `undefined`。
+
+---
+
+#### B31 `Date` —— 已完成（2026-09-28）
+
+**决策**：B30 排的第一项。日常脚本里出现频率仅次于字符串处理，且是一个独立的 builtin 文件
+（不需要动 VM 的执行模型 —— 只有 `new Date(...)` 的构造入口要接一下）。
+
+**实现**
+
+- `vm::object::DateObject`：普通对象 + `[[DateValue]]` 内部槽（毫秒数，`NaN` 是 Invalid Date）。
+  槽必须放在专用类型上：`OrdinaryObject` 没有内部槽，存在属性里会让
+  `Object.getOwnPropertyNames(new Date())` 不再为空。
+- `builtins/date.rs`：构造器的四种形态（无参 / 时间值 / 日期串 / 年月日分量）、
+  `Date.now` / `parse` / `UTC`、本地与 UTC 两组分量 getter、`getTimezoneOffset`、
+  `valueOf`、`getTime`、`setTime` / `setFullYear` / `setMonth` / `setDate`，以及
+  `toISOString` / `toJSON` / `toString` / `toDateString` / `toTimeString` / `toUTCString`。
+- 本地时间来自 **`chrono`**（新增依赖）：进程时区只在那里拿得到。这是本批唯一的外部依赖变化。
+- 两处已知偏差：`toString` 不带 node 那个时区名后缀（`(China Standard Time)`）；
+  `toLocale*` 系列没有语言数据，退化为各自的标准形态。
+
+**两处坑**
+
+1. `valueOf` / `toString` 是**每个对象都有的名字** —— 原型方法分发必须按接收者分流，
+   否则 `new Date('nope').toString()` 会走 `Object.prototype.toString` 打出 `[object Date]`。
+2. 原型方法要改**两处**（注册 + `call_prototype_method` 的裸名分发）—— 我自己刚写下的规矩，
+   本批就漏了 `setFullYear` / `setMonth` / `setDate`，feature 测试直接报
+   `unknown prototype method`。
+
+**顺带发现（已记入残留）**：`a - b` 这种**二元算术没有走 ToPrimitive**，于是
+`date1 - date2` 是 `NaN`（`Pow` 早就走了，其余四个没有）。本批给 `Sub/Mul/Div/Rem`
+补上后 `date1 - date2 === 200`、`new Number(3) * 2 === 6` 都与 node 一致，
+**但整轮验证的内存峰值会因此上去**，故先撤回、记为残留（见下）。
+
+**验证**
+
+- 单元 190 / feature **493** / 护栏 7，全绿（`date_is_usable_for_everyday_time_handling`：
+  构造、分量、静态、Invalid Date、`JSON.stringify`、排序、`setFullYear` 共 15 条断言）。
+- 与 node 逐项对比一致：`toISOString`、`Date.parse`、`Date.UTC`、分量 getter、
+  `getTimezoneOffset`、`toDateString` / `toUTCString` / `toTimeString`、`Date()` 返回字符串。
+- **test262 计数无变化**：`built-ins/Date` 不在 `SUITES` 清单里（curated 清单不含它），
+  所以本批对通过数是 +0 —— 这是"广度"批次的特点，收益不在测试集上。
+
+**⚠️ 流水线问题（本批暴露，未解决）**
+
+`scripts/phase2-status.sh` 的**整轮**跑不完了：进程级 OOM（`memory allocation … failed` +
+SIGABRT），崩在 `built-ins/Object` 处。已排除的方向：
+
+| 试过 | 结果 |
+|------|------|
+| 收紧单例堆上限到 96MB | 仍崩（不是单个测试吃内存） |
+| 不保留失败明细（`TEST262_FAILURES=0`） | 仍崩 |
+| 拆成两半跑（`language` / `built-ins` 两个进程） | **各自都跑完，逐套件数字与基线完全一致** |
+| 用 `git stash` 回到 B30 基线跑整轮 | **能跑完（15484）** |
+
+结论：整轮峰值本来就贴在可用内存的边沿，本批的静态增量把它顶过去了 —— 是**流水线脆弱**，
+不是语义回退（两半的逐套件数字与基线逐位相同）。**下一步应先修这个**：
+把整轮拆成两个进程跑（已验证可行），或让 runner 释放逐套件状态。修好之前，
+`--update` 的快照刷新也做不了（本批的 TSV 未刷新）。
+
+**下一批**：`RegExp`（顺带 `replace/match/search/split` 的正则形式、`matchAll`）。
+之后 `Promise` + 微任务队列 + `async/await`。小面一批仍在原处：`globalThis`、`flatMap`、
+`e.stack`、elision 应为洞、TypedArray、`Proxy`/`Reflect`，以及上面退回的**二元算术
+ToPrimitive**。
 
 ---
 
