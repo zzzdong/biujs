@@ -2,6 +2,7 @@ mod array;
 mod boolean;
 mod console;
 mod date;
+mod regexp;
 mod error;
 mod function;
 mod json;
@@ -27,6 +28,7 @@ pub use crate::vm::ObjectKind;
 
 pub use array::{ARRAY_SPECIES_NATIVE, array_constructor, validate_array_length};
 pub use date::date_construct_value;
+pub use regexp::regexp_construct_value;
 pub use boolean::boolean_constructor;
 pub use error::{
     ErrorType, create_error_object, error_constructor, runtime_error_to_js_error,
@@ -398,6 +400,7 @@ pub struct Builtins {
     pub weakmap_prototype: Rc<RefCell<dyn JSObject>>,
     pub weakset_prototype: Rc<RefCell<dyn JSObject>>,
     pub date_prototype: Rc<RefCell<dyn JSObject>>,
+    pub regexp_prototype: Rc<RefCell<dyn JSObject>>,
 }
 
 impl Builtins {
@@ -421,6 +424,7 @@ impl Builtins {
         let weakmap_proto = new_proto(Some(Rc::clone(&object_proto)), "WeakMap");
         let weakset_proto = new_proto(Some(Rc::clone(&object_proto)), "WeakSet");
         let date_proto = new_proto(Some(Rc::clone(&object_proto)), "Date");
+        let regexp_proto = new_proto(Some(Rc::clone(&object_proto)), "RegExp");
 
         // Needed before any built-in function object is created: every one of
         // them inherits from `Function.prototype`.
@@ -449,6 +453,7 @@ impl Builtins {
             weakmap_prototype: weakmap_proto,
             weakset_prototype: weakset_proto,
             date_prototype: date_proto,
+            regexp_prototype: regexp_proto,
         }
     }
 
@@ -786,6 +791,16 @@ impl Builtins {
         Self::link_constructor_prototype(&date_fn_val, &self.date_prototype);
         register_wrapper_prototype("Date", Rc::clone(&self.date_prototype));
         globals.insert("Date".to_string(), date_fn_val);
+
+        // `RegExp`: the matcher lives in `vm::object::RegExpObject` (a
+        // `regex::Regex`). `RegExp(...)` answers an object whether or not it is
+        // called with `new`, so `call_native` can serve both paths.
+        let regexp_fn_val =
+            Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("RegExp"))));
+        regexp::register_regexp_prototype(&self.regexp_prototype);
+        Self::link_constructor_prototype(&regexp_fn_val, &self.regexp_prototype);
+        register_wrapper_prototype("RegExp", Rc::clone(&self.regexp_prototype));
+        globals.insert("RegExp".to_string(), regexp_fn_val);
         globals.insert("JSON".to_string(), json::register_json());
 
         // Global convenience functions (they are plain functions, not
@@ -907,6 +922,7 @@ pub fn call_native(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         // `Date()` without `new` returns a *string* (ES 21.4.2.1); `new Date()`
         // goes through `VM::date_construct` instead.
         "Date" => date::date_as_function(args),
+        "RegExp" => regexp::regexp_construct_value(args, None),
         "parseInt" => global_parse_int(args),
         "encodeURIComponent" => global_encode_uri(args, false),
         "encodeURI" => global_encode_uri(args, true),
@@ -1057,14 +1073,20 @@ pub fn call_prototype_method(
             number::number_to_string_with_radix(obj, args)
         }
         "toString" => {
-            // A Date overrides `toString` (and `toLocaleString`), and these two
-            // names are on every object — so the receiver decides.
+            // Date and RegExp both override `toString`, and the name is on every
+            // object — so the receiver decides.
             if date::is_date_receiver(obj) {
                 date::date_to_string(obj, args)
+            } else if regexp::is_regexp_receiver(obj) {
+                regexp::regexp_to_string(obj)
             } else {
                 dispatch_to_string(obj)
             }
         }
+        "match" => regexp::regexp_match(obj, args),
+        "search" => regexp::regexp_search(obj, args),
+        "test" => regexp::regexp_test(obj, args),
+        "exec" => regexp::regexp_exec(obj, args),
         // `Object.prototype.toLocaleString` delegates to `toString`
         // (ES 20.1.3.5); Array/Number inherit the same entry.
         // ES 20.1.3.5: unlike `Object.prototype.toString`, whose prologue
@@ -1142,8 +1164,24 @@ pub fn call_prototype_method(
         "padEnd" => string::string_pad(obj, args, false),
         "codePointAt" => string::string_code_point_at(obj, args),
         // `at` exists on both Array.prototype and String.prototype.
-        "replace" => string::string_replace(obj, args, false),
-        "replaceAll" => string::string_replace(obj, args, true),
+        // A RegExp argument routes to the regex-aware implementation
+        // (`Symbol.replace` / `Symbol.split` in ES); a plain string stays here.
+        // The routing has to happen in the dispatch: the closure passed to
+        // `set_prototype_method` is *not* what runs (`_f` is ignored).
+        "replace" => {
+            if regexp::is_regexp_receiver(args.first().unwrap_or(&Value::Undefined)) {
+                regexp::regexp_replace(obj, args)
+            } else {
+                string::string_replace(obj, args, false)
+            }
+        }
+        "replaceAll" => {
+            if regexp::is_regexp_receiver(args.first().unwrap_or(&Value::Undefined)) {
+                regexp::regexp_replace(obj, args)
+            } else {
+                string::string_replace(obj, args, true)
+            }
+        }
         "flat" => array::array_flat(obj, args),
         "at" => {
             if string_prototype_receiver(obj) {
@@ -1155,7 +1193,13 @@ pub fn call_prototype_method(
         "copyWithin" => array::array_copy_within(obj, args),
         "normalize" => string::string_normalize(obj, args),
         "localeCompare" => string::string_locale_compare(obj, args),
-        "split" => string::string_split(obj, args),
+        "split" => {
+            if regexp::is_regexp_receiver(args.first().unwrap_or(&Value::Undefined)) {
+                regexp::regexp_split(obj, args)
+            } else {
+                string::string_split(obj, args)
+            }
+        }
         "substring" => string::string_substring(obj, args),
         "startsWith" => string::string_starts_with(obj, args),
         "endsWith" => string::string_ends_with(obj, args),

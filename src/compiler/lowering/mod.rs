@@ -1979,6 +1979,7 @@ impl<'a> JSASTLower<'a> {
             Expression::FunctionExpression(func) => self.lower_function_expr(func),
             Expression::SequenceExpression(seq) => self.lower_sequence(seq),
             Expression::TemplateLiteral(tpl) => self.lower_template_literal(tpl),
+            Expression::RegExpLiteral(lit) => self.lower_regexp_literal(lit),
             Expression::ParenthesizedExpression(paren) => self.lower_expression(&paren.expression),
             Expression::ThisExpression(_) => {
                 // If inside an arrow function with captured this, use the captured value
@@ -3100,6 +3101,21 @@ impl<'a> JSASTLower<'a> {
             result = self.lower_expression(expr);
         }
         result
+    }
+
+    /// A regex literal: build the object from its source text and flags.
+    ///
+    /// `/a+/gi` and `new RegExp("a+", "gi")` produce the same thing; the literal
+    /// just carries both pieces at compile time.
+    fn lower_regexp_literal(
+        &mut self,
+        lit: &oxc_ast::ast::RegExpLiteral<'_>,
+    ) -> Value {
+        let dst = self.builder.alloc();
+        let source = self.make_name_constant(&lit.regex.pattern.text.as_str().to_string());
+        let flags = self.make_name_constant(&lit.regex.flags.to_string());
+        self.builder.make_regexp(dst, source, flags);
+        dst
     }
 
     fn lower_template_literal(&mut self, tpl: &TemplateLiteral<'_>) -> Value {

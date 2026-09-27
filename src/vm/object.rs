@@ -2167,6 +2167,175 @@ impl JSObject for DateObject {
     }
 }
 
+/// A `RegExp` instance (ES 22.2): the source text, the flags, the mutable
+/// `lastIndex`, and the compiled matcher.
+///
+/// The matcher is the `regex` crate's `Regex`, so the engine does not carry its
+/// own pattern compiler. That buys the everyday patterns (`\d+`, `[a-z]*`,
+/// alternation, groups) but not the JS-only constructs it cannot express —
+/// lookaround and backreferences — which are reported as unsupported rather
+/// than silently mismatching.
+#[derive(Debug)]
+pub struct RegExpObject {
+    /// The pattern as written (`source`).
+    pub source: String,
+    pub flags: String,
+    /// `lastIndex`: where a `g`/`y` search resumes. Only meaningful with those
+    /// flags, but it is always readable.
+    pub last_index: f64,
+    /// `None` when the pattern could not be compiled.
+    pub compiled: Option<regex::Regex>,
+    base: OrdinaryObject,
+}
+
+impl RegExpObject {
+    pub fn new(
+        source: String,
+        flags: String,
+        prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    ) -> Self {
+        let mut base = OrdinaryObject::with_class_name("RegExp");
+        base.set_prototype(prototype);
+        let compiled = Self::compile(&source, &flags);
+        Self {
+            source,
+            flags,
+            last_index: 0.0,
+            compiled,
+            base,
+        }
+    }
+
+    /// Translate the JS flags onto the Rust builder.
+    fn compile(source: &str, flags: &str) -> Option<regex::Regex> {
+        let mut builder = regex::RegexBuilder::new(source);
+        builder
+            .case_insensitive(flags.contains('i'))
+            .multi_line(flags.contains('m'))
+            .dot_matches_new_line(flags.contains('s'))
+            // Without `u` a JS pattern is a sequence of UTF-16 code units; the
+            // crate is Unicode-aware by default, so only `u` turns it on.
+            .unicode(flags.contains('u'));
+        builder.build().ok()
+    }
+
+    pub fn is_global(&self) -> bool {
+        self.flags.contains('g')
+    }
+
+    pub fn is_sticky(&self) -> bool {
+        self.flags.contains('y')
+    }
+}
+
+impl JSObject for RegExpObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::RegExp
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        // `lastIndex`, `source`, `flags` and the boolean flag reads are the
+        // object's own state, not properties: `lastIndex` in particular has to
+        // be writable *through* to the matcher, which a property copy of it
+        // would not be.
+        if let PropertyKey::Str(k) = key {
+            let slot = match k.as_str() {
+                "lastIndex" => Some((Value::Number(self.last_index), true)),
+                "source" => Some((Value::string(&self.source), false)),
+                "flags" => Some((Value::string(&self.flags), false)),
+                "global" => Some((Value::Bool(self.is_global()), false)),
+                "sticky" => Some((Value::Bool(self.is_sticky()), false)),
+                "ignoreCase" => Some((Value::Bool(self.flags.contains('i')), false)),
+                "multiline" => Some((Value::Bool(self.flags.contains('m')), false)),
+                "dotAll" => Some((Value::Bool(self.flags.contains('s')), false)),
+                "unicode" => Some((Value::Bool(self.flags.contains('u')), false)),
+                "hasIndices" => Some((Value::Bool(self.flags.contains('d')), false)),
+                _ => None,
+            };
+            if let Some((value, writable)) = slot {
+                return Some(PropertyDescriptor {
+                    value,
+                    writable,
+                    // All of them are non-enumerable in ES, which is what keeps
+                    // `Object.keys(/a/)` empty.
+                    enumerable: false,
+                    configurable: false,
+                    getter: None,
+                    setter: None,
+                });
+            }
+        }
+        self.base.property_get(key)
+    }
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        if let PropertyKey::Str(k) = &key {
+            if k.as_str() == "lastIndex" {
+                self.last_index = value.to_number();
+                return Ok(true);
+            }
+            if matches!(
+                k.as_str(),
+                "source" | "flags" | "global" | "sticky" | "ignoreCase" | "multiline"
+                    | "dotAll" | "unicode" | "hasIndices"
+            ) {
+                return Err("Cannot assign to read only property".to_string());
+            }
+        }
+        self.base.property_set(key, value)
+    }
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        self.base.define_property(key, descriptor)
+    }
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        self.base.property_delete(key)
+    }
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        self.base.has_property(key)
+    }
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.base.own_keys()
+    }
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.base.get_prototype()
+    }
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.base.set_prototype(proto)
+    }
+    fn is_extensible(&self) -> bool {
+        self.base.is_extensible()
+    }
+    fn prevent_extensions(&mut self) {
+        self.base.prevent_extensions()
+    }
+    fn is_frozen(&self) -> bool {
+        self.base.is_frozen()
+    }
+    fn freeze(&mut self) {
+        self.base.freeze()
+    }
+    fn is_sealed(&self) -> bool {
+        self.base.is_sealed()
+    }
+    fn seal(&mut self) {
+        self.base.seal()
+    }
+    fn class_name(&self) -> &'static str {
+        "RegExp"
+    }
+}
+
 #[derive(Debug)]
 pub struct MapObject {
     entries: Vec<Option<(Value, Value)>>,

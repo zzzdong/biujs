@@ -9,8 +9,6 @@ language/statements/for-in	78	22	15
 language/destructuring	15	3	1
 language/expressions/assignment/destructuring	3	1	4
 language/rest-parameters	11	0	0
-built-ins/Array/prototype/Symbol.iterator	0	1	0
-built-ins/String/prototype/Symbol.iterator	4	1	1
 language/expressions/addition	36	8	4
 language/expressions/assignment	407	18	60
 language/expressions/bitwise-and	20	7	3
@@ -87,11 +85,13 @@ language/literals/string	67	6	0
 language/computed-property-names	40	0	8
 language/identifiers	202	66	0
 language/types	92	10	11
+built-ins/Array/prototype/Symbol.iterator	0	1	0
+built-ins/String/prototype/Symbol.iterator	4	1	1
 built-ins/Array	2056	277	748
 built-ins/Boolean	27	8	16
 built-ins/Error	38	19	36
 built-ins/Function	192	191	126
-built-ins/JSON	112	51	2
+built-ins/JSON	113	51	1
 built-ins/Map	182	17	5
 built-ins/Set	344	19	20
 built-ins/WeakMap	131	9	1
@@ -99,6 +99,6 @@ built-ins/WeakSet	79	5	1
 built-ins/Math	270	37	20
 built-ins/NativeErrors	68	12	14
 built-ins/Number	189	53	98
-built-ins/Object	2784	295	332
-built-ins/String	631	216	376
+built-ins/Object	2786	295	330
+built-ins/String	702	216	305
 built-ins/Symbol	54	27	17

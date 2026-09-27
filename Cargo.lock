@@ -116,6 +116,7 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "petgraph",
+ "regex",
  "test262-harness",
 ]
 

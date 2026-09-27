@@ -55,6 +55,14 @@ pub fn register_string_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "toLowerCase", |this, _args| string_to_lower(this));
     set_prototype_method(proto, "trim", |this, _args| string_trim_both(this));
     set_prototype_method(proto, "split", |this, args| string_split(this, args));
+    set_prototype_method(proto, "match", |this, args| {
+        super::regexp::regexp_match(this, args)
+    });
+    set_prototype_method(proto, "search", |this, args| {
+        super::regexp::regexp_search(this, args)
+    });
+    // A RegExp argument is routed to the regex-aware implementation in the
+    // dispatch (`call_prototype_method`), not here — the closure is not what runs.
     set_prototype_method(proto, "replace", |this, args| {
         string_replace(this, args, false)
     });

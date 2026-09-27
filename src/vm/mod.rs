@@ -2136,6 +2136,20 @@ impl VM {
                 let value = Self::from_constant(&module.constants[const_index as usize]);
                 self.set_value(operands[0], value)?;
             }
+            Opcode::MakeRegExp => {
+                let source = match &module.constants[operands[1].as_immd() as usize] {
+                    Constant::String(v) => v.to_string(),
+                };
+                let flags = match &module.constants[operands[2].as_immd() as usize] {
+                    Constant::String(v) => v.to_string(),
+                };
+                let proto = Some(Value::Object(Rc::clone(&self.builtins.regexp_prototype)));
+                let value = crate::builtins::regexp_construct_value(
+                    &[Value::string(&source), Value::string(&flags)],
+                    proto,
+                )?;
+                self.set_value(operands[0], value)?;
+            }
             Opcode::DeclareLexical => {
                 let name_index = operands[0].as_immd();
                 let name = match &module.constants[name_index as usize] {

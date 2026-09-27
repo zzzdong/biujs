@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15484 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 493 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15558 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 494 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1733,6 +1733,53 @@ language 行**的快照写回去（少 17 行），只能从 HEAD 还原；改�
 之后 `Promise` + 微任务队列 + `async/await`。小面一批仍在原处：`globalThis`、`flatMap`、
 `e.stack`、elision 应为洞、TypedArray、`Proxy`/`Reflect`，以及上面退回的**二元算术
 ToPrimitive**。
+
+---
+
+#### B32 `RegExp` —— 已完成（2026-09-28）
+
+**决策**：B30 排的第二项。此前 `/a+/` 字面量直接是 `undefined`（整族缺失），
+`String.prototype.replace/match/search/split` 也都不认正则。
+
+**实现**
+
+| 改动 | 说明 |
+|------|------|
+| `MakeRegExp` 指令 | 正则字面量没法降级成 `new RegExp(...)`（要凭空造 callee 与实参），所以单独一条指令：两个常量（pattern、flags）进常量池，VM 直接造对象 |
+| `vm::object::RegExpObject` | `[[RegExpMatcher]]` + source/flags/lastIndex。`lastIndex` 在 `property_get`/`property_set` 里拦截 —— 做成属性则 `re.lastIndex = 3` 到不了匹配器 |
+| `builtins/regexp.rs` | 构造器（含"传 RegExp 作实参"的复制语义）、`test`/`exec`/`toString`、四个正则感知的 String 方法（`match`/`search`/`replace`/`split`）与 `$` 替换（`$$ $& $` $' $n`） |
+| `regex` crate | 新增依赖。引擎不自造模式编译器 |
+
+**范围与偏差**：字符类、量词、分组、锚点、`i/m/s/u` 旗标、`g`/`y` 的 `lastIndex` 语义都在。
+**不支持** lookaround 与反向引用（`regex` crate 表达不了），这类模式报
+"pattern … is not supported" 而不是静默错配。函数的 replacer、正则的 `matchAll`
+仍未做。ES 走 `Symbol.replace/match/search/split` 派发，这里按**实参形状**分流。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15484 | **15558** | **+74** |
+| 失败 | 2793 | 2719 | −74 |
+| 通过率 | 84.72% | **85.12%** | +0.40pp |
+| 单元 / feature / 护栏 | 190 / 493 / 7 | 190 / **494** / 7 | +1 用例（18 条断言） |
+
+3 个套件提升、**零回退**：`built-ins/String` +71、`built-ins/Object` +2、`built-ins/JSON` +1。
+与 node 逐项对比一致（字面量、`source/flags`、`test/exec`、`toString`、旗标、`lastIndex`、
+`match/search/replace/split`、`$1` 替换、`$$` 转义、`g` 循环计数、`split` 的 limit）。
+
+**踩到的坑（同一条规矩，第三次）**
+
+1. `set_prototype_method` 的闭包**不会被执行**（参数是 `_f`）。我把"实参是正则就走正则实现"
+   的路由写进了闭包，`replace`/`split` 毫无变化 —— 路由必须写在 `call_prototype_method` 的
+   分发里。
+2. SSA 重命名里 `MakeRegExp` 只写了 `{}`：`dst` 是真正的定义，漏了 `rename_definition`
+   会让 codegen 写到 SSA 之前的槽位（字节码里写 `[rbp+2]`、后面读 `[rbp+3]`），字面量因此
+   是 `undefined`。与 B21 的 `InitLexical` 同一个坑。
+
+**下一批**：`Promise` + 微任务队列 + `async/await`（B30 排的第三项，唯一要动执行模型的）。
+之后的小面一批：`globalThis`、`flatMap`、`e.stack`、elision 应为洞、TypedArray、
+`Proxy`/`Reflect`、`matchAll`、函数式 replacer、二元算术的 ToPrimitive。
 
 ---
 

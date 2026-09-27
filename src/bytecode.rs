@@ -153,6 +153,8 @@ pub enum Opcode {
     /// set_function_name func, name — give a just-created function/class object
     /// its name (NamedEvaluation)
     SetFunctionName,
+    /// make_regexp dst, source, flags — build a RegExp object from a literal
+    MakeRegExp,
     /// load_env dst, name
     LoadEnv,
     /// halt
@@ -360,6 +362,7 @@ impl fmt::Display for Opcode {
             Opcode::CallNative => write!(f, "call_native"),
             Opcode::Ret => write!(f, "ret"),
             Opcode::LoadConst => write!(f, "load_const"),
+            Opcode::MakeRegExp => write!(f, "make_regexp"),
             Opcode::DeclareLexical => write!(f, "declare_lexical"),
             Opcode::SetFunctionName => write!(f, "set_function_name"),
             Opcode::InitLexical => write!(f, "init_lexical"),

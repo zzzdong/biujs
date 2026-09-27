@@ -158,6 +158,17 @@ impl Codegen {
                             const_id.to_operand(),
                         ));
                     }
+                    Instruction::MakeRegExp { dst, source, flags } => {
+                        let dst = self.gen_operand(dst);
+                        let source = self.gen_operand(source);
+                        let flags = self.gen_operand(flags);
+                        self.codes.push(Bytecode::triple(
+                            Opcode::MakeRegExp,
+                            dst,
+                            source,
+                            flags,
+                        ));
+                    }
                     Instruction::DeclareLexical { name } => {
                         let name = name.to_operand();
                         self.codes

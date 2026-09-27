@@ -172,6 +172,11 @@ pub trait InstBuilder {
         dst
     }
 
+    /// Build a `RegExp` object from a literal (see `Instruction::MakeRegExp`).
+    fn make_regexp(&mut self, dst: Value, source: Value, flags: Value) {
+        self.emit(Instruction::MakeRegExp { dst, source, flags });
+    }
+
     /// Register a script-scope lexical name (see `Instruction::DeclareLexical`).
     fn declare_lexical(&mut self, name: Value) {
         self.emit(Instruction::DeclareLexical { name });

@@ -199,6 +199,16 @@ pub enum Instruction {
     /// what nested functions read, and an uninitialized entry is the temporal
     /// dead zone — a `ReferenceError`, where the global lookup used to answer
     /// `undefined` for "no such property".
+    /// Build a `RegExp` object from a **literal's** source text and flags.
+    ///
+    /// A regex literal cannot be lowered to a `new RegExp(...)` call: it would
+    /// need a synthesised callee and arguments. The pattern and flags are both
+    /// constants, so one instruction is enough.
+    MakeRegExp {
+        dst: Value,
+        source: Value,
+        flags: Value,
+    },
     DeclareLexical {
         name: Value,
     },
@@ -544,6 +554,9 @@ impl Instruction {
         match self {
             Instruction::LoadArg { dst, .. } => (vec![*dst], vec![]),
             Instruction::LoadConst { dst, .. } => (vec![*dst], vec![]),
+            Instruction::MakeRegExp { dst, source, flags } => {
+                (vec![*dst], vec![*source, *flags])
+            }
             Instruction::DeclareLexical { name } => (vec![], vec![*name]),
             Instruction::SetFunctionName { func, name } => (vec![], vec![*func, *name]),
             Instruction::InitLexical { name, value } => (vec![], vec![*name, *value]),
@@ -716,6 +729,9 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::LoadConst { dst, const_id: src } => {
                 write!(f, "{dst} = load_const {src}")
+            }
+            Instruction::MakeRegExp { dst, source, flags } => {
+                write!(f, "make_regexp {dst}, {source}, {flags}")
             }
             Instruction::DeclareLexical { name } => write!(f, "declare_lexical {name}"),
             Instruction::SetFunctionName { func, name } => {

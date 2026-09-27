@@ -800,6 +800,13 @@ impl<'a> SSABuilder<'a> {
             Instruction::PopSeh => {}
             // No definition, and the operands are a constant and a value that is
             // read, not written: nothing to rename.
+            Instruction::MakeRegExp { dst, .. } => {
+                // The operands are constants, but `dst` is a real definition:
+                // skipping the rename makes codegen write to the pre-SSA slot,
+                // which is then read through a different register — the literal
+                // used to come out `undefined`.
+                SSABuilder::rename_definition(dst, new_versions);
+            }
             Instruction::DeclareLexical { name } => {
                 SSABuilder::rename_use(name, stacks);
             }

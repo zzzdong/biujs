@@ -576,3 +576,42 @@ fn date_is_usable_for_everyday_time_handling() {
         2020.0
     );
 }
+
+#[test]
+fn regular_expressions_work_for_everyday_patterns() {
+    // A literal builds a real RegExp; the engine used to answer `undefined`.
+    assert_eq!(eval_string("typeof /a+/"), "object");
+    assert_eq!(eval_string("/ab+c/gi.source"), "ab+c");
+    assert_eq!(eval_string("/ab+c/gi.flags"), "gi");
+    assert_eq!(eval_string("String(/a+/g)"), "/a+/g");
+
+    // `test` / `exec`, including groups and the `index`/`input` properties.
+    assert_eq!(eval_string("String(/ab+c/.test('xxabbbcxx'))"), "true");
+    assert_eq!(
+        eval_string("JSON.stringify(/(\\d+)-(\\d+)/.exec('a12-34b'))"),
+        "[\"12-34\",\"12\",\"34\"]"
+    );
+    assert_eq!(eval_string("String(/z/.exec('abc'))"), "null");
+    assert_eq!(eval_string("new RegExp('a+', 'i').test('AAA') ? 'y' : 'n'"), "y");
+
+    // Flags are readable, and `lastIndex` advances across `g` matches.
+    assert_eq!(eval_string("String(/a/g.global)"), "true");
+    assert_eq!(eval_string("String(/a/.global)"), "false");
+    assert_eq!(
+        eval_number("(function () { var r = /\\d/g; var n = 0; while (r.exec('a1b2c3')) { n++; } return n; })()"),
+        3.0
+    );
+
+    // The four String methods that take a pattern.
+    assert_eq!(eval_string("JSON.stringify('a1b2c3'.match(/\\d/g))"), "[\"1\",\"2\",\"3\"]");
+    assert_eq!(eval_string("'a1b2'.replace(/\\d/g, '#')"), "a#b#");
+    assert_eq!(eval_number("'abc123'.search(/\\d/)"), 3.0);
+    assert_eq!(
+        eval_string("JSON.stringify('a1b22c'.split(/\\d+/))"),
+        "[\"a\",\"b\",\"c\"]"
+    );
+    // `$` substitutions in the replacement.
+    assert_eq!(eval_string("'Doe, John'.replace(/(\\w+), (\\w+)/, '$2 $1')"), "John Doe");
+    // … while a plain string argument still takes the string path.
+    assert_eq!(eval_string("'a1b2'.replace('1', '#')"), "a#b2");
+}

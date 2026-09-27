@@ -56,9 +56,9 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 
 | 指标 | 数值 |
 |------|------|
-| test262 执行 / 通过 / 失败 / 跳过 | 18277 / **15484** / 2793 / 8133 |
-| 通过率 | 84.72%（参考值；分母口径见计划书 §2.1） |
-| 单元 / feature / 护栏测试 | 190 / 493 / 7，全绿 |
+| test262 执行 / 通过 / 失败 / 跳过 | 18277 / **15558** / 2719 / 8133 |
+| 通过率 | 85.12%（参考值；分母口径见计划书 §2.1） |
+| 单元 / feature / 护栏测试 | 190 / 494 / 7，全绿 |
 | 全量耗时 | 约 3m（三层护栏封顶：单例 15s 墙钟、2×10^7 指令、256MiB 堆增量） |
 | runner 覆盖面 | 25586 / 53568 个测试文件（47%）——**未覆盖里约 4920 条属承诺的 M5/M6** |
 | 基线快照 | `phase2-status.tsv`（`scripts/phase2-status.sh` 生成的逐套件表） |
@@ -66,13 +66,15 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 **已完成**：M0 → M4（语法、内置对象、JSON、生成器与迭代协议）；阶段二的 B0（度量铺底）、B1（spread 走 `GetIterator`）、B5a（数组 `length` 的错误种类）、B5b（Object 描述符长尾 + 六个完整性方法）、B2a（`Map` 180/187）、B2b（`Set` 344/364，含 `set-methods` 七算子）、B3（`WeakMap` 131/132、`WeakSet` 79/80）、B4（KPI 归类脚本 + `Date` 判"实现"→ B14）、B15a（`for-of`/`for-in` 头部的**赋值模式**此前整族不赋值，+177）、B15b（**标签语句**此前被整段丢弃，+24）、B16（**`rest` 参数**在所有函数形态下都没绑定，+15；同时修掉 `SUITES` 里一个静默的覆盖空洞）、B17（生成器参数改为**调用时绑定**，+88）、B18（**`var` 的函数作用域与提升**，+62）、B19（`try` 内的 `break`/`continue` 曾跳到指令流之外，+6）、B20（**TDZ**：`let`/`const`/类名
 的"已绑定但未初始化"窗口，+9）、B21（脚本**声明记录**与全局对象分离，+3 —— 闭包从此看到脚本级 `let` 的活绑定，B20 残留 1 落地）、B22（**NamedEvaluation**：匿名函数/类取绑定名，+271 —— 15 个套件提升、零回退）、B23（**实例类字段**：默认构造器此前整族不装字段，+244）、B24（**生成器两处生命周期漏洞**：方法调用路径漏了生成器判定、抛出后没收尾（后者会 abort 整轮），+122）、B25（**`Array.prototype` 的泛型语义**：`length` 走完整 `[[Get]]`、原始值先 `ToObject`、回调第三参数是 `O`，+102）、B28（**函数表达式捕获**（B26 第 1 层）+ **装箱 callee 的生成器判定**，+104 —— 21 个套件提升、零回退）、B29（**生成器前导的可重入性**：参数默认值里再创建生成器会踩掉「正在跑前导」这个标志，导致体被跑两遍，+42 —— 5 个套件提升、零回退）、B30（**转向广度 / 日常可用性**：`console`、`String.replace`\n`replaceAll`、`Array.flat`、`Object.fromEntries`、`encodeURI*` 系列，+32 —— 3 个套件提升、零回退）、B31（`Date`：构造器四种形态、`now/parse/UTC`、两组分量 getter、
 `toISOString`/`toString` 等，本地时区走 `chrono`；test262 计数 +0，因为 `built-ins/Date` 不在
-curated 清单里）。
+curated 清单里）、B32（`RegExp`：字面量此前是 `undefined`；新增 `MakeRegExp` 指令、`RegExpObject`、
+`test/exec/toString` 与正则感知的 `match/search/replace/split`，本地时区之外新增 `regex` 依赖，
++74 —— 3 个套件提升、零回退）。
 
 **已完成**：整轮验证的 OOM 已修（见下）。
 
 **下一步**：（整轮峰值贴在内存边沿，B31 把它顶过去了；已验证拆成
 `language` / `built-ins` 两个进程各跑一半可行且逐套件数字一致）—— 不修，`--update` 刷新不了快照。
-然后按 B30 定的顺序铺面：`RegExp`（顺带 `replace/match/search/split` 的正则形式）→ `Promise` +
+然后按 B30 定的顺序铺面：`Promise` +
 微任务队列 + `async/await`；小面一批（`globalThis`、`flatMap`、`e.stack`、elision 应为洞、
 TypedArray、`Proxy`/`Reflect`、二元算术的 ToPrimitive）。深处的债仍在原处：`class/dstr` 约 76 条、共享 cell（`counter()` 仍返回 `0,0,0`）。
 
