@@ -1435,10 +1435,22 @@ B26 把第 1 层按快照接上时，`expressions/function` 掉了 94。B27 的�
 - 已排除的方向（逐个试过，都不成立）：模式本身（空/elision/rest）、生成器对象作实参、
   脚本级 `var` 的写入、函数声明的同名形状、`function ()` 与 `var f = function ()` 两种写法。
 
-因此 B27 的第一件事是**定位 harness 的哪个结构触发它**。建议手段：在 `emit_closure_vars`
-里加一条调试输出（只打印"被捕获但既不在 `global_names` 也不在 `script_lexical` 中"的名字），
-只跑 `language/expressions/function` 一个套件，对照 14 条用例的共同点；怀疑对象是 harness 里的
-`$DONOTEVALUATE` / `Test262Error` 类 / 包装函数那类结构。带着未知回归动大改，事后无法判断是谁弄坏的。
+B27 的第 2 轮用**二分**把它钉死了（只跑 `language/expressions/function`，基线 218 通过 / 20 失败）：
+
+| 接上的部分 | 通过 / 失败 | 结论 |
+|-----------|------------|------|
+| 只接"显式 `make_func_obj`"（捕获关掉） | 204 / **34** | 回归来自**这里** |
+| 显式 `make_func_obj` + 捕获 | 206 / **32** | 捕获本身是 **+2**（把这 14 条中的 2 条修回来） |
+
+也就是说：**触发点是"把函数表达式的值从裸 `Value::Function(id)` 改成显式物化的对象"**，
+与捕获逻辑无关。失败形状（参数里的数组模式拿到 `undefined` 作为源）指向
+**被装箱的 callee 那条调用路径在该形状下把实参丢了**（`GetMethod(undefined, @@iterator)`）。
+
+**下一批的入口**：先对比 `Call`/`CallMethod` 里 `Value::Function(id)` 与 `Value::Object(FunctionObject)`
+两个分支的实参收集（`enter_frame(arg_count)` + `[rbp-i-1]`），用一个"装载 harness 的 dstr 用例"
+当靶子；两者等价之后，第 1 层才能安全接上。**不要**先接上再查——本批两轮都证明了那是无归因的回归。
+顺带记一条：cell 落地后，捕获表可以挂在 **cell** 上（每次求值共享同一批 cell），
+也许根本不需要"每次求值一个新函数对象"这条改动 —— 这条捷径要在实参路径查清之后再定。
 
 **6. 验证方案（固定）**
 
