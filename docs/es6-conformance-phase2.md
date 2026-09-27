@@ -1421,11 +1421,24 @@ B26 的侦察给出了三层根因与顺序建议；这份稿子是**动手前**
 
 **5. 落地前的门禁（B26 未解的回归）**
 
-B26 把第 1 层按快照接上时，`expressions/function` 掉了 94，退回后仍有 **16 条**
-`Cannot read properties of undefined (reading 'Symbol(…))`（参数默认值 + 解构）没能定位。
-**本批动工前必须先复现并定位这 16 条**（候选方向：函数表达式现在走显式 `MakeFuncObj` 的时机、
-新建对象与记忆化对象在 `prototype`/标识上的差异、以及 `eval_default_on` 里默认值求值的
-块与 phi 形态）。带着未知回归动大改，事后无法判断是谁弄坏的。
+B26 把第 1 层按快照接上时，`expressions/function` 掉了 94。B27 的第 1 轮又实测了一次，
+结论更精确：
+
+- **14 条新失败**（路径级 diff 得到，全部在 `dstr/`），报错一律是
+  `TypeError: Cannot read properties of undefined (reading 'Symbol(…)')` —— 即
+  `GetMethod(undefined, @@iterator)`：**参数里的数组模式拿到了 `undefined` 作为源**。
+  形状是 `f = function ([]) {…}` / `function ([,])` / `function ([...[]])`，且测试体内有
+  `assert.sameValue`（见下）。
+- **只在真实 harness 下复现**。把这些用例改写成等价的独立脚本（自建 `assert`、生成器实参、
+  同样模式、同样的 `callCount += 1`）**全部通过** —— 触发点在 harness 自身的某个结构里，
+  不在用例本身。
+- 已排除的方向（逐个试过，都不成立）：模式本身（空/elision/rest）、生成器对象作实参、
+  脚本级 `var` 的写入、函数声明的同名形状、`function ()` 与 `var f = function ()` 两种写法。
+
+因此 B27 的第一件事是**定位 harness 的哪个结构触发它**。建议手段：在 `emit_closure_vars`
+里加一条调试输出（只打印"被捕获但既不在 `global_names` 也不在 `script_lexical` 中"的名字），
+只跑 `language/expressions/function` 一个套件，对照 14 条用例的共同点；怀疑对象是 harness 里的
+`$DONOTEVALUATE` / `Test262Error` 类 / 包装函数那类结构。带着未知回归动大改，事后无法判断是谁弄坏的。
 
 **6. 验证方案（固定）**
 
