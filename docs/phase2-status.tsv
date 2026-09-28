@@ -62,7 +62,7 @@ language/expressions/void	8	1	0
 language/expressions/arrow-function	218	22	103
 language/statements/block	12	7	2
 language/statements/break	18	2	0
-language/statements/class	1354	2863	150
+language/statements/class	1356	2863	148
 language/statements/const	122	5	9
 language/statements/continue	19	5	0
 language/statements/do-while	26	10	0
@@ -99,6 +99,6 @@ built-ins/WeakSet	79	5	1
 built-ins/Math	270	37	20
 built-ins/NativeErrors	68	12	14
 built-ins/Number	189	53	98
-built-ins/Object	2786	295	330
+built-ins/Object	2787	295	329
 built-ins/String	702	216	305
 built-ins/Symbol	54	27	17

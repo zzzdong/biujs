@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15568 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 495 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15571 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 496 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1809,6 +1809,59 @@ ToPrimitive**。
 **下一批**：`Promise` + 微任务队列 + `async/await`（唯一要动执行模型的）。之后的小面：
 `globalThis`、`e.stack`（字节码里没有行列信息，只能给函数名）、elision 应为洞、`matchAll`、
 函数式 replacer、TypedArray、`Proxy`/`Reflect`。
+
+---
+
+#### B34 `Promise` 与微任务队列 —— 已完成（部分；2026-09-28）
+
+**决策**：B30 排的第三项，也是唯一要动执行模型的一件。本轮先落地**对象 + 队列 + 构造 +
+`then`/`catch` + 两个静态**；`async/await`、`all/race/allSettled/any` 留下一轮。
+
+**实现**
+
+| 改动 | 说明 |
+|------|------|
+| `vm::object::PromiseObject` | `[[PromiseState]]` / `[[PromiseResult]]` / 反应队列 + `id`（注册表用） |
+| `State::promise_jobs` | 微任务队列（FIFO）。引擎没有事件循环，所以它在**顶层 `run` 结束时**排空 |
+| `promise_construct` | `new Promise(executor)`：造对象 → 铸 `resolve`/`reject` → 调 executor；executor 抛出即 reject（ES 27.2.3.1 step 11） |
+| `try_promise_method` | `then`/`catch`/`finally` 由 VM 派发（要调用户函数）。**两处**方法调用路径都要挂 |
+| `Promise.resolve/reject` | VM 侧拦截（要登记进 promise 注册表）；`resolve(promise)` 原样返回该 promise |
+
+`resolve` / `reject` 是宿主函数按名字派发的，所以它们把目标的 `id` 编码进函数名
+（`__promise_resolve__<id>`），VM 收到调用时按 id 找回 promise —— 与 Map 的迭代器、
+`Symbol.replace` 那类"只有 VM 能造"的对象同一种手法。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15568 | **15571** | **+3** |
+| 失败 | 2709 | 2706 | −3 |
+| 通过率 | 85.18% | **85.19%** | +0.01pp |
+| 单元 / feature / 护栏 | 190 / 495 / 7 | 190 / **496** / 7 | +1 用例（7 条断言） |
+
+2 个套件提升、**零回退**（`language/statements/class` +2、`built-ins/Object` +1）。
+与 node 逐项对比一致的部分（探针在 /tmp/p2.js 一类脚本里）：
+
+```
+order: then:1 | resolve:2 | catch:boom | reject:bad | resolved-promise:3     ← 引擎
+order: then:1 | resolve:2 | catch:boom | reject:bad | exec:exec-throw | resolved-promise:3  ← node
+```
+
+顺序、链式传递（`then` 返回值喂给下一个 `then`）、reject 走 `then` 的第二参或 `catch`、
+`Promise.resolve(p) === p`、同步代码先于微任务 —— 都对。
+
+**残留（下一轮的输入）**
+
+1. **链式 `new Promise(…抛出…).catch(cb)` 的 handler 收不到**：实测在该路径上
+   `args.first()` 是 `undefined`（同一段代码改成 `var p = new Promise(…); p.catch(cb);` 就正常）。
+   已确认不是 handler 装箱的问题（装箱修过、仍 `undefined`）。看起来是**已 reject 的 promise**
+   + 链式方法调用这条组合上的实参丢失，需要顺着 `Opcode::CallMethod` 的实参收集查。
+2. `async/await` 未做。设计已定：`Module.asyncs` 集合（照 `generators`）+ `Await` 指令；
+   `await` 对未 settle 的 promise **就地排空队列**直到它 settle —— 引擎里 promise 只能靠 job
+   settle，没有外部源（没有定时器/IO），所以这样是收敛的；代价是没有真正的并发交错。
+3. `all/race/allSettled/any`、`finally` 的返回 promise 语义、thenable 采纳未做。
+4. 下一批顺序：先修 1，再做 `async/await`，然后 `all/race`。
 
 ---
 

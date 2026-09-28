@@ -2336,6 +2336,122 @@ impl JSObject for RegExpObject {
     }
 }
 
+/// A promise's settlement state (ES 27.2.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled,
+    Rejected,
+}
+
+/// One `then` reaction: the two handlers and the promise they settle when the
+/// handler answers.
+#[derive(Debug, Clone)]
+pub struct PromiseReaction {
+    pub on_fulfilled: Option<Value>,
+    pub on_rejected: Option<Value>,
+    pub target: Rc<RefCell<PromiseObject>>,
+}
+
+/// A `Promise` instance: state, settled value, and the reactions waiting on it.
+///
+/// The engine has no real event loop — the only source of settlement is a job —
+/// so the queue in `vm::mod` is drained after the script's top-level run, and
+/// `await` drains it on the spot (see `Opcode::Await`).
+#[derive(Debug)]
+pub struct PromiseObject {
+    /// Identity used by the VM's promise registry — `resolve` / `reject` carry
+    /// it in their native name, and `then` needs it to find the target back.
+    pub id: u64,
+    pub state: PromiseState,
+    /// The fulfilment value, or the rejection reason. `Undefined` while pending.
+    pub value: Value,
+    pub reactions: Vec<PromiseReaction>,
+    base: OrdinaryObject,
+}
+
+impl PromiseObject {
+    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>, id: u64) -> Self {
+        let mut base = OrdinaryObject::with_class_name("Promise");
+        base.set_prototype(prototype);
+        Self {
+            id,
+            state: PromiseState::Pending,
+            value: Value::Undefined,
+            reactions: Vec::new(),
+            base,
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.state == PromiseState::Pending
+    }
+}
+
+impl JSObject for PromiseObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Promise
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        self.base.property_get(key)
+    }
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        self.base.property_set(key, value)
+    }
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        self.base.define_property(key, descriptor)
+    }
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        self.base.property_delete(key)
+    }
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        self.base.has_property(key)
+    }
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.base.own_keys()
+    }
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.base.get_prototype()
+    }
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.base.set_prototype(proto)
+    }
+    fn is_extensible(&self) -> bool {
+        self.base.is_extensible()
+    }
+    fn prevent_extensions(&mut self) {
+        self.base.prevent_extensions()
+    }
+    fn is_frozen(&self) -> bool {
+        self.base.is_frozen()
+    }
+    fn freeze(&mut self) {
+        self.base.freeze()
+    }
+    fn is_sealed(&self) -> bool {
+        self.base.is_sealed()
+    }
+    fn seal(&mut self) {
+        self.base.seal()
+    }
+    fn class_name(&self) -> &'static str {
+        "Promise"
+    }
+}
+
 #[derive(Debug)]
 pub struct MapObject {
     entries: Vec<Option<(Value, Value)>>,

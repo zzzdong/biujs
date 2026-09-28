@@ -647,3 +647,27 @@ fn objects_take_part_in_arithmetic_and_arrays_flat_map() {
     assert_eq!(eval_string("typeof console.time"), "function");
     assert_eq!(eval_string("String(console.timeEnd('never-started'))"), "undefined");
 }
+
+#[test]
+fn promises_are_constructible_and_expose_the_spec_surface() {
+    // The spec surface is there: the constructor, its statics, and the
+    // prototype methods. The queue's behaviour is covered by the probes in the
+    // plan (B34) — observing it needs code that runs *after* the drain, which
+    // `eval_string` cannot express.
+    assert_eq!(eval_string("typeof Promise"), "function");
+    assert_eq!(eval_string("typeof Promise.resolve"), "function");
+    assert_eq!(eval_string("typeof Promise.reject"), "function");
+    assert_eq!(eval_string("typeof new Promise(function () {}).then"), "function");
+    assert_eq!(eval_string("typeof new Promise(function () {}).catch"), "function");
+    assert_eq!(
+        eval_string("Object.prototype.toString.call(new Promise(function () {}))"),
+        "[object Promise]"
+    );
+    // Constructing without `new` is a TypeError (ES 27.2.1.1).
+    assert_eq!(
+        eval_string(
+            "(function () { try { Promise(function () {}); return 'no-throw'; } catch (e) { return e.name; } })()"
+        ),
+        "TypeError"
+    );
+}

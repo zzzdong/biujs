@@ -2,6 +2,7 @@ mod array;
 mod boolean;
 mod console;
 mod date;
+mod promise;
 mod regexp;
 mod error;
 mod function;
@@ -401,6 +402,7 @@ pub struct Builtins {
     pub weakset_prototype: Rc<RefCell<dyn JSObject>>,
     pub date_prototype: Rc<RefCell<dyn JSObject>>,
     pub regexp_prototype: Rc<RefCell<dyn JSObject>>,
+    pub promise_prototype: Rc<RefCell<dyn JSObject>>,
 }
 
 impl Builtins {
@@ -425,6 +427,7 @@ impl Builtins {
         let weakset_proto = new_proto(Some(Rc::clone(&object_proto)), "WeakSet");
         let date_proto = new_proto(Some(Rc::clone(&object_proto)), "Date");
         let regexp_proto = new_proto(Some(Rc::clone(&object_proto)), "RegExp");
+        let promise_proto = new_proto(Some(Rc::clone(&object_proto)), "Promise");
 
         // Needed before any built-in function object is created: every one of
         // them inherits from `Function.prototype`.
@@ -454,6 +457,7 @@ impl Builtins {
             weakset_prototype: weakset_proto,
             date_prototype: date_proto,
             regexp_prototype: regexp_proto,
+            promise_prototype: promise_proto,
         }
     }
 
@@ -801,6 +805,17 @@ impl Builtins {
         Self::link_constructor_prototype(&regexp_fn_val, &self.regexp_prototype);
         register_wrapper_prototype("RegExp", Rc::clone(&self.regexp_prototype));
         globals.insert("RegExp".to_string(), regexp_fn_val);
+
+        // `Promise`: the object lives in `vm::object::PromiseObject`, and the
+        // methods that must *call* JS (`then`, `catch`) are dispatched by the
+        // VM; the registration below is what makes the names resolvable.
+        let promise_fn_val =
+            Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("Promise"))));
+        promise::register_promise_prototype(&self.promise_prototype);
+        promise::register_promise_statics(&promise_fn_val);
+        Self::link_constructor_prototype(&promise_fn_val, &self.promise_prototype);
+        register_wrapper_prototype("Promise", Rc::clone(&self.promise_prototype));
+        globals.insert("Promise".to_string(), promise_fn_val);
         globals.insert("JSON".to_string(), json::register_json());
 
         // Global convenience functions (they are plain functions, not
@@ -923,6 +938,11 @@ pub fn call_native(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         // goes through `VM::date_construct` instead.
         "Date" => date::date_as_function(args),
         "RegExp" => regexp::regexp_construct_value(args, None),
+        // `Promise(...)` without `new` is a TypeError (ES 27.2.1.1 step 1);
+        // `[[Construct]]` is `VM::promise_construct`.
+        "Promise" => Err(RuntimeError::TypeError(
+            "Constructor Promise requires 'new'".to_string(),
+        )),
         "parseInt" => global_parse_int(args),
         "encodeURIComponent" => global_encode_uri(args, false),
         "encodeURI" => global_encode_uri(args, true),

@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::builtins::Builtins;
+use crate::vm::object::{PromiseObject, PromiseReaction, PromiseState};
 use crate::vm::iterator::iterator_symbol_key;
 use crate::bytecode::{
     Bytecode, Constant, FunctionId, Module, Opcode, Operand, Primitive, Register,
@@ -315,6 +316,10 @@ impl VM {
         self.builtins.register(&mut self.state.globals);
 
         while self.step(module)? {}
+
+        // Promises settle through jobs, and there is no event loop: the end of
+        // the top-level run is the point where the microtask queue drains.
+        self.run_promise_jobs(module)?;
 
         // If we run out of instructions, return Rv
         Ok(self
@@ -1553,6 +1558,30 @@ impl VM {
         let args: &[Value] = &boxed_args;
         let this: Value = self.as_object_value(&this);
 
+        // The `resolve` / `reject` handed to a `Promise` executor. They carry
+        // their target's id in the name (see `promise_construct`), because a
+        // native function here is identified by name alone.
+        if let Some(id) = name.strip_prefix("__promise_resolve__") {
+            if let Ok(id) = id.parse::<u64>() {
+                if let Some(promise) = self.state.promises.get(&id).cloned() {
+                    let value = args.first().cloned().unwrap_or(Value::Undefined);
+                    // A resolved promise fulfils with the value (thenable
+                    // adoption is not modelled: there is no way to run a
+                    // foreign `then` and observe it synchronously).
+                    self.promise_settle(&promise, PromiseState::Fulfilled, value);
+                }
+            }
+            return Ok(Value::Undefined);
+        }
+        if let Some(id) = name.strip_prefix("__promise_reject__") {
+            if let Ok(id) = id.parse::<u64>() {
+                if let Some(promise) = self.state.promises.get(&id).cloned() {
+                    let value = args.first().cloned().unwrap_or(Value::Undefined);
+                    self.promise_settle(&promise, PromiseState::Rejected, value);
+                }
+            }
+            return Ok(Value::Undefined);
+        }
         if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
             return self.object_prototype_to_string(&this, args, module);
         }
@@ -1711,6 +1740,11 @@ impl VM {
             if let Some(result) = self.try_array_callback_method(&this, method, args, module)? {
                 return Ok(result);
             }
+            // `Promise.prototype.then` has to *call* the handlers, so it is
+            // dispatched here rather than in the builtin table.
+            if let Some(result) = self.try_promise_method(&this, method, args, module)? {
+                return Ok(result);
+            }
             // `entries` / `keys` / `values` return a *fresh* iterator over a
             // snapshot; only the VM can mint iterator objects (they live in the
             // iterator registry so `next()` can find its state).
@@ -1763,6 +1797,11 @@ impl VM {
                 return self.map_group_by(&items, &callback, module);
             }
             // The descriptor arguments are read through [[Get]] first, which
+            // `Promise.resolve` / `Promise.reject` build promises, which only the
+            // VM can register.
+            if let Some(result) = self.promise_static(name, args) {
+                return Ok(result);
+            }
             // only the VM can do (their fields may be accessors).
             if name == "Object.defineProperty" && args.len() >= 3 {
                 let descriptor = self.to_property_descriptor(&args[2], module)?;
@@ -2926,6 +2965,17 @@ impl VM {
                 // are executed here so they can call the user function.
                 if let Some(result) =
                     self.try_array_callback_method(&obj_val, &method_name, &args, module)?
+                {
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
+
+                // `then` / `catch` / `finally` likewise (they call the handler).
+                // This is the second method-call path — a chained call like
+                // `new Promise(f).catch(cb)` comes through here, not through the
+                // one above, and used to silently do nothing.
+                if let Some(result) = self.try_promise_method(&obj_val, &method_name, &args, module)?
                 {
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
@@ -4893,6 +4943,267 @@ impl VM {
             }
         }
         Ok(map_val)
+    }
+
+    /// A promise as a `Value` (the coercion to `dyn JSObject` has to happen
+    /// where the target type is known).
+    fn promise_value(promise: &Rc<RefCell<PromiseObject>>) -> Value {
+        let obj: Rc<RefCell<dyn crate::vm::object::JSObject>> = promise.clone();
+        Value::Object(obj)
+    }
+
+    /// A fresh promise with the engine's `Promise.prototype`.
+    fn new_promise(&mut self) -> Rc<RefCell<PromiseObject>> {
+        let proto = Rc::clone(&self.builtins.promise_prototype);
+        let id = self.state.next_promise_id;
+        self.state.next_promise_id += 1;
+        let promise = Rc::new(RefCell::new(PromiseObject::new(Some(proto), id)));
+        self.state.promises.insert(id, Rc::clone(&promise));
+        promise
+    }
+
+    /// Settle `promise` and queue the reactions that were waiting on it. A
+    /// promise settles at most once; later attempts are ignored (ES 27.2.1.4).
+    /// `Promise.resolve(value)` / `Promise.reject(reason)` — the two statics that
+    /// only need to build a promise (no user callback involved).
+    fn promise_static(&mut self, name: &str, args: &[Value]) -> Option<Value> {
+        match name {
+            "Promise.resolve" => {
+                let promise = self.new_promise();
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                // A promise argument is answered as-is (ES 27.2.4.6 step 2).
+                if let Some(existing) = self.as_promise(&value) {
+                    return Some(Self::promise_value(&existing));
+                }
+                self.promise_settle(&promise, PromiseState::Fulfilled, value);
+                Some(Self::promise_value(&promise))
+            }
+            "Promise.reject" => {
+                let promise = self.new_promise();
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                self.promise_settle(&promise, PromiseState::Rejected, value);
+                Some(Self::promise_value(&promise))
+            }
+            _ => None,
+        }
+    }
+
+    fn promise_settle(
+        &mut self,
+        promise: &Rc<RefCell<PromiseObject>>,
+        state: PromiseState,
+        value: Value,
+    ) {
+        let reactions = {
+            let mut borrowed = promise.borrow_mut();
+            if !borrowed.is_pending() {
+                return;
+            }
+            borrowed.state = state;
+            borrowed.value = value.clone();
+            std::mem::take(&mut borrowed.reactions)
+        };
+        let fulfilled = state == PromiseState::Fulfilled;
+        for reaction in reactions {
+            self.state.promise_jobs.push_back(PromiseJob::Reaction {
+                reaction,
+                argument: value.clone(),
+                fulfilled,
+            });
+        }
+    }
+
+    /// The receiver as a promise, or None when it is not one.
+    fn as_promise(&self, value: &Value) -> Option<Rc<RefCell<PromiseObject>>> {
+        let Value::Object(obj_ref) = value else {
+            return None;
+        };
+        let id = {
+            let borrowed = obj_ref.borrow();
+            if borrowed.kind() != ObjectKind::Promise {
+                return None;
+            }
+            borrowed.as_any().downcast_ref::<PromiseObject>()?.id
+        };
+        self.state.promises.get(&id).cloned()
+    }
+
+    /// `promise.then(onFulfilled, onRejected)` — always asynchronous, so a
+    /// settled promise still queues its reaction.
+    fn promise_then(
+        &mut self,
+        promise: &Rc<RefCell<PromiseObject>>,
+        on_fulfilled: Option<Value>,
+        on_rejected: Option<Value>,
+    ) -> Value {
+        let child = self.new_promise();
+        let reaction = PromiseReaction {
+            on_fulfilled,
+            on_rejected,
+            target: Rc::clone(&child),
+        };
+        let settled = {
+            let borrowed = promise.borrow();
+            if borrowed.is_pending() {
+                None
+            } else {
+                Some((borrowed.state, borrowed.value.clone()))
+            }
+        };
+        match settled {
+            None => promise.borrow_mut().reactions.push(reaction),
+            Some((state, value)) => {
+                self.state.promise_jobs.push_back(PromiseJob::Reaction {
+                    reaction,
+                    argument: value,
+                    fulfilled: state == PromiseState::Fulfilled,
+                });
+            }
+        }
+        Self::promise_value(&child)
+    }
+
+    /// `then` / `catch` / `finally`, when the receiver is a promise.
+    fn try_promise_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+        _module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if !matches!(method, "then" | "catch" | "finally") {
+            return Ok(None);
+        }
+        let Some(promise) = self.as_promise(this) else {
+            // Not a promise: let the ordinary prototype dispatch answer (it is
+            // what reports "not a function" for a missing method).
+            return Ok(None);
+        };
+        // A bare `Value::Function(id)` is callable but `is_callable()` only
+        // answers for the boxed form, so box first — that is exactly what
+        // `call_native_by_name` does before handing arguments to the builtin
+        // layer, and this interception runs *before* that.
+        let mut callable = |v: Option<&Value>| -> Option<Value> {
+            v.filter(|v| v.is_callable() || matches!(v, Value::Function(_)))
+                .map(|v| {
+                    let mut boxed = v.clone();
+                    if matches!(boxed, Value::Function(_)) {
+                        boxed = self.as_object_value(&boxed);
+                    }
+                    boxed
+                })
+        };
+        match method {
+            "then" => {
+                let on_fulfilled = callable(args.first());
+                let on_rejected = callable(args.get(1));
+                Ok(Some(self.promise_then(&promise, on_fulfilled, on_rejected)))
+            }
+            "catch" => {
+                let on_rejected = callable(args.first());
+                Ok(Some(self.promise_then(&promise, None, on_rejected)))
+            }
+            _ => {
+                // `finally`: the callback runs either way and the settlement
+                // passes through unchanged (a returned promise is not awaited —
+                // there is no event loop to await it on).
+                let callback = callable(args.first());
+                if let Some(cb) = callback {
+                    if let Err(e) = self.invoke(&cb, Value::Undefined, &[], _module) {
+                        let value = self.error_value(e);
+                        self.promise_settle(&promise, PromiseState::Rejected, value);
+                        return Ok(Some(Self::promise_value(&promise)));
+                    }
+                }
+                Ok(Some(Self::promise_value(&promise)))
+            }
+        }
+    }
+
+    /// Drain the microtask queue, running each reaction handler.
+    fn run_promise_jobs(&mut self, module: &Module) -> Result<(), RuntimeError> {
+        while let Some(job) = self.state.promise_jobs.pop_front() {
+            let PromiseJob::Reaction {
+                reaction,
+                argument,
+                fulfilled,
+            } = job;
+            let handler = if fulfilled {
+                reaction.on_fulfilled.clone()
+            } else {
+                reaction.on_rejected.clone()
+            };
+            match handler {
+                Some(handler) if handler.is_callable() => {
+                    match self.invoke(&handler, Value::Undefined, &[argument], module) {
+                        Ok(value) => {
+                            self.promise_settle(&reaction.target, PromiseState::Fulfilled, value)
+                        }
+                        Err(RuntimeError::Thrown(reason)) => {
+                            self.promise_settle(&reaction.target, PromiseState::Rejected, reason)
+                        }
+                        Err(other) => {
+                            let value = self.error_value(other);
+                            self.promise_settle(&reaction.target, PromiseState::Rejected, value)
+                        }
+                    }
+                }
+                // No handler of the matching kind: the settlement passes
+                // through to the child (ES 27.2.2.1 step 9).
+                _ => {
+                    let state = if fulfilled {
+                        PromiseState::Fulfilled
+                    } else {
+                        PromiseState::Rejected
+                    };
+                    self.promise_settle(&reaction.target, state, argument);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A `RuntimeError` as a JS error value (what a rejection reason should be).
+    fn error_value(&self, err: RuntimeError) -> Value {
+        match err {
+            RuntimeError::Thrown(value) => value,
+            other => crate::builtins::runtime_error_to_js_error(&other, &self.builtins),
+        }
+    }
+
+    /// `new Promise(executor)`: build the promise, mint its `resolve` / `reject`
+    /// natives (their target is carried in the function name), then run the
+    /// executor. A throw from the executor rejects (ES 27.2.3.1 step 11).
+    fn promise_construct(
+        &mut self,
+        executor: &Value,
+        proto: Option<Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let promise = match proto {
+            Some(Value::Object(p)) => {
+                let id = self.state.next_promise_id;
+                self.state.next_promise_id += 1;
+                let promise = Rc::new(RefCell::new(PromiseObject::new(Some(p), id)));
+                self.state.promises.insert(id, Rc::clone(&promise));
+                promise
+            }
+            _ => self.new_promise(),
+        };
+        let id = promise.borrow().id;
+        let native = |name: &str| {
+            Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(name))))
+        };
+        let resolve = native(&format!("__promise_resolve__{id}"));
+        let reject = native(&format!("__promise_reject__{id}"));
+        match self.invoke(executor, Value::Undefined, &[resolve, reject], module) {
+            Ok(_) => {}
+            Err(err) => {
+                let value = self.error_value(err);
+                self.promise_settle(&promise, PromiseState::Rejected, value);
+            }
+        }
+        Ok(Self::promise_value(&promise))
     }
 
     fn try_array_callback_method(
@@ -7061,6 +7372,18 @@ impl VM {
             let proto = self.prototype_from_constructor(constructor_val, new_target);
             return crate::builtins::date_construct_value(args, proto);
         }
+        // `new Promise(executor)`: the executor has to be *called* with the two
+        // settling functions, which only the VM can do.
+        if name == "Promise" {
+            let executor = args.first().cloned().unwrap_or(Value::Undefined);
+            if !executor.is_callable() {
+                return Err(RuntimeError::TypeError(
+                    "Promise resolver undefined is not a function".to_string(),
+                ));
+            }
+            let proto = self.prototype_from_constructor(constructor_val, new_target);
+            return self.promise_construct(&executor, proto, module);
+        }
 
         // ES 9.1.14 `GetPrototypeFromConstructor`: `newTarget.prototype` when
         // it is an object, otherwise the constructor's own `prototype` — which
@@ -7204,6 +7527,14 @@ struct State {
     /// Fresh per `run` (`run` replaces the whole `State`), so one test's
     /// declarations cannot leak into the next.
     script_env: HashMap<String, Option<Value>>,
+    /// The microtask queue. The engine has no event loop, so this is drained at
+    /// the end of the top-level `run` and inside `await`.
+    promise_jobs: std::collections::VecDeque<PromiseJob>,
+    /// Promises reachable from the native `resolve` / `reject` functions, keyed
+    /// by the id embedded in their names — the engine dispatches natives by
+    /// name, so that is how those two closures carry their target.
+    promises: HashMap<u64, Rc<RefCell<PromiseObject>>>,
+    next_promise_id: u64,
     this_val: Value,
     /// Stack of captured variable maps for active closure scopes
     closure_var_stack: Vec<HashMap<String, Value>>,
@@ -7247,6 +7578,9 @@ impl State {
             seh_stack: Vec::new(),
             globals: HashMap::new(),
             script_env: HashMap::new(),
+            promise_jobs: std::collections::VecDeque::new(),
+            promises: HashMap::new(),
+            next_promise_id: 0,
             this_val: Value::Undefined,
             closure_var_stack: Vec::new(),
             construct_stack: Vec::new(),
@@ -7607,6 +7941,17 @@ struct SavedExecutionState {
     ctrl: usize,
     delegate: usize,
     registers: [Value; 19],
+}
+
+/// One entry of the microtask queue: a reaction to run and the settlement that
+/// triggered it.
+#[derive(Debug, Clone)]
+pub enum PromiseJob {
+    Reaction {
+        reaction: crate::vm::object::PromiseReaction,
+        argument: Value,
+        fulfilled: bool,
+    },
 }
 
 #[derive(Debug)]
