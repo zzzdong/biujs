@@ -136,7 +136,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
 | A8 | 计划内通过数 | 15972 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 500 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A9 | 单元 / feature / 护栏测试 | 190 / 501 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1917,7 +1917,10 @@ feature 499（+3 用例）。
    3GB 上限会在单片内 OOM，5GB 才行。修掉它能把上限往下调、也让长跑更稳。
 3. `drive_bytecode_frame` 退出时 `self.state.frame_argc.truncate(saved_this_depth)` 用的是
    `this_stack` 的长度 —— 两条栈的长度未必同步，这里值得单独看一眼（记为疑点）。
-4. B34 留下的"链式 `new Promise(…抛出…).catch` 收不到 handler"仍在。
+4. B34 留下的"链式 `new Promise(…抛出…).catch` 收不到 handler" —— **随 B37 的 `VM::run`
+   补齐重置一并好了**（B37 之后那条用例与 node 逐字一致）。已加防回归断言：
+   `chained_reactions_run_including_when_the_executor_throws`，用 `VM::global` 在 drain 之后
+   读回结果（微任务只能这样观察）。
 
 ---
 

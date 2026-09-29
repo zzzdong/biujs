@@ -883,3 +883,44 @@ fn async_functions_and_await() {
         "sum:3"
     );
 }
+
+#[test]
+fn chained_reactions_run_including_when_the_executor_throws() {
+    // The legacy symptom: `new Promise(function () { throw … }).catch(cb)` dropped
+    // the handler, so the reaction never ran. It turned out to be left-over state
+    // between runs (B37's `VM::run` resets), and the chained form is the one that
+    // exposed it — `var p = …; p.catch(cb)` worked.
+    //
+    // Observing a microtask needs the same trick the test262 runner uses: run the
+    // program (which drains the queue), then read a global back off the VM. (The
+    // handler writes through an object, because writing a captured binding is the
+    // engine's known closure debt.)
+    use biujs::{Compiler, VM};
+
+    let mut vm = VM::new();
+    let mut compiler = Compiler::new();
+    let module = compiler
+        .compile(
+            "var box = { seen: '' };
+             new Promise(function (resolve) { resolve(1); })
+                 .then(function (v) { box.seen = box.seen + 't:' + v + ';'; });
+             new Promise(function () { throw new Error('exec'); })
+                 .catch(function (e) { box.seen = box.seen + 'c:' + e.message + ';'; });
+             Promise.resolve(2).then(function (v) { box.seen = box.seen + 'r:' + v + ';'; });
+             box",
+        )
+        .expect("compiles");
+    vm.run(&module).expect("runs");
+
+    let boxed = vm.global("box").expect("the program's global");
+    let Value::Object(obj) = &boxed else {
+        panic!("box should be an object");
+    };
+    let seen = obj
+        .borrow()
+        .property_get(&biujs::vm::PropertyKey::from_str("seen"))
+        .expect("seen property")
+        .value;
+    // Same order node reports: the reactions run in the order they were queued.
+    assert_eq!(seen.to_js_string(), "t:1;c:exec;r:2;");
+}

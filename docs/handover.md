@@ -58,7 +58,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 |------|------|
 | test262 执行 / 通过 / 失败 / 跳过 | 18914 / **15972** / 2942 / 8173 |
 | 通过率 | 84.45%（参考值；分母口径见计划书 §2.1；分母因 `built-ins/Promise` 入册变大） |
-| 单元 / feature / 护栏测试 | 190 / 500 / 7，全绿 |
+| 单元 / feature / 护栏测试 | 190 / 501 / 7，全绿 |
 | 全量耗时 | 约 3m（三层护栏封顶：单例 15s 墙钟、2×10^7 指令、256MiB 堆增量） |
 | runner 覆盖面 | 25586 / 53568 个测试文件（47%）——**未覆盖里约 4920 条属承诺的 M5/M6** |
 | 基线快照 | `phase2-status.tsv`（`scripts/phase2-status.sh` 生成的逐套件表） |
@@ -84,8 +84,7 @@ curated 清单里）、B32（`RegExp`：字面量此前是 `undefined`；新增 
 会改内建对象，所以 runner 仍每用例新建 VM（实测复用只有 14002 通过）。
 
 **下一步**：`built-ins/Array` 里那条合法的大分配（~384MB）决定单片上限的下限，可以看看能否
-压下来；然后是 B35 记的 `frame_argc.truncate(saved_this_depth)` 疑点，以及 B34 的
-"链式 `new Promise(…抛出…).catch` 收不到 handler"。
+压下来；然后是 B35 记的 `frame_argc.truncate(saved_this_depth)` 疑点，B34 那条"链式 `new Promise(…抛出…).catch` 收不到 handler"已随 B37 一并修好（与 node 逐字一致）。
 
 **历史**：（整轮峰值贴在内存边沿，B31 把它顶过去了；已验证拆成
 `language` / `built-ins` 两个进程各跑一半可行且逐套件数字一致）—— 不修，`--update` 刷新不了快照。
