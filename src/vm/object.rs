@@ -2453,6 +2453,130 @@ impl JSObject for PromiseObject {
     }
 }
 
+/// The global object: an object whose properties *are* the script's globals.
+///
+/// The engine keeps globals in a `HashMap` on `State` rather than an object, so
+/// `globalThis` is a view onto that map — the same `Rc` — instead of a second
+/// copy that would need syncing on every write. (A script-level `let`/`const`
+/// lives in the script's declarative record and is deliberately **not** here:
+/// `globalThis.x` stays `undefined` for `let x`, per B21.)
+#[derive(Debug)]
+pub struct GlobalObject {
+    store: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+}
+
+impl GlobalObject {
+    pub fn new(
+        store: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+    ) -> Self {
+        Self { store }
+    }
+
+    fn key_name(key: &PropertyKey) -> Option<String> {
+        match key {
+            PropertyKey::Str(s) => Some(s.as_str().to_string()),
+            _ => None,
+        }
+    }
+
+    fn data(value: Value) -> PropertyDescriptor {
+        PropertyDescriptor {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+            getter: None,
+            setter: None,
+        }
+    }
+}
+
+impl JSObject for GlobalObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Ordinary
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        let name = Self::key_name(key)?;
+        self.store.borrow().get(&name).cloned().map(Self::data)
+    }
+
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        let Some(name) = Self::key_name(&key) else {
+            return Ok(false);
+        };
+        self.store.borrow_mut().insert(name, value);
+        Ok(true)
+    }
+
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        // Accessors have nowhere to live on a plain map-backed global; a data
+        // descriptor is what every built-in registration uses anyway.
+        let Some(name) = Self::key_name(&key) else {
+            return Ok(false);
+        };
+        self.store
+            .borrow_mut()
+            .insert(name, descriptor.value.clone());
+        Ok(true)
+    }
+
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        match Self::key_name(key) {
+            Some(name) => self.store.borrow_mut().remove(&name).is_some(),
+            None => false,
+        }
+    }
+
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        match Self::key_name(key) {
+            Some(name) => self.store.borrow().contains_key(&name),
+            None => false,
+        }
+    }
+
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.store
+            .borrow()
+            .keys()
+            .map(|k| PropertyKey::from_str(k))
+            .collect()
+    }
+
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        None
+    }
+    fn set_prototype(&mut self, _proto: Option<Rc<RefCell<dyn JSObject>>>) {}
+    fn is_extensible(&self) -> bool {
+        true
+    }
+    fn prevent_extensions(&mut self) {}
+    fn is_frozen(&self) -> bool {
+        false
+    }
+    fn freeze(&mut self) {}
+    fn is_sealed(&self) -> bool {
+        false
+    }
+    fn seal(&mut self) {}
+
+    fn class_name(&self) -> &'static str {
+        "global"
+    }
+}
+
 #[derive(Debug)]
 pub struct MapObject {
     entries: Vec<Option<(Value, Value)>>,

@@ -136,7 +136,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
 | A8 | 计划内通过数 | 15978 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 502 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A9 | 单元 / feature / 护栏测试 | 190 / 503 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -2050,6 +2050,40 @@ feature **500**（+1 条防回归用例：同一个 VM 连跑两个程序，后�
 elision 应为洞、`matchAll`、TypedArray、`Proxy`/`Reflect`。另外两条债仍在：
 `built-ins/Array` 那条 ~384MB 的大分配（决定单片上限下限），以及
 `drive_bytecode_frame` 里 `frame_argc.truncate(saved_this_depth)` 的疑点。
+
+---
+
+#### B39 `globalThis` —— 已完成（2026-09-29）
+
+**为什么要它**：脚本里最常见的全局引用，此前完全没有（引擎的全局只是个 `HashMap` 放在 `State`
+上，脚本层 `this` 也因此不是全局对象）。
+
+**实现**：`State.globals` 改成 `Rc<RefCell<HashMap<..>>>`，再加一个 `GlobalObject` 与它共享同一
+个 `Rc` —— `globalThis` 是这个 map 的**视图**而不是副本，因此不需要在任何写入点做同步。
+`class_name` 给 `global`，于是 `Object.prototype.toString.call(globalThis) === "[object global]"`。
+
+脚本语义下与 node 一致的点：`var` 会作为属性出现、写入可见、`Object.keys` 列出全局
+（含内建）、`delete` 有效；而脚本层 `let` **不会**出现（B21 的声明记录，本来就该如此）。
+两处与 `node file.js` 不同是**脚本 vs 模块**的差别：node 把文件包成 CommonJS 模块，所以它的
+`var gv` 不是全局属性 —— test262 跑的是脚本，引擎是对的。
+
+**踩到的两个坑（同一个环，两种躲法）**
+
+1. 把 `globalThis` 作为属性放进 globals map 会形成 `map → 对象 → map` 的环；没有 GC，于是
+   **每个 run 的整个 `State` 都被钉住** —— 实测表现为分片撞穿自己的 `ulimit`（一次 240MB 的
+   分配失败）。
+2. 想绕开它、改成"环境查找时特判 `globalThis` 这个名字"，环没了，但
+   `globalThis.globalThis === globalThis` 就变成 `undefined` 了。
+
+最后的做法是保留这个属性，在**丢弃 State 之前**手动摘掉自引用（`run` 开头 + `Drop for VM`），
+与 B37 断 `prototype`⇄`constructor` 是同一种手写断环。
+
+**效果**：test262 计数 **+0**（curated 清单里没有套件考它），feature **503**（+1 用例 /
+7 条断言），内存无退步（分片仍能在 1GB 上限下跑完）。
+
+**下一批**：铺面继续 —— `e.stack`（只能给函数名，字节码无行列信息）、elision 应为洞、
+`matchAll`、TypedArray、`Proxy`/`Reflect`。两条债仍在：`built-ins/Array` 那条 ~384MB 的大分配
+（决定单片上限下限），以及 `drive_bytecode_frame` 里 `frame_argc.truncate(saved_this_depth)`。
 
 ---
 

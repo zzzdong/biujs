@@ -247,7 +247,12 @@ impl VM {
     pub fn new() -> Self {
         let mut state = State::new();
         let builtins = Builtins::new();
-        builtins.register(&mut state.globals);
+        builtins.register(&mut state.globals.borrow_mut());
+        // `globalThis.globalThis === globalThis`, as in every host.
+        state
+            .globals
+            .borrow_mut()
+            .insert("globalThis".to_string(), state.global_object.clone());
         Self {
             state,
             builtins,
@@ -297,6 +302,10 @@ impl VM {
 
     /// Execute a bytecode module and return the result
     pub fn run(&mut self, module: &Module) -> Result<Value, RuntimeError> {
+        // Break the `globals` ⇄ `globalThis` cycle *before* dropping this run's
+        // State: the map holds the global object and the object holds the map, so
+        // with no GC the pair (and the whole State with it) would survive.
+        self.state.globals.borrow_mut().remove("globalThis");
         self.state = State::new();
         // Break each boxed function's `prototype` ⇄ `constructor` cycle before
         // dropping the map: a function object and its `prototype` object point at
@@ -342,7 +351,11 @@ impl VM {
         // test's teardown) must not be blamed on the program about to run.
         clear_memory_pressure();
         // Re-register builtins into the fresh state
-        self.builtins.register(&mut self.state.globals);
+        self.builtins.register(&mut self.state.globals.borrow_mut());
+        self.state
+            .globals
+            .borrow_mut()
+            .insert("globalThis".to_string(), self.state.global_object.clone());
 
         while self.step(module)? {}
 
@@ -365,7 +378,7 @@ impl VM {
     /// queue performed. That is how a host observes an async outcome: the test
     /// records it in a global, then the host reads that global.
     pub fn global(&self, name: &str) -> Option<Value> {
-        self.state.globals.get(name).cloned()
+        self.state.globals.borrow().get(name).cloned()
     }
 
     /// Box a bare `Value::Function(id)` into a stable `FunctionObject`.
@@ -3040,7 +3053,7 @@ impl VM {
                         )))
                     }
                     None => {
-                        self.state.globals.insert(name, value);
+                        self.state.globals.borrow_mut().insert(name, value);
                     }
                 }
             }
@@ -8268,7 +8281,12 @@ struct State {
     ctrl_stack: Vec<usize>,
     registers: [Value; 19],
     seh_stack: Vec<SehRecord>,
-    globals: HashMap<String, Value>,
+    /// The script's globals — shared with the `globalThis` object (see
+    /// `vm::object::GlobalObject`), so both views stay in step.
+    globals: Rc<RefCell<HashMap<String, Value>>>,
+    /// The `globalThis` object itself, kept here so it survives re-registration
+    /// and can be published as a global of the same name.
+    global_object: Value,
     /// The script's **declarative record**: `let` / `const` / `class` declared at
     /// script scope. Distinct from `globals` (the global *object*) because those
     /// bindings are not properties: `globalThis.x` stays `undefined` for
@@ -8332,12 +8350,17 @@ struct State {
 
 impl State {
     fn new() -> Self {
+        let globals = Rc::new(RefCell::new(HashMap::new()));
+        let global_object = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::GlobalObject::new(Rc::clone(&globals)),
+        )));
         Self {
             data_stack: Vec::with_capacity(1024),
             ctrl_stack: Vec::with_capacity(256),
             registers: std::array::from_fn(|_| Value::Undefined),
             seh_stack: Vec::new(),
-            globals: HashMap::new(),
+            globals,
+            global_object,
             script_env: HashMap::new(),
             promise_jobs: std::collections::VecDeque::new(),
             promises: HashMap::new(),
@@ -8525,6 +8548,13 @@ impl State {
     /// `typeof` that skipped the record answered `"undefined"` for a name the
     /// ordinary read resolves to a function.
     fn resolve_env_name(&self, name: &str) -> Result<Option<Value>, RuntimeError> {
+        // `globalThis` is answered from the realm's global object rather than
+        // from the globals map: publishing it *in* the map would make
+        // map → object → map, a cycle that (with no GC) pinned every run's
+        // whole `State` — measured as a shard that outgrew its `ulimit`.
+        if name == "globalThis" {
+            return Ok(Some(self.global_object.clone()));
+        }
         match self.script_env.get(name) {
             Some(Some(value)) => return Ok(Some(value.clone())),
             Some(None) => {
@@ -8546,7 +8576,7 @@ impl State {
     }
 
     fn get_global(&self, name: &str) -> Option<Value> {
-        self.globals.get(name).cloned()
+        self.globals.borrow().get(name).cloned()
     }
 }
 
@@ -8775,6 +8805,7 @@ impl Drop for VM {
     /// whole builtins graph of every program: measured as a shard that could not
     /// finish under a 1 GiB `ulimit`.
     fn drop(&mut self) {
+        self.state.globals.borrow_mut().remove("globalThis");
         self.builtins.teardown();
     }
 }
@@ -8882,7 +8913,7 @@ mod tests {
         assert_eq!(state.rbp, 0);
         assert!(state.ctrl_stack.is_empty());
         assert!(state.seh_stack.is_empty());
-        assert!(state.globals.is_empty());
+        assert!(state.globals.borrow().is_empty());
     }
 
     #[test]
@@ -9017,7 +9048,10 @@ mod tests {
     fn test_state_global() {
         let mut state = State::new();
         assert!(state.get_global("x").is_none());
-        state.globals.insert("x".to_string(), Value::Number(42.0));
+        state
+            .globals
+            .borrow_mut()
+            .insert("x".to_string(), Value::Number(42.0));
         assert_eq!(state.get_global("x"), Some(Value::Number(42.0)));
     }
 

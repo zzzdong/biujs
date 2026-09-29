@@ -953,3 +953,27 @@ fn replace_accepts_a_function_replacer() {
     // … while a string replacer still takes the old code path.
     assert_eq!(eval_string("'a1b2'.replace(/\\d/g, '#')"), "a#b#");
 }
+
+#[test]
+fn global_this_is_the_script_s_global_object() {
+    assert_eq!(eval_string("typeof globalThis"), "object");
+    assert_eq!(eval_string("Object.prototype.toString.call(globalThis)"), "[object global]");
+    // It is a *view* onto the script's globals, not a copy: a `var` shows up as a
+    // property and a write through it is visible as a binding. (Script semantics —
+    // node wraps a file in a module, so `var` there is not global; test262 runs
+    // scripts.)
+    assert_eq!(eval_string("var gv = 1; String(globalThis.gv)"), "1");
+    assert_eq!(eval_string("globalThis.gw = 2; String(gw)"), "2");
+    assert_eq!(eval_string("String(globalThis.globalThis === globalThis)"), "true");
+    assert_eq!(eval_string("String(typeof globalThis.Math === 'object')"), "true");
+    // A script-scope `let` is *not* a property of the global object (B21's whole
+    // point: it lives in the script's declarative record).
+    assert_eq!(
+        eval_string("let gl = 5; String(typeof globalThis.gl)"),
+        "undefined"
+    );
+    // Enumerating it lists the realm's globals (built-ins included). Each
+    // `eval_string` is its own program, so this cannot look for the `gv` above.
+    assert_eq!(eval_string("String(Object.keys(globalThis).indexOf('Math') >= 0)"), "true");
+    assert_eq!(eval_string("String(Object.keys(globalThis).length > 10)"), "true");
+}
