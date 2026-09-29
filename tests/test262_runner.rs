@@ -138,6 +138,14 @@ fn memory_allowance() -> usize {
     })
 }
 
+// NOTE: reusing one `VM` across tests was tried to stop the per-test leak (see
+// the plan's B36): creating a `VM` per test leaked a whole `Builtins` graph per
+// test (`Rc` cycles, no GC). It fixed the memory — a shard that died at 1 GiB
+// completed — but it **changed results**: 15972 → 14002 passing. So `VM::run`
+// does *not* reset everything a run touches, and the engine's documented
+// "a host reuses the VM across tests" contract is not actually met yet.
+// Until that is fixed, each test gets a fresh VM and the leak stays.
+
 /// The VM every test runs in, carrying the three guards from the table above.
 fn guarded_vm() -> VM {
     static STEP_LIMIT: OnceLock<Option<u64>> = OnceLock::new();
@@ -908,6 +916,25 @@ fn test262_at_pinned_revision() {
 
 #[test]
 fn test262_report() {
+    // The whole suite runs on one worker thread with a large stack.
+    //
+    // Two reasons, both measured:
+    // * The VM is reused across tests (see `with_vm`), so a deep recursive test
+    //   reaches the same native depth as before — but the default 2 MiB test
+    //   thread stack is too small for `MAX_CALL_DEPTH` (512) nested Rust frames.
+    // * And a single process-wide VM's graph is only dropped once, which must
+    //   not happen on a small stack either.
+    let handle = std::thread::Builder::new()
+        .name("test262-suite".to_string())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(test262_report_inner)
+        .expect("spawn the suite thread");
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn test262_report_inner() {
     if !has_tests() {
         eprintln!(
             "test262 not found at {:?}, skipping (run `git submodule update --init`)",
