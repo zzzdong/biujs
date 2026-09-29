@@ -1875,6 +1875,10 @@ impl VM {
             if let Some(result) = self.try_promise_method(&this, method, args, module)? {
                 return Ok(result);
             }
+            // `String.prototype.replace(re, fn)` — the replacer is user code.
+            if let Some(result) = self.try_string_callback_method(&this, method, args, module)? {
+                return Ok(result);
+            }
             // `entries` / `keys` / `values` return a *fresh* iterator over a
             // snapshot; only the VM can mint iterator objects (they live in the
             // iterator registry so `next()` can find its state).
@@ -3159,6 +3163,15 @@ impl VM {
                     return Ok(());
                 }
 
+                // A function replacer for `String.prototype.replace` runs here
+                // for the same reason (it calls user code).
+                if let Some(result) =
+                    self.try_string_callback_method(&obj_val, &method_name, &args, module)?
+                {
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
                 // `then` / `catch` / `finally` likewise (they call the handler).
                 // This is the second method-call path — a chained call like
                 // `new Promise(f).catch(cb)` comes through here, not through the
@@ -5644,6 +5657,118 @@ impl VM {
             }
         }
         Self::promise_value(&child)
+    }
+
+    /// `String.prototype.replace(searchValue, replacer)` when the replacer is a
+    /// **function** — the everyday `s.replace(/re/g, fn)` shape.
+    ///
+    /// The builtin layer cannot call user code, so the whole substitution runs
+    /// here: find the matches, call the replacer with
+    /// `(match, group…, offset, input)`, and splice its `ToString` in.
+    fn try_string_callback_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if !matches!(method, "replace" | "replaceAll") {
+            return Ok(None);
+        }
+        let Value::String(text) = this else {
+            return Ok(None);
+        };
+        let replacer = match args.get(1) {
+            // A bare `Value::Function(id)` is callable too; `is_callable()` only
+            // answers for the boxed form, and this interception runs before the
+            // boxing that `call_native_by_name` does.
+            Some(v) if v.is_callable() || matches!(v, Value::Function(_)) => v.clone(),
+            _ => return Ok(None),
+        };
+        let replacer = match replacer {
+            Value::Function(_) => self.as_object_value(&replacer),
+            other => other,
+        };
+        let search = args.first().cloned().unwrap_or(Value::Undefined);
+        let mut global = method == "replaceAll";
+
+        // Collect the matches: a RegExp contributes its captures (all of them
+        // when `g`), anything else is a plain substring search.
+        let mut matches: Vec<(usize, usize, Vec<Option<String>>)> = Vec::new();
+        let mut regex_flags = String::new();
+        let compiled = match &search {
+            Value::Object(obj_ref) => {
+                let kind_is_regexp =
+                    obj_ref.borrow().kind() == crate::vm::property::ObjectKind::RegExp;
+                if kind_is_regexp {
+                    let borrowed = obj_ref.borrow();
+                    let re = borrowed
+                        .as_any()
+                        .downcast_ref::<crate::vm::object::RegExpObject>()
+                        .expect("ObjectKind::RegExp implies RegExpObject");
+                    regex_flags = re.flags.clone();
+                    global = global || regex_flags.contains('g');
+                    re.compiled.clone()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(matcher) = compiled {
+            for captures in matcher.captures_iter(text.as_str()) {
+                let whole = match captures.get(0) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let groups = (1..captures.len())
+                    .map(|i| captures.get(i).map(|m| m.as_str().to_string()))
+                    .collect();
+                matches.push((whole.start(), whole.end(), groups));
+                if !global {
+                    break;
+                }
+            }
+        } else {
+            let needle = search.to_js_string();
+            if !needle.is_empty() {
+                if global {
+                    let mut from = 0usize;
+                    while let Some(at) = text.as_str()[from..].find(needle.as_str()) {
+                        let start = from + at;
+                        matches.push((start, start + needle.len(), Vec::new()));
+                        from = start + needle.len().max(1);
+                    }
+                } else if let Some(at) = text.as_str().find(needle.as_str()) {
+                    matches.push((at, at + needle.len(), Vec::new()));
+                }
+            } else {
+                // An empty pattern matches at both ends (ES 22.1.3.17 step 8).
+                matches.push((0, 0, Vec::new()));
+            }
+        }
+
+        let mut out = String::new();
+        let mut last = 0usize;
+        for (start, end, groups) in matches {
+            out.push_str(&text.as_str()[last..start]);
+            let mut call_args: Vec<Value> = vec![Value::string(&text.as_str()[start..end])];
+            for group in groups {
+                call_args.push(match group {
+                    Some(g) => Value::string(&g),
+                    None => Value::Undefined,
+                });
+            }
+            call_args.push(Value::Number(start as f64));
+            call_args.push(Value::string(text.as_str()));
+            let replacement = self
+                .invoke(&replacer, Value::Undefined, &call_args, module)?
+                .to_js_string();
+            out.push_str(&replacement);
+            last = end;
+        }
+        out.push_str(&text.as_str()[last..]);
+        Ok(Some(Value::string(&out)))
     }
 
     /// `then` / `catch` / `finally`, when the receiver is a promise.

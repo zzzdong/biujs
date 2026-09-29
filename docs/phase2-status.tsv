@@ -26,7 +26,7 @@ language/identifiers	202	66	0
 built-ins/Error	38	19	36
 built-ins/Set	344	19	20
 built-ins/NativeErrors	68	12	14
-built-ins/String	702	216	305
+built-ins/String	708	216	299
 language/statements/generators	237	9	20
 language/destructuring	17	1	1
 built-ins/String/prototype/Symbol.iterator	4	1	1

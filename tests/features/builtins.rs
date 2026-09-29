@@ -924,3 +924,32 @@ fn chained_reactions_run_including_when_the_executor_throws() {
     // Same order node reports: the reactions run in the order they were queued.
     assert_eq!(seen.to_js_string(), "t:1;c:exec;r:2;");
 }
+
+#[test]
+fn replace_accepts_a_function_replacer() {
+    // The everyday `s.replace(/re/g, fn)` shape. The replacer is user code, so
+    // the substitution is driven by the VM (the builtin layer cannot call back).
+    assert_eq!(
+        eval_string("'a1b2c3'.replace(/\\d/g, function (m) { return '[' + m + ']'; })"),
+        "a[1]b[2]c[3]"
+    );
+    // `(match, group…, offset, input)`, per ES 22.1.3.17 step 12.
+    assert_eq!(
+        eval_string("'Doe, John'.replace(/(\\w+), (\\w+)/, function (m, a, b) { return b + ' ' + a; })"),
+        "John Doe"
+    );
+    assert_eq!(
+        eval_string("'x=1'.replace(/(\\w)=(\\d)/g, function (m, k, v, off) { return k + ':' + v + '@' + off; })"),
+        "x:1@0"
+    );
+    assert_eq!(
+        eval_string("'a-b'.replace(/-/g, function (m, off, str) { return String(off) + '/' + str.length; })"),
+        "a1/3b"
+    );
+    // A plain string pattern works the same way, and a miss leaves the string
+    // alone without calling the replacer.
+    assert_eq!(eval_string("'abc'.replace('b', function (m) { return m.toUpperCase(); })"), "aBc");
+    assert_eq!(eval_string("'no-match'.replace(/z/, function () { return 'N'; })"), "no-match");
+    // … while a string replacer still takes the old code path.
+    assert_eq!(eval_string("'a1b2'.replace(/\\d/g, '#')"), "a#b#");
+}

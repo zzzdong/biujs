@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15972 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 501 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15978 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 502 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -2016,6 +2016,40 @@ feature **500**（+1 条防回归用例：同一个 VM 连跑两个程序，后�
 2. `drive_bytecode_frame` 退出时 `frame_argc.truncate(saved_this_depth)` 用的是 `this_stack`
    长度（B35 记的疑点，仍在）。
 3. B34 的"链式 `new Promise(…抛出…).catch` 收不到 handler"仍在。
+
+---
+
+#### B38 函数式 replacer —— 已完成（2026-09-29）
+
+**为什么要它**：`s.replace(/re/g, fn)` 是日常写法里最常见的一种，此前直接报
+"a function replacer is not supported yet"（B30 落地字符串 replace 时就留下的口子）。
+
+**实现**：替换要**调用用户函数**，所以整段替换在 VM 里跑（`try_string_callback_method`），
+与数组回调、`then/catch` 同一条路子：找匹配 → 以 `(match, group…, offset, input)` 调函数 →
+把返回值 `ToString` 后拼回去。搜索值可以是 RegExp（带 `g` 则全部匹配，否则只第一个）或字符串；
+`replaceAll` 一律全部匹配。
+
+**又一次踩到同一条规矩**：拦截要挂在**两处**方法调用路径上（`try_array_callback_method`
+旁边那个只有一处不够），而且传进来的实参可能是未装箱的 `Value::Function(id)` ——
+`is_callable()` 对它返回 false，得先 `as_object_value`。这两个坑在数组回调与 promise 上都
+出现过，这是第三次。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15972 | **15978** | **+6** |
+| 失败 | 2942 | 2936 | −6 |
+| 单元 / feature / 护栏 | 190 / 501 / 7 | 190 / **502** / 7 | +1 用例（7 条断言） |
+
+1 个套件提升（`built-ins/String` 702 → 708）、**零回退**。与 node 逐字一致的 7 种形状：
+全局替换、分组交换、`offset`/`input`、字符串模式、无匹配（不调函数）、以及字符串 replacer
+仍走老路径。
+
+**下一批**：铺面继续 —— `globalThis`、`e.stack`（字节码无行列信息，只能给函数名）、
+elision 应为洞、`matchAll`、TypedArray、`Proxy`/`Reflect`。另外两条债仍在：
+`built-ins/Array` 那条 ~384MB 的大分配（决定单片上限下限），以及
+`drive_bytecode_frame` 里 `frame_argc.truncate(saved_this_depth)` 的疑点。
 
 ---
 
