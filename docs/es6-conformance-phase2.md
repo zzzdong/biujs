@@ -136,7 +136,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
 | A8 | 计划内通过数 | 15972 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 499 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A9 | 单元 / feature / 护栏测试 | 190 / 500 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1967,6 +1967,52 @@ builtins。内存问题**当场解决**：同一分片在 **1GB** 上限下跑�
 3. `drive_bytecode_frame` 退出时 `frame_argc.truncate(saved_this_depth)` 用的是 `this_stack`
    长度（B35 记的疑点，仍在）。
 4. B34 的"链式 `new Promise(…抛出…).catch` 收不到 handler"仍在。
+
+---
+
+#### B37 `VM::run` 的重置与 realm 的断环 —— 已完成（2026-09-29）
+
+**同一条根因，两个表面症状**（B36 的两条残留其实是同一件事）：
+
+1. `VM::run` 只重置了 `state` / `func_objs` / `bound_functions` / `invoke_boundaries` /
+   计数器，**没有**重置 `iterator_registry`、`generator_registry`、`delegate_stack`、
+   `generator_send`/`generator_yielded`/`generator_yield_pc`、`running_generator_prologue`。
+   前两者持有一轮里造过的**全部**迭代器与生成器对象 —— 于是宿主复用同一个 VM 时，每轮的对象图
+   都被钉住（内存增长），而且下一轮能看见上一轮的残留（"复用就变结果"）。
+2. realm 的 `Rc` 环没人断：`prototype.constructor` ↔ `constructor.prototype`，以及每个函数对象
+   与它的 `prototype` 对象互指。没有 GC，环就永不回收 —— 于是"每个程序一个 VM"（runner 必须
+   如此，见下）每程序漏掉整套 `Builtins` 图。
+
+**改动**
+
+| 位置 | 改动 |
+|------|------|
+| `VM::run` | 补齐上面那五处重置 |
+| `VM::run` | 清 `func_objs` **之前**先删掉每个已装箱函数对象的 `prototype` 属性（断环） |
+| `Builtins::teardown` | 删掉 21 个原型的 `constructor` 属性，并清空线程本地的包装原型表（它按名字索引，会钉住上一个 realm） |
+| `impl Drop for VM` | 调 `teardown()` |
+
+**实测**
+
+| 测量 | 修前 | 修后 |
+|------|------|------|
+| 分片 0 在 **1GB** `ulimit` 下 | OOM（`memory allocation … failed`） | **跑完**（TOTAL 3658） |
+| 整轮默认内存上限 | 5GB | **2.5GB**（实测下限：分片 1GB 即可；`built-ins/Array` 里有一条**合法**的 ~384MB 单例分配，所以留余量） |
+
+test262：**15972 / 8173 / 2942**，与 B35 逐位一致、零逐套件回退（本批是修债，不改语义）。
+feature **500**（+1 条防回归用例：同一个 VM 连跑两个程序，后者看不到前者的 `var` 与注册表）。
+
+**一个要写清楚的区分**：状态重置修好之后，"宿主复用同一个 VM"这条契约在**状态**层面成立了；
+但 runner **仍然**每用例新建 VM —— 因为 test262 用例会**改动内建对象**（`Array.prototype[Symbol.iterator] = …`、
+`Object.defineProperty`、删除属性……）并且每条都期望一个**干净 realm**。实测：即使重置补齐，
+复用同一个 VM 也只有 14002 通过。所以"realm 新鲜"是比"状态重置"更硬的要求，两者不能混为一谈。
+
+**残留**
+
+1. `built-ins/Array` 有一条合法的大分配（~384MB），决定了单片上限的下限。
+2. `drive_bytecode_frame` 退出时 `frame_argc.truncate(saved_this_depth)` 用的是 `this_stack`
+   长度（B35 记的疑点，仍在）。
+3. B34 的"链式 `new Promise(…抛出…).catch` 收不到 handler"仍在。
 
 ---
 

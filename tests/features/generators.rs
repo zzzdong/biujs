@@ -779,3 +779,51 @@ fn a_generator_prologue_inside_a_parameter_default_is_re_entrant() {
         1.0
     );
 }
+
+#[test]
+fn one_vm_can_run_two_programs_without_carrying_state_over() {
+    // A host may reuse a VM (the engine documents that). Every run therefore has
+    // to reset everything it *touches*: the iterator / generator registries, the
+    // delegate stack and the generator prologue flag used to survive, which both
+    // leaked a program's whole object graph per run and let a later program see
+    // stale registries (measured as 15972 → 14002 passing when the test262 runner
+    // switched to one VM — see the plan's B36/B37).
+    use biujs::{Compiler, VM};
+
+    let mut vm = VM::new();
+    let mut run = |vm: &mut VM, source: &str| -> String {
+        let mut compiler = Compiler::new();
+        let module = compiler.compile(source).expect("compiles");
+        match vm.run(&module) {
+            Ok(value) => value.to_js_string(),
+            Err(err) => format!("error: {err}"),
+        }
+    };
+
+    // The first program leaves live iterators and a suspended generator behind.
+    assert_eq!(
+        run(
+            &mut vm,
+            "var s = 0;
+             for (var v of [1, 2, 3]) { s += v; }
+             function* g() { yield 1; }
+             var it = g();
+             it.next();
+             String(s)"
+        ),
+        "6"
+    );
+    // The second program must see a clean world: no `s`, no stale registries, and
+    // iterators it makes itself still work.
+    assert_eq!(run(&mut vm, "typeof s"), "undefined");
+    assert_eq!(
+        run(
+            &mut vm,
+            "var c = 0;
+             for (var x of [4, 5]) { c += x; }
+             function* h() { yield 7; }
+             c + '/' + h().next().value"
+        ),
+        "9/7"
+    );
+}

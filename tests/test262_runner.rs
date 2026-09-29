@@ -138,13 +138,12 @@ fn memory_allowance() -> usize {
     })
 }
 
-// NOTE: reusing one `VM` across tests was tried to stop the per-test leak (see
-// the plan's B36): creating a `VM` per test leaked a whole `Builtins` graph per
-// test (`Rc` cycles, no GC). It fixed the memory — a shard that died at 1 GiB
-// completed — but it **changed results**: 15972 → 14002 passing. So `VM::run`
-// does *not* reset everything a run touches, and the engine's documented
-// "a host reuses the VM across tests" contract is not actually met yet.
-// Until that is fixed, each test gets a fresh VM and the leak stays.
+// NOTE (B37): reusing one `VM` across tests is **not** the answer, even after
+// making `VM::run` reset everything it touches. test262 mutates built-ins by
+// design (`Array.prototype[Symbol.iterator] = …`, `Object.defineProperty`, …)
+// and every test expects a fresh realm, so a shared VM still scored 14002
+// instead of 15972. The leak has to be fixed *inside* the per-test-VM model:
+// make each VM's graph collectable (see `Builtins::teardown`).
 
 /// The VM every test runs in, carrying the three guards from the table above.
 fn guarded_vm() -> VM {

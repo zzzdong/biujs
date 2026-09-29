@@ -298,11 +298,40 @@ impl VM {
     /// Execute a bytecode module and return the result
     pub fn run(&mut self, module: &Module) -> Result<Value, RuntimeError> {
         self.state = State::new();
+        // Break each boxed function's `prototype` ⇄ `constructor` cycle before
+        // dropping the map: a function object and its `prototype` object point at
+        // each other, so the pair survives the map being cleared (no GC) and
+        // takes the whole program's graph with it.
+        for value in self.func_objs.values() {
+            if let Value::Object(obj_ref) = value {
+                let _ = obj_ref
+                    .borrow_mut()
+                    .property_delete(&crate::vm::property::PropertyKey::from_str("prototype"));
+            }
+        }
         self.func_objs.clear();
         self.current_module_info = Some(module.func_info.clone());
         self.bound_functions.clear();
         self.next_bound_id = 0;
         self.invoke_boundaries.clear();
+        // Everything else a run *touches* has to be reset too, or a reused VM
+        // carries the previous program across. These five were the leak: the
+        // registries hold every iterator / generator the program made, so a host
+        // that reuses one VM (which the contract says it may) accumulated the
+        // whole object graph of every run — measured as a shard that could not
+        // finish under a 1 GiB `ulimit`, and as *different results* when the
+        // runner was switched to reuse (15972 → 14002 passing).
+        self.iterator_registry.clear();
+        self.next_iterator_id = 0;
+        self.generator_registry.clear();
+        self.next_generator_id = 0;
+        self.generator_send = Value::Undefined;
+        self.generator_yielded = None;
+        self.generator_yield_pc = 0;
+        self.delegate_stack.clear();
+        // A prologue that was interrupted left this set; the next program's
+        // first generator would then stop at its own `PrologueEnd`.
+        self.running_generator_prologue = false;
         self.steps = 0;
         self.next_guard_check = GUARD_CHECK_INTERVAL;
         self.guard_fired = None;
@@ -8611,6 +8640,18 @@ pub struct PromiseAggregation {
     rejections: usize,
     /// `any` total element count (known only after the iterable is exhausted).
     total: usize,
+}
+
+impl Drop for VM {
+    /// Break this realm's cycles so dropping the VM actually frees it.
+    ///
+    /// A host that builds a VM per program (the test262 runner does, because a
+    /// test may mutate built-ins and expects a clean realm) otherwise leaks the
+    /// whole builtins graph of every program: measured as a shard that could not
+    /// finish under a 1 GiB `ulimit`.
+    fn drop(&mut self) {
+        self.builtins.teardown();
+    }
 }
 
 #[derive(Debug)]

@@ -80,6 +80,14 @@ pub fn register_wrapper_prototype(name: &'static str, proto: Rc<RefCell<dyn JSOb
     });
 }
 
+/// Drop every entry of the thread-local wrapper-prototype registry.
+///
+/// Called from [`Builtins::teardown`]: the registry is keyed by name, so it
+/// holds an `Rc` to the *last* realm's prototypes and would pin that realm.
+pub fn clear_wrapper_prototypes() {
+    WRAPPER_PROTOTYPES.with(|map| map.borrow_mut().clear());
+}
+
 pub fn wrapper_prototype(name: &str) -> Option<Rc<RefCell<dyn JSObject>>> {
     WRAPPER_PROTOTYPES.with(|map| map.borrow().get(name).cloned())
 }
@@ -480,6 +488,51 @@ impl Builtins {
             PropertyKey::from_str("constructor"),
             method_descriptor(fn_val.clone()),
         );
+    }
+
+    /// Break the `prototype` ⇄ `constructor` cycles this realm created.
+    ///
+    /// There is no GC: a cycle between the prototype and its constructor keeps
+    /// both — and everything they reach — alive even after the last external
+    /// reference is gone. A host that makes a fresh `VM` per program (which is
+    /// what the test262 runner must do: a test may mutate built-ins and expects a
+    /// clean realm) therefore leaked one whole builtins graph per program.
+    ///
+    /// Removing the `constructor` property is enough: the constructor is only
+    /// reachable through it once the realm's `globals` are gone.
+    pub fn teardown(&self) {
+        let prototypes: [&Rc<RefCell<dyn JSObject>>; 21] = [
+            &self.object_prototype,
+            &self.array_prototype,
+            &self.error_prototype,
+            &self.type_error_prototype,
+            &self.reference_error_prototype,
+            &self.range_error_prototype,
+            &self.uri_error_prototype,
+            &self.eval_error_prototype,
+            &self.syntax_error_prototype,
+            &self.boolean_prototype,
+            &self.number_prototype,
+            &self.string_prototype,
+            &self.function_prototype,
+            &self.symbol_prototype,
+            &self.map_prototype,
+            &self.set_prototype,
+            &self.weakmap_prototype,
+            &self.weakset_prototype,
+            &self.date_prototype,
+            &self.regexp_prototype,
+            &self.promise_prototype,
+        ];
+        for proto in prototypes {
+            let _ = proto
+                .borrow_mut()
+                .property_delete(&PropertyKey::from_str("constructor"));
+        }
+        // And drop the thread-local registry's `Rc`s: it keys by name, so it
+        // would otherwise pin this realm's prototypes until the next realm is
+        // built.
+        clear_wrapper_prototypes();
     }
 
     pub fn register(&self, globals: &mut HashMap<String, Value>) {
