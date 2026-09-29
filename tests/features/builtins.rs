@@ -977,3 +977,26 @@ fn global_this_is_the_script_s_global_object() {
     assert_eq!(eval_string("String(Object.keys(globalThis).indexOf('Math') >= 0)"), "true");
     assert_eq!(eval_string("String(Object.keys(globalThis).length > 10)"), "true");
 }
+
+#[test]
+fn an_array_elision_is_a_hole_not_undefined() {
+    // `[1,,2]` has three slots and the middle one is a *hole*: it is not an
+    // element, so the array methods skip it. Pushing `undefined` instead made
+    // `[1,,2].flat()` answer `[1,undefined,2]` where every host answers `[1,2]`.
+    assert_eq!(eval_number("[1, , 2].length"), 3.0);
+    assert_eq!(eval_string("String(1 in [1, , 2])"), "false");
+    assert_eq!(eval_string("String([1, , 2][1])"), "undefined");
+    // Skipped by the traversal methods, but kept (as a hole) by `map`.
+    assert_eq!(eval_string("JSON.stringify([1, , 3].flat())"), "[1,3]");
+    // (The counter goes through an object: writing a captured binding is the
+    // engine's known closure debt.)
+    assert_eq!(
+        eval_string("(function () { var s = { seen: [] }; [1, , 3].forEach(function (v, i) { s.seen.push(i); }); return s.seen.join(''); })()"),
+        "02"
+    );
+    assert_eq!(eval_string("JSON.stringify([1, , 3].join('-'))"), "\"1--3\"");
+    assert_eq!(eval_string("JSON.stringify(Object.keys([1, , 3]))"), "[\"0\",\"2\"]");
+    // A trailing comma is not an elision, and `[,,]` is two holes.
+    assert_eq!(eval_number("[1, 2,].length"), 2.0);
+    assert_eq!(eval_number("[,,].length"), 2.0);
+}

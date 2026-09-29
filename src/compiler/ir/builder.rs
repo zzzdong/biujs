@@ -380,6 +380,11 @@ pub trait InstBuilder {
         array
     }
 
+    /// Mark the element just appended as a hole (see `Instruction::MarkHole`).
+    fn mark_hole(&mut self, array: Value) {
+        self.emit(Instruction::MarkHole { array });
+    }
+
     /// Append every element of `src` to `array` (`[...src]`).
     fn array_push_spread(&mut self, array: Value, src: Value) -> Value {
         self.emit(Instruction::ArrayPushSpread { array, src });

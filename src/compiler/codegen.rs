@@ -225,6 +225,10 @@ impl Codegen {
                             src,
                         ));
                     }
+                    Instruction::MarkHole { array } => {
+                        let array = self.gen_operand(array);
+                        self.codes.push(Bytecode::single(Opcode::MarkHole, array));
+                    }
                     Instruction::ArrayPush { array, value } => {
                         let array = self.gen_operand(array);
                         let value = self.gen_operand(value);

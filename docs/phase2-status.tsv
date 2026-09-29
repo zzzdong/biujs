@@ -74,10 +74,10 @@ language/statements/function	347	74	30
 language/statements/switch	51	54	6
 language/statements/while	28	10	0
 language/literals/string	67	6	0
-built-ins/Array	2067	188	826
+built-ins/Array	2101	188	792
 built-ins/JSON	113	51	1
 built-ins/WeakSet	79	5	1
-built-ins/Object	2787	292	332
+built-ins/Object	2790	292	329
 language/expressions/yield	40	3	20
 language/rest-parameters	11	0	0
 language/expressions/assignment	407	18	60

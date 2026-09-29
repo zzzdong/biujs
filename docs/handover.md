@@ -56,9 +56,9 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 
 | 指标 | 数值 |
 |------|------|
-| test262 执行 / 通过 / 失败 / 跳过 | 18914 / **15978** / 2936 / 8173 |
-| 通过率 | 84.48%（参考值；分母口径见计划书 §2.1；分母因 `built-ins/Promise` 入册变大） |
-| 单元 / feature / 护栏测试 | 190 / 503 / 7，全绿 |
+| test262 执行 / 通过 / 失败 / 跳过 | 18914 / **16015** / 2899 / 8173 |
+| 通过率 | 84.67%（参考值；分母口径见计划书 §2.1；分母因 `built-ins/Promise` 入册变大） |
+| 单元 / feature / 护栏测试 | 190 / 504 / 7，全绿 |
 | 全量耗时 | 约 3m（三层护栏封顶：单例 15s 墙钟、2×10^7 指令、256MiB 堆增量） |
 | runner 覆盖面 | 25586 / 53568 个测试文件（47%）——**未覆盖里约 4920 条属承诺的 M5/M6** |
 | 基线快照 | `phase2-status.tsv`（`scripts/phase2-status.sh` 生成的逐套件表） |
@@ -78,7 +78,8 @@ curated 清单里）、B32（`RegExp`：字面量此前是 `undefined`；新增 
 `s.replace(/re/g, fn)`，由 VM 驱动（要调用户函数），+6 —— `built-ins/String` 提升，零回退）、
 B39（**`globalThis`**：`GlobalObject` 是 globals map 的视图（共享 `Rc`），`[object global]`；
 自引用会在丢弃 State 前手动摘除，否则 `map → 对象 → map` 的环会钉住每轮 State —— 实测分片会撞穿
-`ulimit`。test262 +0，feature 503）。
+`ulimit`。test262 +0，feature 503）、B40（**数组 elision 是「洞」**：`[1,,2].flat()` 从此是 `[1,2]`，
+新增 `MarkHole` 指令；+37 —— `built-ins/Array` +34、`built-ins/Object` +3，零回退）。
 
 **已完成**：整轮验证的 OOM 已修（见下）。
 

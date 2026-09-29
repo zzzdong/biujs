@@ -2951,6 +2951,19 @@ impl VM {
                     )),
                 }?;
             }
+            Opcode::MarkHole => {
+                let Value::Object(obj_ref) = self.get_value(operands[0])? else {
+                    return Ok(());
+                };
+                let mut borrowed = obj_ref.borrow_mut();
+                if let Some(arr) = borrowed
+                    .as_any_mut()
+                    .downcast_mut::<crate::vm::object::ArrayObject>()
+                {
+                    let index = arr.len().saturating_sub(1);
+                    arr.mark_hole(index);
+                }
+            }
             Opcode::ArrayPush => {
                 let array_val = self.get_value(operands[0])?;
                 let elem = self.get_value(operands[1])?;

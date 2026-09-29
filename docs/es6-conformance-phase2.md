@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15978 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 503 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 16015 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 504 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -2084,6 +2084,42 @@ elision 应为洞、`matchAll`、TypedArray、`Proxy`/`Reflect`。另外两条�
 **下一批**：铺面继续 —— `e.stack`（只能给函数名，字节码无行列信息）、elision 应为洞、
 `matchAll`、TypedArray、`Proxy`/`Reflect`。两条债仍在：`built-ins/Array` 那条 ~384MB 的大分配
 （决定单片上限下限），以及 `drive_bytecode_frame` 里 `frame_argc.truncate(saved_this_depth)`。
+
+---
+
+#### B40 数组 elision 是"洞"而不是 `undefined` —— 已完成（2026-09-30）
+
+**症状**：`[1,,2].flat()` 出 `[1,undefined,2]`，而每个宿主都是 `[1,2]` —— 数组字面量里的 elision
+此前被降级成"压入 `undefined`"，于是那个槽位是个**真实元素**，`flat`/`forEach`/`join`/`keys`
+都不会跳过它。
+
+**改动**：新增 `MarkHole` 指令（IR / opcode / codegen / builder / VM），elision 在压入之后再补
+一条。`ArrayObject::mark_hole(i)` 早就有（B25 的泛型化里用过），缺的只是降级侧没有用它。
+
+一个细节值得记：`MarkHole` **不带下标** —— 洞永远是刚压入的那个位置，所以
+`[...a, , b]` 这种被 spread 打乱位置的写法也照样正确。
+
+**又一次踩到（这条已经第 N 次了）**：新指令的 SSA 重命名不能偷懒 —— `array` 是**使用**，
+漏了 `rename_use` 就会读到 SSA 之前的槽位（B21 的 `InitLexical`、B32 的 `MakeRegExp`
+都是同一个坑）。这次一开始就补上了。
+另外写断言时又踩了一次"闭包写捕获变量不生效"（已知债）：探针里用对象/数组收集才对。
+
+**效果**
+
+| 指标 | 起点 | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15978 | **16015** | **+37** |
+| 失败 | 2936 | 2899 | −37 |
+| 单元 / feature / 护栏 | 190 / 503 / 7 | 190 / **504** / 7 | +1 用例（8 条断言） |
+
+2 个套件提升（`built-ins/Array` +34、`built-ins/Object` +3）、**零回退**。
+与 node 逐字一致的 8 种形状：`length` / `in` / 取值 / `flat` / `forEach` 跳过 / `join` /
+`Object.keys` / 尾逗号与 `[,,]` 的长度。
+
+**下一步**：`e.stack` —— 需要一条调用名栈：JS 调用**没有汇聚点**（`drive_bytecode_frame` 只有
+async 路径在用），所以要在几个 `Opcode::Call*` 上各挂一次 push/pop，或者改从帧里取函数名。
+其次是 `matchAll`、TypedArray、`Proxy`/`Reflect`；两条债仍在（`built-ins/Array` 的 ~384MB
+大分配、`drive_bytecode_frame` 里 `frame_argc.truncate(saved_this_depth)`）。
 
 ---
 

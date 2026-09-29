@@ -772,6 +772,9 @@ impl<'a> SSABuilder<'a> {
             Instruction::MakeArray { dst } => {
                 SSABuilder::rename_definition(dst, new_versions);
             }
+            Instruction::MarkHole { array } => {
+                SSABuilder::rename_use(array, stacks);
+            }
             Instruction::ArrayPush { array, value } => {
                 SSABuilder::rename_use(array, stacks);
                 SSABuilder::rename_use(value, stacks);

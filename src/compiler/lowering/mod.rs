@@ -2782,9 +2782,11 @@ impl<'a> JSASTLower<'a> {
                     self.emit_iterate_push(array, src);
                 }
                 ArrayExpressionElement::Elision(_) => {
-                    // holes in array → push undefined
+                    // An elision is a *hole*, not `undefined`: the slot has to be
+                    // flagged so `flat` / `forEach` / `join` skip it.
                     let undef = Value::Primitive(Primitive::Undefined);
                     self.builder.array_push(array, undef);
+                    self.builder.mark_hole(array);
                 }
                 _ => {
                     let elem = self.lower_expression_or_null(element);

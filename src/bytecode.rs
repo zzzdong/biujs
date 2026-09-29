@@ -263,6 +263,8 @@ pub enum Opcode {
     /// make_array dst
     MakeArray,
     /// array_push dst, src
+    /// mark_hole array — turn the element just appended into a hole (`[1,,2]`)
+    MarkHole,
     ArrayPush,
     /// array_push_spread dst, src — append every element of `src` to `array`
     ArrayPushSpread,
@@ -412,6 +414,7 @@ impl fmt::Display for Opcode {
             Opcode::MakeIter => write!(f, "make_iter"),
             Opcode::IterNext => write!(f, "iter_next"),
             Opcode::MakeArray => write!(f, "make_array"),
+            Opcode::MarkHole => write!(f, "mark_hole"),
             Opcode::ArrayPush => write!(f, "array_push"),
             Opcode::ArrayPushSpread => write!(f, "array_push_spread"),
             Opcode::MakeObject => write!(f, "make_object"),

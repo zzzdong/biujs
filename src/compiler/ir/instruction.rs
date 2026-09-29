@@ -336,6 +336,16 @@ pub enum Instruction {
     /// over through memory (see `codegen::Codegen::store_jump_args`) — but a
     /// single opcode is still cheaper: fewer basic blocks, fewer phi parameters
     /// and fewer block-boundary reloads.
+    /// Turn the element just appended into a **hole** (`[1,,2]`).
+    ///
+    /// A hole is not an element: `flat`, `forEach`, `join` and friends skip it.
+    /// Pushing `undefined` instead made `[1,,2].flat()` answer `[1,undefined,2]`
+    /// where every host answers `[1,2]`. The hole is always the last index, so
+    /// this carries no index — which also keeps it right when a spread before it
+    /// shifted the positions.
+    MarkHole {
+        array: Value,
+    },
     ArrayPushSpread {
         array: Value,
         src: Value,
@@ -672,6 +682,7 @@ impl Instruction {
                 args,
             } => (vec![*dst], vec![*constructor, *args]),
             Instruction::MakeArray { dst } => (vec![*dst], vec![]),
+            Instruction::MarkHole { array } => (vec![], vec![*array]),
             Instruction::ArrayPush { array, value } => (vec![], vec![*array, *value]),
             Instruction::ArrayPushSpread { array, src } => (vec![], vec![*array, *src]),
             Instruction::MakeObject { dst } => (vec![*dst], vec![]),
@@ -934,6 +945,9 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::MakeArray { dst: array } => {
                 write!(f, "{array} = make_array")
+            }
+            Instruction::MarkHole { array } => {
+                write!(f, "mark_hole {array}")
             }
             Instruction::ArrayPush { array, value } => {
                 write!(f, "array_push {array}, {value}")
