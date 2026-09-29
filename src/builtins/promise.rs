@@ -12,6 +12,10 @@ use crate::RuntimeError;
 use crate::vm::object::JSObject;
 use crate::vm::value::Value;
 
+/// Dispatch name of `get Promise[Symbol.species]` (ES 27.2.2.3). The getter
+/// returns its receiver, so the VM answers it (`Map`/`Set`/`Array` do the same).
+pub const PROMISE_SPECIES_NATIVE: &str = "__promise_species__";
+
 /// `Promise.prototype.then` / `catch` / `finally`: the VM intercepts all three
 /// before the ordinary prototype dispatch, so these are registered for lookups
 /// (`p.then` must be a function) but never reached.
@@ -37,7 +41,7 @@ pub fn register_promise_statics(ctor: &Value) {
     let Value::Object(obj_ref) = ctor else {
         return;
     };
-    for name in ["resolve", "reject"] {
+    for name in ["resolve", "reject", "all", "race", "allSettled", "any"] {
         let _ = obj_ref.borrow_mut().define_property(
             crate::vm::property::PropertyKey::from_str(name),
             crate::vm::property::PropertyDescriptor {

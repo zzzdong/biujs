@@ -1677,6 +1677,7 @@ impl NativeFunctionObject {
             "get size".to_string()
         } else if self.name == crate::builtins::MAP_SPECIES_NATIVE
             || self.name == crate::builtins::SET_SPECIES_NATIVE
+            || self.name == crate::builtins::PROMISE_SPECIES_NATIVE
         {
             "get [Symbol.species]".to_string()
         } else if self.name == crate::vm::iterator::ITERATOR_NATIVE_NAME {

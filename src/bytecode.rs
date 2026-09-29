@@ -17,6 +17,9 @@ pub struct Module {
     /// Ids of the functions declared as `function*`. A call to one of these
     /// creates a generator object instead of pushing a frame.
     pub generators: std::collections::HashSet<u32>,
+    /// Ids of the functions declared `async`. A call to one of these runs the
+    /// body (which may `await`) and answers a promise settled with its outcome.
+    pub asyncs: std::collections::HashSet<u32>,
     /// Ids of constructors declared in a class with an `extends` clause. Their
     /// `this` is uninitialized until `super()` runs.
     pub derived_ctors: std::collections::HashSet<u32>,
@@ -42,6 +45,7 @@ impl Module {
         symtab: HashMap<FunctionId, usize>,
         func_info: HashMap<u32, (String, usize)>,
         generators: std::collections::HashSet<u32>,
+        asyncs: std::collections::HashSet<u32>,
         derived_ctors: std::collections::HashSet<u32>,
         exit_pc: HashMap<u32, usize>,
         instructions: Vec<Bytecode>,
@@ -52,6 +56,7 @@ impl Module {
             symtab,
             func_info,
             generators,
+            asyncs,
             derived_ctors,
             exit_pc,
             instructions,
@@ -329,6 +334,11 @@ pub enum Opcode {
     /// frame here until the first `next()` continues past it. Emitted only for
     /// generators, so ordinary functions never carry it.
     PrologueEnd,
+    /// await dst, src — suspend an `async` function on `src` until it settles.
+    /// The engine has no event loop, so the VM drains the microtask queue on the
+    /// spot until the awaited promise is no longer pending, then writes its
+    /// fulfilment value to `dst` (or throws its reason).
+    Await,
     /// to_string dst, src — ES ToString (objects via ToPrimitive("string"))
     ToString,
     /// to_number dst, src — ES ToNumber (objects via ToPrimitive("number"))
@@ -432,6 +442,7 @@ impl fmt::Display for Opcode {
             Opcode::RequireObjectCoercible => write!(f, "require_object_coercible"),
             Opcode::Yield => write!(f, "yield"),
             Opcode::PrologueEnd => write!(f, "prologue_end"),
+            Opcode::Await => write!(f, "await"),
             Opcode::ToString => write!(f, "to_string"),
             Opcode::ToNumber => write!(f, "to_number"),
             Opcode::MakeRest => write!(f, "make_rest"),
@@ -954,6 +965,7 @@ mod tests {
             HashMap::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
             HashMap::new(),
             vec![],
         );
@@ -970,6 +982,7 @@ mod tests {
             vec![Constant::from("hello")],
             HashMap::new(),
             HashMap::new(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             HashMap::new(),

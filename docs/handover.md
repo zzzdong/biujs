@@ -56,9 +56,9 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 
 | 指标 | 数值 |
 |------|------|
-| test262 执行 / 通过 / 失败 / 跳过 | 18277 / **15571** / 2706 / 8133 |
-| 通过率 | 85.19%（参考值；分母口径见计划书 §2.1） |
-| 单元 / feature / 护栏测试 | 190 / 496 / 7，全绿 |
+| test262 执行 / 通过 / 失败 / 跳过 | 18914 / **15972** / 2942 / 8173 |
+| 通过率 | 84.45%（参考值；分母口径见计划书 §2.1；分母因 `built-ins/Promise` 入册变大） |
+| 单元 / feature / 护栏测试 | 190 / 499 / 7，全绿 |
 | 全量耗时 | 约 3m（三层护栏封顶：单例 15s 墙钟、2×10^7 指令、256MiB 堆增量） |
 | runner 覆盖面 | 25586 / 53568 个测试文件（47%）——**未覆盖里约 4920 条属承诺的 M5/M6** |
 | 基线快照 | `phase2-status.tsv`（`scripts/phase2-status.sh` 生成的逐套件表） |
@@ -71,7 +71,10 @@ curated 清单里）、B32（`RegExp`：字面量此前是 `undefined`；新增 
 +74 —— 3 个套件提升、零回退）、B33（小面一批：二元算术的 ToPrimitive、
 `Array.prototype.flatMap`、`console.time/timeEnd`，+10 —— 5 个套件提升、零回退）、B34（**`Promise` + 微任务队列**：
 `PromiseObject`、`new Promise(executor)`、`then`/`catch`/`finally`、`Promise.resolve/reject`，
-队列在顶层 `run` 结束时排空，+3 —— 2 个套件提升、零回退；`async/await` 留下一轮）。
+队列在顶层 `run` 结束时排空，+3 —— 2 个套件提升、零回退）、B35（**`async/await` + 四个组合子 + `Promise` 套件入册**：
+`await` 就地排空队列、`all/race/allSettled/any`、species/tag、runner 的 `$DONE` shim；并修掉
+`IteratorClose` 在正常完成时吞掉 `return()` 异常的规范错误（ES 7.4.6 step 8）。执行 18277 →
+18914（新套件入册），通过 15571 → **15972**，零逐套件回退）。
 
 **已完成**：整轮验证的 OOM 已修（见下）。
 

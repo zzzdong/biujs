@@ -381,6 +381,17 @@ pub enum Instruction {
         dst: Value,
         src: Option<Value>,
     },
+    /// `await expr`: run `expr`, wait for it to settle, and yield its
+    /// fulfilment value (or rethrow its reason). Only valid inside an `async`
+    /// function.
+    ///
+    /// The engine has no event loop, so "wait" means draining the microtask
+    /// queue until the promise is settled — which always terminates here,
+    /// because a promise can only ever be settled by one of those jobs.
+    Await {
+        dst: Value,
+        src: Option<Value>,
+    },
     /// ES ToString: primitives directly; objects via ToPrimitive("string").
     ToString {
         dst: Value,
@@ -640,6 +651,7 @@ impl Instruction {
             Instruction::IteratorClose { iter } => (vec![], vec![*iter]),
             Instruction::RequireObjectCoercible { src } => (vec![], vec![*src]),
             Instruction::Yield { dst, src } => (vec![*dst], src.iter().copied().collect()),
+            Instruction::Await { dst, src } => (vec![*dst], src.iter().copied().collect()),
             Instruction::ToString { dst, src } => (vec![*dst], vec![*src]),
             Instruction::MakeRest { dst, .. } => (vec![*dst], vec![]),
             Instruction::CallSpread {
@@ -879,6 +891,10 @@ impl std::fmt::Display for Instruction {
             Instruction::Yield { dst, src } => match src {
                 Some(src) => write!(f, "{dst} = yield {src}"),
                 None => write!(f, "{dst} = yield"),
+            },
+            Instruction::Await { dst, src } => match src {
+                Some(src) => write!(f, "{dst} = await {src}"),
+                None => write!(f, "{dst} = await"),
             },
             Instruction::ToString { dst, src } => {
                 write!(f, "{dst} = to_string {src}")

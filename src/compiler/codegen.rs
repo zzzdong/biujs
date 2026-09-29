@@ -356,6 +356,14 @@ impl Codegen {
                     Instruction::PrologueEnd => {
                         self.codes.push(Bytecode::empty(Opcode::PrologueEnd));
                     }
+                    Instruction::Await { dst, src } => {
+                        let dst = self.gen_operand(dst);
+                        let src = match src {
+                            Some(src) => self.gen_operand(src),
+                            None => Operand::new_immd(-1),
+                        };
+                        self.codes.push(Bytecode::double(Opcode::Await, dst, src));
+                    }
                     Instruction::ToString { dst, src } => {
                         let dst = self.gen_operand(dst);
                         let src = self.gen_operand(src);

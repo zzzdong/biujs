@@ -257,6 +257,53 @@ fn harness(name: &str) -> Option<&'static str> {
 /// baseline harness must always be loaded.
 const BASELINE_HARNESS: &[&str] = &["sta.js", "assert.js"];
 
+/// `$DONE` support for `flags: [async]` tests.
+///
+/// test262 reports an async outcome through `$DONE`, which the standard harness
+/// wires to `print` — a host function this runner does not provide. Instead the
+/// shim records the completion in a global object, and the runner reads that
+/// global back through `VM::global` *after* `run` returns. Because `run` drains
+/// the microtask queue before returning (there is no event loop), the recorder
+/// reflects every `$DONE` call the queue made.
+///
+/// It also defines the `globalThis` that `asyncHelpers.js` probes with
+/// `hasOwnProperty`; the engine has no `globalThis` global, and the shim only
+/// has to answer that one question.
+const ASYNC_SHIM: &str = r#"
+var __test262_async = { called: false, error: undefined };
+function $DONE(error) {
+  if (__test262_async.called) { return; }
+  __test262_async.called = true;
+  __test262_async.error = error;
+}
+var globalThis = { "$DONE": $DONE };
+"#;
+
+/// The global the shim records the async outcome in.
+const ASYNC_RECORDER: &str = "__test262_async";
+
+/// The recorded outcome of an async test, read off the recorder global.
+fn async_outcome(value: &Value) -> Result<(), String> {
+    let Value::Object(obj) = value else {
+        return Err("$DONE was never called".to_string());
+    };
+    let borrowed = obj.borrow();
+    let called = borrowed
+        .property_get(&biujs::vm::PropertyKey::from_str("called"))
+        .map(|d| d.value.to_boolean())
+        .unwrap_or(false);
+    if !called {
+        return Err("$DONE was never called (async test did not finish)".to_string());
+    }
+    match borrowed
+        .property_get(&biujs::vm::PropertyKey::from_str("error"))
+        .map(|d| d.value)
+    {
+        None | Some(Value::Undefined) => Ok(()),
+        Some(err) => Err(format!("$DONE({})", err.to_js_string())),
+    }
+}
+
 /// Build the full source for a test: the baseline harness, its declared
 /// includes, then the test itself.
 fn build_source(test: &Test) -> String {
@@ -278,6 +325,12 @@ fn build_source(test: &Test) -> String {
             // Missing harness file: the test cannot run faithfully.
             None => return String::new(),
         }
+    }
+
+    let is_async = test.desc.flags.contains(&Flag::Async);
+    if is_async {
+        // After the includes, so this `$DONE` wins over `doneprintHandle.js`'s.
+        parts.push(ASYNC_SHIM);
     }
 
     parts.push(&test.source);
@@ -340,6 +393,18 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 "modules",
 "numeric-separator",
 "optional-chaining",
+// ES2018+ Promise surface: implemented so ordinary ES6 programs can use it,
+// but outside the ES6 target, so its own tests stay gated (§B34).
+"Promise.allSettled",
+"Promise.any",
+"Promise.prototype.finally",
+"AggregateError",
+"await-dictionary",
+"Promise.allKeyed",
+"Promise.allSettledKeyed",
+// ES2025 statics, also out of the ES6 target.
+"promise-try",
+"promise-with-resolvers",
 "reflect-metadata",
 "regexp-",
 "SharedArrayBuffer",
@@ -360,10 +425,9 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 /// B3 (all four suites are in `SUITES`); the others stay gated until the
 /// feature exists.
 const IN_SCOPE_PENDING: &[&str] = &[
-"Promise",
-"Proxy",
-"Reflect",
-"TypedArray",
+    "Proxy",
+    "Reflect",
+    "TypedArray",
 ];
 
 /// Every feature tag whose tests this engine currently cannot pass.
@@ -397,9 +461,9 @@ const UNSUPPORTED_PATTERNS: &[&str] = &[
     "Function('",
     "$ERROR",
     "print(",
-    // `yield ` used to be listed here while generators were unimplemented; the
-    // subset in §2.1p handles them, so tests exercising `yield` must run.
-    "await ",
+    // `yield ` and `async `/`await ` used to be listed here while generators and
+    // async functions were unimplemented; both are implemented now, so sources
+    // exercising them must run.
     "import(",
     "import ",
     "export ",
@@ -409,7 +473,6 @@ const UNSUPPORTED_PATTERNS: &[&str] = &[
     // `function*` used to be listed here while generators were unimplemented;
     // the M4-G1 subset handles them, so generator sources must run.
     "=>*",
-    "async ",
 ];
 
 fn should_skip(test: &Test) -> Option<String> {
@@ -419,14 +482,17 @@ fn should_skip(test: &Test) -> Option<String> {
 
     for flag in &test.desc.flags {
         match flag {
-            // `Async` and `Module` are real gating conditions: the source needs
-            // a syntax this engine deliberately does not have (G3).
+            // `Module` is a real gating condition (G3): the source needs a
+            // syntax this engine deliberately does not have. `Async` is **not**:
+            // the runner supplies a `$DONE` shim (see `ASYNC_SHIM`) and judges
+            // the test by what the shim recorded before the microtask queue
+            // drained, so `flags: [async]` tests run.
             //
-            // `Generated` is *not*. It only records that the file was produced
-            // by a tool rather than typed by hand; such tests are ordinary
-            // tests and have to run. Skipping them silently dropped ~5k tests
-            // (463 of the 556 generator tests alone) — see §2.1y.
-            Flag::Async | Flag::Module => {
+            // `Generated` is *not* a gate either. It only records that the file
+            // was produced by a tool rather than typed by hand; such tests are
+            // ordinary tests and have to run. Skipping them silently dropped
+            // ~5k tests (463 of the 556 generator tests alone) — see §2.1y.
+            Flag::Module => {
                 return Some(format!("flag {flag:?}"));
             }
             _ => {}
@@ -502,7 +568,15 @@ fn run_test(test: &Test) -> Result<(), String> {
         None => match compiled {
             Ok(module) => {
                 let mut vm = guarded_vm();
-                vm.run(&module).map(|_| ()).map_err(|e| e.to_string())
+                vm.run(&module).map_err(|e| e.to_string())?;
+                if test.desc.flags.contains(&Flag::Async) {
+                    match vm.global(ASYNC_RECORDER) {
+                        Some(recorder) => async_outcome(&recorder),
+                        None => Err("$DONE was never called".to_string()),
+                    }
+                } else {
+                    Ok(())
+                }
             }
             Err(err) => Err(format!("Compilation error: {err}")),
         },
@@ -801,6 +875,7 @@ const SUITES: &[&str] = &[
     "built-ins/NativeErrors",
     "built-ins/Number",
     "built-ins/Object",
+    "built-ins/Promise",
     "built-ins/String",
     "built-ins/Symbol",
 ];
@@ -848,6 +923,25 @@ fn test262_report() {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Optional sharding: `TEST262_CHUNKS=3 TEST262_CHUNK_INDEX=1` runs every
+    // suite whose position in `SUITES` satisfies `position % chunks == index`.
+    //
+    // Each shard is its own process, so its peak memory is released when it
+    // exits. The whole list in one address space is what the OOM killer used to
+    // take down; sharding keeps every process well under a small `ulimit`.
+    let chunks: usize = std::env::var("TEST262_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    let chunk_index: usize = std::env::var("TEST262_CHUNK_INDEX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if chunks > 1 {
+        println!("== shard {chunk_index}/{chunks} ==");
+    }
+
     let mut total = 0u32;
     let mut passed = 0u32;
     let mut skipped = 0u32;
@@ -857,8 +951,11 @@ fn test262_report() {
     let mut slowest: Vec<(Duration, String)> = Vec::new();
     let suite_clock = Instant::now();
 
-    for suite in SUITES {
+    for (position, suite) in SUITES.iter().enumerate() {
         if !filters.is_empty() && !filters.iter().any(|f| suite.contains(f)) {
+            continue;
+        }
+        if chunks > 1 && position % chunks != chunk_index {
             continue;
         }
         let r = run_suite(suite);

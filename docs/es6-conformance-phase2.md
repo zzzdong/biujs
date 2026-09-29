@@ -135,8 +135,8 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
 | A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 15571 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 496 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 15972 | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 499 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -1862,6 +1862,62 @@ order: then:1 | resolve:2 | catch:boom | reject:bad | exec:exec-throw | resolved
    settle，没有外部源（没有定时器/IO），所以这样是收敛的；代价是没有真正的并发交错。
 3. `all/race/allSettled/any`、`finally` 的返回 promise 语义、thenable 采纳未做。
 4. 下一批顺序：先修 1，再做 `async/await`，然后 `all/race`。
+
+---
+
+#### B35 `async/await` + `Promise` 组合子 + `Promise` 套件入册 —— 已完成（2026-09-29）
+
+**这批有一部分是用户手写的**（`async/await` 的管线、四个组合子、species/tag、runner 的
+`$DONE` shim），我接手做的是：核对、修一处规范错误、把验证跑通、把编号入册。
+
+**实现（照 B34 记录里定下的设计）**
+
+| 改动 | 说明 |
+|------|------|
+| `Module.asyncs` | 照 `generators` 的写法；五个调用点都挂了钩子 |
+| `Opcode::Await` + IR/builder/codegen/ssa | `await expr` |
+| `await_value` | 就地排空微任务队列直到目标 promise 不再 pending，然后取值 / 抛原因 |
+| `drive_bytecode_frame` | 从 `invoke` 里抽出的"推帧、跑到 `Ret`、恢复调用者上下文" |
+| `promise_aggregate` | `Promise.all` / `race` / `allSettled` / `any`；每个元素两个原生 handler 把 `(聚合 id, 下标)` 编码进函数名（与 `__promise_resolve__` 同一种手法） |
+| `Promise[Symbol.species]` + `Promise.prototype[Symbol.toStringTag]` | 与 Map/Set/Array 一致 |
+| `VM::global(name)` | 宿主读回顶层 `run` 之后（含已排空的队列）留下的全局 —— 这是 runner 判定 `flags: [async]` 用例的手段 |
+| runner：`$DONE` shim + 解除 `async`/`await` 门控 + `built-ins/Promise` 入册 | 见下 |
+
+**修掉的一处规范错误（本批的关键）**：`IteratorClose` 在**正常完成**时也把
+`iterator.return()` 抛出的异常吞掉了。ES 7.4.6 只在"正在传播的 throw 完成"里吞（step 7），
+正常完成时那个异常必须传播（step 8）。`if let Ok(result) = self.invoke(...)` 正好把它丢掉 ——
+在 `invoke` 改成把错误作为 `Err` 返回之后，这一点暴露成 4 条用例失败
+（`assignment/dstr/*iter-nrml-close-err`）。改成 `?` 之后与基线**逐条一致**（该套件失败集
+固定为 60 条，与 HEAD 相同），复现脚本也与 node 一致。
+
+**验证基建**：整轮拆成 **4 片**（runner 新增 `TEST262_CHUNKS` / `TEST262_CHUNK_INDEX`，
+按 `position % chunks` 分），每片一个进程、各自 `ulimit`；内存上限默认降到 **5GB**
+（机器 7.7GB，OS 不会来 kill）。顺带量出一个事实：**3GB 不够**，而按套件分片并不减少用例
+总数 —— 峰值是**按"每条用例"累积**的，这是一处待查的 per-test 内存增长。
+
+**效果**（分母变了：`built-ins/Promise` 入册，执行 18277 → 18914）
+
+| 指标 | 起点（B34） | 终点 | 变化 |
+|------|------|------|------|
+| 通过 | 15571 | **15972** | **+401** |
+| 失败 | 2706 | 2942 | +236 |
+| 跳过 | 8133 | 8173 | +40（新套件的门控用例） |
+| 执行 | 18277 | 18914 | +637 |
+| 通过率 | 85.19% | **84.45%** | 分母不同，不可直比 |
+
+`built-ins/Promise` 入册后 238 通过 / 301 跳过 / 138 失败。**零逐套件回退**。
+feature 499（+3 用例）。
+
+**残留**
+
+1. `await` 是"就地排空队列"，所以它与先前排队的 job **不交错**：探针里
+   `rejected` 与 `awaited` 的先后与 node 相反。语义上仍在"微任务在同步代码之后"的框架内，
+   但没有真正的并发交错 —— 要真交错就得让 `await` 挂起帧（生成器那套机制）。
+2. **per-test 内存增长**（新增待查项）：整轮峰值随用例数增长，而不是随套件数。
+   3GB 上限会在单片内 OOM，5GB 才行。修掉它能把上限往下调、也让长跑更稳。
+3. `drive_bytecode_frame` 退出时 `self.state.frame_argc.truncate(saved_this_depth)` 用的是
+   `this_stack` 的长度 —— 两条栈的长度未必同步，这里值得单独看一眼（记为疑点）。
+4. B34 留下的"链式 `new Promise(…抛出…).catch` 收不到 handler"仍在。
 
 ---
 

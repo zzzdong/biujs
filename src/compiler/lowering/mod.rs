@@ -765,6 +765,7 @@ impl<'a> JSASTLower<'a> {
                     false,
                     &instance_fields,
                     false,
+                    false,
                     has_heritage,));
             }
         }
@@ -879,7 +880,8 @@ impl<'a> JSASTLower<'a> {
                         false,
                         &[],
                         func.generator,
-                        false,);
+                func.r#async,
+                false,);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
                     let desc = self.method_descriptor(func_val);
                     self.define_member(proto, key, desc);
@@ -896,7 +898,8 @@ impl<'a> JSASTLower<'a> {
                         false,
                         &[],
                         func.generator,
-                        false,);
+                func.r#async,
+                false,);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
                     let desc = self.method_descriptor(func_val);
                     self.define_member(func_obj, key, desc);
@@ -913,7 +916,8 @@ impl<'a> JSASTLower<'a> {
                         false,
                         &[],
                         func.generator,
-                        false,);
+                func.r#async,
+                false,);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
                     let (getter, setter) = if *is_get {
                         (Some(func_val), None)
@@ -935,7 +939,8 @@ impl<'a> JSASTLower<'a> {
                         false,
                         &[],
                         func.generator,
-                        false,);
+                func.r#async,
+                false,);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
                     let (getter, setter) = if *is_get {
                         (Some(func_val), None)
@@ -2008,6 +2013,13 @@ impl<'a> JSASTLower<'a> {
                     .expect("`yield*` always has an argument");
                 self.lower_yield_delegate(arg)
             }
+            // `await expr` (ES 6.2.3.1 Await). Only meaningful inside an async
+            // function; the enclosing call wraps the outcome in a promise (see
+            // `Module::asyncs`), so this just suspends on the operand.
+            Expression::AwaitExpression(a) => {
+                let src = Some(self.lower_expression(&a.argument));
+                self.builder.await_(src)
+            }
             Expression::MetaProperty(meta) => {
                 // `new.target` (ES 14.2.3) reads the current frame's constructor
                 // slot: the constructor for a `[[Construct]]` frame, otherwise
@@ -3042,6 +3054,7 @@ impl<'a> JSASTLower<'a> {
             true,
             &[],
             false,
+            arrow.r#async,
             false,);
 
         // At runtime, capture the current `this` value. No `load_this` here on
@@ -3087,6 +3100,7 @@ impl<'a> JSASTLower<'a> {
                 false,
                 &[],
                 func.generator,
+                func.r#async,
                 false,);
             self.emit_closure_vars(&captured);
             self.builder.make_func_obj(func_val)
@@ -3174,6 +3188,7 @@ impl<'a> JSASTLower<'a> {
                 false,
                 &[],
                 func.generator,
+                func.r#async,
                 false,);
             Some((name, func_id_val))
         } else {
@@ -3198,6 +3213,7 @@ impl<'a> JSASTLower<'a> {
         is_arrow: bool,
         instance_fields: &[&PropertyDefinition<'_>],
         is_generator: bool,
+        is_async: bool,
         is_derived_ctor: bool,
     ) -> Value {
         // During hoisting, there may be no current block yet
@@ -3224,6 +3240,11 @@ impl<'a> JSASTLower<'a> {
         let func_sig = FuncSignature::with_arity(name.clone(), sig_params, arity);
         let func_sig = if is_generator {
             func_sig.as_generator()
+        } else {
+            func_sig
+        };
+        let func_sig = if is_async {
+            func_sig.as_async()
         } else {
             func_sig
         };

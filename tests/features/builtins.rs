@@ -671,3 +671,215 @@ fn promises_are_constructible_and_expose_the_spec_surface() {
         "TypeError"
     );
 }
+
+#[test]
+fn promise_microtasks_settle_handlers_and_propagate_values() {
+    // `run` drains the microtask queue at the end of the top-level program, and
+    // the *last* handler's return value is what ends up in `Rv` — which is what
+    // `eval_string` reads back. That makes the queue's observable behaviour
+    // testable without an event loop.
+    assert_eq!(
+        eval_string("Promise.resolve(41).then(function (v) { return String(v + 1); })"),
+        "42"
+    );
+    // `then` chains: the return value of one handler feeds the next.
+    assert_eq!(
+        eval_string(
+            "new Promise(function (r) { r(1); }) \
+             .then(function (a) { return 'A' + a; }) \
+             .then(function (b) { return b + 'B'; })"
+        ),
+        "A1B"
+    );
+    // A rejected promise reaches `catch`'s handler with the reason.
+    assert_eq!(
+        eval_string("Promise.reject('boom').catch(function (e) { return 'caught:' + e; })"),
+        "caught:boom"
+    );
+    // Regression: a chained `new Promise(…throw…).catch(cb)` used to lose `cb`.
+    // The throwing executor unwound a nested frame without rewinding that
+    // frame's control-stack entries, so the chain's arguments were read from the
+    // wrong slots and the handler saw `undefined`.
+    assert_eq!(
+        eval_string(
+            "new Promise(function (r, j) { throw 'x'; }) \
+             .catch(function (e) { return 'c:' + e; })"
+        ),
+        "c:x"
+    );
+    // Synchronous code runs before the queue drains.
+    assert_eq!(
+        eval_string(
+            "var log = ['sync']; \
+             new Promise(function (r) { r(); }) \
+               .then(function () { log.push('then'); return log.join(','); })"
+        ),
+        "sync,then"
+    );
+}
+
+#[test]
+fn promise_combinators_and_resolution_procedure() {
+    // `Promise.all` fulfils with the element values in order once all settle.
+    assert_eq!(
+        eval_string(
+            "Promise.all([1, Promise.resolve(2), 3]) \
+               .then(function (v) { return v.join(','); })"
+        ),
+        "1,2,3"
+    );
+    // The first rejection wins.
+    assert_eq!(
+        eval_string(
+            "Promise.all([1, Promise.reject('boom')]) \
+               .catch(function (e) { return 'caught:' + e; })"
+        ),
+        "caught:boom"
+    );
+    // `Promise.all([])` fulfils with an empty array.
+    assert_eq!(
+        eval_string("Promise.all([]).then(function (v) { return 'len:' + v.length; })"),
+        "len:0"
+    );
+    // `Promise.race` settles with the first element to settle.
+    assert_eq!(
+        eval_string(
+            "Promise.race([new Promise(function () {}), Promise.resolve('fast')]) \
+               .then(function (v) { return v; })"
+        ),
+        "fast"
+    );
+    // `Promise.race` also passes a rejection through.
+    assert_eq!(
+        eval_string(
+            "Promise.race([Promise.reject('r')]) \
+               .catch(function (e) { return 'race:' + e; })"
+        ),
+        "race:r"
+    );
+    // `Promise.allSettled` never rejects; it reports both statuses in order.
+    assert_eq!(
+        eval_string(
+            "Promise.allSettled([Promise.resolve(1), Promise.reject('bad')]) \
+               .then(function (v) { \
+                 return v.map(function (r) { return r.status; }).join(','); \
+               })"
+        ),
+        "fulfilled,rejected"
+    );
+    assert_eq!(
+        eval_string(
+            "Promise.allSettled([Promise.reject('bad')]) \
+               .then(function (v) { return v[0].reason; })"
+        ),
+        "bad"
+    );
+    // `Promise.any` fulfils with the first fulfilment and ignores rejections.
+    assert_eq!(
+        eval_string(
+            "Promise.any([Promise.reject('x'), Promise.resolve('ok')]) \
+               .then(function (v) { return v; })"
+        ),
+        "ok"
+    );
+    // `finally` runs its callback and passes the settlement through to a fresh
+    // promise.
+    assert_eq!(
+        eval_string(
+            "Promise.resolve(5).finally(function () {}) \
+               .then(function (v) { return 'v:' + v; })"
+        ),
+        "v:5"
+    );
+    assert_eq!(
+        eval_string(
+            "Promise.reject('n').finally(function () {}) \
+               .catch(function (e) { return 'e:' + e; })"
+        ),
+        "e:n"
+    );
+    // A throwing `finally` callback rejects the derived promise.
+    assert_eq!(
+        eval_string(
+            "Promise.resolve(1).finally(function () { throw 'f'; }) \
+               .catch(function (e) { return 'f:' + e; })"
+        ),
+        "f:f"
+    );
+    // The resolution procedure adopts a foreign thenable.
+    assert_eq!(
+        eval_string(
+            "Promise.resolve({ then: function (res) { res(7); } }) \
+               .then(function (v) { return 't:' + v; })"
+        ),
+        "t:7"
+    );
+}
+
+#[test]
+fn async_functions_and_await() {
+    // An `async` function answers a promise that fulfils with its return value.
+    assert_eq!(
+        eval_string(
+            "async function f() { return 1; } \
+               f().then(function (v) { return 'r:' + v; })"
+        ),
+        "r:1"
+    );
+    // `await` on an already-settled promise yields its value.
+    assert_eq!(
+        eval_string(
+            "async function f() { return await Promise.resolve(2); } \
+               f().then(function (v) { return 'r:' + v; })"
+        ),
+        "r:2"
+    );
+    // `await` on a non-promise wraps it (ES 27.7.5.3 resolution procedure).
+    assert_eq!(
+        eval_string("async function f() { return await 3; } f().then(function (v) { return 'n:' + v; })"),
+        "n:3"
+    );
+    // A throw inside an `async` function rejects its promise.
+    assert_eq!(
+        eval_string(
+            "async function f() { throw 'bad'; } \
+               f().catch(function (e) { return 'e:' + e; })"
+        ),
+        "e:bad"
+    );
+    // A rejection awaited inside `try`/`catch` is observable synchronously.
+    assert_eq!(
+        eval_string(
+            "async function f() { \
+               try { await Promise.reject('x'); } catch (e) { return 'caught:' + e; } \
+             } \
+             f().then(function (v) { return v; })"
+        ),
+        "caught:x"
+    );
+    // Async arrow functions work the same way.
+    assert_eq!(
+        eval_string("var f = async () => 4; f().then(function (v) { return 'a:' + v; })"),
+        "a:4"
+    );
+    // Async methods too.
+    assert_eq!(
+        eval_string(
+            "var o = { m: async function () { return 5; } }; \
+               o.m().then(function (v) { return 'm:' + v; })"
+        ),
+        "m:5"
+    );
+    // `await` sequences: the second await sees the first result.
+    assert_eq!(
+        eval_string(
+            "async function f() { \
+               var a = await Promise.resolve(1); \
+               var b = await Promise.resolve(a + 1); \
+               return a + b; \
+             } \
+             f().then(function (v) { return 'sum:' + v; })"
+        ),
+        "sum:3"
+    );
+}

@@ -49,6 +49,7 @@ pub use number::{
     number_to_fixed, number_to_precision,
 };
 pub use object::{OBJECT_TO_STRING_NATIVE, object_constructor, object_prototype_to_string};
+pub use promise::PROMISE_SPECIES_NATIVE;
 pub use set::{
     SET_SIZE_NATIVE, SET_SPECIES_NATIVE, register_set_prototype, set_add, set_clear, set_delete,
     set_has, set_size,
@@ -813,6 +814,26 @@ impl Builtins {
             Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("Promise"))));
         promise::register_promise_prototype(&self.promise_prototype);
         promise::register_promise_statics(&promise_fn_val);
+        // `Promise.prototype[Symbol.toStringTag] === "Promise"` (ES 27.2.5.5).
+        define_string_tag(&self.promise_prototype, "Promise");
+        // `Promise[Symbol.species]` (ES 27.2.2.3) is an accessor returning its
+        // receiver, mirroring `Map`/`Set`/`Array`; the VM answers the getter.
+        let promise_species_getter = Value::Object(Rc::new(RefCell::new(
+            NativeFunctionObject::new(promise::PROMISE_SPECIES_NATIVE),
+        )));
+        if let Value::Object(promise_obj) = &promise_fn_val {
+            let _ = promise_obj.borrow_mut().define_property(
+                species_symbol_key(),
+                PropertyDescriptor {
+                    value: Value::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: Some(promise_species_getter),
+                    setter: None,
+                },
+            );
+        }
         Self::link_constructor_prototype(&promise_fn_val, &self.promise_prototype);
         register_wrapper_prototype("Promise", Rc::clone(&self.promise_prototype));
         globals.insert("Promise".to_string(), promise_fn_val);
@@ -1750,6 +1771,12 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         "toFixed" | "toExponential" | "toPrecision" => 1,
         // ── Symbol ──
         "Symbol.for" | "Symbol.keyFor" => 1,
+        // ── Promise (ES 27.2) ──
+        "Promise" => 1,
+        "Promise.resolve" | "Promise.reject" | "Promise.all" | "Promise.race"
+        | "Promise.allSettled" | "Promise.any" => 1,
+        "then" => 2,
+        "catch" | "finally" => 1,
         // ── Math ──
         "Math.atan2" | "Math.hypot" | "Math.imul" | "Math.max" | "Math.min" | "Math.pow" => 2,
         "Math.random" => 0,

@@ -328,6 +328,17 @@ impl VM {
             .unwrap_or(Value::Undefined))
     }
 
+    /// Read a global by name from the state left behind by the last `run`.
+    ///
+    /// The state (and so every `var` / function declaration the program made) is
+    /// reset at the *start* of a run, so after `run` returns this reflects the
+    /// program that just finished — including mutations the drained microtask
+    /// queue performed. That is how a host observes an async outcome: the test
+    /// records it in a global, then the host reads that global.
+    pub fn global(&self, name: &str) -> Option<Value> {
+        self.state.globals.get(name).cloned()
+    }
+
     /// Box a bare `Value::Function(id)` into a stable `FunctionObject`.
     ///
     /// The mapping is memoized for the lifetime of a `run` so that `F.prototype`
@@ -899,6 +910,60 @@ impl VM {
             );
         }
 
+        // An `async` function answers a promise, so the frame is driven first
+        // and its outcome wrapped: a return fulfils the promise, a throw rejects
+        // it (ES 27.7.5.1 `AsyncFunctionStart`).
+        if module.asyncs.contains(&func_id) {
+            let promise = self.new_promise();
+            let outcome = self.drive_bytecode_frame(
+                func_id,
+                callee,
+                args,
+                &captured_vars,
+                effective_this,
+                captured_this_new_target,
+                new_target_override,
+                module,
+            );
+            match outcome {
+                Ok(value) => self.promise_resolve(&promise, value, module),
+                Err(err) => {
+                    let value = self.error_value(err);
+                    self.promise_settle(&promise, PromiseState::Rejected, value);
+                }
+            }
+            return Ok(Self::promise_value(&promise));
+        }
+
+        self.drive_bytecode_frame(
+            func_id,
+            callee,
+            args,
+            &captured_vars,
+            effective_this,
+            captured_this_new_target,
+            new_target_override,
+            module,
+        )
+    }
+
+    /// Push the callee's frame, run it to completion, then restore the caller's
+    /// execution context and answer the frame's `Rv`.
+    ///
+    /// The frame is driven by a nested `step` loop that stops at the sentinel
+    /// return address one past the last instruction.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_bytecode_frame(
+        &mut self,
+        func_id: u32,
+        callee: &Value,
+        args: &[Value],
+        captured_vars: &[(String, Value)],
+        effective_this: Value,
+        captured_this_new_target: Option<Value>,
+        new_target_override: Option<Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
         let saved_pc = self.state.pc;
         let saved_rsp = self.state.rsp;
         let saved_rbp = self.state.rbp;
@@ -912,7 +977,8 @@ impl VM {
         // Control-stack depth of the *caller*: SEH records at or below it belong
         // to an outer frame and must see the exception propagated, not handled
         // from inside this nested loop.
-        self.invoke_boundaries.push(self.state.ctrl_stack.len());
+        let saved_ctrl = self.state.ctrl_stack.len();
+        self.invoke_boundaries.push(saved_ctrl);
 
         // Push the arguments and open the callee's frame at the new stack top,
         // using the same convention as the `Call`/`CallEx` opcodes (arg0 ends up
@@ -932,7 +998,7 @@ impl VM {
             Value::Function(id) => self.materialize_function(*id),
             other => other.clone(),
         };
-        for (name, value) in &captured_vars {
+        for (name, value) in captured_vars {
             let mut map = std::collections::HashMap::new();
             map.insert(name.clone(), value.clone());
             self.state.closure_var_stack.push(map);
@@ -971,6 +1037,13 @@ impl VM {
         // Restore the caller's execution context *before* propagating: the
         // callee frame is gone either way, whether it returned or was unwound
         // by an exception escaping to an outer handler.
+        //
+        // A normal return already popped this frame's three control-stack
+        // entries in `Ret`; an exception that escapes the frame did not, so
+        // rewind them here. Without this a native that *catches* the error and
+        // keeps going in the same frame (the `Promise` executor) would pop the
+        // stale `return_pc` as its own saved `rbp`.
+        self.state.ctrl_stack.truncate(saved_ctrl);
         self.state.pc = saved_pc;
         self.state.rsp = saved_rsp;
         self.state.rbp = saved_rbp;
@@ -1582,6 +1655,32 @@ impl VM {
             }
             return Ok(Value::Undefined);
         }
+        // Per-element handlers of `Promise.all` / `race` / `allSettled` / `any`.
+        if name.starts_with("__promise_agg_ok__") || name.starts_with("__promise_agg_err__") {
+            if let Some(result) = self.dispatch_aggregation(name, args) {
+                return result;
+            }
+        }
+        // `Promise.prototype.finally` callbacks (name carries a registry id).
+        if let Some(rest) = name.strip_prefix("__promise_finally__") {
+            // `"<id>_f"` / `"<id>_r"`: which reaction (fulfilled or rejected)
+            // decides what "pass through unchanged" means.
+            if let Some((id, tag)) = rest.split_once('_') {
+                if let Ok(id) = id.parse::<u64>() {
+                    let callback = self.state.finally_handlers.get(&id).cloned();
+                    let argument = args.first().cloned().unwrap_or(Value::Undefined);
+                    if let Some(cb) = callback {
+                        // A throwing callback rejects the derived promise.
+                        self.invoke(&cb, Value::Undefined, &[], module)?;
+                        if tag == "r" {
+                            return Err(RuntimeError::Thrown(argument));
+                        }
+                        return Ok(argument);
+                    }
+                }
+            }
+            return Ok(Value::Undefined);
+        }
         if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
             return self.object_prototype_to_string(&this, args, module);
         }
@@ -1598,9 +1697,11 @@ impl VM {
             return crate::builtins::set_size(&this);
         }
         // `get Map[Symbol.species]` / `get Set[Symbol.species]` (23.1.2.2,
-        // 23.2.2.2) both answer their receiver.
+        // 23.2.2.2) and `get Promise[Symbol.species]` (27.2.2.3) all answer
+        // their receiver.
         if name == crate::builtins::MAP_SPECIES_NATIVE
             || name == crate::builtins::SET_SPECIES_NATIVE
+            || name == crate::builtins::PROMISE_SPECIES_NATIVE
         {
             return Ok(this);
         }
@@ -1799,7 +1900,7 @@ impl VM {
             // The descriptor arguments are read through [[Get]] first, which
             // `Promise.resolve` / `Promise.reject` build promises, which only the
             // VM can register.
-            if let Some(result) = self.promise_static(name, args) {
+            if let Some(result) = self.promise_static(name, args, module) {
                 return Ok(result);
             }
             // only the VM can do (their fields may be accessors).
@@ -1872,11 +1973,38 @@ impl VM {
                 self.generator_yield_pc = self.state.pc;
                 self.state.jump(module.instructions.len());
             }
+            Opcode::Await => {
+                let value = match operands.get(1) {
+                    Some(Operand::Immd(-1)) => Value::Undefined,
+                    Some(src) => self.get_value(*src)?,
+                    None => Value::Undefined,
+                };
+                let awaited = self.await_value(value, module)?;
+                if let Some(dst) = operands.first() {
+                    self.set_value(*dst, awaited)?;
+                }
+            }
             // ===== Control Flow =====
             Opcode::Call => {
                 let func_id = operands[0].as_immd();
                 // Second operand is the argument count (see `CodeGen::gen_call`).
                 let arg_count = operands.get(1).map(|o| o.as_immd() as usize).unwrap_or(0);
+                // An `async` function answers a promise. Route it through
+                // `invoke`, which drives the body and wraps its outcome, instead
+                // of entering the frame directly.
+                if module.asyncs.contains(&(func_id as u32)) {
+                    self.state.rbp = self.state.rsp;
+                    let args = self.collect_call_args(arg_count)?;
+                    let result = self.invoke(
+                        &Value::Function(func_id as u32),
+                        Value::Undefined,
+                        &args,
+                        module,
+                    )?;
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
                 match module.symtab.get(&FunctionId::new(func_id as u32)) {
                     Some(location) => {
                         self.state.enter_frame(arg_count)?;
@@ -1931,6 +2059,20 @@ impl VM {
                                 module,
                             )?;
                             self.state.set_register(Register::Rv, gobj)?;
+                            self.state.jump_offset(1);
+                            return Ok(());
+                        }
+                        // `async` in its bare spelling: the call answers a
+                        // promise (see `invoke_with_new_target`).
+                        if module.asyncs.contains(&id) {
+                            let args = self.collect_call_args(arg_count)?;
+                            let result = self.invoke(
+                                &Value::Function(id),
+                                Value::Undefined,
+                                &args,
+                                module,
+                            )?;
+                            self.state.set_register(Register::Rv, result)?;
                             self.state.jump_offset(1);
                             return Ok(());
                         }
@@ -1997,6 +2139,23 @@ impl VM {
                                     module,
                                 )?;
                                 self.state.set_register(Register::Rv, gobj)?;
+                                self.state.jump_offset(1);
+                                return Ok(());
+                            }
+
+                            // `async` in its *boxed* spelling (a method taken
+                            // off its object, or a function expression): the call
+                            // answers a promise.
+                            if module.asyncs.contains(&id) {
+                                let args = self.collect_call_args(arg_count)?;
+                                let this = captured_this.unwrap_or(Value::Undefined);
+                                let result = self.invoke(
+                                    &Value::Object(Rc::clone(&obj_ref)),
+                                    this,
+                                    &args,
+                                    module,
+                                )?;
+                                self.state.set_register(Register::Rv, result)?;
                                 self.state.jump_offset(1);
                                 return Ok(());
                             }
@@ -3072,6 +3231,14 @@ impl VM {
                             module,
                         )?;
                         self.state.set_register(Register::Rv, gobj)?;
+                        self.state.jump_offset(1);
+                        return Ok(());
+                    }
+                    // An `async` method (`obj.m()`): the call answers a promise.
+                    if module.asyncs.contains(&id) {
+                        let result =
+                            self.invoke(&method_val, obj_val.clone(), &args, module)?;
+                        self.state.set_register(Register::Rv, result)?;
                         self.state.jump_offset(1);
                         return Ok(());
                     }
@@ -4962,11 +5129,10 @@ impl VM {
         promise
     }
 
-    /// Settle `promise` and queue the reactions that were waiting on it. A
-    /// promise settles at most once; later attempts are ignored (ES 27.2.1.4).
-    /// `Promise.resolve(value)` / `Promise.reject(reason)` — the two statics that
-    /// only need to build a promise (no user callback involved).
-    fn promise_static(&mut self, name: &str, args: &[Value]) -> Option<Value> {
+    /// `Promise.resolve(value)` / `Promise.reject(reason)` / `Promise.all` /
+    /// `race` / `allSettled` / `any` — the statics that need the VM (they either
+    /// register a promise or have to call user `then` methods).
+    fn promise_static(&mut self, name: &str, args: &[Value], module: &Module) -> Option<Value> {
         match name {
             "Promise.resolve" => {
                 let promise = self.new_promise();
@@ -4975,7 +5141,7 @@ impl VM {
                 if let Some(existing) = self.as_promise(&value) {
                     return Some(Self::promise_value(&existing));
                 }
-                self.promise_settle(&promise, PromiseState::Fulfilled, value);
+                self.promise_resolve(&promise, value, module);
                 Some(Self::promise_value(&promise))
             }
             "Promise.reject" => {
@@ -4984,8 +5150,396 @@ impl VM {
                 self.promise_settle(&promise, PromiseState::Rejected, value);
                 Some(Self::promise_value(&promise))
             }
+            "Promise.all" => Some(self.promise_aggregate(AggregateKind::All, args, module)),
+            "Promise.race" => Some(self.promise_aggregate(AggregateKind::Race, args, module)),
+            "Promise.allSettled" => {
+                Some(self.promise_aggregate(AggregateKind::AllSettled, args, module))
+            }
+            "Promise.any" => Some(self.promise_aggregate(AggregateKind::Any, args, module)),
             _ => None,
         }
+    }
+
+    /// A host function boxed for use as a handler (the reaction runner checks
+    /// `is_callable`, which is only answered by the boxed form).
+    fn native_fn(name: &str) -> Value {
+        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(name))))
+    }
+
+    /// `await src` (ES 27.7.5.3): convert `src` to a promise, wait for it, then
+    /// answer its fulfilment value or rethrow its reason.
+    ///
+    /// "Wait" here means draining the microtask queue until the promise settles:
+    /// the engine has no event loop, so the only thing that can ever settle a
+    /// promise is one of those jobs, which makes the loop convergent. A promise
+    /// that can never settle (nothing left in the queue) leaves `undefined`.
+    fn await_value(&mut self, src: Value, module: &Module) -> Result<Value, RuntimeError> {
+        let promise = match self.as_promise(&src) {
+            Some(p) => p,
+            None => {
+                let p = self.new_promise();
+                self.promise_resolve(&p, src, module);
+                p
+            }
+        };
+        loop {
+            let (state, value) = {
+                let borrowed = promise.borrow();
+                (borrowed.state, borrowed.value.clone())
+            };
+            match state {
+                PromiseState::Fulfilled => return Ok(value),
+                PromiseState::Rejected => return Err(RuntimeError::Thrown(value)),
+                PromiseState::Pending => {
+                    if self.state.promise_jobs.is_empty() {
+                        return Ok(Value::Undefined);
+                    }
+                    self.run_promise_jobs(module)?;
+                }
+            }
+        }
+    }
+
+    /// The promise resolution procedure (`ResolvePromise`, ES 27.2.1.3.2) as
+    /// far as this engine can go: adopt a real promise, queue a job for a
+    /// foreign thenable, otherwise fulfil.
+    fn promise_resolve(
+        &mut self,
+        promise: &Rc<RefCell<PromiseObject>>,
+        value: Value,
+        module: &Module,
+    ) {
+        if let Some(existing) = self.as_promise(&value) {
+            if Rc::ptr_eq(&existing, promise) {
+                // `resolve(p)` with p itself: a chaining cycle (ES 27.2.1.3.2
+                // step 6.1) is a TypeError.
+                let reason = crate::builtins::runtime_error_to_js_error(
+                    &RuntimeError::TypeError("Chaining cycle detected".to_string()),
+                    &self.builtins,
+                );
+                self.promise_settle(promise, PromiseState::Rejected, reason);
+                return;
+            }
+            // Adopt by forwarding: a reaction with no handlers passes the
+            // settlement straight through to `promise` (ES 27.2.2.1 step 9).
+            let forwarding = PromiseReaction {
+                on_fulfilled: None,
+                on_rejected: None,
+                target: Rc::clone(promise),
+            };
+            let settled = {
+                let borrowed = existing.borrow();
+                if borrowed.is_pending() {
+                    None
+                } else {
+                    Some((borrowed.state, borrowed.value.clone()))
+                }
+            };
+            match settled {
+                None => existing.borrow_mut().reactions.push(forwarding),
+                Some((state, value)) => self.state.promise_jobs.push_back(PromiseJob::Reaction {
+                    reaction: forwarding,
+                    argument: value,
+                    fulfilled: state == PromiseState::Fulfilled,
+                }),
+            }
+            return;
+        }
+        // `ResolvePromise` step 8: an object (or function) with a callable
+        // `then` is adopted through a job that calls `thenable.then(...)`.
+        if matches!(value, Value::Object(_) | Value::Function(_)) {
+            if let Ok(then) = self.get_member(&value, &PropertyKey::from_str("then"), module) {
+                if then.is_callable() || matches!(then, Value::Function(_)) {
+                    let then = self.as_object_value(&then);
+                    let _ = then;
+                    self.state.promise_jobs.push_back(PromiseJob::Thenable {
+                        promise: Rc::clone(promise),
+                        thenable: value,
+                    });
+                    return;
+                }
+            }
+        }
+        self.promise_settle(promise, PromiseState::Fulfilled, value);
+    }
+
+    /// `Promise.all` / `race` / `allSettled` / `any`. The iterable's elements are
+    /// each resolved to a promise and get a per-element native handler whose name
+    /// carries `(aggregation id, index)`.
+    fn promise_aggregate(
+        &mut self,
+        kind: AggregateKind,
+        args: &[Value],
+        module: &Module,
+    ) -> Value {
+        let result = self.new_promise();
+        let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+        let id = self.state.next_aggregation_id;
+        self.state.next_aggregation_id += 1;
+        // Collect the element promises first: `remaining` is only known once the
+        // iterable is exhausted, and the handlers must not fire before then.
+        let mut elements: Vec<Value> = Vec::new();
+        match self.make_iterator(iterable, module) {
+            Ok(iter) => loop {
+                let (value, done) = match self.iterator_next(iter.clone(), None, module) {
+                    Ok(step) => step,
+                    Err(err) => {
+                        // A throwing iterator rejects the result promise
+                        // (ES 27.2.4.1.1 step 6.f.i).
+                        let reason = self.error_value(err);
+                        self.promise_settle(&result, PromiseState::Rejected, reason);
+                        return Self::promise_value(&result);
+                    }
+                };
+                if done {
+                    break;
+                }
+                elements.push(value);
+            },
+            Err(err) => {
+                let reason = self.error_value(err);
+                self.promise_settle(&result, PromiseState::Rejected, reason);
+                return Self::promise_value(&result);
+            }
+        }
+        let total = elements.len();
+        self.state.aggregations.insert(
+            id,
+            PromiseAggregation {
+                kind,
+                result: Rc::clone(&result),
+                remaining: total,
+                values: vec![Value::Undefined; total],
+                done: false,
+                rejections: 0,
+                total,
+            },
+        );
+        // `Promise.all([])` / `race([])` / `allSettled([])` settle right away;
+        // `Promise.any([])` rejects with an (empty) AggregateError.
+        if total == 0 {
+            return self.finish_empty_aggregate(id, kind);
+        }
+        for (index, element) in elements.into_iter().enumerate() {
+            let element_promise = match self.as_promise(&element) {
+                Some(p) => p,
+                None => {
+                    let p = self.new_promise();
+                    self.promise_resolve(&p, element, module);
+                    p
+                }
+            };
+            // `promise_then` mints the child that the handler's return value
+            // settles; the aggregation itself settles the result promise.
+            self.promise_then(
+                &element_promise,
+                Some(Self::native_fn(&format!("__promise_agg_ok__{id}_{index}"))),
+                Some(Self::native_fn(&format!("__promise_agg_err__{id}_{index}"))),
+            );
+        }
+        Self::promise_value(&result)
+    }
+
+    /// Settle an aggregation whose element list is empty.
+    fn finish_empty_aggregate(&mut self, id: u64, kind: AggregateKind) -> Value {
+        let result = {
+            let Some(agg) = self.state.aggregations.get(&id) else {
+                return Value::Undefined;
+            };
+            Rc::clone(&agg.result)
+        };
+        self.state.aggregations.remove(&id);
+        match kind {
+            AggregateKind::All | AggregateKind::AllSettled => {
+                let array = Value::Object(Rc::new(RefCell::new(
+                    crate::vm::object::ArrayObject::from_vec(vec![]),
+                )));
+                self.promise_settle(&result, PromiseState::Fulfilled, array);
+            }
+            AggregateKind::Race => {
+                // `race` over an empty iterable stays pending for ever.
+                self.promise_settle(&result, PromiseState::Pending, Value::Undefined);
+            }
+            AggregateKind::Any => {
+                let err = self.aggregate_error(vec![]);
+                self.promise_settle(&result, PromiseState::Rejected, err);
+            }
+        }
+        Self::promise_value(&result)
+    }
+
+    /// `AggregateError` with an `errors` array, as a JS error value.
+    ///
+    /// The full constructor is ES2021 and out of this engine's ES6 target, so
+    /// no `AggregateError` global exists; the rejection reason still has the
+    /// right shape (`name` `"AggregateError"`, own `errors`) for `Promise.any`.
+    fn aggregate_error(&self, errors: Vec<Value>) -> Value {
+        let prototype = Rc::clone(&self.builtins.error_prototype);
+        let mut value = crate::builtins::create_error_object(
+            Some("All promises were rejected".to_string()),
+            prototype,
+            "AggregateError",
+        );
+        let array = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::ArrayObject::from_vec(errors),
+        )));
+        if let Value::Object(obj) = &mut value {
+            obj.borrow_mut()
+                .define_property(
+                    PropertyKey::from_str("name"),
+                    crate::vm::property::PropertyDescriptor::data_descriptor(Value::string(
+                        "AggregateError",
+                    )),
+                )
+                .ok();
+            obj.borrow_mut()
+                .define_property(
+                    PropertyKey::from_str("errors"),
+                    crate::vm::property::PropertyDescriptor::data_descriptor(array),
+                )
+                .ok();
+        }
+        value
+    }
+
+    /// Run one per-element handler of an aggregation. Returns the value the
+    /// reaction's child should settle with (ignored — the aggregation settles the
+    /// result promise directly).
+    fn dispatch_aggregation(
+        &mut self,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Result<Value, RuntimeError>> {
+        let (id, index) = parse_aggregation_handler(name)?;
+        let argument = args.first().cloned().unwrap_or(Value::Undefined);
+        let kind = self.state.aggregations.get(&id)?.kind;
+        match kind {
+            AggregateKind::All => {
+                if name.starts_with("__promise_agg_err__") {
+                    let result = {
+                        let Some(agg) = self.state.aggregations.get(&id) else {
+                            return Some(Ok(Value::Undefined));
+                        };
+                        if agg.done {
+                            return Some(Ok(Value::Undefined));
+                        }
+                        Rc::clone(&agg.result)
+                    };
+                    self.state.aggregations.remove(&id);
+                    self.promise_settle(&result, PromiseState::Rejected, argument);
+                    return Some(Ok(Value::Undefined));
+                }
+                let (complete, result) = {
+                    let Some(agg) = self.state.aggregations.get_mut(&id) else {
+                        return Some(Ok(Value::Undefined));
+                    };
+                    agg.values[index] = argument;
+                    agg.remaining -= 1;
+                    (agg.remaining == 0, Rc::clone(&agg.result))
+                };
+                if complete {
+                    let values = self
+                        .state
+                        .aggregations
+                        .remove(&id)
+                        .map(|a| a.values)
+                        .unwrap_or_default();
+                    let array = Value::Object(Rc::new(RefCell::new(
+                        crate::vm::object::ArrayObject::from_vec(values),
+                    )));
+                    self.promise_settle(&result, PromiseState::Fulfilled, array);
+                }
+            }
+            AggregateKind::Race => {
+                let fulfilled = name.starts_with("__promise_agg_ok__");
+                let result = {
+                    let Some(agg) = self.state.aggregations.get(&id) else {
+                        return Some(Ok(Value::Undefined));
+                    };
+                    if agg.done {
+                        return Some(Ok(Value::Undefined));
+                    }
+                    Rc::clone(&agg.result)
+                };
+                self.state.aggregations.remove(&id);
+                let state = if fulfilled {
+                    PromiseState::Fulfilled
+                } else {
+                    PromiseState::Rejected
+                };
+                self.promise_settle(&result, state, argument);
+            }
+            AggregateKind::AllSettled => {
+                let fulfilled = name.starts_with("__promise_agg_ok__");
+                let (complete, result) = {
+                    let Some(agg) = self.state.aggregations.get_mut(&id) else {
+                        return Some(Ok(Value::Undefined));
+                    };
+                    let status = Value::string(if fulfilled { "fulfilled" } else { "rejected" });
+                    let key = if fulfilled { "value" } else { "reason" };
+                    let mut obj = crate::vm::object::OrdinaryObject::new();
+                    obj.define_property(
+                        PropertyKey::from_str("status"),
+                        crate::vm::property::PropertyDescriptor::data_descriptor(status),
+                    )
+                    .ok();
+                    obj.define_property(
+                        PropertyKey::from_str(key),
+                        crate::vm::property::PropertyDescriptor::data_descriptor(argument),
+                    )
+                    .ok();
+                    agg.values[index] = Value::Object(Rc::new(RefCell::new(obj)));
+                    agg.remaining -= 1;
+                    (agg.remaining == 0, Rc::clone(&agg.result))
+                };
+                if complete {
+                    let values = self
+                        .state
+                        .aggregations
+                        .remove(&id)
+                        .map(|a| a.values)
+                        .unwrap_or_default();
+                    let array = Value::Object(Rc::new(RefCell::new(
+                        crate::vm::object::ArrayObject::from_vec(values),
+                    )));
+                    self.promise_settle(&result, PromiseState::Fulfilled, array);
+                }
+            }
+            AggregateKind::Any => {
+                if name.starts_with("__promise_agg_ok__") {
+                    let result = {
+                        let Some(agg) = self.state.aggregations.get(&id) else {
+                            return Some(Ok(Value::Undefined));
+                        };
+                        if agg.done {
+                            return Some(Ok(Value::Undefined));
+                        }
+                        Rc::clone(&agg.result)
+                    };
+                    self.state.aggregations.remove(&id);
+                    self.promise_settle(&result, PromiseState::Fulfilled, argument);
+                    return Some(Ok(Value::Undefined));
+                }
+                let (exhausted, errors, result) = {
+                    let Some(agg) = self.state.aggregations.get_mut(&id) else {
+                        return Some(Ok(Value::Undefined));
+                    };
+                    agg.values[index] = argument;
+                    agg.rejections += 1;
+                    (
+                        agg.rejections == agg.total,
+                        agg.values.clone(),
+                        Rc::clone(&agg.result),
+                    )
+                };
+                if exhausted {
+                    self.state.aggregations.remove(&id);
+                    let err = self.aggregate_error(errors);
+                    self.promise_settle(&result, PromiseState::Rejected, err);
+                }
+            }
+        }
+        Some(Ok(Value::Undefined))
     }
 
     fn promise_settle(
@@ -5104,18 +5658,26 @@ impl VM {
                 Ok(Some(self.promise_then(&promise, None, on_rejected)))
             }
             _ => {
-                // `finally`: the callback runs either way and the settlement
-                // passes through unchanged (a returned promise is not awaited —
-                // there is no event loop to await it on).
+                // `finally(cb)` (ES 27.2.5.3): returns a *fresh* promise that
+                // settles like the receiver, except that a throwing `cb` rejects
+                // it. The two handlers are natives carrying a registry id; the
+                // callback itself runs when the reaction is drained.
                 let callback = callable(args.first());
-                if let Some(cb) = callback {
-                    if let Err(e) = self.invoke(&cb, Value::Undefined, &[], _module) {
-                        let value = self.error_value(e);
-                        self.promise_settle(&promise, PromiseState::Rejected, value);
-                        return Ok(Some(Self::promise_value(&promise)));
+                match callback {
+                    None => Ok(Some(self.promise_then(&promise, None, None))),
+                    Some(cb) => {
+                        let id = self.state.next_finally_id;
+                        self.state.next_finally_id += 1;
+                        self.state.finally_handlers.insert(id, cb);
+                        let fulfilled = Self::native_fn(&format!("__promise_finally__{id}_f"));
+                        let rejected = Self::native_fn(&format!("__promise_finally__{id}_r"));
+                        Ok(Some(self.promise_then(
+                            &promise,
+                            Some(fulfilled),
+                            Some(rejected),
+                        )))
                     }
                 }
-                Ok(Some(Self::promise_value(&promise)))
             }
         }
     }
@@ -5123,11 +5685,38 @@ impl VM {
     /// Drain the microtask queue, running each reaction handler.
     fn run_promise_jobs(&mut self, module: &Module) -> Result<(), RuntimeError> {
         while let Some(job) = self.state.promise_jobs.pop_front() {
-            let PromiseJob::Reaction {
-                reaction,
-                argument,
-                fulfilled,
-            } = job;
+            let (reaction, argument, fulfilled) = match job {
+                PromiseJob::Reaction {
+                    reaction,
+                    argument,
+                    fulfilled,
+                } => (reaction, argument, fulfilled),
+                PromiseJob::Thenable { promise, thenable } => {
+                    // ES 27.2.1.9: call `thenable.then(resolveFn, rejectFn)` with
+                    // functions that resolve/reject the adopting promise.
+                    let id = promise.borrow().id;
+                    let resolve = Self::native_fn(&format!("__promise_resolve__{id}"));
+                    let reject = Self::native_fn(&format!("__promise_reject__{id}"));
+                    let then = match self.get_member(
+                        &thenable,
+                        &PropertyKey::from_str("then"),
+                        module,
+                    ) {
+                        Ok(then) => then,
+                        Err(err) => {
+                            let value = self.error_value(err);
+                            self.promise_settle(&promise, PromiseState::Rejected, value);
+                            continue;
+                        }
+                    };
+                    // A throwing `then` rejects the adopting promise.
+                    if let Err(err) = self.invoke(&then, thenable, &[resolve, reject], module) {
+                        let value = self.error_value(err);
+                        self.promise_settle(&promise, PromiseState::Rejected, value);
+                    }
+                    continue;
+                }
+            };
             let handler = if fulfilled {
                 reaction.on_fulfilled.clone()
             } else {
@@ -5137,7 +5726,10 @@ impl VM {
                 Some(handler) if handler.is_callable() => {
                     match self.invoke(&handler, Value::Undefined, &[argument], module) {
                         Ok(value) => {
-                            self.promise_settle(&reaction.target, PromiseState::Fulfilled, value)
+                            // ES 27.2.2.1 step 12: the handler's answer goes
+                            // through the resolution procedure, so a thenable it
+                            // returns is adopted rather than fulfilled directly.
+                            self.promise_resolve(&reaction.target, value, module)
                         }
                         Err(RuntimeError::Thrown(reason)) => {
                             self.promise_settle(&reaction.target, PromiseState::Rejected, reason)
@@ -7143,17 +7735,18 @@ impl VM {
                 let _ = self.invoke(&return_fn, iterator, &args, module);
                 return Ok(());
             }
-            // Step 5: an error raised by `return()` itself is swallowed — the
-            // completion being closed over wins.
-            if let Ok(result) = self.invoke(&return_fn, iterator, &args, module) {
-                // Step 9: but a *normal* result that is not an object is a
-                // TypeError of its own. Without this an iterator whose `return`
-                // answers `null` closed silently (`*-close-null` families).
-                if !result.is_object() {
-                    return Err(RuntimeError::TypeError(
-                        "iterator.return() returned a non-object value".to_string(),
-                    ));
-                }
+            // ES 7.4.6: only a *throw* completion swallows what `return()`
+            // does (step 7, the `over_abrupt` branch above). For a normal
+            // completion an exception out of `return()` **propagates** (step 8),
+            // so it must not be discarded here.
+            let result = self.invoke(&return_fn, iterator, &args, module)?;
+            // Step 9: and a normal result that is not an object is a TypeError
+            // of its own. Without this an iterator whose `return` answers `null`
+            // closed silently (`*-close-null` families).
+            if !result.is_object() {
+                return Err(RuntimeError::TypeError(
+                    "iterator.return() returned a non-object value".to_string(),
+                ));
             }
         }
         Ok(())
@@ -7202,7 +7795,8 @@ impl VM {
         let saved_function = self.state.function_val.clone();
         // See `invoke_with_new_target`: exceptions escaping this frame must be
         // propagated to the caller rather than handled from inside this loop.
-        self.invoke_boundaries.push(self.state.ctrl_stack.len());
+        let saved_ctrl = self.state.ctrl_stack.len();
+        self.invoke_boundaries.push(saved_ctrl);
 
         for arg in args.iter().rev() {
             self.state.push(arg.clone())?;
@@ -7249,6 +7843,9 @@ impl VM {
 
         self.invoke_boundaries.pop();
 
+        // Rewind this frame's control-stack entries on the exception path, as
+        // in `invoke_with_new_target` (a normal return did it in `Ret`).
+        self.state.ctrl_stack.truncate(saved_ctrl);
         self.state.pc = saved_pc;
         self.state.rsp = saved_rsp;
         self.state.rbp = saved_rbp;
@@ -7535,6 +8132,16 @@ struct State {
     /// name, so that is how those two closures carry their target.
     promises: HashMap<u64, Rc<RefCell<PromiseObject>>>,
     next_promise_id: u64,
+    /// In-flight `Promise.all` / `race` / `allSettled` / `any` aggregations,
+    /// keyed by the id embedded in the per-element native handler names — the
+    /// engine dispatches natives by name, so that is how those handlers carry
+    /// their aggregation state.
+    aggregations: HashMap<u64, PromiseAggregation>,
+    next_aggregation_id: u64,
+    /// Pending `finally` callbacks, keyed by the id embedded in the handler
+    /// names minted by `try_promise_method`.
+    finally_handlers: HashMap<u64, Value>,
+    next_finally_id: u64,
     this_val: Value,
     /// Stack of captured variable maps for active closure scopes
     closure_var_stack: Vec<HashMap<String, Value>>,
@@ -7581,6 +8188,10 @@ impl State {
             promise_jobs: std::collections::VecDeque::new(),
             promises: HashMap::new(),
             next_promise_id: 0,
+            aggregations: HashMap::new(),
+            next_aggregation_id: 0,
+            finally_handlers: HashMap::new(),
+            next_finally_id: 0,
             this_val: Value::Undefined,
             closure_var_stack: Vec::new(),
             construct_stack: Vec::new(),
@@ -7952,6 +8563,54 @@ pub enum PromiseJob {
         argument: Value,
         fulfilled: bool,
     },
+    /// `PromiseResolveThenableJob` (ES 27.2.1.9): a foreign thenable was passed
+    /// to a resolving function, so its `then` has to be called with functions
+    /// that settle the promise this job is adopting (`promise`).
+    Thenable {
+        promise: Rc<RefCell<crate::vm::object::PromiseObject>>,
+        thenable: Value,
+    },
+}
+
+/// Which of the four `Promise` combinators an aggregation belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateKind {
+    All,
+    Race,
+    AllSettled,
+    Any,
+}
+
+/// Recognise the two per-element handler names minted by `promise_aggregate`,
+/// answering `(aggregation id, element index)`.
+fn parse_aggregation_handler(name: &str) -> Option<(u64, usize)> {
+    let rest = name
+        .strip_prefix("__promise_agg_ok__")
+        .or_else(|| name.strip_prefix("__promise_agg_err__"))?;
+    let (id, index) = rest.split_once('_')?;
+    Some((id.parse().ok()?, index.parse().ok()?))
+}
+
+/// State for one in-flight `Promise.all` / `race` / `allSettled` / `any`.
+///
+/// The per-element handlers are natives whose names carry `id`; when the queue
+/// runs them they look the aggregation up here and mutate it. That is the
+/// engine's usual way of giving a host function captured state (see
+/// `__promise_resolve__`).
+#[derive(Debug)]
+pub struct PromiseAggregation {
+    kind: AggregateKind,
+    result: Rc<RefCell<crate::vm::object::PromiseObject>>,
+    /// Elements still to settle (for `all` / `allSettled` / `any`).
+    remaining: usize,
+    /// Element results, by index (`all` / `allSettled` values, `any` reasons).
+    values: Vec<Value>,
+    /// `race` / `any` settle on the first match; once true later ones are noise.
+    done: bool,
+    /// `any` rejection countdown.
+    rejections: usize,
+    /// `any` total element count (known only after the iterable is exhausted).
+    total: usize,
 }
 
 #[derive(Debug)]
@@ -8325,6 +8984,7 @@ mod tests {
             constants,
             HashMap::new(),
             HashMap::new(),
+            std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             HashMap::new(),

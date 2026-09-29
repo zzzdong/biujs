@@ -653,6 +653,12 @@ impl<'a> SSABuilder<'a> {
                     SSABuilder::rename_use(src, stacks);
                 }
             }
+            Instruction::Await { dst, src } => {
+                SSABuilder::rename_definition(dst, new_versions);
+                if let Some(src) = src {
+                    SSABuilder::rename_use(src, stacks);
+                }
+            }
             Instruction::DelegateOpen { iter } | Instruction::DelegateClose { iter } => {
                 SSABuilder::rename_use(iter, stacks);
             }

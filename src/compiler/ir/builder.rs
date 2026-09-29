@@ -351,6 +351,13 @@ pub trait InstBuilder {
         dst
     }
 
+    /// `await expr` inside an `async` function: waits for `src` to settle.
+    fn await_(&mut self, src: Option<Value>) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::Await { dst, src });
+        dst
+    }
+
     fn iterate_next(&mut self, iter: Value) -> (Value, Value) {
         let next = self.alloc();
         let has_next = self.alloc();

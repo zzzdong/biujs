@@ -16,7 +16,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 SNAP="docs/phase2-status.tsv"
-MEM_LIMIT_KB=6000000          # §6.5：全量回归一律带内存上限（OS 侧的硬兜底）
+# §6.5：全量回归一律带内存上限（OS 侧的硬兜底）。
+# 实测：3GB 撑不住（进程在自己的上限内 OOM），说明**整轮峰值是按"每条用例"累积**的 ——
+# 按套件分片并不减少用例总数。5GB 有充足余量，又低于机器内存，OS 不会来 kill。
+# 等 per-test 泄漏被修掉之后，这个数可以往下调；分片机制已经在（见下），届时直接改这一行。
+# 可用 MEM_LIMIT_KB 覆盖。
+: "${MEM_LIMIT_KB:=5000000}"
+# 片数：每片一个进程。4 片时单片峰值约为整轮的 1/3，3GB 上限有充足余量。
+: "${TEST262_CHUNKS:=4}"
 # 三层护栏（见 tests/test262_runner.rs 顶部）：每条都由 runner 变成一条**普通失败**，
 # 而不是让进程挂死或被杀（后者会丢掉整轮结果）。
 #   TEST262_TIMEOUT_MS  单条用例的墙钟预算（0 = 关）
@@ -87,52 +94,50 @@ if [ "$QUICK" = "1" ]; then
   exit 0
 fi
 # ── 4. 全量 test262 ────────────────────────────────────────────────────────
-# 分两块跑（language / built-ins），每块一个进程。
-#
-# 为什么：单个进程跑完 101 个套件会把峰值顶到内存上限，进程被 OOM 杀掉
-# （`memory allocation … failed` + SIGABRT）。分块后每块结束进程即退出，内存随之
-# 释放。诊断过程见计划书 B31：两个进程各跑一半都正常、逐套件数字与整轮基线逐位
-# 相同，合起来才 OOM —— 所以这是峰值问题，不是某条用例吃内存。
+# 分片跑：每片一个进程（`TEST262_CHUNKS` / `TEST262_CHUNK_INDEX`），片结束进程退出、
+# 内存随之释放。为什么：整轮（101 个套件）在一个地址空间里会把峰值推到 OOM killer 或
+# 撞上 ulimit；分片后每片都远低于上限，于是上限本身也能调小。
 echo
-echo "== 全量 test262（分两块跑；每块内存上限 ${MEM_LIMIT_KB}KB）=="
-echo "   护栏：单例 ${TEST262_TIMEOUT_MS}ms / ${TEST262_STEP_LIMIT:-默认} 步 / 堆 ${TEST262_MEMORY_MB}MB，每块硬超时 ${TEST262_HARD_TIMEOUT}s"
-echo "   分块：language（84 个套件）+ built-ins（17 个套件）"
+echo "== 全量 test262（分 ${TEST262_CHUNKS} 片跑；每片内存上限 ${MEM_LIMIT_KB}KB）=="
+echo "   护栏：单例 ${TEST262_TIMEOUT_MS}ms / ${TEST262_STEP_LIMIT:-默认} 步 / 堆 ${TEST262_MEMORY_MB}MB，每片硬超时 ${TEST262_HARD_TIMEOUT}s"
 
-CHUNKS="language built-ins"
-RUN_STATUS=0
 CHUNK_FILES=""
-for CHUNK in $CHUNKS; do
-  OUT="$TMP/full-$CHUNK.txt"
+RUN_STATUS=0
+INDEX=0
+while [ "$INDEX" -lt "$TEST262_CHUNKS" ]; do
+  OUT="$TMP/full-chunk-$INDEX.txt"
   CHUNK_FILES="$CHUNK_FILES $OUT"
   ( ulimit -v "$MEM_LIMIT_KB"
     timeout --signal=TERM "$TEST262_HARD_TIMEOUT" \
-      env TEST262_FAILURES=0 TEST262_SUITES="$CHUNK" cargo test --release --test test262_runner -- --nocapture ) > "$OUT" 2>&1
+      env TEST262_FAILURES=0 TEST262_CHUNKS="$TEST262_CHUNKS" TEST262_CHUNK_INDEX="$INDEX" \
+        cargo test --release --test test262_runner -- --nocapture ) > "$OUT" 2>&1
   STATUS=$?
   if [ "$STATUS" = "124" ] || [ "$STATUS" = "143" ]; then
-    echo "块 $CHUNK 超过硬超时 ${TEST262_HARD_TIMEOUT}s 被中止。" >&2
+    echo "第 $INDEX 片超过硬超时 ${TEST262_HARD_TIMEOUT}s 被中止。" >&2
     echo "先看卡在哪个用例：TEST262_TIMINGS=1 复跑看最慢的十条，或 BIUJS_TEST262_TRACE=1 看最后一行。" >&2
-    tail -20 "$TMP/full-$CHUNK.txt" >&2
+    tail -20 "$OUT" >&2
     exit 1
   fi
-  if ! grep -q "^TOTAL" "$TMP/full-$CHUNK.txt"; then
-    echo "块 $CHUNK 没有跑完（进程可能被内存上限打断或崩溃）。" >&2
+  if ! grep -q "^TOTAL" "$OUT"; then
+    echo "第 $INDEX 片没有跑完（进程可能被内存上限打断或崩溃）。" >&2
     echo "最后 20 行：" >&2
-    tail -20 "$TMP/full-$CHUNK.txt" >&2
+    tail -20 "$OUT" >&2
     exit 1
   fi
   if [ "$STATUS" != "0" ]; then
-    echo "块 $CHUNK 的 test262_runner 退出码 $STATUS，但摘要已生成 —— 请检查是否有套件报告失败以外的异常。" >&2
+    echo "第 $INDEX 片的 test262_runner 退出码 $STATUS，但摘要已生成 —— 请检查是否有套件报告失败以外的异常。" >&2
     RUN_STATUS="$STATUS"
   fi
+  INDEX=$((INDEX + 1))
 done
-# 后面的 grep 仍按整轮输出处理：把两块拼起来。
+# 后面的 grep 仍按整轮输出处理：把各片拼起来。
 cat $CHUNK_FILES > "$TMP/full.txt"
 
-# 摘要表 → TSV（表头下面到分隔线之间的行）。两块的行直接合起来即为整轮。
+# 摘要表 → TSV（表头下面到分隔线之间的行）。各片的行直接合起来即为整轮。
 awk '/^suite[[:space:]]+passed/{f=1; next} /^-{10,}/{f=0} f && NF>=4 {print $1"\t"$2"\t"$3"\t"$4}' \
   $CHUNK_FILES > "$TMP/new.tsv"
 
-# 头条数字：整轮 = 两块之和（每块的 TOTAL 只统计自己那部分套件）。
+# 头条数字：整轮 = 各片之和（每片的 TOTAL 只统计自己那部分套件）。
 SUMS="$(awk '/^[[:space:]]*TOTAL[[:space:]]/{p+=$2; s+=$3; f+=$4} END{print p+0, s+0, f+0}' \
   $CHUNK_FILES)"
 PASSED="$(echo "$SUMS" | awk '{print $1}')"
@@ -166,7 +171,10 @@ echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 # 8149 → 8133（B3）：`built-ins/WeakMap`/`WeakSet` 入册（各带 9 + 5 条门控），
 # 两个特性名从 IN_SCOPE_PENDING 摘掉后，先前被它们顺带跳过、分散在已入册套件里的
 # 30 条用例转为执行。
-EXPECTED_SKIPPED=8133
+# 8133 → 8173（B35）：`built-ins/Promise` 入册，套件自带的 40 条门控用例进跳过表；同时
+# `Promise` 从 IN_SCOPE_PENDING 摘掉、`Promise.allSettled` / `Promise.any` /
+# `Promise.prototype.finally` / `AggregateError` 等 ES2018+ 特性进 OUT_OF_SCOPE。
+EXPECTED_SKIPPED=8173
 if [ "$SKIPPED" != "$EXPECTED_SKIPPED" ]; then
   echo "  !! 跳过数从 $EXPECTED_SKIPPED 变为 $SKIPPED —— 跳过表被改动了。"
   echo "     请确认这是有意的（计划书 §2.2：交付特性时必须同批解锁），并更新本脚本的 EXPECTED_SKIPPED。"

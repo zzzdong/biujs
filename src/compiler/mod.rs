@@ -84,6 +84,7 @@ impl Compiler {
         let mut func_info: HashMap<u32, (String, usize)> = HashMap::new();
         let mut exit_pc: HashMap<u32, usize> = HashMap::new();
         let mut generators: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut asyncs: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut derived_ctors: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for func in &unit.functions {
             func_info.insert(
@@ -97,6 +98,9 @@ impl Compiler {
             );
             if func.signature.is_generator {
                 generators.insert(func.id.as_usize() as u32);
+            }
+            if func.signature.is_async {
+                asyncs.insert(func.id.as_usize() as u32);
             }
             if func.signature.is_derived_ctor {
                 derived_ctors.insert(func.id.as_usize() as u32);
@@ -151,6 +155,7 @@ impl Compiler {
             symtab,
             func_info,
             generators,
+            asyncs,
             derived_ctors,
             exit_pc,
             all_codes,
