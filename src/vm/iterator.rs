@@ -256,6 +256,44 @@ impl JSObject for NativeIteratorObject {
     }
 }
 
+/// Every remaining value of a native iterator, drained in one go.
+///
+/// `Array.from` needs this twice over: when the source *is* an iterator
+/// (`str.matchAll(re)`, `arr.keys()`) and when it merely has to be turned into
+/// one (a Set or a Map). `None` when `iter_val` is not a native iterator — a
+/// generator, whose steps can run user code and so need the VM's `iterator_next`.
+pub fn drain_native_iterator(iter_val: &Value) -> Option<Vec<Value>> {
+    let Value::Object(obj_ref) = iter_val else {
+        return None;
+    };
+    let is_native = obj_ref
+        .borrow()
+        .as_any()
+        .downcast_ref::<NativeIteratorObject>()
+        .is_some();
+    if !is_native {
+        return None;
+    }
+    let mut out = Vec::new();
+    loop {
+        // One step per borrow: `native_next` mutates the state, and a `RefMut`
+        // held across the call would panic on the next turn of the loop.
+        let next = {
+            let borrowed = obj_ref.borrow();
+            let iterator = borrowed
+                .as_any()
+                .downcast_ref::<NativeIteratorObject>()
+                .expect("checked above");
+            native_next(&mut iterator.state().borrow_mut())
+        };
+        match next {
+            Some(value) => out.push(value),
+            None => break,
+        }
+    }
+    Some(out)
+}
+
 /// Fast-path step for array/string iterators. `None` means exhausted.
 pub fn native_next(state: &mut NativeIteratorState) -> Option<Value> {
     match state {

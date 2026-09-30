@@ -76,6 +76,15 @@ pub fn array_from(args: &[Value]) -> Result<Value, RuntimeError> {
             "Array.from requires an array-like object".to_string(),
         ));
     };
+    // `Array.from` takes the @@iterator path *first* (ES 23.1.2.1): a Set, a Map,
+    // `str.matchAll(re)` and `arr.keys()` are all iterable without being
+    // array-like, and they reach the builtin layer as native iterators. Draining
+    // one needs no VM: its state is right here.
+    if let Some(items) = crate::vm::iterator::drain_native_iterator(source) {
+        return Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
+            items,
+        )))));
+    }
     let mut out: Vec<Value> = Vec::new();
     match source {
         Value::Object(obj_ref) => {

@@ -58,6 +58,10 @@ pub fn register_string_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "match", |this, args| {
         super::regexp::regexp_match(this, args)
     });
+    // `matchAll` answers an *iterator*, which only the VM can mint (iterators
+    // live in its registry so `next()` can find its state), so the method is
+    // marked for the VM rather than implemented here.
+    super::mark_prototype_method(proto, "matchAll");
     set_prototype_method(proto, "search", |this, args| {
         super::regexp::regexp_search(this, args)
     });

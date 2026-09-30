@@ -214,6 +214,112 @@ pub fn regexp_exec(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     Ok(Value::Object(Rc::new(RefCell::new(array))))
 }
 
+/// Every match of a global pattern over `text`, as match arrays (ES 22.2.5.8).
+///
+/// Serves both entry points, which are the same algorithm with the arguments
+/// swapped: `String.prototype.matchAll(re)` (receiver is the string) and
+/// `RegExp.prototype[Symbol.matchAll](s)` (receiver is the regexp).
+///
+/// The matches are collected eagerly and the VM turns them into an iterator. The
+/// spec's iterator is lazy and advances a *clone* of the regexp, so a snapshot
+/// is observationally equivalent for every use except mutating the pattern
+/// mid-iteration.
+pub fn match_all_matches(
+    this: &Value,
+    args: &[Value],
+    regexp_proto: Option<Value>,
+) -> Result<Vec<Value>, RuntimeError> {
+    let (regexp_val, text) = if is_regexp_receiver(this) {
+        (
+            this.clone(),
+            args.first().map(|v| v.to_js_string()).unwrap_or_default(),
+        )
+    } else {
+        let text = this.to_js_string();
+        let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+        // A non-RegExp argument is coerced with a fresh `g` (step 2): the whole
+        // point of `matchAll` is *all* matches, so the flag is added for the
+        // caller instead of rejecting the argument.
+        let re = if is_regexp_receiver(&pattern) {
+            pattern
+        } else {
+            regexp_construct_value(&[pattern, Value::string("g")], regexp_proto)?
+        };
+        (re, text)
+    };
+    let re = as_regexp(&regexp_val, "matchAll")?;
+    if !re.is_global() {
+        return Err(RuntimeError::TypeError(
+            "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
+        ));
+    }
+    let matcher = match re.compiled.clone() {
+        Some(m) => m,
+        None => {
+            return Err(RuntimeError::TypeError(format!(
+                "RegExp.prototype.matchAll: pattern {:?} is not supported by this engine",
+                re.source
+            )))
+        }
+    };
+    // The iteration runs on a *clone* (step 3), so the receiver's own
+    // `lastIndex` is left where it was.
+    let mut from = re.last_index.max(0.0) as usize;
+    let mut out: Vec<Value> = Vec::new();
+    while from <= text.len() {
+        let Some(captures) = matcher.captures_at(text.as_str(), from) else {
+            break;
+        };
+        let whole = captures.get(0).expect("a match implies group 0");
+        out.push(match_array(&captures, &text));
+        // An empty match would never advance, so the spec steps `lastIndex` by
+        // one code unit in that case (step 6.a.ii).
+        from = if whole.end() == whole.start() {
+            whole.end() + 1
+        } else {
+            whole.end()
+        };
+    }
+    Ok(out)
+}
+
+/// The match array for one set of captures: the groups, plus `index` / `input`.
+fn match_array(captures: &regex::Captures, text: &str) -> Value {
+    let mut elements: Vec<Value> = Vec::new();
+    for i in 0..captures.len() {
+        elements.push(match captures.get(i) {
+            Some(m) => Value::string(m.as_str()),
+            None => Value::Undefined,
+        });
+    }
+    let mut array = ArrayObject::from_vec(elements);
+    let index = captures.get(0).map(|m| m.start()).unwrap_or(0) as f64;
+    // Same shape `exec` produces, including `groups` being present and
+    // `undefined` when the pattern has no named groups.
+    for (key, value) in [
+        ("index", Value::Number(index)),
+        ("input", Value::string(text)),
+        ("groups", Value::Undefined),
+    ] {
+        let _ = array.define_property(
+            PropertyKey::from_str(key),
+            PropertyDescriptor {
+                value,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+                getter: None,
+                setter: None,
+            },
+        );
+    }
+    Value::Object(Rc::new(RefCell::new(array)))
+}
+
+/// `Symbol.matchAll` — the id the well-known symbol table in `builtins::mod`
+/// registers for it.
+const MATCH_ALL_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0009;
+
 /// `toString`: `/source/flags` (ES 22.2.5.14).
 pub fn regexp_to_string(this: &Value) -> Result<Value, RuntimeError> {
     let re = as_regexp(this, "toString")?;
@@ -225,6 +331,23 @@ pub fn register_regexp_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     set_prototype_method(proto, "test", |this, args| regexp_test(this, args));
     set_prototype_method(proto, "exec", |this, args| regexp_exec(this, args));
     set_prototype_method(proto, "toString", |this, _| regexp_to_string(this));
+    // `RegExp.prototype[Symbol.matchAll]` is the other entry point of the same
+    // algorithm (`String.prototype.matchAll` delegates to it). Handled by the
+    // VM for the same reason: the result is an iterator.
+    //
+    // It has to be defined under the *symbol key*: registering it as the method
+    // name "Symbol.matchAll" put it on the wrong key, and `re[Symbol.matchAll]`
+    // then found nothing.
+    let _ = proto.borrow_mut().define_property(
+        PropertyKey::Symbol(MATCH_ALL_SYMBOL_ID),
+        super::method_descriptor(Value::Object(Rc::new(RefCell::new(
+            NativeFunctionObject::new(&format!(
+                "{}{}",
+                super::PROTO_METHOD_PREFIX,
+                "matchAll"
+            )),
+        )))),
+    );
 }
 
 pub fn register_regexp_statics(ctor: &Value) {

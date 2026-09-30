@@ -1000,3 +1000,98 @@ fn an_array_elision_is_a_hole_not_undefined() {
     assert_eq!(eval_number("[1, 2,].length"), 2.0);
     assert_eq!(eval_number("[,,].length"), 2.0);
 }
+
+#[test]
+fn string_match_all_answers_an_iterator_of_match_arrays() {
+    // Every match, in order, with its `index`.
+    assert_eq!(
+        eval_string(
+            "(function () { var r = [];
+             for (var m of 'a1b2c3'.matchAll(/[a-z]/g)) { r.push(m[0] + '@' + m.index); }
+             return r.join(','); })()"
+        ),
+        "a@0,b@2,c@4"
+    );
+    // Capture groups come along as `1`, `2`…
+    assert_eq!(
+        eval_string(
+            "(function () { var r = [];
+             for (var m of 'a1b2'.matchAll(/([a-z])([0-9])/g)) { r.push(m[1] + m[2]); }
+             return r.join(','); })()"
+        ),
+        "a1,b2"
+    );
+    // A non-global pattern is a TypeError: `matchAll` is *all* matches (ES
+    // 22.2.5.8 step 4).
+    assert_eq!(
+        eval_string("try { 'abc'.matchAll(/[a-z]/); } catch (e) { e.name; }"),
+        "TypeError"
+    );
+    // A non-RegExp argument is coerced with a fresh `g`.
+    assert_eq!(
+        eval_string(
+            "(function () { var r = [];
+             for (var m of 'aXa'.matchAll('a')) { r.push(m[0] + '@' + m.index); }
+             return r.join(','); })()"
+        ),
+        "a@0,a@2"
+    );
+    // The receiver's `lastIndex` is untouched — the iteration runs on a clone.
+    assert_eq!(
+        eval_number(
+            "(function () { var re = /[a-z]/g; 'abc'.matchAll(re); return re.lastIndex; })()"
+        ),
+        0.0
+    );
+    // An empty match steps forward by one code unit rather than looping for ever.
+    assert_eq!(
+        eval_number(
+            "(function () { var n = 0;
+             for (var m of 'ab'.matchAll(/x*/g)) { n += 1; }
+             return n; })()"
+        ),
+        3.0
+    );
+    // `Array.from` drains the iterator — the canonical way to get the matches.
+    assert_eq!(
+        eval_string(
+            "JSON.stringify(Array.from('a1'.matchAll(/[a-z][0-9]/g)).map(function (m) { return m[0]; }))"
+        ),
+        "[\"a1\"]"
+    );
+    // Each match array carries `index` and `input`, as `exec` does.
+    assert_eq!(
+        eval_string("(function () { var m = 'hey'.matchAll(/e/g).next().value; return m.index + '|' + m.input; })()"),
+        "1|hey"
+    );
+    // `RegExp.prototype[Symbol.matchAll]` is the same algorithm with the
+    // arguments swapped.
+    assert_eq!(
+        eval_string(
+            "(function () { var r = [];
+             for (var m of /[a-z]/g[Symbol.matchAll]('ab')) { r.push(m[0]); }
+             return r.join(','); })()"
+        ),
+        "a,b"
+    );
+}
+
+#[test]
+fn array_from_drains_a_native_iterator() {
+    // `Array.from` takes the @@iterator path first: a source that is iterable
+    // without being array-like.
+    assert_eq!(
+        eval_string("JSON.stringify(Array.from([1, 2].values()))"),
+        "[1,2]"
+    );
+    assert_eq!(
+        eval_string("JSON.stringify(Array.from('a1'.matchAll(/[a-z]/g)).map(function (m) { return m[0]; }))"),
+        "[\"a\"]"
+    );
+    // A string still goes through the array-like path (per code unit).
+    assert_eq!(eval_string("JSON.stringify(Array.from('ab'))"), "[\"a\",\"b\"]");
+    // NOTE: `Array.from(new Set([1, 2]))` is still a gap — a Set is iterable
+    // without being array-like, and turning it into an iterator needs the VM.
+    // `[...set]` works, which is what scripts can use meanwhile.
+    assert_eq!(eval_string("JSON.stringify([...new Set([1, 2])])"), "[1,2]");
+}

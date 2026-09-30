@@ -26,7 +26,7 @@ language/identifiers	202	66	0
 built-ins/Error	38	19	36
 built-ins/Set	344	19	20
 built-ins/NativeErrors	68	12	14
-built-ins/String	708	216	299
+built-ins/String	715	216	292
 language/statements/generators	237	9	20
 language/destructuring	17	1	1
 built-ins/String/prototype/Symbol.iterator	4	1	1
@@ -100,6 +100,6 @@ language/statements/throw	13	1	0
 language/literals/boolean	4	0	0
 language/computed-property-names	40	0	8
 built-ins/Boolean	27	8	16
-built-ins/Map	182	17	5
+built-ins/Map	186	17	1
 built-ins/Math	270	37	20
 built-ins/Promise	238	301	138

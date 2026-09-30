@@ -2123,6 +2123,41 @@ async 路径在用），所以要在几个 `Opcode::Call*` 上各挂一次 push/
 
 ---
 
+#### B42 `String.prototype.matchAll` + `Array.from` 吃迭代器（+11，零回退）
+
+**做了什么**：`String.prototype.matchAll(re)` 与 `RegExp.prototype[Symbol.matchAll](s)` —— 同一算法的
+两个入口（参数互换），产出匹配数组的迭代器；顺带 `Array.from` 现在能排空原生迭代器。
+
+**三处坑（都写进注释）**
+
+1. **迭代器只有 VM 造得出来**（对象活在它的 registry 里，`next()` 靠 id 找状态）。所以方法用
+   `mark_prototype_method` 标给 VM，再挂 `try_match_all_method` —— 照 `entries`/`keys`/`values`
+   的既有做法。
+2. **基本类型字符串的接收者到不了原生分发**：`"ab".matchAll(re)` 走 `CallMethod` →
+   `call_prototype_method` → `lookup_property_on_object`，而后者只认真实对象，于是拿到 Undefined
+   （`new String("ab").matchAll(re)` 与 `String.prototype.matchAll.call("ab", re)` 却都正常）。
+   钩子因此要挂**两处**：原生分发里一处，`CallMethod` 兜底前一处。
+3. **`RegExp.prototype[Symbol.matchAll]` 必须定义在符号键上**：按方法名 `"Symbol.matchAll"` 注册
+   会落到错误的键上，`re[Symbol.matchAll]` 找不到（用 `PropertyKey::Symbol(id)` +
+   `PROTO_METHOD_PREFIX` 的原生函数名）。
+
+**与规范的差距**：规范的迭代器是惰性的、跑在正则的**克隆体**上，所以每步推进克隆的 `lastIndex`；
+这里是先一次性收完再让 VM 造迭代器。除了"迭代中途改 Pattern"这种写法，观察上等价：
+接收者的 `lastIndex` 不动（克隆语义 ✓），空匹配按一个码元前进（不会死循环 ✓），
+非全局抛 TypeError ✓，非正则实参按 `new RegExp(x, 'g')` 转换 ✓。
+
+**`Array.from`**：迭代器路径优先（ES 23.1.2.1）。`drain_native_iterator` 放在 `vm/iterator.rs`，
+builtin 层直接用（不需要 VM）。**`Array.from(new Set([1,2]))` 仍是洞** —— Set 不是迭代器对象，
+要先造迭代器，而 builtin 层没有 VM；三个候选分发点（CallMethod 的静态分支、
+`call_native_by_name` 的静态分支、`call_native` 那个调用点）都挂过，都没走到 ——
+`Array.from` 到达 builtin 的那条路径没找到。变通写法 `[...set]` 可用（已写进测试注释）。
+`Array.from(gen())` 同样是洞（生成器是 `Js` 迭代器，步进要跑用户代码，得 VM 的 `iterator_next`）。
+
+**数字**：通过 16015 → 16026（+11），失败 2899 → 2888，通过率 84.67% → 84.73%。
+2 个套件提升、零回退：`built-ins/String` +7、`built-ins/Map` +4。feature 506（+2 用例 / 12 条断言）。
+
+---
+
 #### B41 `e.stack`：做完又撤回（2026-09-30，留作设计稿）
 
 **做成了什么**：错误对象带上 `stack`，形如

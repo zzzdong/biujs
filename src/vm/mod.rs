@@ -1892,6 +1892,9 @@ impl VM {
             if let Some(result) = self.try_string_callback_method(&this, method, args, module)? {
                 return Ok(result);
             }
+            if let Some(result) = self.try_match_all_method(&this, method, args, module)? {
+                return Ok(result);
+            }
             // `entries` / `keys` / `values` return a *fresh* iterator over a
             // snapshot; only the VM can mint iterator objects (they live in the
             // iterator registry so `next()` can find its state).
@@ -3257,6 +3260,18 @@ impl VM {
                     return Ok(());
                 }
 
+                // `matchAll` answers an iterator, which the builtin layer cannot
+                // build — and a *primitive* string receiver never reaches the
+                // native dispatch further down (`lookup_property_on_object` only
+                // reads real objects), so it has to be caught here.
+                if let Some(result) =
+                    self.try_match_all_method(&obj_val, &method_name, &args, module)?
+                {
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
+
                 // Try built-in prototype method dispatch. As above: only
                 // "no such method" may fall through.
                 match crate::builtins::call_prototype_method(&obj_val, &method_name, &args) {
@@ -3954,6 +3969,33 @@ impl VM {
             }
         }
         Ok(entries)
+    }
+
+    /// `String.prototype.matchAll(re)` / `RegExp.prototype[Symbol.matchAll](s)`.
+    ///
+    /// Both answer an iterator of match arrays, and only the VM can mint
+    /// iterator objects (they live in the iterator registry, which is how
+    /// `next()` finds its state) — hence a hook rather than a builtin.
+    fn try_match_all_method(
+        &mut self,
+        receiver: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if method != "matchAll" && method != "Symbol.matchAll" {
+            return Ok(None);
+        }
+        crate::builtins::require_object_coercible(receiver)?;
+        let matches = crate::builtins::match_all_matches(
+            receiver,
+            args,
+            Some(Value::Object(Rc::clone(&self.builtins.regexp_prototype))),
+        )?;
+        let snapshot_val = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::ArrayObject::from_vec(matches),
+        )));
+        Ok(Some(self.make_iterator(snapshot_val, module)?))
     }
 
     /// Species-aware wrapper for `slice` / `splice` / `concat`.
