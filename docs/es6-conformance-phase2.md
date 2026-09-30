@@ -2123,6 +2123,41 @@ async 路径在用），所以要在几个 `Opcode::Call*` 上各挂一次 push/
 
 ---
 
+#### B41 `e.stack`：做完又撤回（2026-09-30，留作设计稿）
+
+**做成了什么**：错误对象带上 `stack`，形如
+
+```
+TypeError: Cannot read properties of null (reading 'x')
+    at inner
+    at outer
+    at top
+    at <anonymous>
+```
+
+帧名取自 `state.function_stack`（每帧的函数值）+ 当前 `function_val`，不需要在调用点 push/pop ——
+这一点很关键：**JS 调用没有汇聚点**（`drive_bytecode_frame` 只有 async 路径在用），所以"维护一条
+调用名栈"的做法要在 5 个 `Opcode::Call*` 上各挂一次。字节码没有行列信息，因此只能给到函数名。
+
+**为什么撤回**：两条 test262 用例（`built-ins/Error/prototype/stack/{instance-no-own-stack,
+instance-not-enumerable}`）测的是**规范形状**：`stack` 是 `Error.prototype` 上的访问器，实例
+**没有**自有 `stack`（sec-properties-of-error-instances）。我实现成了实例上的自有非枚举数据属性 ——
+V8 的老做法，不是规范。两条用例此前是"偶然通过"（那时根本没有 stack）。
+
+试过把它们按 `error-stack-accessor` 门控（项目既有做法），但门控会连一条**原本通过**的用例一起跳过，
+于是 `built-ins/Error` 38 → 37 —— 仍是回退。按 §7.1 的"解释或回退"，这一批选择**回退**，等能按
+规范形状做时再做。
+
+**规范的形状要什么**：一个 `Error` 对象类型（像 `DateObject`/`PromiseObject`），带 `[[ErrorData]]`
+与 `stack` 内部槽；`Error.prototype.stack` 注册为访问器，由 VM 按接收者取槽里的值。顺带一个已踩过
+并修好的坑：头部里的 `name` 在**原型**上（`TypeError.prototype.name`），只读自有属性会得到空串
+（于是打印成 ": boom"），必须沿原型链读。
+
+**下一步（仍是广度）**：`matchAll`、TypedArray、`Proxy`/`Reflect`；两条债仍在
+（`built-ins/Array` 的 ~384MB 大分配、`drive_bytecode_frame` 里 `frame_argc.truncate(saved_this_depth)`）。
+
+---
+
 ---
 
 ---
