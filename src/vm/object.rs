@@ -2577,6 +2577,434 @@ impl JSObject for GlobalObject {
     }
 }
 
+/// An `ArrayBuffer` instance: the byte block itself (ES 25.1).
+///
+/// The bytes have to live behind a shared `Rc` because a TypedArray *view*
+/// aliases them: `new Uint8Array(buf)` and `buf` see each other's writes.
+#[derive(Debug)]
+pub struct ArrayBufferObject {
+    data: Vec<u8>,
+    detached: bool,
+    base: OrdinaryObject,
+}
+
+impl ArrayBufferObject {
+    pub fn new(byte_length: usize, prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+        let mut base = OrdinaryObject::with_class_name("ArrayBuffer");
+        base.set_prototype(prototype);
+        Self {
+            data: vec![0u8; byte_length],
+            detached: false,
+            base,
+        }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    pub fn byte_length(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
+}
+
+impl JSObject for ArrayBufferObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Buffer
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        self.base.property_get(key)
+    }
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        self.base.property_set(key, value)
+    }
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        self.base.define_property(key, descriptor)
+    }
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        self.base.property_delete(key)
+    }
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        self.base.has_property(key)
+    }
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.base.own_keys()
+    }
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.base.get_prototype()
+    }
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.base.set_prototype(proto)
+    }
+    fn is_extensible(&self) -> bool {
+        self.base.is_extensible()
+    }
+    fn prevent_extensions(&mut self) {
+        self.base.prevent_extensions()
+    }
+    fn is_frozen(&self) -> bool {
+        self.base.is_frozen()
+    }
+    fn freeze(&mut self) {
+        self.base.freeze()
+    }
+    fn is_sealed(&self) -> bool {
+        self.base.is_sealed()
+    }
+    fn seal(&mut self) {
+        self.base.seal()
+    }
+    fn class_name(&self) -> &'static str {
+        "ArrayBuffer"
+    }
+}
+
+/// Element type of a TypedArray (ES 23.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedArrayKind {
+    Int8,
+    Uint8,
+    Uint8Clamped,
+    Int16,
+    Uint16,
+    Int32,
+    Uint32,
+    Float32,
+    Float64,
+}
+
+impl TypedArrayKind {
+    pub fn bytes_per_element(self) -> usize {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
+            Self::Int16 | Self::Uint16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Float64 => 8,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Int8 => "Int8Array",
+            Self::Uint8 => "Uint8Array",
+            Self::Uint8Clamped => "Uint8ClampedArray",
+            Self::Int16 => "Int16Array",
+            Self::Uint16 => "Uint16Array",
+            Self::Int32 => "Int32Array",
+            Self::Uint32 => "Uint32Array",
+            Self::Float32 => "Float32Array",
+            Self::Float64 => "Float64Array",
+        }
+    }
+
+    /// Element `index` as a `Value`. The bytes are read little-endian, which is
+    /// what every platform this engine targets uses.
+    fn read(self, data: &[u8], index: usize) -> Value {
+        let at = index * self.bytes_per_element();
+        if at + self.bytes_per_element() > data.len() {
+            return Value::Undefined;
+        }
+        let bytes = |n: usize| &data[at..at + n];
+        let value: f64 = match self {
+            Self::Int8 => bytes(1)[0] as i8 as f64,
+            Self::Uint8 | Self::Uint8Clamped => bytes(1)[0] as f64,
+            Self::Int16 => i16::from_le_bytes([bytes(2)[0], bytes(2)[1]]) as f64,
+            Self::Uint16 => u16::from_le_bytes([bytes(2)[0], bytes(2)[1]]) as f64,
+            Self::Int32 => i32::from_le_bytes([bytes(4)[0], bytes(4)[1], bytes(4)[2], bytes(4)[3]])
+                as f64,
+            Self::Uint32 => u32::from_le_bytes([
+                bytes(4)[0],
+                bytes(4)[1],
+                bytes(4)[2],
+                bytes(4)[3],
+            ]) as f64,
+            Self::Float32 => f32::from_le_bytes([
+                bytes(4)[0],
+                bytes(4)[1],
+                bytes(4)[2],
+                bytes(4)[3],
+            ]) as f64,
+            Self::Float64 => f64::from_le_bytes([
+                bytes(8)[0],
+                bytes(8)[1],
+                bytes(8)[2],
+                bytes(8)[3],
+                bytes(8)[4],
+                bytes(8)[5],
+                bytes(8)[6],
+                bytes(8)[7],
+            ]),
+        };
+        Value::Number(value)
+    }
+
+    /// Store `value` (after ToNumber) at `index`, wrapping the way the element
+    /// type does — clamping for `Uint8ClampedArray`, modulo for the rest.
+    pub fn write(self, data: &mut [u8], index: usize, value: f64) {
+        let size = self.bytes_per_element();
+        let at = index * size;
+        if at + size > data.len() {
+            return;
+        }
+        let bytes = match self {
+            Self::Int8 => (value as i8).to_le_bytes().to_vec(),
+            Self::Uint8 => (value as u8).to_le_bytes().to_vec(),
+            // Clamping rounds to nearest, ties away from zero (ES 25.1.1.5).
+            Self::Uint8Clamped => {
+                let clamped = if value.is_nan() || value <= 0.0 {
+                    0.0
+                } else if value >= 255.0 {
+                    255.0
+                } else {
+                    let floor = value.floor();
+                    if value - floor > 0.5 {
+                        floor + 1.0
+                    } else if value - floor == 0.5 && floor as i64 % 2 != 0 {
+                        floor + 1.0
+                    } else {
+                        floor
+                    }
+                };
+                (clamped as u8).to_le_bytes().to_vec()
+            }
+            Self::Int16 => (value as i16).to_le_bytes().to_vec(),
+            Self::Uint16 => (value as u16).to_le_bytes().to_vec(),
+            Self::Int32 => (value as i32).to_le_bytes().to_vec(),
+            Self::Uint32 => (value as u32).to_le_bytes().to_vec(),
+            Self::Float32 => (value as f32).to_le_bytes().to_vec(),
+            Self::Float64 => value.to_le_bytes().to_vec(),
+        };
+        data[at..at + size].copy_from_slice(&bytes);
+    }
+}
+
+/// A TypedArray instance: a *view* over an `ArrayBuffer` (ES 23.2).
+///
+/// The elements are not stored here. `property_get("0")` decodes them from the
+/// buffer's bytes, which is what makes two views of one buffer alias — and what
+/// keeps `Object.keys(new Uint8Array(2))` answering `["0", "1"]`.
+#[derive(Debug)]
+pub struct TypedArrayObject {
+    pub kind: TypedArrayKind,
+    /// `[[ViewedArrayBuffer]]`.
+    pub buffer: Rc<RefCell<dyn JSObject>>,
+    /// `[[ByteOffset]]`.
+    pub byte_offset: usize,
+    /// `[[ArrayLength]]`.
+    pub length: usize,
+    base: OrdinaryObject,
+}
+
+impl TypedArrayObject {
+    pub fn new(
+        kind: TypedArrayKind,
+        buffer: Rc<RefCell<dyn JSObject>>,
+        byte_offset: usize,
+        length: usize,
+        prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    ) -> Self {
+        let mut base = OrdinaryObject::with_class_name(kind.name());
+        base.set_prototype(prototype);
+        Self {
+            kind,
+            buffer,
+            byte_offset,
+            length,
+            base,
+        }
+    }
+
+    /// `true` when the buffer is gone: every element read then answers
+    /// `undefined` and every write is dropped.
+    fn detached(&self) -> bool {
+        match self.buffer.borrow().as_any().downcast_ref::<ArrayBufferObject>() {
+            Some(buf) => buf.is_detached(),
+            None => true,
+        }
+    }
+
+    /// Element `index`, or `undefined` when out of range.
+    pub fn get_element(&self, index: usize) -> Value {
+        if index >= self.length || self.detached() {
+            return Value::Undefined;
+        }
+        let buffer = self.buffer.borrow();
+        let Some(buf) = buffer.as_any().downcast_ref::<ArrayBufferObject>() else {
+            return Value::Undefined;
+        };
+        let data = buf.data();
+        let start = self.byte_offset + index * self.kind.bytes_per_element();
+        if start >= data.len() {
+            return Value::Undefined;
+        }
+        self.kind.read(&data[start..], 0)
+    }
+
+    /// Store at `index`. An out-of-range or detached write is silently dropped,
+    /// which is what an integer-indexed exotic property does.
+    pub fn set_element(&mut self, index: usize, value: Value) {
+        if index >= self.length || self.detached() {
+            return;
+        }
+        let number = match value {
+            Value::Number(n) => n,
+            other => other.to_number(),
+        };
+        let mut buffer = self.buffer.borrow_mut();
+        let Some(buf) = buffer
+            .as_any_mut()
+            .downcast_mut::<ArrayBufferObject>()
+        else {
+            return;
+        };
+        let start = self.byte_offset + index * self.kind.bytes_per_element();
+        if start + self.kind.bytes_per_element() > buf.data().len() {
+            return;
+        }
+        // `write` counts in *elements from the start of the slice*, so the
+        // slice has to begin at this view's own offset within the buffer.
+        self.kind.write(&mut buf.data_mut()[start..], 0, number);
+    }
+
+    /// Canonical integer key, as `[[Get]]` on an integer-indexed object sees it:
+    /// `"0"`, `"1"`, … and *not* `"01"`, `"1.0"` or `"-0"`.
+    fn canonical_index(key: &PropertyKey) -> Option<usize> {
+        let text = key.as_str()?;
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if text.len() > 1 && text.starts_with('0') {
+            return None;
+        }
+        text.parse::<usize>().ok()
+    }
+}
+
+impl JSObject for TypedArrayObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::TypedArray
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        if let Some(index) = Self::canonical_index(key) {
+            if index < self.length {
+                return Some(PropertyDescriptor {
+                    value: self.get_element(index),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                    getter: None,
+                    setter: None,
+                });
+            }
+            return None;
+        }
+        self.base.property_get(key)
+    }
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        if let Some(index) = Self::canonical_index(&key) {
+            // An index at or past `length` is not an element: the write is
+            // dropped (ES 10.4.5.5 IntegerIndexedElementSet step 9).
+            self.set_element(index, value);
+            return Ok(index < self.length);
+        }
+        self.base.property_set(key, value)
+    }
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        // An integer-indexed own property cannot be made non-writable or
+        // non-configurable, and its value is stored as an element. Keeping the
+        // *element* shape is what `JSON.stringify` and `Object.keys` rely on.
+        if let Some(index) = Self::canonical_index(&key) {
+            if index < self.length {
+                // `value` is `Undefined` for an accessor descriptor, which
+                // carries no value to store.
+                if !descriptor.value.is_undefined() {
+                    self.set_element(index, descriptor.value.clone());
+                }
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        self.base.define_property(key, descriptor)
+    }
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        if let Some(index) = Self::canonical_index(key) {
+            // Elements cannot be deleted — only absent ones stay absent.
+            return index >= self.length;
+        }
+        self.base.property_delete(key)
+    }
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        if let Some(index) = Self::canonical_index(key) {
+            return index < self.length;
+        }
+        self.base.has_property(key)
+    }
+    /// The indices, then whatever else the object holds: `Object.keys(new
+    /// Uint8Array(2))` is `["0", "1"]`.
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        let mut keys: Vec<PropertyKey> = (0..self.length)
+            .map(|i| PropertyKey::from_str(&i.to_string()))
+            .collect();
+        keys.extend(self.base.own_keys());
+        keys
+    }
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.base.get_prototype()
+    }
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.base.set_prototype(proto)
+    }
+    fn is_extensible(&self) -> bool {
+        self.base.is_extensible()
+    }
+    fn prevent_extensions(&mut self) {
+        self.base.prevent_extensions()
+    }
+    fn is_frozen(&self) -> bool {
+        self.base.is_frozen()
+    }
+    fn freeze(&mut self) {
+        self.base.freeze()
+    }
+    fn is_sealed(&self) -> bool {
+        self.base.is_sealed()
+    }
+    fn seal(&mut self) {
+        self.base.seal()
+    }
+    fn class_name(&self) -> &'static str {
+        self.kind.name()
+    }
+}
+
 #[derive(Debug)]
 pub struct MapObject {
     entries: Vec<Option<(Value, Value)>>,

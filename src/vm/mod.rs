@@ -1738,6 +1738,23 @@ impl VM {
         if name == crate::builtins::SET_SIZE_NATIVE {
             return crate::builtins::set_size(&this);
         }
+        // TypedArray / ArrayBuffer getters (ES 23.2.3.1-4, 25.1.5.1). They are
+        // accessors on the prototype, so the receiver arrives as `this`.
+        if name == crate::builtins::typedarray::TA_LENGTH_NATIVE {
+            return crate::builtins::typedarray::ta_length(&this);
+        }
+        if name == crate::builtins::typedarray::TA_BYTE_LENGTH_NATIVE {
+            return crate::builtins::typedarray::ta_byte_length(&this);
+        }
+        if name == crate::builtins::typedarray::TA_BYTE_OFFSET_NATIVE {
+            return crate::builtins::typedarray::ta_byte_offset(&this);
+        }
+        if name == crate::builtins::typedarray::TA_BUFFER_NATIVE {
+            return crate::builtins::typedarray::ta_buffer(&this);
+        }
+        if name == crate::builtins::typedarray::AB_BYTE_LENGTH_NATIVE {
+            return crate::builtins::typedarray::ab_byte_length(&this);
+        }
         // `get Map[Symbol.species]` / `get Set[Symbol.species]` (23.1.2.2,
         // 23.2.2.2) and `get Promise[Symbol.species]` (27.2.2.3) all answer
         // their receiver.
@@ -3887,6 +3904,17 @@ impl VM {
                             .map(|i| arr.get(i).cloned().unwrap_or(Value::Undefined))
                             .collect(),
                     );
+                }
+                // A TypedArray view: its `length` is a *prototype getter*, so
+                // reading it as an own property (what the array-like path below
+                // does) answers `undefined`, and iterating a view yielded
+                // nothing at all — `[...new Uint8Array([1,2,3])]` was `[]`.
+                if let Some(view) = obj_ref
+                    .borrow()
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::TypedArrayObject>()
+                {
+                    return Some((0..view.length).map(|i| view.get_element(i)).collect());
                 }
                 // Generic array-like: `length` plus integer-keyed properties.
                 // `Array.prototype.every.call({length:2, 0:'a', 1:'b'}, …)` and
@@ -8183,6 +8211,17 @@ impl VM {
         }
         if name == "WeakSet" {
             return self.weakset_construct(constructor_val, args, new_target, module);
+        }
+        // `ArrayBuffer` and the TypedArray views: `new Uint8Array(buf)` is a
+        // *view* over an existing buffer and `new Uint8Array(4)` one over a fresh
+        // one, and the prototype comes from `newTarget` — so both need the VM.
+        if name == "ArrayBuffer" {
+            let proto = self.prototype_from_constructor(constructor_val, new_target);
+            return crate::builtins::typedarray::arraybuffer_construct(args, proto);
+        }
+        if let Some(kind) = crate::builtins::typedarray::kind_from_name(name) {
+            let proto = self.prototype_from_constructor(constructor_val, new_target);
+            return crate::builtins::typedarray::typedarray_construct(kind, args, proto);
         }
         // `new Date(...)` builds the object itself: `Date()` without `new`
         // answers a *string*, so `call_native` cannot serve both

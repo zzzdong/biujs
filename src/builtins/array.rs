@@ -80,6 +80,11 @@ pub fn array_from(args: &[Value]) -> Result<Value, RuntimeError> {
     // `str.matchAll(re)` and `arr.keys()` are all iterable without being
     // array-like, and they reach the builtin layer as native iterators. Draining
     // one needs no VM: its state is right here.
+    if let Some(items) = crate::builtins::typedarray::typedarray_elements(source) {
+        return Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
+            items,
+        )))));
+    }
     if let Some(items) = crate::vm::iterator::drain_native_iterator(source) {
         return Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
             items,

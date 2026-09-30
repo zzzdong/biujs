@@ -30,6 +30,7 @@ pub use crate::vm::ObjectKind;
 pub use array::{ARRAY_SPECIES_NATIVE, array_constructor, validate_array_length};
 pub use date::date_construct_value;
 pub use regexp::match_all_matches;
+pub mod typedarray;
 pub use regexp::regexp_construct_value;
 pub use boolean::boolean_constructor;
 pub use error::{
@@ -674,6 +675,47 @@ impl Builtins {
         symbol::register_symbol_prototype(&self.symbol_prototype);
         Self::link_constructor_prototype(&symbol_fn_val, &self.symbol_prototype);
 
+        // `ArrayBuffer` and the TypedArray views (ES 25.1 / 23.2). The
+        // constructors are dispatched by the VM: `new Uint8Array(buf)` builds a
+        // *view* over an existing buffer, and `new Uint8Array(4)` one over a fresh
+        // one — the prototype comes from `newTarget`, so the builtin layer gets it
+        // handed in.
+        let ab_proto = new_proto(Some(Rc::clone(&self.object_prototype)), "ArrayBuffer");
+        let ab_fn_val = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+            "ArrayBuffer",
+        ))));
+        typedarray::register_arraybuffer_prototype(&ab_proto);
+        Self::link_constructor_prototype(&ab_fn_val, &ab_proto);
+        set_static_method(&ab_fn_val, "isView", |args| {
+            typedarray::arraybuffer_is_view(args)
+        });
+        globals.insert("ArrayBuffer".to_string(), ab_fn_val);
+
+        for kind in typedarray::TYPED_ARRAY_KINDS {
+            let name = kind.name();
+            let proto = new_proto(Some(Rc::clone(&self.object_prototype)), name);
+            let ctor_val = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+                name,
+            ))));
+            typedarray::register_typedarray_prototype(kind, &proto);
+            Self::link_constructor_prototype(&ctor_val, &proto);
+            // `Uint8Array.BYTES_PER_ELEMENT` (ES 23.2.5.3), read-only.
+            if let Value::Object(ctor_obj) = &ctor_val {
+                let _ = ctor_obj.borrow_mut().define_property(
+                    PropertyKey::from_str("BYTES_PER_ELEMENT"),
+                    PropertyDescriptor {
+                        value: Value::Number(kind.bytes_per_element() as f64),
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                        getter: None,
+                        setter: None,
+                    },
+                );
+            }
+            globals.insert(name.to_string(), ctor_val);
+        }
+
         // `Map` (ES 23.1). The constructor itself is dispatched by the VM:
         // `new Map(iterable)` has to drive the iterator protocol, and calling
         // it without `new` is a TypeError.
@@ -1100,6 +1142,7 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
                 })
                 .unwrap_or(f64::NAN),
         )),
+        "ArrayBuffer.isView" => typedarray::arraybuffer_is_view(args),
         "Date.now" => date::date_now(args),
         "Date.parse" => date::date_parse(args),
         "Date.UTC" => date::date_utc(args),
@@ -1162,6 +1205,22 @@ pub fn call_prototype_method(
     method_name: &str,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
+    // A TypedArray view: `set` / `subarray` / `slice` / `fill` collide with
+    // `Array.prototype`'s, so the receiver has to decide before the shared
+    // names are reached. (Registered on the prototype *and* dispatched here —
+    // the closure a prototype method carries is never called, only its name is.)
+    if typedarray::is_typedarray_receiver(obj) {
+        match method_name {
+            "set" => return typedarray::ta_set(obj, args),
+            "subarray" => return typedarray::ta_subarray(obj, args),
+            "slice" => return typedarray::ta_slice(obj, args),
+            "fill" => return typedarray::ta_fill(obj, args),
+            _ => {}
+        }
+    }
+    if typedarray::is_arraybuffer_receiver(obj) && method_name == "slice" {
+        return typedarray::ab_slice(obj, args);
+    }
     match method_name {
         // `Number.prototype.toString([radix])` takes the radix argument.
         "toString" if matches!(obj, Value::Number(_)) => {

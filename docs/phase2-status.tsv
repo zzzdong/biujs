@@ -74,10 +74,10 @@ language/statements/function	347	74	30
 language/statements/switch	51	54	6
 language/statements/while	28	10	0
 language/literals/string	67	6	0
-built-ins/Array	2101	188	792
+built-ins/Array	2102	188	791
 built-ins/JSON	113	51	1
 built-ins/WeakSet	79	5	1
-built-ins/Object	2790	292	329
+built-ins/Object	2800	292	319
 language/expressions/yield	40	3	20
 language/rest-parameters	11	0	0
 language/expressions/assignment	407	18	60
@@ -93,7 +93,7 @@ language/expressions/prefix-decrement	22	5	7
 language/expressions/strict-does-not-equals	20	10	0
 language/expressions/typeof	7	7	2
 language/expressions/void	8	1	0
-language/statements/class	1407	2809	151
+language/statements/class	1409	2809	149
 language/statements/empty	1	1	0
 language/statements/if	50	19	0
 language/statements/throw	13	1	0

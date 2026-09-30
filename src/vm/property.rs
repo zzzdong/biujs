@@ -141,6 +141,8 @@ pub enum ObjectKind {
     Arguments,
     Generator,
     Buffer,
+    /// A TypedArray: an integer-indexed view over an `ArrayBuffer`.
+    TypedArray,
     /// Native (built-in) function
     NativeFunction,
 }

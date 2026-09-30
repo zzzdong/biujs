@@ -2123,6 +2123,53 @@ async 路径在用），所以要在几个 `Opcode::Call*` 上各挂一次 push/
 
 ---
 
+#### B43 `ArrayBuffer` + TypedArray（+13，零回退）
+
+**做了什么**：`ArrayBuffer` 与 9 个视图构造器（`Int8Array` / `Uint8Array` / `Uint8ClampedArray` /
+`Int16Array` / `Uint16Array` / `Int32Array` / `Uint32Array` / `Float32Array` / `Float64Array`），
+外加 `ArrayBuffer.isView` / `prototype.slice` / `byteLength`；视图侧有
+`length` / `byteLength` / `byteOffset` / `buffer` / `BYTES_PER_ELEMENT`、下标读写、
+`set` / `subarray` / `slice` / `fill`、`Symbol.iterator`。
+
+**设计**：字节住在 `ArrayBufferObject` 里，视图是 `TypedArrayObject`，**元素不存** ——
+`property_get("0")` 从缓冲区的字节按元素类型解码。别名语义（`new Uint8Array(buf)` 与 `buf`
+互相看得见）和 `Object.keys(new Uint8Array(2)) === ["0","1"]` 都由此而来；越界读写不是元素
+（写丢弃、读 `undefined`），`Uint8ClampedArray` 按规范做四舍五入夹紧。
+
+**四处坑（都写进注释）**
+
+1. **写完忘了加偏移**：`set_element` 把视图的 `byte_offset` 算进了 `data` 切片起点，却把
+   `index` 传成 0 —— 于是每次写都落在第 0 字节（`new Uint32Array(buf)[0]` 给 1 而不是 511）。
+   切片必须从视图自己的偏移开始。
+2. **`length` 是原型 getter**，于是所有"读自有 `length`"的路径都看不见它：迭代/spread 走 VM 的
+   `array_like_elements`（读自有属性）→ `[...new Uint8Array([1,2,3])]` 是 `[]`；`Array.from`
+   走 builtin 层 → 也是 `[]`。两处都要单独处理。
+3. **`ArrayBuffer.isView` 只注册不够**：`set_static_method` 挂了名字，但 `call_static_method`
+   里没有对应分支，调用直接 `unknown static method`。
+4. **名字冲突**：`set` / `subarray` / `slice` / `fill` 与 `Array.prototype` 同名，分发必须按
+   接收者先判（和 `toString` 按日期/正则分流同一个道理）。
+
+**数字**：通过 16026 → 16039（+13），失败 2888 → 2875，通过率 84.73% → 84.80%。
+3 个套件提升、零回退：`built-ins/Object` +10、`language/statements/class` +2、
+`built-ins/Array` +1。feature 507（+1 用例 / 19 条断言）。
+
+注意：curated 的 `SUITES` **不含** TypedArray 族（`TypedArray` 2184 条被列为排除项），
+所以这 +13 不是 TypedArray 用例带来的，是顺带修到的面（见坑 2 的 `array_like_elements`）。
+与 node 的对照：20 条探针输出逐行一致（含 `new Uint32Array(buf)[0] === 511` 的小端别名、
+`JSON.stringify(new Uint8Array([1,2])) === {"0":1,"1":2}`、`Object.prototype.toString`、
+`ArrayBuffer.isView`、越界读写）。
+
+**流水线**：整轮验证在第 2 片被 `ulimit -v 2.5GB` 打断，失败的是那条**已记录在案**的
+`built-ins/Array` ~384MB 合法单例分配（`memory allocation of 402653184 bytes failed`）——
+与本次改动无关。用 `MEM_LIMIT_KB=4000000` 重跑即通过（上限可覆盖是既有设计）。
+
+**残留**：`%TypedArray%`（抽象基类）未暴露 —— 各视图原型直接接 `Object.prototype`；
+`DataView`、`BigInt64Array` / `BigUint64Array`、`SharedArrayBuffer` / `Atomics`、回调式方法
+（`forEach` / `map` / `filter` / `reduce`）、`indexOf` / `join` / `sort` / `includes` 都还没有；
+`Object.getOwnPropertyDescriptor(view, "0")` 的取值属性形状也还没对齐。
+
+---
+
 #### B42 `String.prototype.matchAll` + `Array.from` 吃迭代器（+11，零回退）
 
 **做了什么**：`String.prototype.matchAll(re)` 与 `RegExp.prototype[Symbol.matchAll](s)` —— 同一算法的

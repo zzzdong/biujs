@@ -1095,3 +1095,105 @@ fn array_from_drains_a_native_iterator() {
     // `[...set]` works, which is what scripts can use meanwhile.
     assert_eq!(eval_string("JSON.stringify([...new Set([1, 2])])"), "[1,2]");
 }
+
+#[test]
+fn typed_array_views_alias_the_buffer_they_were_built_on() {
+    // A view sees the buffer's bytes — and another view of the same bytes sees
+    // the writes. Little-endian, so 0xFF then 0x01 is 511 as a Uint32.
+    assert_eq!(
+        eval_number(
+            "(function () { var buf = new ArrayBuffer(8);
+             var u8 = new Uint8Array(buf); u8[0] = 255; u8[1] = 1;
+             return new Uint32Array(buf)[0]; })()"
+        ),
+        511.0
+    );
+    assert_eq!(eval_number("new ArrayBuffer(8).byteLength"), 8.0);
+    assert_eq!(eval_number("new Uint8Array(3).length"), 3.0);
+    assert_eq!(
+        eval_string("JSON.stringify(Array.from(new Uint8Array([1, 2, 3])))"),
+        "[1,2,3]"
+    );
+    // The indices are own enumerable properties, and `length` is not one of
+    // them — it is a getter on the prototype.
+    assert_eq!(
+        eval_string("JSON.stringify(Object.keys(new Uint8Array(2)))"),
+        "[\"0\",\"1\"]"
+    );
+    assert_eq!(
+        eval_string("JSON.stringify(new Uint8Array([1, 2]))"),
+        "{\"0\":1,\"1\":2}"
+    );
+    // A view over part of a buffer keeps its own offset.
+    assert_eq!(
+        eval_string(
+            "(function () { var v = new Uint8Array(new ArrayBuffer(8), 2, 3);
+             return v.length + '|' + v.byteOffset + '|' + v.byteLength; })()"
+        ),
+        "3|2|3"
+    );
+    // `subarray` shares the buffer; `slice` copies it.
+    assert_eq!(
+        eval_number(
+            "(function () { var a = new Uint8Array([1, 2, 3]);
+             a.subarray(1)[0] = 9; return a[1]; })()"
+        ),
+        9.0
+    );
+    assert_eq!(
+        eval_number(
+            "(function () { var a = new Uint8Array([1, 2, 3]);
+             a.slice(1)[0] = 9; return a[1]; })()"
+        ),
+        2.0
+    );
+    // `set` / `fill`.
+    assert_eq!(
+        eval_string(
+            "(function () { var a = new Uint8Array(4); a.set([9, 8], 1);
+             return Array.from(a).join(','); })()"
+        ),
+        "0,9,8,0"
+    );
+    assert_eq!(
+        eval_string("Array.from(new Uint8Array(3).fill(7)).join(',')"),
+        "7,7,7"
+    );
+    // Element types wrap the way they say they do.
+    assert_eq!(
+        eval_string(
+            "(function () { var a = new Uint8ClampedArray(2); a[0] = -5; a[1] = 300;
+             return a[0] + ',' + a[1]; })()"
+        ),
+        "0,255"
+    );
+    assert_eq!(eval_number("(function () { var a = new Int16Array(1); a[0] = -2; return a[0]; })()"), -2.0);
+    assert_eq!(eval_number("(function () { var a = new Float64Array(1); a[0] = 1.5; return a[0]; })()"), 1.5);
+    // A read or write past the end is not an element at all.
+    assert_eq!(
+        eval_string(
+            "(function () { var a = new Uint8Array(2); a[5] = 9;
+             return a.length + '|' + String(a[5]); })()"
+        ),
+        "2|undefined"
+    );
+    // Identity, the static, and iteration.
+    assert_eq!(
+        eval_string("Object.prototype.toString.call(new Uint8Array())"),
+        "[object Uint8Array]"
+    );
+    assert_eq!(
+        eval_string("String(ArrayBuffer.isView(new Uint8Array())) + ',' + String(ArrayBuffer.isView([]))"),
+        "true,false"
+    );
+    assert_eq!(
+        eval_number(
+            "(function () { var s = 0;
+             for (var x of new Uint8Array([1, 2, 3])) { s += x; }
+             return s; })()"
+        ),
+        6.0
+    );
+    assert_eq!(eval_number("new Uint8Array().BYTES_PER_ELEMENT"), 1.0);
+    assert_eq!(eval_number("Float64Array.BYTES_PER_ELEMENT"), 8.0);
+}
