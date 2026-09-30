@@ -110,8 +110,9 @@
 | `SetObject`（B2b） | `entries: Vec<Option<Value>>`（同上，插入序 + 墓碑） |
 | `WeakMapObject` / `WeakSetObject`（B3） | 各自包一个 `MapObject` / `SetObject`（宏转发 20 个 `JSObject` 方法），只覆盖 `kind`/`class_name`；条目不会被回收（§8 偏差） |
 | `NativeIteratorObject`（`iterator.rs:100`） | 迭代器状态（`Map` 变体见 `NativeIteratorState`） |
+| `ProxyObject`（B45，`:3008`） | `target` / `handler` / `revoked` + 一个只作兜底的 `OrdinaryObject`。**它自己不实现任何陷阱**：每个方法都转发给目标（ES 10.5 的"没有陷阱 = 目标上的同一次操作"），真正要跑 JS 的陷阱由 VM 在到达这里之前派发（`vm/mod.rs` 的 `Proxy` 段） |
 
-- `PropertyKey`（`property.rs:5`）= `Str(Rc<String>) | Symbol(u64)`；`PropertyDescriptor:45`；`ObjectKind:99`（20 个变体，`Map`/`Set`/`WeakMap`/`WeakSet` 已实现，`Promise`/`Proxy`/`TypedArray` 等**仍是占位**）。
+- `PropertyKey`（`property.rs:5`）= `Str(Rc<String>) | Symbol(u64)`；`PropertyDescriptor:45`；`ObjectKind:99`（21 个变体，`Map`/`Set`/`WeakMap`/`WeakSet`/`Promise`/`Proxy`/`TypedArray` 已实现）。
 - `prototype.rs`：`find_descriptor:83` / `internal_get:36` / `internal_set:110` / `internal_has_property:183` / `internal_delete:212`。**错误类型是 `String`**（见地雷 5）。
 
 ### 2.7 内置对象层
@@ -132,10 +133,12 @@
 | 新增内置方法（**不需要**跑用户代码） | `builtins/<obj>.rs` 注册 + `builtins/mod.rs` 的 arity 表 | —— |
 | 新增内置语义（**需要** `[[Get]]`/`[[Set]]`/`Construct`/回调） | `src/vm/mod.rs` 的派发层（`call_native_by_name` 之上的分支） | builtins 层做不到，别在那里硬写 |
 | 属性 / 描述符语义 | `vm/property.rs` + `vm/prototype.rs` + 各对象的 `JSObject` impl | `builtins/object.rs` 的静态方法；**错误种类**受 String 通道影响（地雷 5） |
+| **`[[Get]]` / `[[Set]]` 带 receiver** | `vm/mod.rs` 的 `get_with_receiver` / `set_with_receiver`（ES 10.1.8 / 10.1.9） | 只有 `Reflect.get` / `Reflect.set` 的第三、四参能让 receiver 不是对象本身；`Reflect` 要布尔答案而赋值要 TypeError，所以 `proxy_set` 只回答布尔、由调用方决定 |
 | 迭代协议 | `vm/iterator.rs` + `vm/mod.rs` 的 `make_iterator`/`iterator_next`/`iterator_close` | `compiler/lowering` 里 `for-of`/spread/解构的降级 |
 | 生成器 | `vm/mod.rs` 的 `generator_*` + `vm/object.rs` 的 `SuspendedFrame` | `compiler/lowering` 的 `Yield` 降级 + `Module::exit_pc` 的记录 |
 | **新增对象类型**（Map/Set/TypedArray…） | `vm/object.rs` 新增 struct + `impl JSObject`；`property.rs` 的 `ObjectKind` 加变体；`builtins/<x>.rs` + `Builtins` 字段 + `register` 装配 | 可迭代则加 `NativeIteratorState` 变体；`call_native_by_name` 的派发分支 |
 | 严格模式早期错误 | 已由 oxc 语义构建器承担（`parse_js`） | runner 侧的 `onlyStrict` 前置 |
+| **代理（`Proxy`）** | `vm/object.rs` 的 `ProxyObject`（只转发） + `vm/mod.rs` 的 `Proxy` 段（`proxy_trap` / `proxy_get` / `proxy_static_trap` …） | 截住点分布在 `get_member` / `set_member` / `delete_member` / `Opcode::In` / `Opcode::CallEx` / `Opcode::New` / `invoke` / `construct` / `call_native_by_name` 的静态分支；`Object.*` 还要加进 `vm_handled_static`（见地雷） |
 | 测试与度量 | `tests/test262_runner.rs`（`SUITES:500`、两套特性表 `:171`/`:206`、`should_skip:256`、`build_source:117`） | 计划书 §2.2 的"入册 + 解锁"联动纪律 |
 
 ### 3.1 新增一个集合类型（Map / Set / WeakMap / TypedArray）的改动清单
@@ -166,6 +169,10 @@
 **错误种类会被 String 通道抹平**。`JSObject::define_property` / `property_set` / `prototype::*` 的失败是 `Result<_, String>`，调用点一律包成 `TypeError`。而 `ArraySetLength` 要求 `RangeError`。现在的做法：`RuntimeError::into_property_error()` 把 RangeError 渲染成 `"RangeError: <msg>"`，`from_property_error()` 还原。**新增任何走 String 通道的错误都要问：种类是否会丢。**
 
 **builtin 层看不到原型链与访问器**。`builtins/*` 直接读 `ArrayObject::elements` 密集存储、走快照（`array_like_elements`），因此**绕过 `[[Get]]`/`[[Set]]` 与访问器**。凡语义要求"按 `[[Get]]` 取值 / 按 `[[Set]]` 写入 / 可能执行用户代码"的，必须上移 VM。已知欠账：Array 回调方法的泛型/访问器路径、`[...a]` 中数组元素的访问器、索引读写不经原型链。
+
+**`Object.*` 的静态分发会绕过 VM，除非名字也在 `vm_handled_static` 里**。`Opcode::CallMethod` 先用 `call_static_method("Object.x", …)` 试一遍，命中就直接返回；只有列在 `vm_handled_static` 里的名字才会继续走到 `lookup_property_on_object` → `call_native_by_name`。所以凡"要看接收者是不是特殊对象、读字段要走 `[[Get]]`"的静态方法（`Object.defineProperty`，以及 B45 的 `getPrototypeOf` / `setPrototypeOf` / `isExtensible` / `preventExtensions` / `getOwnPropertyDescriptor` / `keys` / `getOwnPropertyNames` / `getOwnPropertySymbols`），**注册之外还要加进那张表**。
+
+**代理的陷阱只有 VM 能跑，对象层看不到**（B45）。`ProxyObject` 的每个 `JSObject` 方法都转发给目标，这正好实现"没有陷阱"的默认语义；但要跑 JS 的十三个陷阱必须在到达对象层**之前**被 VM 截住。由此留下一处已知缺口：`find_descriptor` / `internal_get` / `internal_has_property` 在对象层走 `property_get` / `has_property`，**原型链上的代理不会触发陷阱**（`Object.create(p).foo`、`"x" in Object.create(p)`）；修法是把原型链查询整体上移 VM，与上面"Array 泛型上移"同属一类跨层改动。
 
 **访问器槽里的 `undefined` 不等于"没有"**。`PropertyDescriptor::getter/setter` 是 `Option<Value>`：`Some(Undefined)` 表示"字段存在、值是 `undefined`"——`{get: undefined}` 装出来的描述符仍是**访问器描述符**，只是读的时候没有东西可调。调用点在判断要不要 `invoke` 时必须走 `invoked_getter()` / `invoked_setter()`（把 `Some(Undefined)` 折成 `None`），不能直接 `match desc.getter`。同理，部分描述符（只给 `enumerable`/`configurable`）落在已有访问器上时**必须保持访问器**，不能按数据描述符重建 —— 见 `apply_property_descriptor` 里的两条早退回。
 

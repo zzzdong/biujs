@@ -174,7 +174,13 @@ echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 # 8133 → 8173（B35）：`built-ins/Promise` 入册，套件自带的 40 条门控用例进跳过表；同时
 # `Promise` 从 IN_SCOPE_PENDING 摘掉、`Promise.allSettled` / `Promise.any` /
 # `Promise.prototype.finally` / `AggregateError` 等 ES2018+ 特性进 OUT_OF_SCOPE。
-EXPECTED_SKIPPED=8173
+# 8173 → 8166（B45）：`Proxy` 从 IN_SCOPE_PENDING 摘掉、`built-ins/Proxy` 入册。
+# 先前被 `features: [Proxy]` 顺带跳过、散落在 Object / JSON / Array / Symbol 等套件里的
+# 7 条用例转为执行（它们的通过数就是本次那几个套件的小幅提升）。
+# 8166 → 7843（B46）：`Reflect` 从 IN_SCOPE_PENDING 摘掉、`built-ins/Reflect` 入册。
+# 这次是 -323：test262 里带 `features: [Reflect]` 的用例远比 Reflect 套件本身多
+# （`Proxy` / `Math` / `Object` / `Promise` 里都有），它们此前被顺带跳过。
+EXPECTED_SKIPPED=7843
 if [ "$SKIPPED" != "$EXPECTED_SKIPPED" ]; then
   echo "  !! 跳过数从 $EXPECTED_SKIPPED 变为 $SKIPPED —— 跳过表被改动了。"
   echo "     请确认这是有意的（计划书 §2.2：交付特性时必须同批解锁），并更新本脚本的 EXPECTED_SKIPPED。"

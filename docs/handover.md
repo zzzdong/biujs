@@ -48,6 +48,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 | 1 | **本文件** | 怎么跑、当前在哪、有哪些纪律 |
 | 2 | `es6-conformance-phase2.md` | **当前有效的计划**：目标 A1–A10、批次表 B0–B13、批次记录 §6.1、度量口径 §2 |
 | 3 | `architecture.md` | **实现地图**：管线、运行时模型、**任务→改哪里**、**地雷与不变量** |
+| 3.5 | **`interpreter-refactor.md`** | **字节码/解释器的结构性重构方案**（P0–P3，自包含，含 ChakraCore 对照、停止点、Go/No-Go）。要动 `bytecode.rs` / `run_instruction` / 帧模型时**先读它** |
 | 4 | `es6-feature-support.md` | 逐特性支持矩阵（给使用者看的口径） |
 | 5 | `es6-conformance-plan.md` | M0–M4 的工作日志（**已冻结**，只在需要追溯"某个结论怎么来的"时查） |
 | — | `biu-js-engine-architecture.md` | 早期**设计蓝图**。注意其中"排除 `var`/`arguments`"等表述已过时，实现问题以 `architecture.md` 为准 |
@@ -56,9 +57,9 @@ python3 scripts/kpi-noise.py /tmp/full.txt     # 3807 范围内 / 100 RegExp / 1
 
 | 指标 | 数值 |
 |------|------|
-| test262 执行 / 通过 / 失败 / 跳过 | 18914 / **16015** / 2899 / 8173 |
-| 通过率 | 84.67%（参考值；分母口径见计划书 §2.1；分母因 `built-ins/Promise` 入册变大） |
-| 单元 / feature / 护栏测试 | 190 / 504 / 7，全绿 |
+| test262 执行 / 通过 / 失败 / 跳过 | 19708 / **16561** / 3147 / 7843 |
+| 通过率 | 84.03%（参考值；分母口径见计划书 §2.1；分母因 `built-ins/Reflect` 入册与解锁变大 476） |
+| 单元 / feature / 护栏测试 | 190 / 523 / 7，全绿 |
 | 全量耗时 | 约 3m（三层护栏封顶：单例 15s 墙钟、2×10^7 指令、256MiB 堆增量） |
 | runner 覆盖面 | 25586 / 53568 个测试文件（47%）——**未覆盖里约 4920 条属承诺的 M5/M6** |
 | 基线快照 | `phase2-status.tsv`（`scripts/phase2-status.sh` 生成的逐套件表） |
@@ -79,7 +80,13 @@ curated 清单里）、B32（`RegExp`：字面量此前是 `undefined`；新增 
 B39（**`globalThis`**：`GlobalObject` 是 globals map 的视图（共享 `Rc`），`[object global]`；
 自引用会在丢弃 State 前手动摘除，否则 `map → 对象 → map` 的环会钉住每轮 State —— 实测分片会撞穿
 `ulimit`。test262 +0，feature 503）、B40（**数组 elision 是「洞」**：`[1,,2].flat()` 从此是 `[1,2]`，
-新增 `MarkHole` 指令；+37 —— `built-ins/Array` +34、`built-ins/Object` +3，零回退）。
+新增 `MarkHole` 指令；+37 —— `built-ins/Array` +34、`built-ins/Object` +3，零回退）、
+B44（`Reflect`：13 个静态方法 + `[Symbol.toStringTag]`，顺带修掉 `delete` 对不存在属性的
+回答，+14）、B45（**`Proxy`**：十三个陷阱全部接通（含 ES 10.5 的主要不变量）、
+`Proxy.revocable`、`built-ins/Proxy` 入册解锁；+212 —— 9 个套件提升、零回退，
+套件通过率 87.0%）、B46（**`Reflect` 收口**：receiver 语义、`new.target`、arity 表、
+键/参数列表走 `[[Get]]`、`built-ins/Reflect` 入册解锁；+296 —— 19 个套件提升、零回退，
+套件 149/150 = 99.3%；顺带修掉 `new String("")` 的 `length` 键顺序）。
 
 **已完成**：整轮验证的 OOM 已修（见下）。
 
@@ -88,7 +95,27 @@ B39（**`globalThis`**：`GlobalObject` 是 globals map 的视图（共享 `Rc`�
 整轮默认上限从 5GB 降到 **2.5GB**。注意区分：**realm 新鲜**仍比"状态重置"更硬 —— test262 用例
 会改内建对象，所以 runner 仍每用例新建 VM（实测复用只有 14002 通过）。
 
-**下一步**：`built-ins/Array` 里那条合法的大分配（~384MB）决定单片上限的下限，可以看看能否
+**另有一条结构性重构线**（与上面的语义线并行，方案见 `docs/interpreter-refactor.md`）：
+指令容器改 enum → 类型收紧 + 与 IR 读写集互校 → 调用路径归一 → `CodeBlock` per function →
+帧结构归一（P3a）→ 堆帧 + 单层主循环（P3b，有 Go/No-Go 判据）。它**不产生 test262 分数**，
+目标是消掉"新增一条指令动五层""`invoke` 必须镜像 `Call`""10 条平行栈"这些结构性坑源。
+
+**下一步**：先清**同类的纪律债** —— `ArrayBuffer` / `DataView` / `TypedArray` 已由 B43 实现，
+但套件未入册、`TypedArray` 还在 `IN_SCOPE_PENDING`。B46 已经证明这类"入册解锁"很值钱：
+单是摘掉 `Reflect` 一个特性名就让跳过数 -323、通过数 +296（因为带
+`features: [Reflect]` 的用例远比 Reflect 套件本身多）。TypedArray 只会更夸张
+（`built-ins/TypedArray` 1446 条里 1339 条被门控）。**做法与 B46 完全同型**：先量
+（把套件加进 `SUITES`、删掉特性名，跑一次定向回归看通过率），达到 A5 的 ≥50%
+就留下并同批更新快照与 `EXPECTED_SKIPPED`。
+
+之后是 `Proxy` 的两条残留：**"原型链上的代理不触发陷阱"**量最大（约 10 条）——
+`find_descriptor` / `internal_has_property` / `internal_get` 在对象层走
+`property_get` / `has_property`，而对象层调不动 JS，所以 `Object.create(p).foo` 不会问到
+`get` 陷阱；修法和 B7（Array 泛型上移 VM）同类，是把原型链查询整体上移 VM。
+其次是描述符的**深度**不变量（`IsCompatiblePropertyDescriptor`，约 11 条），以及
+`Reflect` 套件尚未入册（B44 遗留，按 §2.2 的纪律补齐后两件）。另外两条既有缺口被本批暴露：
+`Array.prototype.length` 不是自有属性、脚本顶层 `this` 仍是 `undefined`（全局对象债）。
+再往后是 `built-ins/Array` 里那条合法的大分配（~384MB）决定单片上限的下限，可以看看能否
 压下来；然后是 B35 记的 `frame_argc.truncate(saved_this_depth)` 疑点，B34 那条"链式 `new Promise(…抛出…).catch` 收不到 handler"已随 B37 一并修好（与 node 逐字一致）。
 
 **历史**：（整轮峰值贴在内存边沿，B31 把它顶过去了；已验证拆成

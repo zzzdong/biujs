@@ -432,8 +432,9 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 /// B3 (all four suites are in `SUITES`); the others stay gated until the
 /// feature exists.
 const IN_SCOPE_PENDING: &[&str] = &[
-    "Proxy",
-    "Reflect",
+    // `Proxy` (B45) and `Reflect` (B44/B46) are implemented and their suites
+    // are enrolled below, so neither is pending — this list is the
+    // "not implemented yet" list only.
     "TypedArray",
 ];
 
@@ -883,6 +884,13 @@ const SUITES: &[&str] = &[
     "built-ins/Number",
     "built-ins/Object",
     "built-ins/Promise",
+    // `built-ins/Reflect` joins the denominator with the feature: B44 delivered
+    // the object, B46 finished it (receiver semantics, `new.target`, the arity
+    // table) and enrolled it (§2.2 — all three in the same batch).
+    "built-ins/Reflect",
+    // `built-ins/Proxy` joins the denominator with the feature itself (B45,
+    // §2.2): implementing without enrolling leaves the progress uncounted.
+    "built-ins/Proxy",
     "built-ins/String",
     "built-ins/Symbol",
 ];

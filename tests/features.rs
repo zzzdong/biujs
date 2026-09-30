@@ -59,6 +59,10 @@ mod new_target;
 mod object_builtins;
 #[path = "features/objects_and_arrays.rs"]
 mod objects_and_arrays;
+#[path = "features/proxy.rs"]
+mod proxy;
+#[path = "features/reflect.rs"]
+mod reflect;
 #[path = "features/set.rs"]
 mod set;
 #[path = "features/stack_overflow.rs"]

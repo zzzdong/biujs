@@ -152,6 +152,18 @@ pub fn reflect_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
     if !changed {
         return Ok(Value::Bool(false));
     }
+    // A prototype chain that reaches the object itself would loop forever on
+    // every later lookup. `[[SetPrototypeOf]]` *refuses* it (ES 10.1.2.1 step 6),
+    // which `Reflect` reports as `false` and `Object.setPrototypeOf` throws.
+    if let Some(proto) = &new_proto {
+        let mut chain = Some(Rc::clone(proto));
+        while let Some(link) = chain {
+            if Rc::ptr_eq(&link, &target) {
+                return Ok(Value::Bool(false));
+            }
+            chain = link.borrow().get_prototype();
+        }
+    }
     target.borrow_mut().set_prototype(new_proto);
     Ok(Value::Bool(true))
 }
@@ -178,6 +190,10 @@ pub fn reflect_prevent_extensions(args: &[Value]) -> Result<Value, RuntimeError>
 /// descriptor carries are never called, only the name is read.
 pub fn create_reflect_object() -> Value {
     let mut obj = OrdinaryObject::with_class_name("Reflect");
+    // `Reflect` is a namespace object, not a constructor: it has no `prototype`
+    // property of its own, but it *inherits* from `Object.prototype`
+    // (`Object.getPrototypeOf(Reflect) === Object.prototype`).
+    obj.set_prototype(crate::builtins::wrapper_prototype("Object"));
     let names: Vec<&str> = BUILTIN_METHODS
         .iter()
         .map(|(name, _)| *name)

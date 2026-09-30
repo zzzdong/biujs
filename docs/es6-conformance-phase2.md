@@ -57,7 +57,7 @@
 | `built-ins/Promise` | 677 | 494 | 183 |
 | `built-ins/DataView` | 561 | 127 | 434 |
 | `built-ins/Set` | 383 | 26 | 357 |
-| `built-ins/Proxy` | 311 | 309 | 2 |
+| ~~`built-ins/Proxy`~~ | ~~311~~ | ~~309~~ | ~~2~~ → **B45 已入册解锁**：311 条中 208 条转为执行，通过 181（87.0%） |
 | `built-ins/ArrayBuffer` | 221 | 36 | 185 |
 | `built-ins/Map` | 204 | 56 | 148 |
 | `built-ins/Reflect` | 153 | 153 | 0 |
@@ -131,12 +131,12 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | A1 | M7 范围内失败 | 3807（§3.1 归类后） | ≤ 800（RegExp 驱动与后 ES6 API 按 §3.1 扣除后计入） |
 | A2 | M7 的六个任务包（§5） | 0/6 | 6/6 有交付记录且各自验收达标 |
 | A3 | `Map` / `Set` / `WeakMap` / `WeakSet` | ✅ 96.3% / 94.5% / 99.2% / 98.8%（B2a–B3 已入册解锁） | 各自套件通过率 ≥ 80%，且已入册解锁 |
-| A4 | `Proxy` / `Reflect` | 0% | 各自套件通过率 ≥ 50%（依赖内部方法，允许更低） |
-| A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0% | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
-| A6 | `Promise` | 0% | 套件通过率 ≥ 50%（含微任务调度点落地） |
+| A4 | `Proxy` / `Reflect` | ✅ **`Proxy` 82.9%**（218 / 263）、**`Reflect` 99.3%**（149 / 150），两者均已入册解锁（B45 / B46） | 各自套件通过率 ≥ 50%（依赖内部方法，允许更低） |
+| A5 | `ArrayBuffer` / `DataView` / `TypedArray` | 0%（实现已落地，套件未入册 —— 见 §6.1 B43） | 各自套件通过率 ≥ 50%；detach/resizable 允许登记偏差 |
+| A6 | `Promise` | 246 / 340（已入册，B35） | 套件通过率 ≥ 50%（含微任务调度点落地） |
 | A7 | `Date` | 结论已落地（§3.1：实现），0 开工 | 批次 B14 交付后套件通过率 ≥ 50% |
-| A8 | 计划内通过数 | 16015 | ≥ 20000（本阶段结束时） |
-| A9 | 单元 / feature / 护栏测试 | 190 / 504 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
+| A8 | 计划内通过数 | 16561（B46 后） | ≥ 20000（本阶段结束时） |
+| A9 | 单元 / feature / 护栏测试 | 190 / 523 / 7 全绿 | 全绿；每个任务包新增 ≥ 5 条断言的 feature 用例 |
 | A10 | 文档一致性 | §1.2 现状栏仍有过时项 | 与 `es6-feature-support.md`、README 三者逐项对齐 |
 
 ---
@@ -199,7 +199,7 @@ python3 scripts/kpi-noise.py /tmp/full.txt
 | **B6** | M7-P6 生成器剩余 + M7-P5 数据模型三债 | 203 + — | 债不还，后面的用例会持续被它误导 |
 | **B7** | M7-P1 Array 回调泛型/访问器上移 VM | ≈450 | **最贵的一批**，跨 builtin/VM 两层，建议再拆 2–3 个小批 |
 | **B8** | M7-P2 class 求值顺序与 own-property | 705 | 单批第二贵 |
-| **B9** | M5-C4 `Proxy`/`Reflect`（含入册解锁） | 464 | 依赖已就绪 |
+| **B9** ✅ | M5-C4 `Proxy`/`Reflect`（含入册解锁） | 464 | **已完成**：`Proxy` B45（+212，已入册解锁）、`Reflect` B44 实现 + B46 收口入册（+296）；两套件 82.9% / 99.3%，A4 达标 |
 | **B10** | M6-T1 `ArrayBuffer` + `DataView` | 782 | |
 | **B11** | M6-T2 `TypedArray` + `TypedArrayConstructors` | 2184 | 同质、可批量 |
 | **B12** | M5-C3 `Promise`（先定微任务调度点） | 677 | 需新机制，放最后 |
@@ -2153,6 +2153,128 @@ feature 508（+1 用例 / 30 条断言）。探针 23 条与 node **逐行一致
 
 **下一步**：`Proxy` —— 处理器 = `Reflect` 的这套方法，地基已经在了（`vm/property.rs` 里
 `ObjectKind::Proxy` 也是现成的变体）。
+
+---
+
+#### B45 `Proxy`（+212，零回退）—— 陷阱分发全在 VM，`ProxyObject` 只做转发
+
+**做了什么**：`Proxy` 的**十三个陷阱**全部接通（除 `ownKeys` 之外的不变量也一并落地），
+外加 `Proxy.revocable`；`built-ins/Proxy` 入册、`Proxy` 从 `IN_SCOPE_PENDING` 摘掉。
+
+**一条设计线**：ES 10.5 的组织原则只有一句 —— **处理器里没有的陷阱不是错误，就是目标上的
+同一次操作**。于是每个 `proxy_*` 都回答 `Option`：`None` 表示"转发"，而转发是**递归派发**
+而不是回落到对象层，因为目标自己也可能是代理（`get/trap-is-null-target-is-proxy` 一类用例
+靠的就是这条）。
+
+| 落点 | 陷阱 | 为什么在这边 |
+|------|------|--------------|
+| VM 运算符路径（`get_member` / `set_member` / `delete_member` / `Opcode::In` / `CallEx` / `invoke` / `construct` / `Opcode::New`） | `get` / `set` / `deleteProperty` / `has` / `apply` / `construct` | 要跑 JS（访问器要重入、`apply` 要调用户函数） |
+| VM 静态方法路径（`call_native_by_name` 的 `name.contains('.')` 分支） | `getPrototypeOf` / `setPrototypeOf` / `isExtensible` / `preventExtensions` / `getOwnPropertyDescriptor` / `defineProperty` / `ownKeys` | 同上；且它们的"第一参数是代理"就是识别条件 |
+| 对象层（`ProxyObject`） | —— | 它调不动 JS，所以只做 `None` 之后的那半：把每次操作原样转给目标 |
+
+**四个坑（都写进注释）**
+
+1. **`Object.*` 的静态分发根本到不了 VM**：`CallMethod` 会先用
+   `call_static_method` 试一遍，命中就直接返回 —— 所以 `Object.getPrototypeOf` /
+   `setPrototypeOf` / `isExtensible` / `preventExtensions` / `getOwnPropertyDescriptor` /
+   `keys` / `getOwnPropertyNames` / `getOwnPropertySymbols` 必须**同时**加进
+   `vm_handled_static`，否则陷阱永远不会被问到。
+2. **`new Proxy(f, h)` 里的 `f` 常常是裸 `Value::Function`**，而 `is_object()` 看不见它 ——
+   构造前要先 `as_object_value` 装箱，否则报"目标不是对象"。
+3. **`null` 陷阱 = 无陷阱**（`GetMethod` 语义）。写成"非函数即报错"会一次挂掉 4 条用例。
+4. **`revoke` 函数没有名字**：`Proxy.revocable` 要造一个"记住自己属于哪个代理"的函数，而
+   原生函数唯一的 state 就是它的名字 —— 于是照抄 `Function.prototype.bind` 的做法
+   （`__revoke__<id>` + VM 侧注册表）。它是**匿名**内建函数，`name` 是空串
+   （ES 28.2.2.1.1），得把 `install_metadata` 写的名字覆盖掉。
+
+**数字**：通过 16053 → **16265**（+212），失败 2861 → 2967，跳过 8173 → 8166，
+通过率 84.87% → 84.57%（分母因 `built-ins/Proxy` 入册 +311 而变大）。
+9 个套件提升、零回退：
+
+| 套件 | 变化 | 说明 |
+|------|------|------|
+| `built-ins/Proxy` | **新入册 181 / 208（87.0%）** | A4 的 ≥50% 达标 |
+| `built-ins/Object` | +17 | 之前被 `features: [Proxy]` 顺带跳过的用例转为执行 |
+| `built-ins/JSON` | +5 | 同上 |
+| `built-ins/Array` | +4 | 同上 |
+| `Symbol` / `Function` / `for-of` / `class` / `typeof` | 各 +1 | 同上 |
+
+feature 518（+10 用例 / 60+ 条断言）。探针 24 行与 node **逐字一致**（含撤销后的四种报错、
+五条不变量的报错原文、`typeof`、`Object.prototype.toString`、`instanceof`）。
+
+**残留**（都是下一批的输入，按量排序）
+
+1. **原型链上的代理不触发陷阱（约 10 条）**：`Object.create(p).foo`、`"x" in Object.create(p)`。
+   根因是 `find_descriptor` / `internal_has_property` / `internal_get` 在**对象层**走
+   `property_get` / `has_property`，而对象层调不动 JS。要修就得把原型链查询上移 VM ——
+   这是和 B7（Array 泛型上移）同类的跨层改动，不便宜。
+2. **描述符的**深度**不变量（约 11 条）**：`IsCompatiblePropertyDescriptor` 未实现
+   （`getOwnPropertyDescriptor/resultdesc-*`、`defineProperty/targetdesc-*`），
+   陷阱返回的描述符也不做 `CompletePropertyDescriptor` 归一化。
+3. **既有缺口被本批暴露（2 条）**：`has/trap-is-undefined.js` 依赖
+   `Array.prototype.length` 是自有属性（现在不是）；`proxy.js` 依赖脚本顶层 `this` 是全局
+   对象（数据模型债，§4 已登记）。
+4. **`Reflect` 套件未入册**（B44 遗留）：实现已落地，但 `built-ins/Reflect` 还不在
+   `SUITES` 里、`Reflect` 也还在 `IN_SCOPE_PENDING` —— 按 §2.2 的纪律，这属于 B44 没做完的
+   后两件，下次动 `Reflect` 时补。
+
+---
+
+#### B46 `Reflect` 收口（+296，零回退）—— 顺带修掉字符串包装对象的键顺序
+
+**为什么要先做这个**：B44 交付了 `Reflect`，但按 §2.2 的纪律只做了三件里的第一件 ——
+`built-ins/Reflect` 没入册、`Reflect` 还在 `IN_SCOPE_PENDING`。那两件不做，B44 的成果
+一个数都进不了。而解锁一测才发现：**test262 里带 `features: [Reflect]` 的用例远比
+`built-ins/Reflect` 本身多**（跳过数一次 -323），它们是 `built-ins/Math` +35、
+`built-ins/Object` +28、`built-ins/Proxy` +37 的来源。
+
+**做了什么**（`Reflect` 相对 `Object.*` 多出来的那半）
+
+| 缺口 | 修法 | 量 |
+|------|------|-----|
+| 13 个 `Reflect.*` 的 `length` 全是 0 | `builtin_arity` 补 13 项 | 13 |
+| `Reflect.*` 不是构造器（`isConstructor` 一族） | 新增 `VM::is_constructor`，`Reflect.construct` 校验第三参 | 13 |
+| `Reflect.get` / `Reflect.set` 的 **receiver** | 新增 `get_with_receiver` / `set_with_receiver`（ES 10.1.8 / 10.1.9 的完整写法），`proxy_get` / `proxy_set` 也带上 receiver | ~10 |
+| 键参数不走 `ToPropertyKey`（`toString` 抛出被吞） | `reflect_key_args`：键在进 builtin 层之前由 VM 转换 | 7 |
+| 参数列表不走 `[[Get]]` | `reflect_argument_list` 改为 VM 驱动（含 `null` 必须抛） | 2 |
+| `Reflect.setPrototypeOf` 放过原型环 | 补 `[[SetPrototypeOf]]` step 6 的链检查 | 2 |
+| `Reflect.has` / `deleteProperty` 不问代理陷阱 | 加进 `proxy_static_trap` 的名字表 | 2 |
+| `Object.getPrototypeOf(Reflect)` 是 `null` | `Reflect` 继承 `Object.prototype` | 1 |
+
+**两条设计线**
+
+1. **`false` 与"抛"的分工**：`[[Set]]` 的答案是布尔，`Object.*` 把 `false` 变成 TypeError
+   而 `Reflect.*` 原样返回 —— 所以 `proxy_set` 现在**回答布尔**，由两个调用方各自决定。
+   这也是 `Reflect.set` 与赋值表达式唯一的差别：非可写属性、无 setter 的访问器、
+   非对象 receiver，都是 `false` 而不是异常。
+2. **`new.target` 终于能传下去**：`construct_with_new_target` 把 `newTarget` 一路带到
+   `invoke_construct`，实例的原型与函数体内的 `new.target` 都以它为准
+   （ES 9.1.14）；`new P(...)` 的 `new.target` 是代理自己。
+
+**顺带修掉**：`new String("")` 的 `length` 此前被 `own_keys` 排在**最后**，于是
+`str.a = 1; str.b = 2` 之后 `Reflect.ownKeys(str)` 是 `["a","b","length"]`。
+`length` 是**构造时**装上的（ES 22.1.5.1），理应在后加的属性之前。
+
+**数字**：通过 16265 → **16561**（+296），失败 2967 → 3147，跳过 8166 → 7843，
+执行 19232 → 19708，通过率 84.57% → 84.03%（分母因解锁变大）。
+19 个套件提升、零回退：
+
+| 套件 | 变化 |
+|------|------|
+| `built-ins/Reflect` | **新入册 149 / 150（99.3%）** |
+| `built-ins/Proxy` | 181 → **218**（解锁后 103 → 48 条跳过转为执行） |
+| `built-ins/Math` +35、`Object` +28、`Promise` +8、`Number` +7、`String`/`JSON`/`Function` 各 +3~4 | 同上：先前被 `features: [Reflect]` 顺带跳过 |
+
+feature 523（+5 用例 / 40+ 条断言）。
+
+**残留**（2 条 + 两条既有债）
+
+1. `Reflect/ownKeys/order-after-define-property` —— 已修（`length` 顺序），**余下的 1 条**
+   是 `Reflect/prop-desc.js`，它和 B45 的 `proxy.js` 同源：脚本顶层 `this` 仍是
+   `undefined`（全局对象债）。
+2. `Reflect.get` 的 receiver 只用于**访问器**：数据属性按规范本就忽略它，但代理目标上的
+   `[[GetOwnProperty]]`（`set_with_receiver` 里读 receiver 的既有属性）目前走对象层，
+   代理的 `getOwnPropertyDescriptor` 陷阱不会被问到。
 
 ---
 

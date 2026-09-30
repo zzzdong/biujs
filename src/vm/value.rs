@@ -156,10 +156,22 @@ impl Value {
         use crate::vm::property::ObjectKind;
         match self {
             Value::Function(_) => true,
-            Value::Object(obj) => matches!(
-                obj.borrow().kind(),
-                ObjectKind::Function | ObjectKind::NativeFunction
-            ),
+            Value::Object(obj) => {
+                let kind = obj.borrow().kind();
+                if kind == ObjectKind::Proxy {
+                    // A proxy is callable exactly when its target is
+                    // (ES 10.5.12) — `typeof new Proxy(f, {})` is "function".
+                    return match obj
+                        .borrow()
+                        .as_any()
+                        .downcast_ref::<crate::vm::object::ProxyObject>()
+                    {
+                        Some(proxy) => proxy.target.is_callable(),
+                        None => false,
+                    };
+                }
+                matches!(kind, ObjectKind::Function | ObjectKind::NativeFunction)
+            }
             _ => false,
         }
     }

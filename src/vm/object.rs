@@ -1979,11 +1979,19 @@ impl JSObject for PrimitiveWrapperObject {
             for i in 0..s.chars().count() {
                 keys.push(PropertyKey::Str(Rc::new(i.to_string())));
             }
-        }
-        keys.extend(self.properties.keys());
-        if matches!(self.primitive, Value::String(_)) {
+            // `length` is installed when the wrapper is created (ES 22.1.5.1),
+            // so it precedes every property added afterwards — putting it last
+            // made `Reflect.ownKeys(new String(""))` answer `["a","b","length"]`
+            // after `str.a = 1; str.b = 2`.
             keys.push(PropertyKey::from_str("length"));
         }
+        let wraps_string = matches!(self.primitive, Value::String(_));
+        keys.extend(
+            self.properties
+                .keys()
+                .into_iter()
+                .filter(|key| !wraps_string || key.as_str() != Some("length")),
+        );
         keys
     }
 
@@ -3002,6 +3010,195 @@ impl JSObject for TypedArrayObject {
     }
     fn class_name(&self) -> &'static str {
         self.kind.name()
+    }
+}
+
+/// A `Proxy` instance: `[[ProxyTarget]]` plus `[[ProxyHandler]]` (ES 10.5).
+///
+/// Every operation on it *defaults to* the same operation on the target — that
+/// is what an empty handler means ("no trap: forward"). Which is why this type's
+/// object-layer methods simply delegate: they cannot call JavaScript, so the
+/// traps that need to (`get`, `set`, `has`, `deleteProperty`, `apply`,
+/// `construct`) are dispatched by the VM before it ever reaches here.
+#[derive(Debug)]
+pub struct ProxyObject {
+    pub target: Value,
+    pub handler: Value,
+    /// `true` once revoked: every operation then throws a TypeError.
+    pub revoked: bool,
+    base: OrdinaryObject,
+}
+
+impl ProxyObject {
+    pub fn new(
+        target: Value,
+        handler: Value,
+        prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    ) -> Self {
+        let mut base = OrdinaryObject::with_class_name("Proxy");
+        base.set_prototype(prototype);
+        Self {
+            target,
+            handler,
+            revoked: false,
+            base,
+        }
+    }
+
+    /// The target as an object, if it still is one.
+    fn target_object(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        match &self.target {
+            Value::Object(obj_ref) => Some(Rc::clone(obj_ref)),
+            _ => None,
+        }
+    }
+}
+
+impl JSObject for ProxyObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Proxy
+    }
+    fn type_of(&self) -> &'static str {
+        // `typeof` follows the target: a proxy of a function is callable, so it
+        // answers "function" (ES 10.5.12). Revocation does not change it —
+        // `typeof` never throws.
+        if self.target.is_callable() {
+            "function"
+        } else {
+            "object"
+        }
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        if self.revoked {
+            return None;
+        }
+        self.target_object()?.borrow().property_get(key)
+    }
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        if self.revoked {
+            return Ok(false);
+        }
+        match self.target_object() {
+            Some(target) => target.borrow_mut().property_set(key, value),
+            None => Ok(false),
+        }
+    }
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        if self.revoked {
+            return Ok(false);
+        }
+        match self.target_object() {
+            Some(target) => target.borrow_mut().define_property(key, descriptor),
+            None => Ok(false),
+        }
+    }
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        if self.revoked {
+            return false;
+        }
+        match self.target_object() {
+            Some(target) => target.borrow_mut().property_delete(key),
+            None => false,
+        }
+    }
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        if self.revoked {
+            return false;
+        }
+        match self.target_object() {
+            Some(target) => target.borrow().has_property(key),
+            None => false,
+        }
+    }
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        if self.revoked {
+            return Vec::new();
+        }
+        match self.target_object() {
+            Some(target) => target.borrow().own_keys(),
+            None => Vec::new(),
+        }
+    }
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        if self.revoked {
+            return self.base.get_prototype();
+        }
+        match self.target_object() {
+            Some(target) => target.borrow().get_prototype(),
+            None => self.base.get_prototype(),
+        }
+    }
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        if let Some(target) = self.target_object() {
+            if !self.revoked {
+                target.borrow_mut().set_prototype(proto);
+                return;
+            }
+        }
+        self.base.set_prototype(proto);
+    }
+    fn is_extensible(&self) -> bool {
+        match self.target_object() {
+            Some(target) if !self.revoked => target.borrow().is_extensible(),
+            _ => self.base.is_extensible(),
+        }
+    }
+    fn prevent_extensions(&mut self) {
+        if let Some(target) = self.target_object() {
+            if !self.revoked {
+                target.borrow_mut().prevent_extensions();
+                return;
+            }
+        }
+        self.base.prevent_extensions();
+    }
+    fn is_frozen(&self) -> bool {
+        match self.target_object() {
+            Some(target) if !self.revoked => target.borrow().is_frozen(),
+            _ => self.base.is_frozen(),
+        }
+    }
+    fn freeze(&mut self) {
+        if let Some(target) = self.target_object() {
+            if !self.revoked {
+                target.borrow_mut().freeze();
+                return;
+            }
+        }
+        self.base.freeze();
+    }
+    fn is_sealed(&self) -> bool {
+        match self.target_object() {
+            Some(target) if !self.revoked => target.borrow().is_sealed(),
+            _ => self.base.is_sealed(),
+        }
+    }
+    fn seal(&mut self) {
+        if let Some(target) = self.target_object() {
+            if !self.revoked {
+                target.borrow_mut().seal();
+                return;
+            }
+        }
+        self.base.seal();
+    }
+    fn class_name(&self) -> &'static str {
+        // A proxy of an array prints as an array: `Object.prototype.toString.call`
+        // answers the *target's* class (ES 10.5.20).
+        match self.target_object() {
+            Some(target) if !self.revoked => target.borrow().class_name(),
+            _ => "Proxy",
+        }
     }
 }
 

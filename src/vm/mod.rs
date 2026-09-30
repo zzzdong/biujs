@@ -100,6 +100,12 @@ impl GuardFired {
 /// Prefix of the synthetic name given to bound-function wrappers.
 const BOUND_PREFIX: &str = "__bound__";
 
+/// Prefix of the synthetic name given to the `revoke` function of
+/// `Proxy.revocable`. The id after it indexes [`VM::revocable_proxies`]: the
+/// function has to know *which* proxy it revokes, and a native's only state is
+/// its name.
+const REVOKE_PREFIX: &str = "__revoke__";
+
 /// Whether an operand denotes a writable storage location.
 fn is_addressable(operand: Operand) -> bool {
     matches!(operand, Operand::Register(_) | Operand::Stack(_))
@@ -182,6 +188,10 @@ pub struct VM {
     /// synthetic id that is embedded in the wrapper's name.
     bound_functions: HashMap<u32, BoundFunction>,
     next_bound_id: u32,
+    /// The proxy each `revoke` function of `Proxy.revocable` belongs to, keyed
+    /// by the id embedded in the function's synthetic name.
+    revocable_proxies: HashMap<u32, Value>,
+    next_revoke_id: u32,
     /// Control-stack depth of the caller for each frame driven by
     /// `invoke_with_new_target` / `invoke_construct` (Rust-driven calls: native
     /// callbacks, `call`/`apply`, `new` from a native).
@@ -275,6 +285,8 @@ impl VM {
             running_generator_prologue: false,
             bound_functions: HashMap::new(),
             next_bound_id: 0,
+            revocable_proxies: HashMap::new(),
+            next_revoke_id: 0,
             invoke_boundaries: Vec::new(),
         }
     }
@@ -322,6 +334,10 @@ impl VM {
         self.current_module_info = Some(module.func_info.clone());
         self.bound_functions.clear();
         self.next_bound_id = 0;
+        // Same reason as above: a revoked proxy from the previous run must not
+        // survive into the next one.
+        self.revocable_proxies.clear();
+        self.next_revoke_id = 0;
         self.invoke_boundaries.clear();
         // Everything else a run *touches* has to be reset too, or a reused VM
         // carries the previous program across. These five were the leak: the
@@ -888,6 +904,20 @@ impl VM {
         new_target_override: Option<Value>,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        // A proxy's `apply` trap decides the *whole* call, including whether it
+        // is legal: the target's callability is the no-trap answer, not a
+        // precondition (ES 10.5.12).
+        if Self::is_proxy(callee) {
+            return match self.proxy_apply(callee, &this, args, module)? {
+                Some(result) => Ok(result),
+                // No `apply` trap: `[[Call]]` on the target itself, with the
+                // same `this` and the same arguments.
+                None => {
+                    let (target, _handler) = self.proxy_parts(callee, "apply")?;
+                    self.invoke_with_new_target(&target, this, args, new_target_override, module)
+                }
+            };
+        }
         // Native built-ins never need a bytecode frame — except when a
         // `super(...)` supplies a `new.target`: then the built-in has to build
         // the instance with `newTarget.prototype` (ES 9.1.14
@@ -1607,7 +1637,7 @@ impl VM {
                 let new_element = self.json_internalize(&value, &key, reviver, module)?;
                 let key = PropertyKey::from_str(&key);
                 if matches!(new_element, Value::Undefined) {
-                    self.delete_member(&value, &key)?;
+                    self.delete_member(&value, &key, module)?;
                 } else if let Value::Object(obj_ref) = &value {
                     // `CreateDataProperty` (not `[[Set]]`): a failure — e.g. a
                     // non-configurable property the reviver created — is
@@ -1951,6 +1981,30 @@ impl VM {
         }
         // Static methods are stored under their qualified name ("Array.from").
         if name.contains('.') {
+            // `Reflect.*` reads its key argument through `ToPropertyKey`, which
+            // runs user code (`{ toString() { throw … } }`) — the builtin layer
+            // cannot do that, so the key is converted here and handed on.
+            let converted_args;
+            let args: &[Value] = if matches!(
+                name,
+                "Reflect.get"
+                    | "Reflect.set"
+                    | "Reflect.has"
+                    | "Reflect.deleteProperty"
+                    | "Reflect.defineProperty"
+                    | "Reflect.getOwnPropertyDescriptor"
+            ) {
+                converted_args = self.reflect_key_args(args, module)?;
+                &converted_args
+            } else {
+                args
+            };
+            // A proxy receiver turns these `Object.*` / `Reflect.*` operations
+            // into trap calls (ES 10.5.5 – 10.5.19); anything else falls
+            // through to the ordinary implementation.
+            if let Some(result) = self.proxy_static_trap(name, args, module)? {
+                return Ok(result);
+            }
             // `Object.assign` reads through real `[[Get]]` and writes through
             // real `[[Set]]` (own or prototype accessors may run), which only
             // the VM can do.
@@ -2004,7 +2058,52 @@ impl VM {
             if let Some(result) = self.reflect_static(name, args, module)? {
                 return Ok(result);
             }
+            // `Proxy.revocable(t, h)` answers `{ proxy, revoke }`, and `revoke`
+            // has to remember *which* proxy it revokes — a native's only state
+            // is its name, so the VM mints it (`make_revoke`).
+            if name == "Proxy.revocable" {
+                // Same boxing as `new Proxy` above: `f` is an object.
+                let target =
+                    self.as_object_value(&args.first().cloned().unwrap_or(Value::Undefined));
+                let handler =
+                    self.as_object_value(&args.get(1).cloned().unwrap_or(Value::Undefined));
+                let proxy = crate::builtins::proxy::proxy_construct(target, handler)?;
+                let revoke = self.make_revoke(proxy.clone());
+                let mut result = crate::vm::object::OrdinaryObject::new();
+                result.set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
+                for (field, value) in [("proxy", proxy), ("revoke", revoke)] {
+                    let _ = result.define_property(
+                        PropertyKey::from_str(field),
+                        PropertyDescriptor::data_descriptor(value),
+                    );
+                }
+                return Ok(Value::Object(Rc::new(RefCell::new(result))));
+            }
             return crate::builtins::call_static_method(name, args);
+        }
+        // The `revoke` function of `Proxy.revocable`: its work is one flag on
+        // the proxy it names. Everything after revocation throws.
+        if let Some(id) = name.strip_prefix(REVOKE_PREFIX) {
+            let id: u32 = id.parse().map_err(|_| {
+                RuntimeError::InternalError("malformed revoke function".to_string())
+            })?;
+            if let Some(Value::Object(obj_ref)) = self.revocable_proxies.get(&id) {
+                if let Some(proxy) = obj_ref
+                    .borrow_mut()
+                    .as_any_mut()
+                    .downcast_mut::<crate::vm::object::ProxyObject>()
+                {
+                    proxy.revoked = true;
+                }
+            }
+            return Ok(Value::Undefined);
+        }
+        // `Proxy` has no `[[Call]]` at all (ES 28.2.2): it can only be
+        // constructed.
+        if name == "Proxy" {
+            return Err(RuntimeError::TypeError(
+                "Constructor Proxy requires 'new'".to_string(),
+            ));
         }
         crate::builtins::call_native(name, args)
     }
@@ -2104,6 +2203,16 @@ impl VM {
                 // callee's frame. The frame switch happens once they are read.
                 let callee = self.get_value(operands[0])?;
                 self.state.rbp = self.state.rsp;
+
+                // A proxy is callable when its target is, and the call itself is
+                // the `apply` trap — JavaScript either way, so `invoke` drives it.
+                if Self::is_proxy(&callee) {
+                    let args = self.collect_call_args(arg_count)?;
+                    let result = self.invoke(&callee, Value::Undefined, &args, module)?;
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
 
                 // Native (built-in) function: dispatch by name. This makes every
                 // registered builtin callable without keeping a static whitelist
@@ -2758,10 +2867,21 @@ impl VM {
                 let obj = self.get_value(operands[2])?;
                 let obj = self.as_object_value(&obj);
                 let result = match obj {
-                    Value::Object(obj_ref) => crate::vm::prototype::internal_has_property(
-                        obj_ref, &key,
-                    )
-                    .map_err(RuntimeError::TypeError)?,
+                    Value::Object(obj_ref) => {
+                        // A `has` trap answers the `in` operator outright
+                        // (ES 10.5.7); with no trap the lookup is the target's.
+                        if obj_ref.borrow().kind() == ObjectKind::Proxy {
+                            let proxy_val = Value::Object(Rc::clone(&obj_ref));
+                            match self.proxy_has(&proxy_val, &key, module)? {
+                                Some(has) => has,
+                                None => crate::vm::prototype::internal_has_property(obj_ref, &key)
+                                    .map_err(RuntimeError::TypeError)?,
+                            }
+                        } else {
+                            crate::vm::prototype::internal_has_property(obj_ref, &key)
+                                .map_err(RuntimeError::TypeError)?
+                        }
+                    }
                     _ => {
                         return Err(RuntimeError::TypeError(
                             "Cannot use 'in' operator on non-object".to_string(),
@@ -3047,7 +3167,7 @@ impl VM {
                 let obj = self.get_value(operands[1])?;
                 let key = self.resolve_property_key(operands[2], module)?;
                 let obj = self.as_object_value(&obj);
-                let removed = self.delete_member(&obj, &key)?;
+                let removed = self.delete_member(&obj, &key, module)?;
                 self.set_value(operands[0], Value::Bool(removed))?;
             }
             Opcode::Arguments => {
@@ -3252,7 +3372,21 @@ impl VM {
                     // fail or lose the getter side effects.
                     let vm_handled_static = matches!(
                         static_method.as_str(),
-                        "Object.defineProperty" | "Object.defineProperties" | "Object.create"
+                        // These have to reach `call_native_by_name` because a
+                        // proxy receiver turns them into trap calls; the VM
+                        // falls back to the same builtin for anything else.
+                        "Object.defineProperty"
+                            | "Object.defineProperties"
+                            | "Object.create"
+                            | "Proxy.revocable"
+                            | "Object.getPrototypeOf"
+                            | "Object.setPrototypeOf"
+                            | "Object.isExtensible"
+                            | "Object.preventExtensions"
+                            | "Object.getOwnPropertyDescriptor"
+                            | "Object.keys"
+                            | "Object.getOwnPropertyNames"
+                            | "Object.getOwnPropertySymbols"
                     );
                     if !vm_handled_static {
                         // A missing static falls through to the prototype chain,
@@ -3307,7 +3441,7 @@ impl VM {
                 }
 
                 // Look up user-defined method on the object's prototype chain
-                let method_val = self.lookup_property_on_object(&obj_val, &method_name);
+                let method_val = self.lookup_property_on_object(&obj_val, &method_name, module)?;
 
                 // A native prototype method (e.g. a method reached through the
                 // prototype chain rather than the fast dispatch above).
@@ -3532,6 +3666,18 @@ impl VM {
 
                     Value::Object(obj_ref) => {
                         let borrowed = obj_ref.borrow();
+                        if borrowed.kind() == ObjectKind::Proxy {
+                            // `new P(...)` on a proxy: the `construct` trap (or,
+                            // without one, `[[Construct]]` on the target). Both
+                            // can run JavaScript, so neither can happen here.
+                            drop(borrowed);
+                            let ctor = Value::Object(Rc::clone(&obj_ref));
+                            let args = self.collect_call_args(arg_count)?;
+                            let rv = self.construct(&ctor, &args, module)?;
+                            self.state.set_register(Register::Rv, rv)?;
+                            self.state.jump_offset(1);
+                            return Ok(());
+                        }
                         if borrowed.kind() == ObjectKind::Function {
                             if let Some(func_obj) =
                                 borrowed.as_any().downcast_ref::<FunctionObject>()
@@ -4028,15 +4174,32 @@ impl VM {
                 target_of(args, "get")?;
                 let target = args[0].clone();
                 let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
-                Ok(Some(self.get_member(&target, &key, module)?))
+                // The third argument is the *receiver*: the `this` an accessor
+                // is invoked with (ES 28.1.9 / 10.1.8). Absent, it is the target.
+                let receiver = if args.len() > 2 {
+                    args[2].clone()
+                } else {
+                    target.clone()
+                };
+                Ok(Some(
+                    self.get_with_receiver(&target, &key, &receiver, module)?,
+                ))
             }
             "Reflect.set" => {
                 target_of(args, "set")?;
                 let target = args[0].clone();
                 let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
                 let value = args.get(2).cloned().unwrap_or(Value::Undefined);
-                self.set_member(&target, key, value, module)?;
-                Ok(Some(Value::Bool(true)))
+                // Same receiver rule, and `[[Set]]` *answers* instead of
+                // throwing: a non-writable property, a setter-less accessor or
+                // a non-object receiver are all `false` (ES 10.1.9).
+                let receiver = if args.len() > 3 {
+                    args[3].clone()
+                } else {
+                    target.clone()
+                };
+                let ok = self.set_with_receiver(&target, &key, &value, &receiver, module)?;
+                Ok(Some(Value::Bool(ok)))
             }
             "Reflect.apply" => {
                 let target = args.first().cloned().unwrap_or(Value::Undefined);
@@ -4046,7 +4209,7 @@ impl VM {
                     ));
                 }
                 let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-                let list = self.reflect_argument_list(args.get(2), "apply")?;
+                let list = self.reflect_argument_list(args.get(2), "apply", module)?;
                 Ok(Some(self.invoke(&target, this_arg, &list, module)?))
             }
             "Reflect.construct" => {
@@ -4056,8 +4219,24 @@ impl VM {
                         "Reflect.construct target is not a constructor".to_string(),
                     ));
                 }
-                let list = self.reflect_argument_list(args.get(1), "construct")?;
-                Ok(Some(self.construct(&target, &list, module)?))
+                let list = self.reflect_argument_list(args.get(1), "construct", module)?;
+                // `newTarget`, when given, has to be a constructor (ES 28.1.2
+                // step 6) — and it decides both the instance's prototype and the
+                // callee's `new.target`.
+                match args.get(2) {
+                    Some(new_target) if !self.is_constructor(new_target, module) => {
+                        Err(RuntimeError::TypeError(format!(
+                            "Reflect.construct: {} is not a constructor",
+                            new_target.to_js_string()
+                        )))
+                    }
+                    new_target => Ok(Some(self.construct_with_new_target(
+                        &target,
+                        &list,
+                        new_target,
+                        module,
+                    )?)),
+                }
             }
             "Reflect.defineProperty" => {
                 target_of(args, "defineProperty")?;
@@ -4084,23 +4263,824 @@ impl VM {
         }
     }
 
+    /// `args` with the key argument (index 1) put through `ToPropertyKey`.
+    ///
+    /// `Reflect.get(t, {toString(){throw x}})` has to throw `x`, and only the
+    /// VM can run the conversion (ES 28.1.6 step 2).
+    fn reflect_key_args(
+        &mut self,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let mut converted = args.to_vec();
+        let key = match args.get(1) {
+            Some(value) => self.to_property_key_value(value, module)?,
+            None => Value::string("undefined"),
+        };
+        if converted.len() > 1 {
+            converted[1] = key;
+        } else {
+            converted.push(key);
+        }
+        Ok(converted)
+    }
+
+    /// `ToPropertyKey` answering the key as a **value** (a string or a symbol),
+    /// for the builtins that take a key argument and store it as one.
+    fn to_property_key_value(
+        &mut self,
+        value: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        match value {
+            Value::Symbol(_) | Value::String(_) => Ok(value.clone()),
+            other => {
+                let primitive = self.to_primitive(other, "string", module)?;
+                match &primitive {
+                    Value::Symbol(_) => Ok(primitive),
+                    other => Ok(Value::string(&other.to_js_string())),
+                }
+            }
+        }
+    }
+
     /// `CreateListFromArrayLike` for `Reflect.apply` / `Reflect.construct`: the
     /// argument list has to be an object with a usable `length`.
+    ///
+    /// `length` and every index are read through real `[[Get]]`, so an accessor
+    /// that throws is observed (`Reflect.apply(fn, null, { get length() { throw } })`).
     fn reflect_argument_list(
-        &self,
+        &mut self,
         value: Option<&Value>,
         method: &str,
+        module: &Module,
     ) -> Result<Vec<Value>, RuntimeError> {
-        match value {
-            Some(value) => self.array_like_elements(value).ok_or_else(|| {
-                RuntimeError::TypeError(format!(
-                    "Reflect.{method}: arguments list must be an array-like object"
-                ))
-            }),
-            None => Err(RuntimeError::TypeError(format!(
+        let Some(value) = value else {
+            return Err(RuntimeError::TypeError(format!(
                 "Reflect.{method}: arguments list is required"
+            )));
+        };
+        match value {
+            // `CreateListFromArrayLike` insists on an object — unlike
+            // `Function.prototype.apply`, `Reflect.apply(f, null, null)` throws.
+            Value::Object(_) => {
+                let length = self.get_member(value, &PropertyKey::from_str("length"), module)?;
+                let len = crate::builtins::to_length_throwing(&length)?;
+                let mut items = Vec::with_capacity(len as usize);
+                for index in 0..len {
+                    items.push(
+                        self.get_member(
+                            value,
+                            &PropertyKey::from_str(&index.to_string()),
+                            module,
+                        )?,
+                    );
+                }
+                Ok(items)
+            }
+            _ => Err(RuntimeError::TypeError(format!(
+                "Reflect.{method}: arguments list must be an array-like object"
             ))),
         }
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Proxy (ES 28.2 / 10.5) — trap dispatch
+    // ─────────────────────────────────────────────────────
+    //
+    // The rule every method here leans on is ES 10.5's: an operation whose trap
+    // the handler does not have is *not* an error, it is the same operation on
+    // the target. So each `proxy_*` answers an `Option`: `None` means "forward",
+    // and the caller then does exactly what it would have done for an ordinary
+    // object — which works because `ProxyObject`'s object-layer methods already
+    // forward to the target.
+    //
+    // The traps that are *not* here (`ownKeys`, `getOwnPropertyDescriptor`,
+    // `defineProperty`, `getPrototypeOf`, `setPrototypeOf`, `isExtensible`,
+    // `preventExtensions`) are therefore "forward" today: a handler that sets
+    // them is not called. See the batch record in the plan for why.
+
+    /// Whether `value` is a proxy exotic object.
+    fn is_proxy(value: &Value) -> bool {
+        match value {
+            Value::Object(obj_ref) => obj_ref.borrow().kind() == ObjectKind::Proxy,
+            _ => false,
+        }
+    }
+
+    /// `[[ProxyTarget]]` and `[[ProxyHandler]]`.
+    ///
+    /// A revoked proxy throws on *every* operation, trap or not — that is the
+    /// whole point of `revoke` (ES 28.2.2.2).
+    fn proxy_parts(&self, proxy: &Value, what: &str) -> Result<(Value, Value), RuntimeError> {
+        match proxy {
+            Value::Object(obj_ref) => {
+                let borrowed = obj_ref.borrow();
+                match borrowed
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::ProxyObject>()
+                {
+                    Some(p) if !p.revoked => Ok((p.target.clone(), p.handler.clone())),
+                    Some(_) => Err(RuntimeError::TypeError(format!(
+                        "Cannot perform '{what}' on a proxy that has been revoked"
+                    ))),
+                    None => Err(RuntimeError::InternalError(
+                        "not a proxy object".to_string(),
+                    )),
+                }
+            }
+            _ => Err(RuntimeError::InternalError(
+                "not a proxy object".to_string(),
+            )),
+        }
+    }
+
+    /// The handler's trap `trap_name`, together with the target and the handler
+    /// it must be called on. `None` = the handler has no such trap.
+    fn proxy_trap(
+        &mut self,
+        proxy: &Value,
+        trap_name: &str,
+        module: &Module,
+    ) -> Result<Option<(Value, Value, Value)>, RuntimeError> {
+        let (target, handler) = self.proxy_parts(proxy, trap_name)?;
+        // Reading the trap is an ordinary `[[Get]]` on the handler: a handler
+        // with an accessor for `get` is legal, and only the VM can run it.
+        let trap = match &handler {
+            Value::Object(_) => {
+                self.get_member(&handler, &PropertyKey::from_str(trap_name), module)?
+            }
+            _ => Value::Undefined,
+        };
+        // `GetMethod`: `null` and `undefined` both mean "no trap" — that is why
+        // `{ get: null }` is a pass-through rather than an error.
+        if trap.is_undefined() || matches!(trap, Value::Null) {
+            return Ok(None);
+        }
+        if !trap.is_callable() {
+            return Err(RuntimeError::TypeError(format!(
+                "Proxy handler's '{trap_name}' trap is not a function"
+            )));
+        }
+        Ok(Some((target, handler, trap)))
+    }
+
+    /// A `PropertyKey` as the value a trap is called with: the key is an
+    /// ordinary argument, symbols included.
+    fn key_to_value(key: &PropertyKey) -> Value {
+        match key {
+            PropertyKey::Str(text) => Value::string(text),
+            PropertyKey::Symbol(id) => {
+                Value::Symbol(Rc::new(crate::vm::value::SymbolData::new(None, *id)))
+            }
+        }
+    }
+
+    /// The target's *own* descriptor for `key`, for the invariant checks below.
+    fn proxy_target_descriptor(target: &Value, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        match target {
+            Value::Object(obj_ref) => obj_ref.borrow().property_get(key),
+            _ => None,
+        }
+    }
+
+    /// The target's own keys, for the `ownKeys` invariants.
+    fn proxy_target_keys(target: &Value) -> Vec<PropertyKey> {
+        match target {
+            Value::Object(obj_ref) => obj_ref.borrow().own_keys(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `[[Get]]` through a proxy (ES 10.5.8).
+    ///
+    /// With no trap the operation is the *target's* `[[Get]]`, which is a
+    /// recursive call rather than a fallthrough: the target may be a proxy too,
+    /// and its own traps have to fire (`get/trap-is-null-target-is-proxy`).
+    fn proxy_get(
+        &mut self,
+        proxy: &Value,
+        key: &PropertyKey,
+        receiver: &Value,
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some((target, handler, trap)) = self.proxy_trap(proxy, "get", module)? else {
+            return Ok(Some(self.get_with_receiver(
+                &self.proxy_parts(proxy, "get")?.0,
+                key,
+                receiver,
+                module,
+            )?));
+        };
+        let key_value = Self::key_to_value(key);
+        let value = self.invoke(
+            &trap,
+            handler,
+            &[target.clone(), key_value, receiver.clone()],
+            module,
+        )?;
+        // Invariant (ES 10.5.8 step 17): a non-writable, non-configurable own
+        // data property of the target cannot be reported as anything else —
+        // otherwise `Object.freeze(t)` would be observable as unfrozen.
+        if let Some(desc) = Self::proxy_target_descriptor(&target, key) {
+            if desc.is_data_descriptor() && !desc.writable && !desc.configurable {
+                if !value.strict_eq(&desc.value) {
+                    return Err(RuntimeError::TypeError(format!(
+                        "'get' on proxy: property '{}' is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value (expected '{}' but got '{}')",
+                        key.display(),
+                        desc.value.to_js_string(),
+                        value.to_js_string()
+                    )));
+                }
+            }
+        }
+        Ok(Some(value))
+    }
+
+    /// `[[Set]]` through a proxy (ES 10.5.9), answering whether the write
+    /// succeeded.
+    ///
+    /// The two callers disagree about a falsish trap: an assignment turns it
+    /// into a TypeError (the engine has no sloppy mode), while `Reflect.set`
+    /// reports it as `false`. So this answers the boolean and lets them decide.
+    fn proxy_set(
+        &mut self,
+        proxy: &Value,
+        key: &PropertyKey,
+        value: &Value,
+        receiver: &Value,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
+        let Some((target, handler, trap)) = self.proxy_trap(proxy, "set", module)? else {
+            // No trap: `[[Set]]` on the target, receiver included — the target
+            // may itself be a proxy, which is why this is a recursive dispatch.
+            let target = self.proxy_parts(proxy, "set")?.0;
+            return self.set_with_receiver(&target, key, value, receiver, module);
+        };
+        let answer = self.invoke(
+            &trap,
+            handler,
+            &[
+                target.clone(),
+                Self::key_to_value(key),
+                value.clone(),
+                receiver.clone(),
+            ],
+            module,
+        )?;
+        // Invariant (step 21): a non-writable, non-configurable own data
+        // property of the target cannot be reported as written.
+        if let Some(desc) = Self::proxy_target_descriptor(&target, key) {
+            if desc.is_data_descriptor() && !desc.writable && !desc.configurable {
+                if !value.strict_eq(&desc.value) {
+                    return Err(RuntimeError::TypeError(format!(
+                        "'set' on proxy: trap returned truish for property '{}' which exists in the proxy target as a non-configurable and non-writable data property with a different value",
+                        key.display()
+                    )));
+                }
+            }
+        }
+        Ok(answer.to_boolean())
+    }
+
+    /// `[[HasProperty]]` through a proxy (ES 10.5.7).
+    fn proxy_has(
+        &mut self,
+        proxy: &Value,
+        key: &PropertyKey,
+        module: &Module,
+    ) -> Result<Option<bool>, RuntimeError> {
+        let Some((target, handler, trap)) = self.proxy_trap(proxy, "has", module)? else {
+            // No trap: `[[HasProperty]]` on the target, which may be a proxy.
+            let target = self.proxy_parts(proxy, "has")?.0;
+            if Self::is_proxy(&target) {
+                return self.proxy_has(&target, key, module);
+            }
+            return match &target {
+                Value::Object(obj_ref) => Ok(Some(
+                    crate::vm::prototype::internal_has_property(Rc::clone(obj_ref), key)
+                        .map_err(RuntimeError::TypeError)?,
+                )),
+                _ => Ok(Some(false)),
+            };
+        };
+        let answer = self
+            .invoke(
+                &trap,
+                handler,
+                &[target.clone(), Self::key_to_value(key)],
+                module,
+            )?
+            .to_boolean();
+        // Invariants (ES 10.5.7): an existing non-configurable property, or any
+        // own property of a non-extensible target, cannot be reported absent.
+        if !answer {
+            let extensible = match &target {
+                Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
+                _ => true,
+            };
+            let desc = Self::proxy_target_descriptor(&target, key);
+            let must_report = match &desc {
+                Some(desc) => !desc.configurable || !extensible,
+                None => false,
+            };
+            if must_report {
+                return Err(RuntimeError::TypeError(format!(
+                    "'has' on proxy: trap returned falsish for property '{}' which exists in the proxy target as non-configurable",
+                    key.display()
+                )));
+            }
+        }
+        Ok(Some(answer))
+    }
+
+    /// `[[Delete]]` through a proxy (ES 10.5.10).
+    fn proxy_delete(
+        &mut self,
+        proxy: &Value,
+        key: &PropertyKey,
+        module: &Module,
+    ) -> Result<Option<bool>, RuntimeError> {
+        let Some((target, handler, trap)) = self.proxy_trap(proxy, "deleteProperty", module)?
+        else {
+            // No trap: `[[Delete]]` on the target, which may be a proxy.
+            let target = self.proxy_parts(proxy, "deleteProperty")?.0;
+            if Self::is_proxy(&target) {
+                return self.proxy_delete(&target, key, module);
+            }
+            return match &target {
+                Value::Object(obj_ref) => Ok(Some(
+                    crate::vm::prototype::internal_delete(Rc::clone(obj_ref), key)
+                        .map_err(RuntimeError::TypeError)?,
+                )),
+                _ => Ok(Some(true)),
+            };
+        };
+        let answer = self
+            .invoke(
+                &trap,
+                handler,
+                &[target.clone(), Self::key_to_value(key)],
+                module,
+            )?
+            .to_boolean();
+        // Invariant (ES 10.5.10): a non-configurable own property cannot be
+        // reported as deleted. (A *frozen* target's property is covered too:
+        // frozen implies non-configurable.)
+        if answer {
+            if let Some(desc) = Self::proxy_target_descriptor(&target, key) {
+                if !desc.configurable {
+                    return Err(RuntimeError::TypeError(format!(
+                        "'deleteProperty' on proxy: trap returned truish for property '{}' which is non-configurable in the proxy target",
+                        key.display()
+                    )));
+                }
+            }
+        }
+        Ok(Some(answer))
+    }
+
+    /// `[[Call]]` through a proxy (ES 10.5.12). `None` = no `apply` trap, which
+    /// forwards to calling the *target* with the same `this` and arguments.
+    fn proxy_apply(
+        &mut self,
+        proxy: &Value,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some((target, handler, trap)) = self.proxy_trap(proxy, "apply", module)? else {
+            return Ok(None);
+        };
+        let list = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::ArrayObject::from_vec(args.to_vec()),
+        )));
+        Ok(Some(self.invoke(
+            &trap,
+            handler,
+            &[target, this.clone(), list],
+            module,
+        )?))
+    }
+
+    /// `[[Construct]]` through a proxy (ES 10.5.13). `None` = no `construct`
+    /// trap, which forwards to constructing the *target*.
+    fn proxy_construct_trap(
+        &mut self,
+        proxy: &Value,
+        args: &[Value],
+        new_target: &Value,
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some((target, handler, trap)) = self.proxy_trap(proxy, "construct", module)? else {
+            return Ok(None);
+        };
+        let list = Value::Object(Rc::new(RefCell::new(
+            crate::vm::object::ArrayObject::from_vec(args.to_vec()),
+        )));
+        let result = self.invoke(&trap, handler, &[target, list, new_target.clone()], module)?;
+        // `[[Construct]]` has to answer an object: a trap returning a primitive
+        // is a TypeError, not a coercion.
+        if !result.is_object() {
+            return Err(RuntimeError::TypeError(
+                "'construct' on proxy: trap returned a non-object".to_string(),
+            ));
+        }
+        Ok(Some(result))
+    }
+
+    /// The traps that hang off `Object.*` / `Reflect.*` instead of an operator:
+    /// `[[GetPrototypeOf]]` … `[[DefineOwnProperty]]`. Every one of them takes
+    /// the target first, so "the receiver is a proxy" is all it takes to
+    /// recognise the call.
+    ///
+    /// `None` = the ordinary path answers — no such trap, or not a proxy — and
+    /// for a proxy that path is the same operation on the target.
+    ///
+    /// The invariant checks here are the ones a *user* could otherwise break:
+    /// without them a proxy could report a frozen target as extensible, or a
+    /// non-configurable property as absent.
+    fn proxy_static_trap(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let trap_name = match name {
+            "Object.getPrototypeOf" | "Reflect.getPrototypeOf" => "getPrototypeOf",
+            // `Reflect.has` / `Reflect.deleteProperty` are the same two
+            // operations the `in` and `delete` operators perform.
+            "Reflect.has" => "has",
+            "Reflect.deleteProperty" => "deleteProperty",
+            "Object.setPrototypeOf" | "Reflect.setPrototypeOf" => "setPrototypeOf",
+            "Object.isExtensible" | "Reflect.isExtensible" => "isExtensible",
+            "Object.preventExtensions" | "Reflect.preventExtensions" => "preventExtensions",
+            "Object.getOwnPropertyDescriptor" | "Reflect.getOwnPropertyDescriptor" => {
+                "getOwnPropertyDescriptor"
+            }
+            // The four "list the keys" operations are one trap.
+            "Object.keys"
+            | "Object.getOwnPropertyNames"
+            | "Object.getOwnPropertySymbols"
+            | "Reflect.ownKeys" => "ownKeys",
+            "Object.defineProperty" | "Reflect.defineProperty" => "defineProperty",
+            _ => return Ok(None),
+        };
+        let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+        if !Self::is_proxy(&receiver) {
+            return Ok(None);
+        }
+        let (target, handler, trap) = match self.proxy_trap(&receiver, trap_name, module)? {
+            Some(parts) => parts,
+            None => {
+                // No trap: the same operation on the target. It is a *recursive*
+                // dispatch rather than a fallthrough to the builtin layer, so a
+                // target that is itself a proxy still gets its own trap called.
+                if !Self::is_proxy(&self.proxy_parts(&receiver, trap_name)?.0) {
+                    return Ok(None);
+                }
+                let mut forwarded = args.to_vec();
+                forwarded[0] = self.proxy_parts(&receiver, trap_name)?.0;
+                return self.proxy_static_trap(name, &forwarded, module);
+            }
+        };
+        let key = args.get(1).cloned().unwrap_or(Value::Undefined);
+        // `Reflect.*` answers a boolean where `Object.*` throws; that is the
+        // only difference between the two spellings of the same operation.
+        let reflects = name.starts_with("Reflect");
+        match trap_name {
+            "getPrototypeOf" => {
+                let result = self.invoke(&trap, handler, &[target.clone()], module)?;
+                if !result.is_object() && !matches!(result, Value::Null) {
+                    return Err(RuntimeError::TypeError(
+                        "'getPrototypeOf' on proxy: trap returned neither an object nor null"
+                            .to_string(),
+                    ));
+                }
+                // ES 10.5.17: a non-extensible target's prototype is whatever it
+                // is — the trap may not report a different one.
+                if let Value::Object(obj_ref) = &target {
+                    if !obj_ref.borrow().is_extensible()
+                        && !Self::same_prototype(&obj_ref.borrow().get_prototype(), &result)
+                    {
+                        return Err(RuntimeError::TypeError(
+                            "'getPrototypeOf' on proxy: trap returned a different prototype for a non-extensible target"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Ok(Some(result))
+            }
+            "setPrototypeOf" => {
+                let proto = key.clone();
+                if !proto.is_object() && !matches!(proto, Value::Null) {
+                    return Err(RuntimeError::TypeError(
+                        "Object prototype may only be an Object or null".to_string(),
+                    ));
+                }
+                let answer = self
+                    .invoke(&trap, handler, &[target.clone(), proto.clone()], module)?
+                    .to_boolean();
+                if answer {
+                    // ES 10.5.18: a non-extensible target's prototype cannot be
+                    // replaced.
+                    if let Value::Object(obj_ref) = &target {
+                        if !obj_ref.borrow().is_extensible()
+                            && !Self::same_prototype(&obj_ref.borrow().get_prototype(), &proto)
+                        {
+                            return Err(RuntimeError::TypeError(
+                                "'setPrototypeOf' on proxy: trap returned truish for a non-extensible target whose prototype differs"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok(Some(Self::proxy_boolean_answer(
+                    reflects,
+                    answer,
+                    receiver,
+                    "setPrototypeOf",
+                )?))
+            }
+            "has" => Ok(Some(Value::Bool(
+                self.proxy_has(&receiver, &crate::builtins::reflect::to_key(&key), module)?
+                    .unwrap_or(false),
+            ))),
+            "deleteProperty" => Ok(Some(Value::Bool(
+                self.proxy_delete(&receiver, &crate::builtins::reflect::to_key(&key), module)?
+                    .unwrap_or(true),
+            ))),
+            "isExtensible" => {
+                let answer = self
+                    .invoke(&trap, handler, &[target.clone()], module)?
+                    .to_boolean();
+                // ES 10.5.16: the trap must agree with the target, or
+                // `Object.isExtensible` and `preventExtensions` disagree.
+                let actual = match &target {
+                    Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
+                    _ => false,
+                };
+                if answer != actual {
+                    return Err(RuntimeError::TypeError(format!(
+                        "'isExtensible' on proxy: trap result does not reflect extensibility of proxy target (which is '{}')",
+                        actual
+                    )));
+                }
+                Ok(Some(Value::Bool(answer)))
+            }
+            "preventExtensions" => {
+                let answer = self
+                    .invoke(&trap, handler, &[target.clone()], module)?
+                    .to_boolean();
+                // ES 10.5.19: reporting success while the target is still
+                // extensible would make the two answers contradict each other.
+                if answer {
+                    if let Value::Object(obj_ref) = &target {
+                        if obj_ref.borrow().is_extensible() {
+                            return Err(RuntimeError::TypeError(
+                                "'preventExtensions' on proxy: trap returned truish but the proxy target is extensible"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok(Some(Self::proxy_boolean_answer(
+                    reflects,
+                    answer,
+                    receiver,
+                    "preventExtensions",
+                )?))
+            }
+            "getOwnPropertyDescriptor" => {
+                let result = self.invoke(&trap, handler, &[target.clone(), key.clone()], module)?;
+                let target_desc =
+                    Self::proxy_target_descriptor(&target, &crate::builtins::reflect::to_key(&key));
+                let extensible = match &target {
+                    Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
+                    _ => false,
+                };
+                if !result.is_object() {
+                    if !result.is_undefined() {
+                        return Err(RuntimeError::TypeError(
+                            "'getOwnPropertyDescriptor' on proxy: trap returned neither an object nor undefined"
+                                .to_string(),
+                        ));
+                    }
+                    // ES 10.5.5: an existing non-configurable property — or any
+                    // own property of a non-extensible target — cannot be
+                    // reported as absent.
+                    if let Some(desc) = &target_desc {
+                        if !desc.configurable || !extensible {
+                            return Err(RuntimeError::TypeError(
+                                "'getOwnPropertyDescriptor' on proxy: trap returned undefined for a property that is non-configurable in the proxy target"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    return Ok(Some(Value::Undefined));
+                }
+                if let Some(desc) = &target_desc {
+                    if !desc.configurable {
+                        let reported = self.get_member(
+                            &result,
+                            &PropertyKey::from_str("configurable"),
+                            module,
+                        )?;
+                        if reported.to_boolean() {
+                            return Err(RuntimeError::TypeError(
+                                "'getOwnPropertyDescriptor' on proxy: trap reported a non-configurable property as configurable"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok(Some(result))
+            }
+            "ownKeys" => {
+                let result = self.invoke(&trap, handler, &[target.clone()], module)?;
+                if !result.is_object() {
+                    return Err(RuntimeError::TypeError(
+                        "'ownKeys' on proxy: trap result must be an object".to_string(),
+                    ));
+                }
+                // `CreateListFromArrayLike` restricted to strings and symbols.
+                let items = self.array_like_elements(&result).ok_or_else(|| {
+                    RuntimeError::TypeError(
+                        "'ownKeys' on proxy: trap result is not array-like".to_string(),
+                    )
+                })?;
+                let mut keys: Vec<PropertyKey> = Vec::new();
+                for item in items {
+                    match item {
+                        Value::String(text) => keys.push(PropertyKey::from_str(&text)),
+                        Value::Symbol(sym) => keys.push(PropertyKey::Symbol(sym.id)),
+                        _ => {
+                            return Err(RuntimeError::TypeError(
+                                "'ownKeys' on proxy: trap result contains a key that is neither a string nor a symbol"
+                                    .to_string(),
+                            ))
+                        }
+                    }
+                }
+                let mut seen: Vec<PropertyKey> = Vec::new();
+                for key in &keys {
+                    if seen.contains(key) {
+                        return Err(RuntimeError::TypeError(
+                            "'ownKeys' on proxy: trap result contains duplicate entries"
+                                .to_string(),
+                        ));
+                    }
+                    seen.push(key.clone());
+                }
+                let target_keys = Self::proxy_target_keys(&target);
+                let extensible = match &target {
+                    Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
+                    _ => false,
+                };
+                for target_key in &target_keys {
+                    // ES 10.5.11: every non-configurable own key has to be
+                    // reported, and a non-extensible target's keys all are.
+                    let required = match Self::proxy_target_descriptor(&target, target_key) {
+                        Some(desc) => !desc.configurable,
+                        None => false,
+                    } || !extensible;
+                    if required && !keys.contains(target_key) {
+                        return Err(RuntimeError::TypeError(format!(
+                            "'ownKeys' on proxy: trap result did not include '{}'",
+                            target_key.display()
+                        )));
+                    }
+                }
+                if !extensible {
+                    // … and a non-extensible target cannot appear to gain keys.
+                    for key in &keys {
+                        if !target_keys.contains(key) {
+                            return Err(RuntimeError::TypeError(
+                                "'ownKeys' on proxy: trap result includes a key the non-extensible target does not have"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                // Each caller reports a different slice of the same list:
+                // `Object.getOwnPropertyNames` strings, `…Symbols` symbols,
+                // `Object.keys` the enumerable strings, `Reflect.ownKeys` all.
+                let values: Vec<Value> = keys
+                    .iter()
+                    .filter(|key| match name {
+                        "Object.keys" => {
+                            key.as_str().is_some()
+                                && Self::proxy_target_descriptor(&target, key)
+                                    .map(|desc| desc.enumerable)
+                                    .unwrap_or(false)
+                        }
+                        "Object.getOwnPropertyNames" => key.as_str().is_some(),
+                        "Object.getOwnPropertySymbols" => key.as_str().is_none(),
+                        _ => true,
+                    })
+                    .map(Self::key_to_value)
+                    .collect();
+                Ok(Some(Value::Object(Rc::new(RefCell::new(
+                    crate::vm::object::ArrayObject::from_vec(values),
+                )))))
+            }
+            _ => {
+                // `defineProperty`: the descriptor is normalised *before* the
+                // trap sees it (ES 10.5.6 step 5) — the trap gets an object
+                // built from the descriptor, not the one the caller passed.
+                let descriptor =
+                    self.to_property_descriptor(args.get(2).unwrap_or(&Value::Undefined), module)?;
+                let answer = self
+                    .invoke(
+                        &trap,
+                        handler,
+                        &[target.clone(), key.clone(), descriptor],
+                        module,
+                    )?
+                    .to_boolean();
+                if answer {
+                    let target_desc = Self::proxy_target_descriptor(
+                        &target,
+                        &crate::builtins::reflect::to_key(&key),
+                    );
+                    let extensible = match &target {
+                        Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
+                        _ => false,
+                    };
+                    // ES 10.5.6: a non-configurable property cannot be
+                    // redefined, and a non-extensible target gains no property.
+                    let forbidden = match &target_desc {
+                        Some(desc) => !desc.configurable,
+                        None => !extensible,
+                    };
+                    if forbidden {
+                        return Err(RuntimeError::TypeError(
+                            "'defineProperty' on proxy: trap returned truish for a non-configurable property in the proxy target"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Ok(Some(Self::proxy_boolean_answer(
+                    reflects,
+                    answer,
+                    receiver,
+                    "defineProperty",
+                )?))
+            }
+        }
+    }
+
+    /// `Object.*` and `Reflect.*` disagree only about *failure*: `Reflect`
+    /// answers `false`, `Object` throws.
+    fn proxy_boolean_answer(
+        reflects: bool,
+        answer: bool,
+        receiver: Value,
+        trap_name: &str,
+    ) -> Result<Value, RuntimeError> {
+        if reflects || answer {
+            return Ok(if reflects {
+                Value::Bool(answer)
+            } else {
+                receiver
+            });
+        }
+        Err(RuntimeError::TypeError(format!(
+            "'{trap_name}' on proxy: trap returned falsish"
+        )))
+    }
+
+    /// Whether a reported prototype is the one the target actually has.
+    fn same_prototype(actual: &Option<Rc<RefCell<dyn JSObject>>>, reported: &Value) -> bool {
+        match (actual, reported) {
+            (None, Value::Null) => true,
+            (Some(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// The `revoke` function of `Proxy.revocable` (ES 28.2.2.2): a native whose
+    /// synthetic name carries the id of the proxy it revokes.
+    fn make_revoke(&mut self, proxy: Value) -> Value {
+        let id = self.next_revoke_id;
+        self.next_revoke_id += 1;
+        self.revocable_proxies.insert(id, proxy);
+        let mut revoke =
+            crate::vm::object::NativeFunctionObject::new(&format!("{REVOKE_PREFIX}{id}"));
+        // A revocation function is *anonymous* (ES 28.2.2.1.1): its `name` is
+        // the empty string, not the synthetic name the VM dispatches on.
+        let _ = revoke.define_property(
+            PropertyKey::from_str("name"),
+            PropertyDescriptor {
+                value: Value::string(""),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                getter: None,
+                setter: None,
+            },
+        );
+        Value::Object(Rc::new(RefCell::new(revoke)))
     }
 
     /// `String.prototype.matchAll(re)` / `RegExp.prototype[Symbol.matchAll](s)`.
@@ -6770,6 +7750,17 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         match obj {
             Value::Object(obj_ref) => {
+                // A proxy's `get` trap is JavaScript, so it has to run *before*
+                // the descriptor search — and only the VM can run it. No trap
+                // (or no `get` on the handler) falls through, and the search
+                // below then answers the target's property: `ProxyObject`
+                // forwards `property_get` to the target.
+                if obj_ref.borrow().kind() == ObjectKind::Proxy {
+                    let proxy_val = Value::Object(Rc::clone(obj_ref));
+                    if let Some(value) = self.proxy_get(&proxy_val, key, &proxy_val, module)? {
+                        return Ok(value);
+                    }
+                }
                 // Accessor properties have to invoke their getter, which needs a
                 // re-entrant call — hence the descriptor search here.
                 if let Some((owner, desc)) =
@@ -6853,6 +7844,127 @@ impl VM {
         Ok(Value::Undefined)
     }
 
+    /// ES `[[Get]]` with an explicit **receiver** (ES 10.1.8).
+    ///
+    /// The receiver is the `this` an accessor is invoked with, and it travels
+    /// unchanged up the prototype chain. Only `Reflect.get`'s third argument can
+    /// make it differ from the object being read — every ordinary property read
+    /// has the object itself as receiver, which is what `get_member` does.
+    fn get_with_receiver(
+        &mut self,
+        obj: &Value,
+        key: &PropertyKey,
+        receiver: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let Value::Object(obj_ref) = obj else {
+            return self.get_member(obj, key, module);
+        };
+        if obj_ref.borrow().kind() == ObjectKind::Proxy {
+            let proxy_val = Value::Object(Rc::clone(obj_ref));
+            if let Some(value) = self.proxy_get(&proxy_val, key, receiver, module)? {
+                return Ok(value);
+            }
+        }
+        if let Some((_owner, desc)) = crate::vm::prototype::find_descriptor(Rc::clone(obj_ref), key)
+            .map_err(RuntimeError::TypeError)?
+        {
+            if desc.is_accessor_descriptor() {
+                return match desc.invoked_getter() {
+                    Some(getter) => self.invoke(getter, receiver.clone(), &[], module),
+                    None => Ok(Value::Undefined),
+                };
+            }
+            return Ok(desc.value);
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// ES `[[Set]]` with an explicit **receiver** (ES 10.1.9), answering whether
+    /// the write succeeded instead of throwing.
+    ///
+    /// `Reflect.set` needs the boolean: a non-writable property, an accessor
+    /// without a setter, or a non-object receiver are all "returns false", not
+    /// errors. An assignment expression is the same operation with the object as
+    /// receiver and a TypeError on failure — that is `set_member`.
+    ///
+    /// The receiver is where the property *lands* when the target only has a
+    /// writable data property to offer: `Reflect.set(t, k, v, r)` writes to `r`.
+    fn set_with_receiver(
+        &mut self,
+        obj: &Value,
+        key: &PropertyKey,
+        value: &Value,
+        receiver: &Value,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
+        let Value::Object(obj_ref) = obj else {
+            return Err(RuntimeError::TypeError(
+                "Reflect.set: target is not an object".to_string(),
+            ));
+        };
+        // A `set` trap answers for the whole operation, receiver included.
+        if obj_ref.borrow().kind() == ObjectKind::Proxy {
+            let proxy_val = Value::Object(Rc::clone(obj_ref));
+            return self.proxy_set(&proxy_val, key, value, receiver, module);
+        }
+        let own = obj_ref.borrow().property_get(key);
+        let own = match own {
+            Some(desc) => desc,
+            None => {
+                // Not an own property: the prototype gets the same request, with
+                // the *same* receiver (ES 10.1.9 step 4).
+                let parent = obj_ref.borrow().get_prototype();
+                return match parent {
+                    Some(parent) => {
+                        self.set_with_receiver(&Value::Object(parent), key, value, receiver, module)
+                    }
+                    // Step 5: no parent, so the property is created — on the
+                    // receiver — with every attribute `true`.
+                    None => Ok(Self::create_data_property(receiver, key, value)),
+                };
+            }
+        };
+        if own.is_data_descriptor() {
+            if !own.writable {
+                return Ok(false);
+            }
+            let Value::Object(recv_ref) = receiver else {
+                return Ok(false);
+            };
+            // Step 11: an existing property of the receiver that cannot be
+            // overwritten makes the whole operation fail.
+            if let Some(existing) = recv_ref.borrow().property_get(key) {
+                if existing.is_accessor_descriptor() || !existing.writable {
+                    return Ok(false);
+                }
+            }
+            return Ok(Self::create_data_property(receiver, key, value));
+        }
+        match own.invoked_setter() {
+            Some(setter) => {
+                self.invoke(setter, receiver.clone(), &[value.clone()], module)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// `CreateDataProperty` (ES 7.3.5): `[[DefineOwnProperty]]` of a fresh
+    /// all-true data descriptor, answering whether it landed.
+    fn create_data_property(obj: &Value, key: &PropertyKey, value: &Value) -> bool {
+        match obj {
+            Value::Object(obj_ref) => obj_ref
+                .borrow_mut()
+                .define_property(
+                    key.clone(),
+                    crate::vm::property::PropertyDescriptor::data_descriptor(value.clone()),
+                )
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     fn lookup_on_prototype(
         &self,
         proto: &Option<Rc<RefCell<dyn JSObject>>>,
@@ -6875,6 +7987,20 @@ impl VM {
     ) -> Result<(), RuntimeError> {
         match obj {
             Value::Object(obj_ref) => {
+                // A `set` trap replaces the whole assignment: it decides both
+                // the value and whether the write succeeded (ES 10.5.9).
+                if obj_ref.borrow().kind() == ObjectKind::Proxy {
+                    let proxy_val = Value::Object(Rc::clone(obj_ref));
+                    if self.proxy_set(&proxy_val, &key, &value, &proxy_val, module)? {
+                        return Ok(());
+                    }
+                    // A trap that answered falsish is a failed assignment,
+                    // which strict mode reports as a TypeError.
+                    return Err(RuntimeError::TypeError(format!(
+                        "'set' on proxy: trap returned falsish for property '{}'",
+                        key.display()
+                    )));
+                }
                 // An accessor anywhere on the chain intercepts the assignment
                 // and routes it to the setter (which needs a re-entrant call).
                 if let Some((owner, desc)) =
@@ -6938,13 +8064,30 @@ impl VM {
     }
 
     /// ES `[[Delete]]` on an object. Returns whether the property was removed.
-    fn delete_member(&mut self, obj: &Value, key: &PropertyKey) -> Result<bool, RuntimeError> {
+    fn delete_member(
+        &mut self,
+        obj: &Value,
+        key: &PropertyKey,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
         match obj {
-            Value::Object(obj_ref) => crate::vm::prototype::internal_delete(Rc::clone(obj_ref), key)
-                .map_err(RuntimeError::TypeError),
+            Value::Object(obj_ref) if obj_ref.borrow().kind() == ObjectKind::Proxy => {
+                // A `deleteProperty` trap answers for the whole operation
+                // (ES 10.5.10); with no trap the delete is the target's.
+                let proxy_val = Value::Object(Rc::clone(obj_ref));
+                match self.proxy_delete(&proxy_val, key, module)? {
+                    Some(removed) => Ok(removed),
+                    None => crate::vm::prototype::internal_delete(Rc::clone(obj_ref), key)
+                        .map_err(RuntimeError::TypeError),
+                }
+            }
+            Value::Object(obj_ref) => {
+                crate::vm::prototype::internal_delete(Rc::clone(obj_ref), key)
+                    .map_err(RuntimeError::TypeError)
+            }
             Value::Function(id) => {
                 let boxed = self.materialize_function(*id);
-                self.delete_member(&boxed, key)
+                self.delete_member(&boxed, key, module)
             }
             _ => Err(RuntimeError::TypeError(
                 "Cannot delete property of a non-object".to_string(),
@@ -6953,21 +8096,34 @@ impl VM {
     }
 
     /// Look up a property on an object via its prototype chain.
-    fn lookup_property_on_object(&self, obj: &Value, prop_name: &str) -> Value {
+    /// `&mut self` because a proxy's `get` trap is JavaScript: `obj.m()` has to
+    /// read `m` through the trap just like `obj.m` does.
+    fn lookup_property_on_object(
+        &mut self,
+        obj: &Value,
+        prop_name: &str,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
         match obj {
             Value::Object(obj_ref) => {
                 let key = PropertyKey::from_str(prop_name);
+                if obj_ref.borrow().kind() == ObjectKind::Proxy {
+                    let proxy_val = Value::Object(Rc::clone(obj_ref));
+                    if let Some(value) = self.proxy_get(&proxy_val, &key, &proxy_val, module)? {
+                        return Ok(value);
+                    }
+                }
                 crate::vm::prototype::internal_get(obj_ref.clone(), &key, None)
-                    .unwrap_or(Value::Undefined)
+                    .map_err(RuntimeError::TypeError)
             }
             Value::String(s) => {
                 if prop_name == "length" {
-                    Value::Number(s.len() as f64)
+                    Ok(Value::Number(s.len() as f64))
                 } else {
-                    Value::Undefined
+                    Ok(Value::Undefined)
                 }
             }
-            _ => Value::Undefined,
+            _ => Ok(Value::Undefined),
         }
     }
 
@@ -8114,6 +9270,7 @@ impl VM {
         callee: &Value,
         new_obj: Value,
         args: &[Value],
+        new_target_override: Option<&Value>,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         if let Some(name) = crate::builtins::native_function_name(callee) {
@@ -8166,10 +9323,14 @@ impl VM {
             self.state.closure_var_stack.push(map);
         }
 
-        // `new.target` of a `[[Construct]]` frame is the constructor itself.
-        let new_target_value = match callee {
-            Value::Function(id) => self.materialize_function(*id),
-            other => other.clone(),
+        // `new.target` of a `[[Construct]]` frame is the constructor itself —
+        // unless `Reflect.construct(F, args, newTarget)` said otherwise.
+        let new_target_value = match new_target_override {
+            Some(overridden) => overridden.clone(),
+            None => match callee {
+                Value::Function(id) => self.materialize_function(*id),
+                other => other.clone(),
+            },
         };
         self.state.function_val = new_target_value.clone();
 
@@ -8218,6 +9379,46 @@ impl VM {
         Ok(rv)
     }
 
+    /// ES 7.3.20 `IsConstructor`: whether `value` can be used with `new` — and,
+    /// which is the same question, whether it is a legal `new.target`
+    /// (`Reflect.construct(function(){}, [], f)` is how the harness asks it).
+    fn is_constructor(&self, value: &Value, module: &Module) -> bool {
+        match value {
+            Value::Object(obj_ref) => {
+                let kind = obj_ref.borrow().kind();
+                match kind {
+                    ObjectKind::Proxy => {
+                        // A proxy is a constructor exactly when its target is.
+                        let target = self
+                            .proxy_parts(value, "construct")
+                            .map(|(target, _)| target)
+                            .ok();
+                        matches!(target, Some(target) if self.is_constructor(&target, module))
+                    }
+                    ObjectKind::NativeFunction => {
+                        let name = obj_ref
+                            .borrow()
+                            .as_any()
+                            .downcast_ref::<crate::vm::object::NativeFunctionObject>()
+                            .map(|f| f.name.clone())
+                            .unwrap_or_default();
+                        // A qualified name is a static or prototype method, and
+                        // none of those is a constructor (ES 17); `Symbol` is
+                        // callable but explicitly not new-able.
+                        !name.contains('.') && name != "Symbol"
+                    }
+                    ObjectKind::Function => true,
+                    _ => false,
+                }
+            }
+            // Generators and `async` functions are callable but not new-able.
+            Value::Function(id) => {
+                !module.generators.contains(id) && !module.asyncs.contains(id)
+            }
+            _ => false,
+        }
+    }
+
     /// `[[Construct]]` (ES6 7.3.19): create the instance, run the constructor
     /// with `this` bound to it, and apply the construct return semantics.
     fn construct(
@@ -8226,10 +9427,37 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        self.construct_with_new_target(constructor_val, args, None, module)
+    }
+
+    /// [`Self::construct`] with an explicit `new.target`
+    /// (`Reflect.construct(F, args, newTarget)`, ES 28.1.2): the instance's
+    /// prototype and the callee's `new.target` both come from `new_target`
+    /// instead of from the constructor being run.
+    fn construct_with_new_target(
+        &mut self,
+        constructor_val: &Value,
+        args: &[Value],
+        new_target: Option<&Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        // A proxy's `construct` trap decides the whole construction; with no
+        // trap the target is constructed (ES 10.5.13).
+        if Self::is_proxy(constructor_val) {
+            // `new P(...)` has the proxy itself as `new.target`.
+            let nt = new_target.unwrap_or(constructor_val);
+            return match self.proxy_construct_trap(constructor_val, args, nt, module)? {
+                Some(result) => Ok(result),
+                None => {
+                    let (target, _handler) = self.proxy_parts(constructor_val, "construct")?;
+                    self.construct_with_new_target(&target, args, new_target, module)
+                }
+            };
+        }
         // Built-in constructors (Object, Array, Error, `f.bind(…)`, …) share
         // their `[[Construct]]` with the `New` opcode.
         if let Some(name) = crate::builtins::native_function_name(constructor_val) {
-            return self.native_construct(&name, constructor_val, args, None, module);
+            return self.native_construct(&name, constructor_val, args, new_target, module);
         }
 
         // Bytecode constructor: resolve the prototype from the (boxed)
@@ -8239,7 +9467,10 @@ impl VM {
             Value::Function(id) => self.materialize_function(*id),
             other => other.clone(),
         };
-        let prototype = match &boxed_ctor {
+        // ES 9.1.14 `GetPrototypeFromConstructor`: with a `new.target`, its
+        // `prototype` is what the instance inherits from.
+        let from = new_target.unwrap_or(&boxed_ctor);
+        let prototype = match from {
             Value::Object(obj_ref) => obj_ref
                 .borrow()
                 .property_get(&PropertyKey::from_str("prototype"))
@@ -8257,7 +9488,7 @@ impl VM {
         }
         let new_obj_val = Value::Object(Rc::new(RefCell::new(new_obj)));
 
-        self.invoke_construct(&boxed_ctor, new_obj_val, args, module)
+        self.invoke_construct(&boxed_ctor, new_obj_val, args, new_target, module)
     }
 
     /// `[[Construct]]` for a built-in constructor (`new Array(…)`,
@@ -8345,6 +9576,17 @@ impl VM {
             }
             let proto = self.prototype_from_constructor(constructor_val, new_target);
             return self.promise_construct(&executor, proto, module);
+        }
+        // `new Proxy(target, handler)`: the object is exotic (its operations are
+        // the handler's traps), so it is built here rather than by the builtin
+        // layer. There is no `prototype` to resolve: a proxy inherits from its
+        // target (ES 28.2.2).
+        if name == "Proxy" {
+            // A bare `Value::Function` reference is a *function*, which is an
+            // object — but `is_object` cannot see that, so it is boxed first.
+            let target = self.as_object_value(&args.first().cloned().unwrap_or(Value::Undefined));
+            let handler = self.as_object_value(&args.get(1).cloned().unwrap_or(Value::Undefined));
+            return crate::builtins::proxy::proxy_construct(target, handler);
         }
 
         // ES 9.1.14 `GetPrototypeFromConstructor`: `newTarget.prototype` when

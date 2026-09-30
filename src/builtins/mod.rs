@@ -32,6 +32,7 @@ pub use date::date_construct_value;
 pub use regexp::match_all_matches;
 pub mod typedarray;
 pub mod reflect;
+pub mod proxy;
 pub use regexp::regexp_construct_value;
 pub use boolean::boolean_constructor;
 pub use error::{
@@ -886,6 +887,11 @@ impl Builtins {
         // before `Proxy` exists on purpose: a proxy handler *is* this list, and
         // building it first is what keeps the proxy work from re-inventing it.
         globals.insert("Reflect".to_string(), reflect::create_reflect_object());
+        // `Proxy` (ES 28.2): the exotic object is inert until something operates on
+        // it, and every operation is a trap lookup — so the constructor only checks
+        // its two arguments and the VM does the rest (`new Proxy(t, h)` and
+        // `Proxy.revocable`). No `prototype`: instances inherit from the target.
+        globals.insert("Proxy".to_string(), proxy::create_proxy_constructor());
 
         // `Date`: everyday scripts need wall-clock time. `new Date(...)` builds
         // the object in the VM (`Date()` without `new` answers a *string*, so
@@ -1846,6 +1852,24 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         | "TypeError" | "ReferenceError" | "RangeError" | "SyntaxError" | "URIError"
         | "EvalError" => 1,
         "Error.isError" => 1,
+        // ── Proxy ──
+        "Proxy" | "Proxy.revocable" => 2,
+        // ── Reflect ──
+        // Every `Reflect.*` is a plain function of its spec signature: the
+        // optional `receiver` argument counts, and the list argument of
+        // `apply` / `construct` is one argument, not many.
+        "Reflect.apply" => 3,
+        "Reflect.construct" => 2,
+        "Reflect.defineProperty" | "Reflect.set" => 3,
+        "Reflect.deleteProperty"
+        | "Reflect.get"
+        | "Reflect.getOwnPropertyDescriptor"
+        | "Reflect.has"
+        | "Reflect.setPrototypeOf" => 2,
+        "Reflect.getPrototypeOf"
+        | "Reflect.isExtensible"
+        | "Reflect.ownKeys"
+        | "Reflect.preventExtensions" => 1,
         // ── JSON ──
         "JSON.parse" => 2,
         "JSON.stringify" => 3,
