@@ -210,6 +210,13 @@ pub fn internal_has_property(
 
 /// ES6 [[Delete]](P) — delete an own property.
 pub fn internal_delete(obj: Rc<RefCell<dyn JSObject>>, key: &PropertyKey) -> Result<bool, String> {
+    // ES 10.1.9.1: `[[Delete]]` answers `true` when the own property is *already*
+    // absent — `false` means "it is there and refuses to go" (a non-configurable
+    // one). Without the first branch `delete o.missing` answered `false`, which
+    // Node answers `true` to (and `Reflect.deleteProperty` must too).
+    if obj.borrow().property_get(key).is_none() {
+        return Ok(true);
+    }
     let mut borrowed = obj.borrow_mut();
     Ok(borrowed.property_delete(key))
 }

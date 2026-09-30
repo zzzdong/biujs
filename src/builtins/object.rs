@@ -230,7 +230,16 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
     };
 
     let borrowed = obj.borrow();
-    if let Some(desc) = borrowed.property_get(&key) {
+    Ok(descriptor_to_value(borrowed.property_get(&key)))
+}
+
+/// A `PropertyDescriptor` as the object `Object.getOwnPropertyDescriptor` (and
+/// `Reflect.getOwnPropertyDescriptor`) answers. `None` becomes `undefined`.
+pub fn descriptor_to_value(descriptor: Option<PropertyDescriptor>) -> Value {
+    let Some(desc) = descriptor else {
+        return Value::Undefined;
+    };
+    {
         // Create a descriptor object
         let mut desc_obj = crate::vm::object::OrdinaryObject::new();
         if desc.is_accessor_descriptor() {
@@ -241,39 +250,37 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
                     PropertyKey::from_str("get"),
                     desc.getter.clone().unwrap_or(undefined.clone()),
                 )
-                .map_err(RuntimeError::from_property_error)?;
+                .ok();
             desc_obj
                 .property_set(
                     PropertyKey::from_str("set"),
                     desc.setter.clone().unwrap_or(undefined),
                 )
-                .map_err(RuntimeError::from_property_error)?;
+                .ok();
         } else {
             desc_obj
                 .property_set(PropertyKey::from_str("value"), desc.value.clone())
-                .map_err(RuntimeError::from_property_error)?;
+                .ok();
             desc_obj
                 .property_set(
                     PropertyKey::from_str("writable"),
                     Value::Bool(desc.writable),
                 )
-                .map_err(RuntimeError::from_property_error)?;
+                .ok();
         }
         desc_obj
             .property_set(
                 PropertyKey::from_str("enumerable"),
                 Value::Bool(desc.enumerable),
             )
-            .map_err(RuntimeError::from_property_error)?;
+            .ok();
         desc_obj
             .property_set(
                 PropertyKey::from_str("configurable"),
                 Value::Bool(desc.configurable),
             )
-            .map_err(RuntimeError::from_property_error)?;
-        Ok(Value::Object(Rc::new(RefCell::new(desc_obj))))
-    } else {
-        Ok(Value::Undefined)
+            .ok();
+        return Value::Object(Rc::new(RefCell::new(desc_obj)));
     }
 }
 

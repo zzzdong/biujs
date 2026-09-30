@@ -1197,3 +1197,157 @@ fn typed_array_views_alias_the_buffer_they_were_built_on() {
     assert_eq!(eval_number("new Uint8Array().BYTES_PER_ELEMENT"), 1.0);
     assert_eq!(eval_number("Float64Array.BYTES_PER_ELEMENT"), 8.0);
 }
+
+#[test]
+fn reflect_exposes_the_internal_methods() {
+    // `Reflect` is a namespace object, not a constructor.
+    assert_eq!(eval_string("typeof Reflect"), "object");
+    assert_eq!(eval_string("String(Reflect.prototype)"), "undefined");
+    assert_eq!(
+        eval_string("Object.prototype.toString.call(Reflect)"),
+        "[object Reflect]"
+    );
+    // get / set / has run the real [[Get]] / [[Set]] / [[HasProperty]].
+    assert_eq!(eval_number("Reflect.get({ a: 1 }, 'a')"), 1.0);
+    assert_eq!(eval_string("String(Reflect.get({}, 'z'))"), "undefined");
+    assert_eq!(
+        eval_number("(function () { var o = {}; Reflect.set(o, 'b', 2); return o.b; })()"),
+        2.0
+    );
+    assert_eq!(
+        eval_string("Reflect.has({ a: 1 }, 'a') + ',' + Reflect.has({}, 'a')"),
+        "true,false"
+    );
+    // `has` walks the prototype chain, like `in`.
+    assert_eq!(eval_string("String(Reflect.has({}, 'toString'))"), "true");
+    // A getter is invoked (`Reflect.get` is not a property read).
+    assert_eq!(
+        eval_number("Reflect.get({ get v() { return 7; } }, 'v')"),
+        7.0
+    );
+
+    // deleteProperty answers the [[Delete]] result, and an absent property
+    // succeeds — the rule the `delete` operator had wrong as well.
+    assert_eq!(
+        eval_string("(function () { var o = { a: 1 }; return Reflect.deleteProperty(o, 'a') + ',' + String(o.a) + ',' + Reflect.deleteProperty(o, 'a'); })()"),
+        "true,undefined,true"
+    );
+    assert_eq!(
+        eval_string("(function () { var o = {}; delete o.missing; return String(delete o.missing); })()"),
+        "true"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = {};
+             Object.defineProperty(o, 'x', { value: 1, configurable: false });
+             return Reflect.deleteProperty(o, 'x') + ',' + String(delete o.x); })()"
+        ),
+        "false,false"
+    );
+
+    // ownKeys reports every own key: non-enumerable and symbol ones included,
+    // strings before symbols.
+    assert_eq!(
+        eval_string("Reflect.ownKeys({ x: 1, y: 2 }).join(',')"),
+        "x,y"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = {}; Object.defineProperty(o, 'hidden', { value: 1 });
+             return Reflect.ownKeys(o).join(','); })()"
+        ),
+        "hidden"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var s = Symbol('s'); var o = { p: 1 }; o[s] = 2;
+             var k = Reflect.ownKeys(o);
+             return k.length + ':' + String(k[1] === s); })()"
+        ),
+        "2:true"
+    );
+
+    // getOwnPropertyDescriptor / getPrototypeOf / setPrototypeOf.
+    assert_eq!(
+        eval_string("JSON.stringify(Reflect.getOwnPropertyDescriptor({ a: 1 }, 'a'))"),
+        "{\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true}"
+    );
+    assert_eq!(eval_string("String(Reflect.getOwnPropertyDescriptor({}, 'a'))"), "undefined");
+    assert_eq!(
+        eval_string("String(Reflect.getPrototypeOf({}) === Object.prototype)"),
+        "true"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var p = { z: 9 }; var o = {};
+             return Reflect.setPrototypeOf(o, p) + ',' + o.z; })()"
+        ),
+        "true,9"
+    );
+    // A non-object prototype is a TypeError; a non-extensible target is refused
+    // with `false` instead.
+    assert_eq!(
+        eval_string("try { Reflect.setPrototypeOf({}, 5); } catch (e) { e.name; }"),
+        "TypeError"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = {}; Object.preventExtensions(o);
+             return String(Reflect.setPrototypeOf(o, {})); })()"
+        ),
+        "false"
+    );
+
+    // isExtensible / preventExtensions answer booleans.
+    assert_eq!(
+        eval_string(
+            "(function () { var o = {}; var before = Reflect.isExtensible(o);
+             Reflect.preventExtensions(o);
+             return before + ',' + Reflect.isExtensible(o); })()"
+        ),
+        "true,false"
+    );
+
+    // apply / construct take the argument list as an array-like.
+    assert_eq!(eval_number("Reflect.apply(Math.max, null, [1, 5, 3])"), 5.0);
+    assert_eq!(
+        eval_string(
+            "Reflect.apply(function (a, b) { return a + '/' + b; }, null,
+                          { length: 2, 0: 'x', 1: 'y' })"
+        ),
+        "x/y"
+    );
+    assert_eq!(
+        eval_number(
+            "(function () { function C(x) { this.x = x; }
+             return Reflect.construct(C, [7]).x; })()"
+        ),
+        7.0
+    );
+    assert_eq!(
+        eval_string("JSON.stringify(Reflect.construct(Array, [1, 2]))"),
+        "[1,2]"
+    );
+
+    // defineProperty answers a boolean, where Object.defineProperty throws.
+    assert_eq!(
+        eval_string(
+            "(function () { var o = {};
+             return Reflect.defineProperty(o, 'k', { value: 5, enumerable: true }) + ',' + o.k; })()"
+        ),
+        "true,5"
+    );
+    assert_eq!(
+        eval_string(
+            "(function () { var o = {}; Object.defineProperty(o, 'x', { value: 1, configurable: false });
+             return String(Reflect.defineProperty(o, 'x', { value: 2 })); })()"
+        ),
+        "false"
+    );
+
+    // The target must be an object — `Reflect` never coerces (unlike `Object.*`).
+    assert_eq!(
+        eval_string("try { Reflect.get(1, 'a'); } catch (e) { e.name; }"),
+        "TypeError"
+    );
+}

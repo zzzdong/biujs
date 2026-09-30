@@ -2123,6 +2123,39 @@ async 路径在用），所以要在几个 `Opcode::Call*` 上各挂一次 push/
 
 ---
 
+#### B44 `Reflect`（+14，零回退）——顺带修掉 `delete` 运算符的一个规范缺口
+
+**做了什么**：完整的 `Reflect`（13 个方法 + `[Symbol.toStringTag]`），按"能不能跑用户代码"分两半：
+
+| 一半 | 方法 | 为什么在这边 |
+|------|------|--------------|
+| builtin（`reflect.rs`，8 个） | `has` / `deleteProperty` / `ownKeys` / `getOwnPropertyDescriptor` / `getPrototypeOf` / `setPrototypeOf` / `isExtensible` / `preventExtensions` | 纯数据，`JSObject` 上都有 |
+| VM（5 个） | `get` / `set` / `apply` / `construct` / `defineProperty` | getter/setter 要重入，`apply`/`construct` 要调用用户代码，描述符要先归一化 |
+
+**顺带修掉一个既有缺口**：探针里出现 `delete o.missing === false`，而 node 是 `true` ——
+`[[Delete]]` 对**不存在**的自有属性应当回答 `true`，`false` 只留给"存在但拒绝删除"（不可配置）。
+规则落在 `vm::prototype::internal_delete` 一处，`delete` 运算符与 `Reflect.deleteProperty` 共用。
+**`language/expressions/delete` +6** 就是这么来的 —— 这条是本次唯一能直接归因的提升。
+
+**Reflect 与 Object 的区别**（也是它值得单独做的原因）：`Object.*` 会 `ToObject` 目标并"返回对象"，
+`Reflect.*` 坚持真对象、不强制转换、把"能不能做成"作为**布尔量**返回（`defineProperty` /
+`setPrototypeOf` / `deleteProperty` / `preventExtensions` 都是）。`Proxy` 的处理器就是这套方法，
+先做 `Reflect` 正是为了不让 `Proxy` 重新发明一遍。
+
+**与规范的差距（都写进注释）**：`Reflect.get` 的第三参 `receiver` 接受但未生效（VM 的 `get_member`
+总把目标当接收者）；`Reflect.construct` 的 `newTarget` 同理；`Reflect.set` 只在写入被直接拒绝时
+才给 `false`（`set_member` 不回报是否落地）。三者都是日常少见的写法。
+
+**数字**：通过 16039 → 16053（+14），失败 2875 → 2861，通过率 84.80% → 84.87%。
+5 个套件提升、零回退：`language/expressions/delete` +6、`built-ins/Object` +3、
+`built-ins/Array` +3、`language/expressions/typeof` +1、`language/expressions/grouping` +1。
+feature 508（+1 用例 / 30 条断言）。探针 23 条与 node **逐行一致**。
+
+**下一步**：`Proxy` —— 处理器 = `Reflect` 的这套方法，地基已经在了（`vm/property.rs` 里
+`ObjectKind::Proxy` 也是现成的变体）。
+
+---
+
 #### B43 `ArrayBuffer` + TypedArray（+13，零回退）
 
 **做了什么**：`ArrayBuffer` 与 9 个视图构造器（`Int8Array` / `Uint8Array` / `Uint8ClampedArray` /

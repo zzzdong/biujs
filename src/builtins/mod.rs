@@ -31,6 +31,7 @@ pub use array::{ARRAY_SPECIES_NATIVE, array_constructor, validate_array_length};
 pub use date::date_construct_value;
 pub use regexp::match_all_matches;
 pub mod typedarray;
+pub mod reflect;
 pub use regexp::regexp_construct_value;
 pub use boolean::boolean_constructor;
 pub use error::{
@@ -881,6 +882,10 @@ impl Builtins {
         // cannot do without: without it the only way to observe a value is to
         // `throw` it.
         globals.insert("console".to_string(), console::create_console_object());
+        // `Reflect` (ES 28.1) — the internal methods as functions. Registered
+        // before `Proxy` exists on purpose: a proxy handler *is* this list, and
+        // building it first is what keeps the proxy work from re-inventing it.
+        globals.insert("Reflect".to_string(), reflect::create_reflect_object());
 
         // `Date`: everyday scripts need wall-clock time. `new Date(...)` builds
         // the object in the VM (`Date()` without `new` answers a *string*, so
@@ -1143,6 +1148,17 @@ pub fn call_static_method(name: &str, args: &[Value]) -> Result<Value, RuntimeEr
                 .unwrap_or(f64::NAN),
         )),
         "ArrayBuffer.isView" => typedarray::arraybuffer_is_view(args),
+        // `Reflect`'s builtin half. The five that run user code (`get`, `set`,
+        // `apply`, `construct`, `defineProperty`) never reach here: the VM
+        // intercepts them by name before this table is consulted.
+        "Reflect.has" => reflect::reflect_has(args),
+        "Reflect.deleteProperty" => reflect::reflect_delete_property(args),
+        "Reflect.ownKeys" => reflect::reflect_own_keys(args),
+        "Reflect.getOwnPropertyDescriptor" => reflect::reflect_get_own_property_descriptor(args),
+        "Reflect.getPrototypeOf" => reflect::reflect_get_prototype_of(args),
+        "Reflect.setPrototypeOf" => reflect::reflect_set_prototype_of(args),
+        "Reflect.isExtensible" => reflect::reflect_is_extensible(args),
+        "Reflect.preventExtensions" => reflect::reflect_prevent_extensions(args),
         "Date.now" => date::date_now(args),
         "Date.parse" => date::date_parse(args),
         "Date.UTC" => date::date_utc(args),

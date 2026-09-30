@@ -1999,6 +1999,11 @@ impl VM {
                     &[args[0].clone(), props],
                 );
             }
+            // `Reflect.get` / `set` / `apply` / `construct` / `defineProperty`:
+            // the internal methods that can run user code.
+            if let Some(result) = self.reflect_static(name, args, module)? {
+                return Ok(result);
+            }
             return crate::builtins::call_static_method(name, args);
         }
         crate::builtins::call_native(name, args)
@@ -3769,6 +3774,8 @@ impl VM {
                     let result = if name == "String" && args.len() == 1 {
                         let primitive = self.to_primitive(&args[0], "string", module)?;
                         Ok(Value::string(&primitive.to_js_string()))
+                    } else if let Some(value) = self.reflect_static(&name, &args, module)? {
+                        Ok(value)
                     } else {
                         crate::builtins::call_native(&name, &args)
                     };
@@ -3997,6 +4004,103 @@ impl VM {
             }
         }
         Ok(entries)
+    }
+
+    /// The half of `Reflect` that runs user code: `get` / `set` run accessors,
+    /// `apply` / `construct` call functions, and `defineProperty`'s attributes
+    /// may be accessors. `Reflect.ownKeys` and the rest are pure data and live in
+    /// the builtin layer.
+    ///
+    /// Two arguments are accepted but not honoured yet, both of them rare in
+    /// daily code: `Reflect.get`'s `receiver` (the VM's `get_member` always
+    /// passes the target) and `Reflect.construct`'s `newTarget`. `Reflect.set`
+    /// answers `true` whenever the write is not refused outright — `set_member`
+    /// does not report whether it landed.
+    fn reflect_static(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        use crate::builtins::reflect::{target_of, to_key};
+        match name {
+            "Reflect.get" => {
+                target_of(args, "get")?;
+                let target = args[0].clone();
+                let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
+                Ok(Some(self.get_member(&target, &key, module)?))
+            }
+            "Reflect.set" => {
+                target_of(args, "set")?;
+                let target = args[0].clone();
+                let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
+                let value = args.get(2).cloned().unwrap_or(Value::Undefined);
+                self.set_member(&target, key, value, module)?;
+                Ok(Some(Value::Bool(true)))
+            }
+            "Reflect.apply" => {
+                let target = args.first().cloned().unwrap_or(Value::Undefined);
+                if !target.is_callable() {
+                    return Err(RuntimeError::TypeError(
+                        "Reflect.apply target is not a function".to_string(),
+                    ));
+                }
+                let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let list = self.reflect_argument_list(args.get(2), "apply")?;
+                Ok(Some(self.invoke(&target, this_arg, &list, module)?))
+            }
+            "Reflect.construct" => {
+                let target = args.first().cloned().unwrap_or(Value::Undefined);
+                if !target.is_callable() {
+                    return Err(RuntimeError::TypeError(
+                        "Reflect.construct target is not a constructor".to_string(),
+                    ));
+                }
+                let list = self.reflect_argument_list(args.get(1), "construct")?;
+                Ok(Some(self.construct(&target, &list, module)?))
+            }
+            "Reflect.defineProperty" => {
+                target_of(args, "defineProperty")?;
+                let attributes = args.get(2).cloned().unwrap_or(Value::Undefined);
+                if !matches!(attributes, Value::Object(_)) {
+                    return Err(RuntimeError::TypeError(
+                        "Reflect.defineProperty: attributes must be an object".to_string(),
+                    ));
+                }
+                // The attributes have to be *normalised* first (which fields are
+                // present decides whether this is a data or accessor descriptor),
+                // and that is the VM's `to_property_descriptor`.
+                let descriptor = self.to_property_descriptor(&attributes, module)?;
+                // A refused definition answers `false` instead of throwing, which
+                // is the point of the `Reflect` form (ES 28.1.4) — so the throw
+                // `Object.defineProperty` raises on refusal becomes `false` here.
+                let defined = crate::builtins::call_static_method(
+                    "Object.defineProperty",
+                    &[args[0].clone(), args[1].clone(), descriptor],
+                );
+                Ok(Some(Value::Bool(defined.is_ok())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `CreateListFromArrayLike` for `Reflect.apply` / `Reflect.construct`: the
+    /// argument list has to be an object with a usable `length`.
+    fn reflect_argument_list(
+        &self,
+        value: Option<&Value>,
+        method: &str,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        match value {
+            Some(value) => self.array_like_elements(value).ok_or_else(|| {
+                RuntimeError::TypeError(format!(
+                    "Reflect.{method}: arguments list must be an array-like object"
+                ))
+            }),
+            None => Err(RuntimeError::TypeError(format!(
+                "Reflect.{method}: arguments list is required"
+            ))),
+        }
     }
 
     /// `String.prototype.matchAll(re)` / `RegExp.prototype[Symbol.matchAll](s)`.

@@ -58,9 +58,9 @@ language/expressions/assignment/destructuring	3	1	4
 language/expressions/addition	36	8	4
 language/expressions/bitwise-or	20	7	3
 language/expressions/coalesce	21	2	1
-language/expressions/delete	38	5	26
+language/expressions/delete	44	5	20
 language/expressions/exponentiation	34	7	3
-language/expressions/grouping	5	1	3
+language/expressions/grouping	6	1	2
 language/expressions/less-than	35	9	1
 language/expressions/logical-or	16	2	0
 language/expressions/new	46	3	10
@@ -74,10 +74,10 @@ language/statements/function	347	74	30
 language/statements/switch	51	54	6
 language/statements/while	28	10	0
 language/literals/string	67	6	0
-built-ins/Array	2102	188	791
+built-ins/Array	2105	188	788
 built-ins/JSON	113	51	1
 built-ins/WeakSet	79	5	1
-built-ins/Object	2800	292	319
+built-ins/Object	2803	292	316
 language/expressions/yield	40	3	20
 language/rest-parameters	11	0	0
 language/expressions/assignment	407	18	60
@@ -91,7 +91,7 @@ language/expressions/member	0	0	0
 language/expressions/new.target	10	3	1
 language/expressions/prefix-decrement	22	5	7
 language/expressions/strict-does-not-equals	20	10	0
-language/expressions/typeof	7	7	2
+language/expressions/typeof	8	7	1
 language/expressions/void	8	1	0
 language/statements/class	1409	2809	149
 language/statements/empty	1	1	0
