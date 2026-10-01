@@ -385,6 +385,36 @@ Rust 的 `match` 穷尽性让"新增变体忘了登记 desc"变成**编译错误
 
 ---
 
+### 3.2.3 P0b-2a：pc 字段的类型由**角色派生**
+
+P0b-1b 让"哪个字段是 pc"进了表；P0b-2a 顺着这一步把它的**类型**也定下来：
+
+```rust
+Instr::Jump   { offset: RelPc }              // jr → RelPc
+Instr::BrIf   { condition: Operand, true_target: RelPc, false_target: RelPc }
+Instr::Try    { catch_offset: RelPc, finally_offset: RelPc }
+Instr::DelayedJump { target: AbsPc, seh_depth: Operand }   // ja → AbsPc
+```
+
+类型是**推出来的**，不是新写一列：三个小宏把角色映射到类型/装箱/还原
+（`field_ty!` / `into_field!` / `field_operand!`），所以 `Instr` 的字段类型、
+`slots()` 的统一视图、`from_parts()` 的通用路径仍然全部由那张表驱动 ——
+**没有第三个需要同步的地方**。
+
+**只对 pc 角色成立**：`jr`/`ja` 能唯一确定类型，而 `r`/`w` 不能 —— 读也可以是立即数或
+常量（`Mov rv, true` 就是），那是 regalloc 的决定，字节码不该替它决定（§3.2 的陷阱）。
+所以全量类型收紧（`Reg`/`ConstIndex`/`SymbolId`）得逐字段手写一列，已降级为 **P0b-2b（可不做）**。
+
+**代价（全仓库 9 个点）**：读**不用改**（`RelPc::as_immd()` 转发到 `Operand::as_immd()`），
+写从 `*offset = Operand::new_immd(x)` 变成 `offset.set(x)`，构造从 `Operand::new_immd(n)`
+变成 `RelPc::immediate(n)`。
+
+**证伪过**：把测试里的 `Instr::Jump { offset: RelPc::immediate(2) }` 改成
+`AbsPc::immediate(2)`，编译器立刻拒绝 —— `expected RelPc, found AbsPc`。
+外加计数断言钉住"相对 5 / 绝对 1"（`Jump` 1 + `BrIf` 2 + `Try` 2 / `DelayedJump` 1）。
+
+---
+
 ### 3.3 P1：调用路径归一
 
 **现状**：5 个调用 opcode（`Call` / `CallEx` / `CallNative` / `CallMethod` / `New` + `CallSpread`）
@@ -705,11 +735,12 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | **P0a-2** `run_instruction` 逐 arm 命名解构（85 arm，含 6 条分组） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单片 114.6s → 107.1s（基线 103.5s）；通过 16561 / 执行 19708 / 跳过 7843 **仍然一个数未动** |
 | **P0b-1a** `Kind` 分类（表里 `@Kind` 标记 + 穷尽 `kind()`）+ VM 源码元测试 | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单元 194→**198**；4 条测试，其中 1 条直接读 `vm/mod.rs` 取证 |
 | **P0b-1b** 操作数角色（表里 `dst: w` / `index: r` / `target: jr`）+ `desc()` + 同款元测试 | **已完成**（2026-10-01） | 同上 | 单元 →**200**；角色用"从实现反推 + 回实现取证"两步定下来 |
+| **P0b-2a** pc 字段类型收紧（`jr`→`RelPc`、`ja`→`AbsPc`，由角色派生） | **已完成**（2026-10-01） | 同上 | 单元 →**201**；`AbsPc` 喂给相对字段已被证实是编译错误 |
 | P1 调用归一 | 未开始 | | |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
 | P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |
-| P0b-2 类型收紧（`RelPc`/`AbsPc`、`Reg`/`ConstIndex`/`SymbolId`） | 未开始 | | 证据已在 §3.2.1：偏移必须分相对/绝对；`New.callee` 是 in/out 不能收成 `Option` |
+| P0b-2b 全量类型收紧（`Reg`/`ConstIndex`/`SymbolId`，逐字段一列类型） | 未开始（**可降级/可不做**） | | 角色 ≠ 类型：读也可以是立即数（`Mov rv, true`），所以推不出来，得逐字段手写；收益是编译期防错，代价是 ~400 个位点 —— 优先级低于 P1 |
 | 语义线：TypedArray 族入册解锁 | 未开始 | | 可随时插入；纯赚 test262 分数 |
 
 ### 9.1 P0a 的实际改动（P0a-1 + P0a-2，至此收口）

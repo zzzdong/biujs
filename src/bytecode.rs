@@ -203,6 +203,116 @@ macro_rules! role_of {
     };
 }
 
+/// 一个**相对**偏移：`pc = pc + off`（`Jump` / `BrIf` / `Try`）。
+///
+/// 与 [`AbsPc`] 分成两个类型，是为了让"混用"**写不出来** —— `Jump` 是相对、
+/// `DelayedJump` 是绝对，这个差异以前只存在于实现里（§3.2.1 第 1 条）。
+/// 两个类型都由表里的角色标记生成（`jr` / `ja`），没有第二个需要人肉同步的地方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelPc(Operand);
+
+impl RelPc {
+    /// 从已有操作数构造（`from_parts` 这类通用路径用）。
+    pub fn new(op: Operand) -> Self {
+        Self(op)
+    }
+
+    /// 立即数形式。
+    pub fn immediate(offset: isize) -> Self {
+        Self(Operand::Immd(offset))
+    }
+
+    /// 偏移值。VM 读它、回填也算它。
+    pub fn as_immd(&self) -> isize {
+        self.0.as_immd()
+    }
+
+    /// 回填：改写偏移。
+    pub fn set(&mut self, offset: isize) {
+        self.0 = Operand::Immd(offset);
+    }
+
+    /// 当普通操作数看待（`slots()` / `Display` 需要统一的视图）。
+    pub fn into_operand(self) -> Operand {
+        self.0
+    }
+}
+
+/// 一个**绝对** pc：`pc = off`（`DelayedJump` / `ResumeExc` 收尾用）。
+/// 见 [`RelPc`] 说明为什么要分开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbsPc(Operand);
+
+impl AbsPc {
+    /// 从已有操作数构造。
+    pub fn new(op: Operand) -> Self {
+        Self(op)
+    }
+
+    /// 立即数形式。
+    pub fn immediate(pc: isize) -> Self {
+        Self(Operand::Immd(pc))
+    }
+
+    /// pc 值。
+    pub fn as_immd(&self) -> isize {
+        self.0.as_immd()
+    }
+
+    /// 回填：改写 pc。
+    pub fn set(&mut self, pc: isize) {
+        self.0 = Operand::Immd(pc);
+    }
+
+    /// 当普通操作数看待。
+    pub fn into_operand(self) -> Operand {
+        self.0
+    }
+}
+
+/// 表里的角色 → **字段类型**。
+///
+/// 只对 pc 角色成立：`jr`/`ja` 能唯一确定类型，于是类型由角色派生、不需要手写第二个
+/// match。其余角色（`r`/`w`/`rw`/`n`）**收不掉** —— 读也可以是立即数/常量
+/// （`Mov rv, true`），那些是 regalloc 的决定，字节码不该替它决定（§3.2 的陷阱）。
+macro_rules! field_ty {
+    (jr) => {
+        RelPc
+    };
+    (ja) => {
+        AbsPc
+    };
+    ($_other:ident) => {
+        Operand
+    };
+}
+
+/// `Operand` → 字段类型（`from_parts` 的通用路径）。
+macro_rules! into_field {
+    (jr, $e:expr) => {
+        RelPc::new($e)
+    };
+    (ja, $e:expr) => {
+        AbsPc::new($e)
+    };
+    ($_t:ident, $e:expr) => {
+        $e
+    };
+}
+
+/// 字段 → `Operand`（`slots()` 的统一视图）。
+macro_rules! field_operand {
+    (jr, $e:expr) => {
+        $e.into_operand()
+    };
+    (ja, $e:expr) => {
+        $e.into_operand()
+    };
+    ($_t:ident, $e:expr) => {
+        $e
+    };
+}
+
 /// 一条指令的操作数一览（[`Instr::desc`] 的返回值）。
 ///
 /// 只服务**工具与测试**：回填校验、dump、以及与实现的互校。解释器主循环仍然直接
@@ -255,9 +365,13 @@ macro_rules! define_instrs {
         #[derive(Debug, Clone, Copy)]
         pub enum Instr {
             $( $z {}, )*
-            $( $o1 { $f1: Operand }, )*
-            $( $o2 { $g1: Operand, $g2: Operand }, )*
-            $( $o3 { $h1: Operand, $h2: Operand, $h3: Operand }, )*
+            $( $o1 { $f1: field_ty!($f1r) }, )*
+            $( $o2 { $g1: field_ty!($g1r), $g2: field_ty!($g2r) }, )*
+            $( $o3 {
+                $h1: field_ty!($h1r),
+                $h2: field_ty!($h2r),
+                $h3: field_ty!($h3r),
+            }, )*
         }
 
         impl Instr {
@@ -377,9 +491,16 @@ macro_rules! define_instrs {
             pub fn from_parts(op: Opcode, a: Operand, b: Operand, c: Operand) -> Self {
                 match op {
                     $( Opcode::$z => Instr::$z {}, )*
-                    $( Opcode::$o1 => Instr::$o1 { $f1: a }, )*
-                    $( Opcode::$o2 => Instr::$o2 { $g1: a, $g2: b }, )*
-                    $( Opcode::$o3 => Instr::$o3 { $h1: a, $h2: b, $h3: c }, )*
+                    $( Opcode::$o1 => Instr::$o1 { $f1: into_field!($f1r, a) }, )*
+                    $( Opcode::$o2 => Instr::$o2 {
+                        $g1: into_field!($g1r, a),
+                        $g2: into_field!($g2r, b),
+                    }, )*
+                    $( Opcode::$o3 => Instr::$o3 {
+                        $h1: into_field!($h1r, a),
+                        $h2: into_field!($h2r, b),
+                        $h3: into_field!($h3r, c),
+                    }, )*
                 }
             }
 
@@ -411,9 +532,16 @@ macro_rules! define_instrs {
             pub fn slots(&self) -> [Operand; 4] {
                 match self {
                     $( Instr::$z {} => [Operand::Immd(0); 4], )*
-                    $( Instr::$o1 { $f1 } => Instr::pack(&[*$f1]), )*
-                    $( Instr::$o2 { $g1, $g2 } => Instr::pack(&[*$g1, *$g2]), )*
-                    $( Instr::$o3 { $h1, $h2, $h3 } => Instr::pack(&[*$h1, *$h2, *$h3]), )*
+                    $( Instr::$o1 { $f1 } => Instr::pack(&[field_operand!($f1r, *$f1)]), )*
+                    $( Instr::$o2 { $g1, $g2 } => Instr::pack(&[
+                        field_operand!($g1r, *$g1),
+                        field_operand!($g2r, *$g2),
+                    ]), )*
+                    $( Instr::$o3 { $h1, $h2, $h3 } => Instr::pack(&[
+                        field_operand!($h1r, *$h1),
+                        field_operand!($h2r, *$h2),
+                        field_operand!($h3r, *$h3),
+                    ]), )*
                 }
             }
 
@@ -1321,8 +1449,8 @@ mod tests {
     #[test]
     fn test_try_has_no_padding_slot() {
         let inst = Instr::Try {
-            catch_offset: Operand::Immd(11),
-            finally_offset: Operand::Immd(22),
+            catch_offset: RelPc::immediate(11),
+            finally_offset: RelPc::immediate(22),
         };
         assert_eq!(inst.arity(), 2);
         assert_eq!(Instr::arity_of(Opcode::Try), 2);
@@ -1700,7 +1828,7 @@ mod tests {
         assert_eq!(d.writes().collect::<Vec<_>>(), vec![Operand::Register(Register::R0)]);
         assert_eq!(d.targets().count(), 0);
 
-        let jump = Instr::Jump { offset: Operand::Immd(7) }.desc();
+        let jump = Instr::Jump { offset: RelPc::immediate(7) }.desc();
         assert_eq!(jump.kind, Kind::Jump);
         assert_eq!(jump.reads().count(), 0);
         assert_eq!(
@@ -1716,6 +1844,35 @@ mod tests {
         .desc();
         assert_eq!(call.kind, Kind::Call);
         assert_eq!((call.reads().count(), call.writes().count()), (0, 0), "参数在栈上，callee 是函数号");
+    }
+
+    /// 类型收紧（P0b-2a）：pc 字段的**类型**由角色派生 —— `jr` → `RelPc`、`ja` → `AbsPc`，
+    /// 于是"相对偏移喂给绝对字段"是编译错误（`expected RelPc, found AbsPc`），
+    /// 不再是靠人记住 `Jump` 与 `DelayedJump` 的区别。
+    ///
+    /// 这里是数量断言：相对 5 个（`Jump` 1 + `BrIf` 2 + `Try` 2）、绝对 1 个
+    /// （`DelayedJump`）。改表时这个数会变，逼你确认是有意的。
+    #[test]
+    fn pc_fields_are_typed_by_role() {
+        let (mut rel, mut abs) = (0, 0);
+        for op in Instr::ALL {
+            for (_, role) in Instr::field_roles(*op) {
+                match role {
+                    Role::RelPc => rel += 1,
+                    Role::AbsPc => abs += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!((rel, abs), (5, 1), "相对 5（Jump/BrIf×2/Try×2）、绝对 1（DelayedJump）");
+
+        // 两个类型各自的读取/回填写法（也顺便钉住"读不改变调用点"这一点）。
+        let mut j = Instr::Jump { offset: RelPc::immediate(3) };
+        assert_eq!(match &j { Instr::Jump { offset } => offset.as_immd(), _ => 0 }, 3);
+        if let Instr::Jump { offset } = &mut j {
+            offset.set(9);
+        }
+        assert!(format!("{j}").contains('9'), "回填后 Display 应反映新偏移：{j}");
     }
 
     /// 跳转类指令的偏移**相对还是绝对**：`Jump` / `BrIf` 是相对（`jump_offset`），

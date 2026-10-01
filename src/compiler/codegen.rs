@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use log::{debug, trace};
 
 use super::ir::{BlockId, ControlFlowGraph, Instruction, Value, Variable};
-use crate::bytecode::{Instr, Operand, Register};
+use crate::bytecode::{AbsPc, Instr, Operand, Register, RelPc};
 
 use super::regalloc::{Action, RegAlloc};
 
@@ -516,11 +516,11 @@ impl Codegen {
                             };
                             let absolute = this.block_map[&target] - pos as isize;
                             if let Instr::Jump { offset } = &mut this.codes[pos] {
-                                *offset = Operand::new_immd(absolute);
+                                offset.set(absolute);
                             }
                         }));
 
-                        self.codes.push(Instr::Jump { offset: dst });
+                        self.codes.push(Instr::Jump { offset: RelPc::new(dst) });
                     }
                     Instruction::BrIf {
                         condition,
@@ -564,12 +564,16 @@ impl Codegen {
                                 ..
                             } = &mut this.codes[pos]
                             {
-                                *true_target = Operand::new_immd(true_off);
-                                *false_target = Operand::new_immd(false_off);
+                                true_target.set(true_off);
+                                false_target.set(false_off);
                             }
                         }));
 
-                        self.codes.push(Instr::BrIf { condition: condition, true_target: true_blk, false_target: false_blk });
+                        self.codes.push(Instr::BrIf {
+                            condition: condition,
+                            true_target: RelPc::new(true_blk),
+                            false_target: RelPc::new(false_blk),
+                        });
                     }
                     Instruction::Halt { value } => {
                         if let Some(v) = value {
@@ -592,14 +596,16 @@ impl Codegen {
                                 finally_offset,
                             } = &mut this.codes[pos]
                             {
-                                *catch_offset = Operand::new_immd(catch_off);
+                                catch_offset.set(catch_off);
                                 if let Some(finally_off) = finally_off {
-                                    *finally_offset = Operand::new_immd(finally_off);
+                                    finally_offset.set(finally_off);
                                 }
                             }
                         }));
-                        // Use triple to hold both catch and finally offsets
-                        self.codes.push(Instr::Try { catch_offset: Operand::new_immd(0), finally_offset: Operand::new_immd(0) });
+                        self.codes.push(Instr::Try {
+                            catch_offset: RelPc::immediate(0),
+                            finally_offset: RelPc::immediate(0),
+                        });
                     }
                     Instruction::PopSeh => {
                         self.codes.push(Instr::EndTry {});
@@ -670,11 +676,14 @@ impl Codegen {
                             // wrong instruction.
                             let absolute = this.block_map[&(target as isize)];
                             if let Instr::DelayedJump { target, .. } = &mut this.codes[pos] {
-                                *target = Operand::new_immd(absolute);
+                                target.set(absolute);
                             }
                         }));
 
-                        self.codes.push(Instr::DelayedJump { target: target_op, seh_depth: seh_depth_op });
+                        self.codes.push(Instr::DelayedJump {
+                            target: AbsPc::new(target_op),
+                            seh_depth: seh_depth_op,
+                        });
                     }
                 }
 

@@ -10351,7 +10351,7 @@ impl std::error::Error for RuntimeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::{Constant, Instr, Opcode, Operand, Primitive, Register};
+    use crate::bytecode::{Constant, Instr, Operand, Primitive, Register, RelPc};
 
     // ──────────────────────── State ────────────────────────
 
@@ -10705,7 +10705,7 @@ mod tests {
         // 3: halt
         let module = make_module(
             vec![
-                Instr::Jump { offset: Operand::Immd(2) },
+                Instr::Jump { offset: RelPc::immediate(2) },
                 Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(false)) },
                 Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(true)) },
                 Instr::Halt {},
@@ -10725,7 +10725,7 @@ mod tests {
         // 3: halt
         let module = make_module(
             vec![
-                Instr::BrIf { condition: Operand::Primitive(Primitive::Boolean(true)), true_target: Operand::Immd(2), false_target: Operand::Immd(1) },
+                Instr::BrIf { condition: Operand::Primitive(Primitive::Boolean(true)), true_target: RelPc::immediate(2), false_target: RelPc::immediate(1) },
                 Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(false)) },
                 Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(true)) },
                 Instr::Halt {},
@@ -10745,7 +10745,7 @@ mod tests {
         // 3: halt
         let module = make_module(
             vec![
-                Instr::BrIf { condition: Operand::Primitive(Primitive::Boolean(false)), true_target: Operand::Immd(1), false_target: Operand::Immd(2) },
+                Instr::BrIf { condition: Operand::Primitive(Primitive::Boolean(false)), true_target: RelPc::immediate(1), false_target: RelPc::immediate(2) },
                 Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(true)) },
                 Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(false)) },
                 Instr::Halt {},
