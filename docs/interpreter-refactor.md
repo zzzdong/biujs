@@ -475,6 +475,34 @@ fn enter_call(&mut self, kind: CallKind, callee: &Value, this: Value,
 **数字**：通过 16561 / 执行 19708 / 跳过 7843 与基线逐字节一致，零逐套件回退；
 单元 201、feature **523→524**（+1 条验收断言）、护栏 7 全绿；告警数 25→24（重复代码消失）。
 
+### 3.3.2 P1-2a：可调用体种类判定收成一处
+
+**发现的重复**："是不是生成器 / async"这套判定在**五个地方各写了一遍，写法还不一样**：
+
+| 位置 | 原来的写法 |
+|------|-----------|
+| `invoke_with_new_target` | `module.generators.contains(&func_id)`（先自己 match 出 `func_id`） |
+| `CallEx`（两个分支内各一对） | 同上，但 `func_id` 来自各自 `match callee` 的分支 |
+| `CallMethod` | 先 `callable_func_id(&method_val)`，再 `module.generators.contains(&id)` |
+| `New` | **反过来**用：`Value::Function(id) if module.generators.contains(&id)` → "不是构造器" |
+| `Call` | 只有裸函数号：`module.asyncs.contains(&(func_id as u32))` |
+
+**做法**：判定的唯一出口是三个小函数 —— `generator_of`（`callable_func_id` +
+`module.generators`，`None` 即不是）、`async_of`（同理）、以及"一眼看全"的
+`callee_kind`（`CalleeKind`：`Proxy`/`Native`/`Generator`/`Async`/`Bytecode`/`NotCallable`）。
+代理、原生、绑定函数都没有字节码函数号，所以 `callable_func_id` 一个下转就够，不必再判种类。
+各站点只改**谓词**、控制流一律不动 —— 这也是本轮敢直接改热路径的原因。
+
+**一次教训（值得记下来）**：我加了 `builtins::is_native_function`，编译立刻报重复定义 ——
+**它早就存在**，只是我 grep 时漏了。重复的助手就是这么攒出来的：加之前先搜一遍。
+
+**数字**：通过 16561 / 执行 19708 / 跳过 7843 与基线逐字节一致，零逐套件回退。
+
+**P1-2a 尚未收口**：`CallEx` 还有 4 处裸判定（同一个 arm 的另外一个分支里两组），
+`is_constructor` 里还有 1 处（"生成器/async 不是构造器"）。这些**故意留到 P1-2b** ——
+那时 `CallEx` 的两个内联开帧会被整体搬进 `enter_call`，这些行本来就要重写，
+现在为它们各打一次补丁反而是白做。
+
 **P1-2 剩下的**：`Call`/`CallEx`/`CallNative`/`CallMethod`/`CallSpread`/`New` 这 6 个 opcode
 仍然各自做"取 callee → 判种类 → 开帧"，要把它们也汇到 `enter_call`
 （届时 `dst: Option<Reg>` 与 native 快路径一并处理）。
@@ -772,7 +800,9 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | **P0b-1b** 操作数角色（表里 `dst: w` / `index: r` / `target: jr`）+ `desc()` + 同款元测试 | **已完成**（2026-10-01） | 同上 | 单元 →**200**；角色用"从实现反推 + 回实现取证"两步定下来 |
 | **P0b-2a** pc 字段类型收紧（`jr`→`RelPc`、`ja`→`AbsPc`，由角色派生） | **已完成**（2026-10-01） | 同上 | 单元 →**201**；`AbsPc` 喂给相对字段已被证实是编译错误 |
 | **P1-1** 帧驱动合一（`FrameMode`：`[[Call]]` / `[[Construct]]` 共用一份驱动） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 删掉 `invoke_construct` 的 100 行拷贝；feature +1 验收断言；数字未动 |
-| P1-2 六个调用 opcode 汇进 `enter_call` | 未开始 | | 面：6 个 opcode × 取 callee/判种类/开帧；届时处理 `dst: Option<Reg>` 与 native 快路径 |
+| **P1-2a** 可调用体种类判定收成一处（`generator_of` / `async_of` / `callee_kind`） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 五个站点各不相同的判定写法统一；`CallEx` 另有 4 处与 `is_constructor` 1 处留给 P1-2b |
+| P1-2b `enter_call(...) -> Control`（把 `CallEx` 的两份内联开帧搬过去） | 未开始 | | 必须保内联（非递归）路径：这些 arm 里 `drive_bytecode_frame` 出现 0 次 |
+| P1-2c 其余调用 opcode 汇进 `enter_call` | 未开始 | | 届时处理 `dst: Option<Reg>` 与 native 快路径 |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
 | P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |

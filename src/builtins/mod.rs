@@ -1991,6 +1991,8 @@ pub fn is_native_function(val: &Value) -> bool {
     }
 }
 
+/// 是不是原生内建函数 —— **只判种类，不复制名字**（已有实现，调用路径上用它，
+/// 免得为了问一句"是不是原生"去 `clone` 一个名字串）。
 pub fn native_function_name(val: &Value) -> Option<String> {
     match val {
         Value::Object(obj_ref) => {

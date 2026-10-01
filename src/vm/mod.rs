@@ -274,6 +274,28 @@ enum FrameMode {
     },
 }
 
+/// 一个可调用体的种类（P1-2a）。判定的**唯一**出口是 [`VM::callee_kind`]。
+///
+/// 以前"是不是原生 / 代理 / 生成器 / async"这套判断散在 `invoke_with_new_target`、
+/// `CallEx`、`CallMethod`、`New`、`Call` 五处，**每处写法还不一样**。B45（代理可调用）
+/// 与 B46（`Reflect.construct` 的 `new.target`）之所以要在好几处分别接线，就是从这些
+/// 分叉漏出去的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalleeKind {
+    /// 代理：`[[Call]]`/`[[Construct]]` 由陷阱决定（ES 10.5.12）。
+    Proxy,
+    /// 原生内建（含绑定函数：它们的名字带 `__bound__` 前缀），按名字分发。
+    Native,
+    /// 生成器函数：调用只造迭代器、不跑函数体，而且**不是构造器**。
+    Generator,
+    /// `async` 函数：调用答一个 promise。
+    Async,
+    /// 普通字节码函数。
+    Bytecode,
+    /// 不可调用。
+    NotCallable,
+}
+
 impl VM {
     pub fn new() -> Self {
         let mut state = State::new();
@@ -899,6 +921,40 @@ impl VM {
         }
     }
 
+    /// 生成器函数的函数号（`None` = 不是生成器）。
+    ///
+    /// **判定的唯一来源**：`callable_func_id` + `module.generators`。代理、原生内建、
+    /// 绑定函数都没有字节码函数号，所以这里不必再判它们是不是 —— 而以前五个调用点
+    /// 各写一遍这套组合（写法还各不相同：`CallMethod` 先 `callable_func_id` 再查集合，
+    /// `New` 反过来用"生成器不是构造器"，`Call` 只有裸函数号直接查集合）。
+    fn generator_of(&self, callee: &Value, module: &Module) -> Option<u32> {
+        self.callable_func_id(callee)
+            .filter(|id| module.generators.contains(id))
+    }
+
+    /// `async` 函数的函数号（`None` = 不是 async）。判定同样只有这一处。
+    fn async_of(&self, callee: &Value, module: &Module) -> Option<u32> {
+        self.callable_func_id(callee)
+            .filter(|id| module.asyncs.contains(id))
+    }
+
+    /// 一个可调用体的种类（[`CalleeKind`]）。给需要"一眼看全"的地方用
+    /// （`invoke_with_new_target` 与 `New` 的"生成器不是构造器"）。
+    fn callee_kind(&self, callee: &Value, module: &Module) -> CalleeKind {
+        if Self::is_proxy(callee) {
+            return CalleeKind::Proxy;
+        }
+        if crate::builtins::is_native_function(callee) {
+            return CalleeKind::Native;
+        }
+        match self.callable_func_id(callee) {
+            Some(id) if module.generators.contains(&id) => CalleeKind::Generator,
+            Some(id) if module.asyncs.contains(&id) => CalleeKind::Async,
+            Some(_) => CalleeKind::Bytecode,
+            None => CalleeKind::NotCallable,
+        }
+    }
+
     pub fn invoke(
         &mut self,
         callee: &Value,
@@ -991,7 +1047,7 @@ impl VM {
         // parameter with a destructuring pattern re-enters `make_iterator`,
         // which reaches this call again: unbounded recursion for a source as
         // ordinary as `Array.prototype[Symbol.iterator] = function* () {…}`.
-        if module.generators.contains(&func_id) {
+        if self.generator_of(callee, module).is_some() {
             return self.create_generator(
                 func_id,
                 effective_this,
@@ -1004,7 +1060,7 @@ impl VM {
         // An `async` function answers a promise, so the frame is driven first
         // and its outcome wrapped: a return fulfils the promise, a throw rejects
         // it (ES 27.7.5.1 `AsyncFunctionStart`).
-        if module.asyncs.contains(&func_id) {
+        if self.async_of(callee, module).is_some() {
             let promise = self.new_promise();
             let outcome = self.drive_bytecode_frame(
                 func_id,
@@ -2213,7 +2269,10 @@ impl VM {
                 // An `async` function answers a promise. Route it through
                 // `invoke`, which drives the body and wraps its outcome, instead
                 // of entering the frame directly.
-                if module.asyncs.contains(&(func_id as u32)) {
+                if self
+                    .async_of(&Value::Function(func_id as u32), module)
+                    .is_some()
+                {
                     self.state.rbp = self.state.rsp;
                     let args = self.collect_call_args(arg_count)?;
                     let result = self.invoke(
@@ -2280,7 +2339,7 @@ impl VM {
                     Value::Function(id) => {
                         // `function*`: calling it only builds the generator;
                         // the body starts at the first `next()`.
-                        if module.generators.contains(&id) {
+                        if self.generator_of(&callee, module).is_some() {
                             let args = self.collect_call_args(arg_count)?;
                             let gobj = self.create_generator(
                                 id,
@@ -2295,7 +2354,7 @@ impl VM {
                         }
                         // `async` in its bare spelling: the call answers a
                         // promise (see `invoke_with_new_target`).
-                        if module.asyncs.contains(&id) {
+                        if self.async_of(&callee, module).is_some() {
                             let args = self.collect_call_args(arg_count)?;
                             let result = self.invoke(
                                 &Value::Function(id),
@@ -3520,27 +3579,25 @@ impl VM {
                 // itself produced a generator object as its result and
                 // `it.next()` was `undefined` — which is what made every
                 // `class { *m() {} }` test fail.
-                if let Some(id) = self.callable_func_id(&method_val) {
-                    if module.generators.contains(&id) {
-                        let gobj = self.create_generator(
-                            id,
-                            obj_val.clone(),
-                            args.clone(),
-                            Vec::new(),
-                            module,
-                        )?;
-                        self.state.set_register(Register::Rv, gobj)?;
-                        self.state.jump_offset(1);
-                        return Ok(());
-                    }
-                    // An `async` method (`obj.m()`): the call answers a promise.
-                    if module.asyncs.contains(&id) {
-                        let result =
-                            self.invoke(&method_val, obj_val.clone(), &args, module)?;
-                        self.state.set_register(Register::Rv, result)?;
-                        self.state.jump_offset(1);
-                        return Ok(());
-                    }
+                if let Some(id) = self.generator_of(&method_val, module) {
+                    let gobj = self.create_generator(
+                        id,
+                        obj_val.clone(),
+                        args.clone(),
+                        Vec::new(),
+                        module,
+                    )?;
+                    self.state.set_register(Register::Rv, gobj)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
+                }
+                // An `async` method (`obj.m()`): the call answers a promise.
+                if self.async_of(&method_val, module).is_some() {
+                    let result =
+                        self.invoke(&method_val, obj_val.clone(), &args, module)?;
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(());
                 }
 
                 match method_val {
@@ -3698,7 +3755,11 @@ impl VM {
 
                 // 1. Determine the function ID and prototype
                 let (func_id, prototype) = match constructor_val {
-                    Value::Function(id) if module.generators.contains(&id) => {
+                    // 生成器不是构造器 —— 判定与别处走同一条路径（`callee_kind`）。
+                    Value::Function(id)
+                        if self.callee_kind(&constructor_val, module)
+                            == CalleeKind::Generator =>
+                    {
                         return Err(RuntimeError::TypeError(format!(
                             "{} is not a constructor",
                             self.current_module_info
