@@ -251,7 +251,9 @@ impl Instr {
 // 新类型：让非法组合写不出来
 pub struct Reg(u16);          // 物理寄存器 / 虚拟寄存器槽
 pub struct ConstIndex(u32);
-pub struct JumpOffset(i32);   // 仍是**绝对 pc**（见 §2.2）
+pub struct JumpOffset(i32);   // ❌ 原设计：单一"绝对 pc"。**已被 P0b-1a 证伪** ——
+                              //    Jump/BrIf 是相对、DelayedJump/ResumeExc 是绝对，
+                              //    要拆成 RelPc / AbsPc，见 §3.2.1 第 1 条
 pub struct SymbolId(u32);
 
 pub enum Instr {
@@ -291,6 +293,50 @@ Rust 的 `match` 穷尽性让"新增变体忘了登记 desc"变成**编译错误
 
 **陷阱**：`Operand::Stack` / `Operand::Primitive` 等**不要**收掉——它们是 regalloc 的决定
 （溢出槽、立即数），字节码不能替它决定。类型收紧只针对"这个字段是什么角色"。
+
+---
+
+### 3.2.1 P0b-1a 实际做法（`Kind`）与它挖出来的三处发现
+
+**做法**：表里每行可以带一个**可选**的 kind 标记（`Jump { offset } @Jump`），没标 = `Normal`。
+宏据此生成 `kind()` / `kind_of()`，**没有兜底分支** —— 往表里加指令而没想它属于哪一类，
+编译期就报错。另生成 `Instr::ALL`（全部 opcode，顺序即表顺序），让测试能"逐条过一遍"。
+
+**元测试（`kind_matches_the_vm_implementation`）**：`kind` 声称的是"这条指令执行时会发生什么"，
+唯一能证明它没说谎的是 `run_instruction` 的实现本身 —— 于是测试直接 `include_str!("vm/mod.rs")`，
+切出每条 arm，按 kind 检查它的正文里有没有相应证据：
+
+| kind | 正文里必须能找到 |
+|------|------------------|
+| `Call` | `self.invoke(` / `self.construct(` / `self.invoke_with_new_target(` / `builtins::call_native(` |
+| `Jump` | `self.state.jump(` / `self.state.jump_offset(` |
+| `Suspend` | `generator_yielded` / `await_value` |
+| `Throw` | `self.handle_throw(` |
+| `Bookkeeping` | `rsp` |
+| `Return` | `unreachable!(`（`Ret`/`Halt` 由 `step()` 处理） |
+
+这些断言是**单向**的：标了 `Call` 就必须真的在调用；反过来不成立，见下面第 3 条。
+
+**它挖出来的三处"只存在于实现里"的知识**（都写进了注释，不再靠口口相传）：
+
+1. **`Jump` / `BrIf` 是相对偏移**（`state.jump_offset`），**`DelayedJump` / `ResumeExc` /
+   `PrologueEnd` 是绝对 pc**（`state.jump`）。本文档 §3.2 原来写"`JumpOffset` 仍是绝对 pc"是
+   **错的** —— 所以类型收紧时一个 `JumpOffset(i32)` 不够，要分成 `RelPc` / `AbsPc`
+   （`jump_offsets_are_relative_or_absolute` 测试钉住了这条差异）。
+2. **`Try` 有 pc 字段但执行期不跳**（登记 SEH 记录后照样往下走），`IterNext` 写布尔寄存器也不是
+   跳转（分支由随后的 `BrIf` 完成）。所以 `Kind` 只能定义成"**执行期的控制流效应**"，
+   而不是"有没有 pc 字段" —— "跳转偏移当寄存器读"那类 bug 发生在**字段角色**层面，
+   是 `desc()` 的职责，不是 `Kind` 的。
+3. **`InstanceOf` / `PropGet` / `ToString` 能跑用户代码**（`Symbol.hasInstance` / getter / `valueOf`），
+   但它们的**形状**不是一次调用。所以 `Kind::Call` 收紧为"指令本身就是一次调用"
+   （callee + 栈上 `argc`），否则 `Call` 会膨胀到把半个指令集吞进去。
+
+**对 P0b 剩余部分的输入**：
+
+- `Desc.writes` **不能**是 `Option<Reg>`（§3.2 原设计）：`New.callee` 与 `CallMethod.callee`
+  是 **in/out** 操作数（先 `get_value` 再回写），所以写集也得是 `Vec`。
+- `ThrowExc` 的抛点是 `self.handle_throw(`，`ResumeExc` 也会 `handle_throw`；做角色标注时
+  别按"函数名像不像抛异常"来猜。
 
 ---
 
@@ -612,11 +658,12 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 |------|------|------|------|
 | **P0a-1** 容器 enum + 指令表（codegen / Module / 回填） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 通过 16561 / 执行 19708 / 跳过 7843 **一个数未动**、零逐套件回退；单元 190→**194**；单片回归 +10.7%（待 P0a-2 收回） |
 | **P0a-2** `run_instruction` 逐 arm 命名解构（85 arm，含 6 条分组） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单片 114.6s → 107.1s（基线 103.5s）；通过 16561 / 执行 19708 / 跳过 7843 **仍然一个数未动** |
-| P0b 类型收紧 + 互校 | 未开始 | | `desc()` 用 `Vec<Reg>`（不在热路径，勿加依赖） |
+| **P0b-1a** `Kind` 分类（表里 `@Kind` 标记 + 穷尽 `kind()`）+ VM 源码元测试 | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单元 194→**198**；新增 4 条测试，其中 1 条直接读 `vm/mod.rs` 取证 |
 | P1 调用归一 | 未开始 | | |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
 | P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |
+| P0b 剩余：操作数角色 + `desc()` + 类型收紧 | 未开始 | | 形状要改（见 §3.2.1）：`Desc.writes` 得是 `Vec`；偏移要分 `RelPc` / `AbsPc` |
 | 语义线：TypedArray 族入册解锁 | 未开始 | | 可随时插入；纯赚 test262 分数 |
 
 ### 9.1 P0a 的实际改动（P0a-1 + P0a-2，至此收口）

@@ -139,6 +139,10 @@ impl Compiler {
             // appends after sealing the last block. A suspended generator
             // resumed with a return completion re-enters here (see
             // `Module::exit_pc`).
+            //
+            // Deliberately `Opcode::Ret` and not `Kind::Return`: the module-level
+            // code ends with `Halt`, which is also `Kind::Return` (`bytecode.rs`),
+            // but its pc is not a function exit.
             if let Some(idx) = func_codes
                 .iter()
                 .rposition(|code| matches!(code.opcode(), crate::bytecode::Opcode::Ret))

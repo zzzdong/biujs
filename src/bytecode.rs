@@ -109,12 +109,62 @@ impl fmt::Display for Module {
 /// **没有一条指令的操作数超过 3 个**，而 `Try` / `Halt` / `Ret` / `EndTry` / `ResumeExc` /
 /// `PrologueEnd` 在旧编码里都带着无意义的填充槽（`Try` 甚至得用 `triple` 才装得下两个偏移，
 /// 第三个槽永远是 0）。
+///
+/// 表里还可以给一行加一个**可选的 kind 标记**（`@Jump` / `@Call` / …），未标即 `Normal`。
+/// 标记由本宏生成 [`Instr::kind`]，且**没有兜底分支** —— 往表里加一条指令而忘了想它属于
+/// 哪一类，编译期就会报错。
+/// 一条指令在执行期的**控制流效应**。这是给"扫字节码的人"用的（回填校验、
+/// 代码生成后处理、将来的 CFG 层），**不是**热路径：主循环仍然直接解构命名字段。
+///
+/// 与"操作数角色"（P0b 的读写集）是两件事：`Kind` 说这条指令**会做什么**，
+/// 读写集说它**碰哪些操作数**。`Try` 有跳转目标却是 `Normal`（它登记处理点后照样往下走），
+/// `IterNext` 写一个布尔寄存器也是 `Normal`（分支由随后的 `BrIf` 完成）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// 顺序执行到 `pc + 1`。
+    Normal,
+    /// 可能把 `pc` 设到别处：`Jump` / `BrIf`（两者都是**相对**偏移，
+    /// 走 `state.jump_offset`）以及 `DelayedJump` / `ResumeExc`（**绝对** pc，
+    /// 走 `state.jump`）。
+    Jump,
+    /// **指令本身就是一次调用**：从栈上取 `argc` 个参数并进入被调方
+    /// （`Call` / `CallEx` / `CallNative` / `CallMethod` / `CallSpread` /
+    /// `CallSuperSpread`）或构造（`New` / `NewSpread`）。
+    ///
+    /// 这**不是**"可能触发用户代码"：`PropGet` 会跑 getter、`InstanceOf` 会跑
+    /// `Symbol.hasInstance`、`ToString` 会跑 `valueOf`，它们都仍算 `Normal` ——
+    /// `Kind` 描述的是指令**自身的形状**，不是"它能跑多少 JS"。
+    Call,
+    /// 结束当前帧：`Ret` / `Halt`。
+    Return,
+    /// 抛出异常：`ThrowExc`。
+    Throw,
+    /// 挂起当前帧、把控制权交回 resumer：`Yield` / `Await`。
+    Suspend,
+    /// 栈指针簿记（`rsp` / `rbp` 的编译期维护），不参与 JS 值流：
+    /// `PushC` / `PopC` / `MovC` / `AddC` / `SubC`。
+    Bookkeeping,
+}
+
+/// 表里的 `@Jump` 这类标记 → `Kind::Jump`；没标 → `Kind::Normal`。
+///
+/// 宏里要写 `make_kind!($( $k )?)`，那个可选重复展开成"什么都没有"或一个 ident，
+/// 于是这里正好用两条规则接住。
+macro_rules! make_kind {
+    () => {
+        Kind::Normal
+    };
+    ($k:ident) => {
+        Kind::$k
+    };
+}
+
 macro_rules! define_instrs {
     (
-        $( $z:ident {} ),* ;
-        $( $o1:ident { $f1:ident } ),* ;
-        $( $o2:ident { $g1:ident, $g2:ident } ),* ;
-        $( $o3:ident { $h1:ident, $h2:ident, $h3:ident } ),*
+        $( $z:ident {} $( @$zk:ident )? ),* ;
+        $( $o1:ident { $f1:ident } $( @$k1:ident )? ),* ;
+        $( $o2:ident { $g1:ident, $g2:ident } $( @$k2:ident )? ),* ;
+        $( $o3:ident { $h1:ident, $h2:ident, $h3:ident } $( @$k3:ident )? ),*
     ) => {
         #[derive(Debug, Clone, Copy)]
         pub enum Instr {
@@ -154,6 +204,41 @@ macro_rules! define_instrs {
                     $( Opcode::$o3 => 3, )*
                 }
             }
+
+            /// 这条指令在执行期的**控制流效应**（表里 `@Kind` 标记；未标 = `Normal`）。
+            ///
+            /// 注意定义：`Kind` 说的是"执行时会发生什么"，**不是**"有没有 pc 字段"。
+            /// 所以 `Try`（登记异常处理点、然后顺序往下走）是 `Normal`，
+            /// `IterNext`（把布尔写进寄存器、由随后的 `BrIf` 分支）也是 `Normal`。
+            pub fn kind(&self) -> Kind {
+                match self {
+                    $( Instr::$z {} => make_kind!($( $zk )?), )*
+                    $( Instr::$o1 { .. } => make_kind!($( $k1 )?), )*
+                    $( Instr::$o2 { .. } => make_kind!($( $k2 )?), )*
+                    $( Instr::$o3 { .. } => make_kind!($( $k3 )?), )*
+                }
+            }
+
+            /// 同上，但只有 opcode 时用（例如回填/扫描时手上没有实例）。
+            pub fn kind_of(op: Opcode) -> Kind {
+                match op {
+                    $( Opcode::$z => make_kind!($( $zk )?), )*
+                    $( Opcode::$o1 => make_kind!($( $k1 )?), )*
+                    $( Opcode::$o2 => make_kind!($( $k2 )?), )*
+                    $( Opcode::$o3 => make_kind!($( $k3 )?), )*
+                }
+            }
+
+            /// 表里**所有** opcode，顺序即表顺序。
+            ///
+            /// 给"逐条过一遍"的工具与测试用：`kind()` 没有兜底分支，所以往表里加指令
+            /// 必须表态；这个常量则保证测试能把每一条都走一遍（否则漏测是无声的）。
+            pub const ALL: &'static [Opcode] = &[
+                $( Opcode::$z, )*
+                $( Opcode::$o1, )*
+                $( Opcode::$o2, )*
+                $( Opcode::$o3, )*
+            ];
 
             /// 按 opcode 组装。`Instruction::UnaryOp` / `BinaryOp` 携带**运行时 opcode**，
             /// 所以必须有这条路径；调用方请用 [`Self::unary`] / [`Self::binary`]，它们核对 arity。
@@ -214,25 +299,25 @@ macro_rules! define_instrs {
 
 define_instrs! {
 // ── arity 0 ──
-        Halt {},
-        Ret {},
+        Halt {} @Return,
+        Ret {} @Return,
         EndTry {},
-        ResumeExc {},
-        PrologueEnd {}
+        ResumeExc {} @Jump,
+        PrologueEnd {} @Suspend
     ;
 // ── arity 1 ──
         DeclareLexical { name },
         Push { src },
         Pop { dst },
-        PushC { src },
-        PopC { dst },
-        Jump { offset },
+        PushC { src } @Bookkeeping,
+        PopC { dst } @Bookkeeping,
+        Jump { offset } @Jump,
         DelegateOpen { iter },
         DelegateClose { iter },
         MakeArray { dst },
         MarkHole { array },
         MakeObject { dst },
-        ThrowExc { value },
+        ThrowExc { value } @Throw,
         LoadException { dst },
         LoadThis { dst },
         LoadNewTarget { dst },
@@ -246,10 +331,10 @@ define_instrs! {
         InitLexical { name, value },
         SetFunctionName { func, name },
         LoadEnv { dst, name },
-        MovC { dst, src },
-        Call { func, argc },
-        CallEx { callee, argc },
-        CallNative { callee, argc },
+        MovC { dst, src } @Bookkeeping,
+        Call { func, argc } @Call,
+        CallEx { callee, argc } @Call,
+        CallNative { callee, argc } @Call,
         Mov { dst, src },
         Not { dst, src },
         BitNot { dst, src },
@@ -261,22 +346,22 @@ define_instrs! {
         ArrayPushSpread { array, src },
         StoreEnv { name, value },
         Try { catch_offset, finally_offset },
-        DelayedJump { target, seh_depth },
+        DelayedJump { target, seh_depth } @Jump,
         CreateClosure { dst, func },
-        New { callee, argc },
+        New { callee, argc } @Call,
         MakeFuncObj { dst, func },
         ClosureVar { name, value },
-        Yield { dst, value },
-        Await { dst, src },
+        Yield { dst, value } @Suspend,
+        Await { dst, src } @Suspend,
         ToString { dst, src },
         ToNumber { dst, src },
         MakeRest { dst, from }
     ;
 // ── arity 3 ──
         MakeRegExp { dst, source, flags },
-        AddC { dst, src, value },
-        SubC { dst, src, value },
-        BrIf { condition, true_target, false_target },
+        AddC { dst, src, value } @Bookkeeping,
+        SubC { dst, src, value } @Bookkeeping,
+        BrIf { condition, true_target, false_target } @Jump,
         BitAnd { dst, lhs, rhs },
         BitOr { dst, lhs, rhs },
         BitXor { dst, lhs, rhs },
@@ -308,11 +393,11 @@ define_instrs! {
         PropSet { object, property, value },
         PropDelete { dst, object, property },
         IndexDelete { dst, object, index },
-        CallMethod { callee, property, argc },
+        CallMethod { callee, property, argc } @Call,
         MakeArrowFuncObj { dst, func, captured_this },
-        CallSpread { callee, this, args },
-        CallSuperSpread { callee, this, args },
-        NewSpread { dst, ctor, args }
+        CallSpread { callee, this, args } @Call,
+        CallSuperSpread { callee, this, args } @Call,
+        NewSpread { dst, ctor, args } @Call
 }
 
 impl fmt::Display for Instr {
@@ -1230,5 +1315,169 @@ mod tests {
         assert!(display.contains("Module main"));
         assert!(display.contains("\"hello\""));
         assert!(display.contains("halt"));
+    }
+
+    // ──────────────────────── Kind（P0b 的控制流分类）────────────────────────
+
+    fn count_of(kind: Kind) -> usize {
+        Instr::ALL.iter().filter(|op| Instr::kind_of(**op) == kind).count()
+    }
+
+    /// 计数断言：改表时这几个数会变，逼你确认"是有意改的"。
+    ///
+    /// 它同时也是"标记没被手滑删掉"的守卫 —— 删掉一个 `@Call`，这里立刻红。
+    #[test]
+    fn kind_markers_cover_the_table() {
+        assert_eq!(Instr::ALL.len(), 93, "表里的指令条数");
+        assert_eq!(count_of(Kind::Call), 8, "Call* / New*");
+        assert_eq!(count_of(Kind::Jump), 4, "Jump / BrIf / DelayedJump / ResumeExc");
+        assert_eq!(count_of(Kind::Return), 2, "Ret / Halt");
+        assert_eq!(count_of(Kind::Throw), 1, "ThrowExc");
+        assert_eq!(count_of(Kind::Suspend), 3, "Yield / Await / PrologueEnd");
+        assert_eq!(count_of(Kind::Bookkeeping), 5, "PushC / PopC / MovC / AddC / SubC");
+        // 其余全是 Normal；没有兜底分支的 kind() 保证"没标"就是 Normal。
+        let marked = count_of(Kind::Call)
+            + count_of(Kind::Jump)
+            + count_of(Kind::Return)
+            + count_of(Kind::Throw)
+            + count_of(Kind::Suspend)
+            + count_of(Kind::Bookkeeping);
+        assert_eq!(count_of(Kind::Normal), Instr::ALL.len() - marked);
+    }
+
+    /// 表的顺序与 `ALL` 一致（`ALL` 是拿来做工具/测试的，顺序即表顺序）。
+    #[test]
+    fn opcode_list_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for op in Instr::ALL {
+            assert!(seen.insert(format!("{op:?}")), "{op:?} 在表里出现了两次");
+        }
+    }
+
+    /// 从 `run_instruction` 的源码里切出每条 arm：(opcode 名字列表, arm 全文)。
+    ///
+    /// arm 头一定在**基线缩进**（12 空格）且以 `Instr::` 开头；or-模式的续行是
+    /// 14 空格 + `| Instr::`，不会被误当成新 arm。
+    fn run_instruction_arms(source: &str) -> Vec<(Vec<String>, String)> {
+        let start = source.find("fn run_instruction").expect("VM 里没有 run_instruction");
+        let rest = &source[start..];
+        let end = rest[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[..end];
+        let m = body.find("match *inst {").expect("run_instruction 不再 match *inst");
+        let text = &body[m..];
+
+        let mut heads = Vec::new();
+        let mut cursor = 0;
+        for line in text.split_inclusive('\n') {
+            // 正好 12 个空格 + `Instr::` = arm 头；or-模式的续行是 14 空格 + `| `。
+            if line.starts_with("            Instr::") {
+                heads.push(cursor);
+            }
+            cursor += line.len();
+        }
+        let mut arms = Vec::new();
+        for (i, &h) in heads.iter().enumerate() {
+            let slice_end = heads.get(i + 1).copied().unwrap_or(text.len());
+            let arm = &text[h..slice_end];
+            let head = &arm[..arm.find("=>").expect("arm 没有 =>")];
+            let mut ops = Vec::new();
+            let mut idx = 0;
+            while let Some(p) = head[idx..].find("Instr::") {
+                let s = idx + p + "Instr::".len();
+                let name: String = head[s..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                ops.push(name);
+                idx = s;
+            }
+            arms.push((ops, arm.to_string()));
+        }
+        arms
+    }
+
+    /// **元测试**：kind 标记说的是"这条指令执行时会发生什么"，而唯一能证明它没说谎的
+    /// 东西就是 `run_instruction` 的实现本身。所以这里直接读 VM 的源码取证 ——
+    /// 判据不是又一份手写知识，而是实现。
+    ///
+    /// 注意这些断言是**单向**的（"标了 Call 就必须真的在调用"）：反过来不成立，
+    /// 因为 `PropGet` 会跑 getter、`InstanceOf` 会跑 `Symbol.hasInstance` ——
+    /// 它们能跑 JS，但自身形状不是"一次调用"，仍算 `Normal`。
+    #[test]
+    fn kind_matches_the_vm_implementation() {
+        let source = include_str!("vm/mod.rs");
+        let arms = run_instruction_arms(source);
+
+        // 覆盖性：表里的每一条都要能在这段源码里找到（也就顺带验证了上面的切分器
+        // 没有漏掉多行模式）。
+        let mut covered = std::collections::HashSet::new();
+        for (ops, _) in &arms {
+            for op in ops {
+                covered.insert(op.clone());
+            }
+        }
+        for op in Instr::ALL {
+            let name = format!("{op:?}");
+            assert!(covered.contains(&name), "{name} 在 run_instruction 里没有 arm");
+        }
+
+        let rules: &[(Kind, &[&str])] = &[
+            (
+                Kind::Call,
+                &[
+                    "self.invoke(",
+                    "self.construct(",
+                    "self.invoke_with_new_target(",
+                    "builtins::call_native(",
+                ],
+            ),
+            (Kind::Jump, &["self.state.jump(", "self.state.jump_offset("]),
+            (Kind::Suspend, &["generator_yielded", "await_value"]),
+            (Kind::Throw, &["self.handle_throw("]),
+            (Kind::Bookkeeping, &["rsp"]),
+            // `Ret` / `Halt` 由 `step()` 处理，这里的 arm 只可能是 `unreachable!`。
+            (Kind::Return, &["unreachable!("]),
+        ];
+
+        for (ops, arm) in &arms {
+            for name in ops {
+                let op = Instr::ALL
+                    .iter()
+                    .copied()
+                    .find(|o| format!("{o:?}") == *name)
+                    .unwrap_or_else(|| panic!("表里没有 {name}"));
+                let kind = Instr::kind_of(op);
+                let Some((_, evidence)) = rules.iter().find(|(k, _)| *k == kind) else {
+                    continue; // Normal：不做断言（见上面的说明）
+                };
+                assert!(
+                    evidence.iter().any(|e| arm.contains(e)),
+                    "{name} 标了 {kind:?}，但它的 arm 里找不到 {evidence:?} 中的任何一个；\
+                     arm 正文是：\n{arm}"
+                );
+            }
+        }
+    }
+
+    /// 跳转类指令的偏移**相对还是绝对**：`Jump` / `BrIf` 是相对（`jump_offset`），
+    /// `DelayedJump` / `ResumeExc` 是绝对（`jump`）。这条差异以前只存在于实现里，
+    /// 现在有两个断言钉住它（P0b 的类型收紧要靠它决定 `RelPc` / `AbsPc`）。
+    #[test]
+    fn jump_offsets_are_relative_or_absolute() {
+        let arms = run_instruction_arms(include_str!("vm/mod.rs"));
+        let arm_of = |want: &str| {
+            arms.iter()
+                .find(|(ops, _)| ops.iter().any(|o| o == want))
+                .map(|(_, arm)| arm.clone())
+                .unwrap_or_else(|| panic!("找不到 {want} 的 arm"))
+        };
+        for relative in ["Jump", "BrIf"] {
+            let arm = arm_of(relative);
+            assert!(arm.contains("jump_offset("), "{relative} 应该是相对跳转");
+        }
+        for absolute in ["DelayedJump", "ResumeExc"] {
+            let arm = arm_of(absolute);
+            assert!(arm.contains("self.state.jump("), "{absolute} 应该是绝对跳转");
+        }
     }
 }
