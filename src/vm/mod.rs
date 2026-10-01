@@ -520,8 +520,10 @@ impl VM {
     /// to continue. This is factored out so that other methods can run a nested
     /// execution loop (e.g. for re-entrant function calls such as ToPrimitive).
     fn step(&mut self, module: &Module) -> Result<bool, RuntimeError> {
+        // Borrowed, not cloned: `module` and `self` are distinct, so the
+        // instruction can be matched in place — no 48-byte copy per step.
         let inst = match module.instructions.get(self.state.pc) {
-            Some(i) => i.clone(),
+            Some(i) => i,
             None => return Ok(false),
         };
         // A spent guard ends the run for good: JS may catch the `RangeError`,
@@ -552,13 +554,11 @@ impl VM {
                 return Err(RuntimeError::RangeError(fired.message(self.timeout)));
             }
         }
-        let opcode = inst.opcode();
-
-        match opcode {
-            Opcode::Halt => {
+        match *inst {
+            Instr::Halt {} => {
                 return Ok(false);
             }
-            Opcode::Ret => {
+            Instr::Ret {} => {
                 // Check if we need to execute any finally blocks before returning.
                 //
                 // The *innermost* pending one goes first, which is both what the
@@ -2106,19 +2106,18 @@ impl VM {
     }
 
     fn run_instruction(&mut self, inst: &Instr, module: &Module) -> Result<(), RuntimeError> {
-        // 过渡接口：`slots()` 把操作数按位置拷出，未用到的位置是 `Immd(0)`（与旧编码的
-        // 填充槽一致，所以语义不变）。逐条 arm 改成命名字段解构是 P0a-2，
-        // 见 `docs/interpreter-refactor.md` §3.1。
-        let operands = inst.slots();
-        let opcode = inst.opcode();
-
-        match opcode {
+        // 按**命名字段**解构，而不是"从 3 个槽位里按下标取"（旧编码的形状）。
+        // `match *inst` 而非 `match inst`：`Instr` 是 Copy，按值匹配后每个绑定都是
+        // `Operand` 而不是 `&Operand`，于是 arm 体里原来的表达式不用改类型。
+        // 分组 arm（`A | B`）用位置别名 `a0/a1/a2`，因为 or-模式要求各分支绑定同名，
+        // 而 `IndexGet { index }` 与 `PropGet { property }` 的字段名并不相同。
+        match *inst {
             // `yield expr`: suspend the enclosing generator. The frame stays on
             // the value stack; `generator_next` lifts it out before rewinding
             // `rsp`. Jumping past the last instruction ends the nested `step`
             // loop the resumer is driving, exactly as a `Ret` to the sentinel
             // return address would.
-            Opcode::PrologueEnd => {
+            Instr::PrologueEnd {  } => {
                 // Only reached while `create_generator` runs the parameter
                 // prologue: on any later resume the instruction is already behind
                 // the frame's pc. Parking mirrors `Yield` exactly — the frame is
@@ -2131,35 +2130,34 @@ impl VM {
                     self.state.jump(module.instructions.len());
                 }
             }
-            Opcode::Yield => {
+            Instr::Yield { value, .. } => {
                 // `-1` is the "no operand" marker emitted for a bare `yield`
-                // (codegen cannot leave an operand slot empty).
-                let value = match operands.get(1) {
-                    Some(Operand::Immd(-1)) => Value::Undefined,
-                    Some(src) => self.get_value(*src)?,
-                    None => Value::Undefined,
+                // (codegen has nothing to point at, but the field is not
+                // optional — P0b turns this into `Option<Operand>`).
+                let value = match value {
+                    Operand::Immd(-1) => Value::Undefined,
+                    src => self.get_value(src)?,
                 };
                 // `yield expr` evaluates to the value the resumer supplied.
                 self.generator_yielded = Some(value);
                 self.generator_yield_pc = self.state.pc;
                 self.state.jump(module.instructions.len());
             }
-            Opcode::Await => {
-                let value = match operands.get(1) {
-                    Some(Operand::Immd(-1)) => Value::Undefined,
-                    Some(src) => self.get_value(*src)?,
-                    None => Value::Undefined,
+            Instr::Await { dst, src } => {
+                // Same `-1` marker as `Yield`: a bare `await` has nothing to
+                // await, so the operand carries the "absent" marker.
+                let value = match src {
+                    Operand::Immd(-1) => Value::Undefined,
+                    src => self.get_value(src)?,
                 };
                 let awaited = self.await_value(value, module)?;
-                if let Some(dst) = operands.first() {
-                    self.set_value(*dst, awaited)?;
-                }
+                self.set_value(dst, awaited)?;
             }
             // ===== Control Flow =====
-            Opcode::Call => {
-                let func_id = operands[0].as_immd();
-                // Second operand is the argument count (see `CodeGen::gen_call`).
-                let arg_count = operands.get(1).map(|o| o.as_immd() as usize).unwrap_or(0);
+            Instr::Call { func, argc } => {
+                let func_id = func.as_immd();
+                // The argument count is its own operand (see `CodeGen::gen_call`).
+                let arg_count = argc.as_immd() as usize;
                 // An `async` function answers a promise. Route it through
                 // `invoke`, which drives the body and wraps its outcome, instead
                 // of entering the frame directly.
@@ -2197,12 +2195,12 @@ impl VM {
                     }
                 }
             }
-            Opcode::CallEx => {
-                let arg_count = operands[1].as_immd() as usize;
+            Instr::CallEx { callee, argc } => {
+                let arg_count = argc.as_immd() as usize;
                 // Operands are read with the *caller's* frame pointer still in
                 // place: a stack-slot operand would otherwise resolve inside the
                 // callee's frame. The frame switch happens once they are read.
-                let callee = self.get_value(operands[0])?;
+                let callee = self.get_value(callee)?;
                 self.state.rbp = self.state.rsp;
 
                 // A proxy is callable when its target is, and the call itself is
@@ -2373,14 +2371,14 @@ impl VM {
                     _ => return Err(RuntimeError::TypeError("not a function".to_string())),
                 }
             }
-            Opcode::Jump => {
-                let offset = operands[0].as_immd();
+            Instr::Jump { offset } => {
+                let offset = offset.as_immd();
                 self.state.jump_offset(offset);
                 return Ok(());
             }
-            Opcode::DelayedJump => {
-                let offset = operands[0].as_immd();
-                let seh_depth = operands[1].as_immd() as usize;
+            Instr::DelayedJump { target, seh_depth } => {
+                let offset = target.as_immd();
+                let seh_depth = seh_depth.as_immd() as usize;
 
                 // Check if we need to execute any finally blocks
                 let mut finally_to_execute = None;
@@ -2423,13 +2421,13 @@ impl VM {
                 self.state.jump(offset.max(0) as usize);
                 return Ok(());
             }
-            Opcode::BrIf => {
-                let cond = self.get_value(operands[0])?;
+            Instr::BrIf { condition, true_target, false_target } => {
+                let cond = self.get_value(condition)?;
                 let b = cond.to_boolean();
                 let offset = if b {
-                    operands[1].as_immd()
+                    true_target.as_immd()
                 } else {
-                    operands[2].as_immd()
+                    false_target.as_immd()
                 };
                 self.state.jump_offset(offset);
                 return Ok(());
@@ -2437,19 +2435,19 @@ impl VM {
             // Opcode::Ret is handled directly in run()
 
             // ===== Stack / Register Manipulation =====
-            Opcode::Mov => {
-                let value = self.get_value(operands[1])?;
-                self.set_value(operands[0], value)?;
+            Instr::Mov { dst, src } => {
+                let value = self.get_value(src)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::Push => {
-                let value = self.get_value(operands[0])?;
+            Instr::Push { src } => {
+                let value = self.get_value(src)?;
                 self.state.push(value)?;
             }
-            Opcode::Pop => {
+            Instr::Pop { dst } => {
                 let value = self.state.pop()?;
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::MovC => match (operands[0], operands[1]) {
+            Instr::MovC { dst, src } => match (dst, src) {
                 (Operand::Register(Register::Rsp), Operand::Register(Register::Rbp)) => {
                     self.state.rsp = self.state.rbp;
                 }
@@ -2462,7 +2460,7 @@ impl VM {
                     )));
                 }
             },
-            Opcode::PushC => match operands[0] {
+            Instr::PushC { src } => match src {
                 Operand::Register(Register::Rsp) => {
                     self.state.pushc(self.state.rsp)?;
                 }
@@ -2475,7 +2473,7 @@ impl VM {
                     )));
                 }
             },
-            Opcode::PopC => match operands[0] {
+            Instr::PopC { dst } => match dst {
                 Operand::Register(Register::Rsp) => {
                     self.state.rsp = self.state.popc()?;
                 }
@@ -2488,9 +2486,9 @@ impl VM {
                     )));
                 }
             },
-            Opcode::AddC => match (operands[0], operands[1]) {
+            Instr::AddC { dst, src, value } => match (dst, src) {
                 (Operand::Register(Register::Rsp), Operand::Register(Register::Rsp)) => {
-                    self.state.rsp += operands[2].as_immd() as usize;
+                    self.state.rsp += value.as_immd() as usize;
                 }
                 _ => {
                     return Err(RuntimeError::TypeError(format!(
@@ -2498,9 +2496,9 @@ impl VM {
                     )));
                 }
             },
-            Opcode::SubC => match (operands[0], operands[1]) {
+            Instr::SubC { dst, src, value } => match (dst, src) {
                 (Operand::Register(Register::Rsp), Operand::Register(Register::Rsp)) => {
-                    self.state.rsp -= operands[2].as_immd() as usize;
+                    self.state.rsp -= value.as_immd() as usize;
                 }
                 _ => {
                     return Err(RuntimeError::TypeError(format!(
@@ -2510,16 +2508,16 @@ impl VM {
             },
 
             // ===== Load Instructions =====
-            Opcode::LoadConst => {
-                let const_index = operands[1].as_immd();
+            Instr::LoadConst { dst, index } => {
+                let const_index = index.as_immd();
                 let value = Self::from_constant(&module.constants[const_index as usize]);
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::MakeRegExp => {
-                let source = match &module.constants[operands[1].as_immd() as usize] {
+            Instr::MakeRegExp { dst, source, flags } => {
+                let source = match &module.constants[source.as_immd() as usize] {
                     Constant::String(v) => v.to_string(),
                 };
-                let flags = match &module.constants[operands[2].as_immd() as usize] {
+                let flags = match &module.constants[flags.as_immd() as usize] {
                     Constant::String(v) => v.to_string(),
                 };
                 let proto = Some(Value::Object(Rc::clone(&self.builtins.regexp_prototype)));
@@ -2527,10 +2525,10 @@ impl VM {
                     &[Value::string(&source), Value::string(&flags)],
                     proto,
                 )?;
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::DeclareLexical => {
-                let name_index = operands[0].as_immd();
+            Instr::DeclareLexical { name } => {
+                let name_index = name.as_immd();
                 let name = match &module.constants[name_index as usize] {
                     Constant::String(s) => s.as_str().to_string(),
                 };
@@ -2538,38 +2536,38 @@ impl VM {
                 // follows is what initializes it.
                 self.state.script_env.entry(name).or_insert(None);
             }
-            Opcode::InitLexical => {
-                let name_index = operands[0].as_immd();
+            Instr::InitLexical { name, value } => {
+                let name_index = name.as_immd();
                 let name = match &module.constants[name_index as usize] {
                     Constant::String(s) => s.as_str().to_string(),
                 };
-                let value = self.get_value(operands[1])?;
+                let value = self.get_value(value)?;
                 // Ends the dead zone. This is the declaration's own write, so it
                 // is allowed even though a plain `StoreEnv` to an uninitialized
                 // binding would throw.
                 self.state.script_env.insert(name, Some(value));
             }
-            Opcode::SetFunctionName => {
-                let func = self.get_value(operands[0])?;
-                let name = self.get_value(operands[1])?;
+            Instr::SetFunctionName { func, name } => {
+                let func = self.get_value(func)?;
+                let name = self.get_value(name)?;
                 if let Value::String(text) = &name {
                     self.set_function_name(&func, text);
                 }
             }
-            Opcode::LoadEnv => {
-                let name_index = operands[1].as_immd();
+            Instr::LoadEnv { dst, name } => {
+                let name_index = name.as_immd();
                 let name = &module.constants[name_index as usize];
                 match name {
                     Constant::String(name) => {
                         match self.state.resolve_env_name(name.as_str())? {
                             Some(value) => {
-                                self.set_value(operands[0], value)?;
+                                self.set_value(dst, value)?;
                             }
                             None => {
                                 // Fall back to global environment
                                 match self.state.get_global(name) {
                                     Some(value) => {
-                                        self.set_value(operands[0], value)?;
+                                        self.set_value(dst, value)?;
                                     }
                                     None => {
                                         return Err(RuntimeError::ReferenceError(format!(
@@ -2584,9 +2582,9 @@ impl VM {
             }
 
             // ===== Arithmetic =====
-            Opcode::Addx => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::Addx { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 // ES `Add`: ToPrimitive both operands, then string-concat if either
                 // is a string, otherwise numeric addition.
                 let lprim = self.to_primitive(&lhs, "default", module)?;
@@ -2600,80 +2598,83 @@ impl VM {
                 } else {
                     lprim + rprim
                 };
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::Subx => {
+            Instr::Subx { dst, lhs, rhs } => {
                 // ToNumeric starts with ToPrimitive(hint number), as `Pow`
                 // already did: without it an object operand (`date1 - date2`, a
                 // boxed Number) collapses to NaN.
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let lprim = self.to_primitive(&lhs, "number", module)?;
                 let rprim = self.to_primitive(&rhs, "number", module)?;
                 let value = lprim - rprim;
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::Mulx => {
+            Instr::Mulx { dst, lhs, rhs } => {
                 // ToNumeric starts with ToPrimitive(hint number), as `Pow`
                 // already did: without it an object operand (`date1 - date2`, a
                 // boxed Number) collapses to NaN.
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let lprim = self.to_primitive(&lhs, "number", module)?;
                 let rprim = self.to_primitive(&rhs, "number", module)?;
                 let value = lprim * rprim;
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::Divx => {
+            Instr::Divx { dst, lhs, rhs } => {
                 // ToNumeric starts with ToPrimitive(hint number), as `Pow`
                 // already did: without it an object operand (`date1 - date2`, a
                 // boxed Number) collapses to NaN.
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let lprim = self.to_primitive(&lhs, "number", module)?;
                 let rprim = self.to_primitive(&rhs, "number", module)?;
                 let value = lprim / rprim;
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::Remx => {
+            Instr::Remx { dst, lhs, rhs } => {
                 // ToNumeric starts with ToPrimitive(hint number), as `Pow`
                 // already did: without it an object operand (`date1 - date2`, a
                 // boxed Number) collapses to NaN.
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let lprim = self.to_primitive(&lhs, "number", module)?;
                 let rprim = self.to_primitive(&rhs, "number", module)?;
                 let value = lprim % rprim;
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::Pow => {
+            Instr::Pow { dst, lhs, rhs } => {
                 // ES `ExponentiationExpression`: ToNumeric on both operands,
                 // then `**`. Like the other arithmetic opcodes this does not
                 // model the BigInt case (the engine has no BigInt).
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let lprim = self.to_primitive(&lhs, "number", module)?;
                 let rprim = self.to_primitive(&rhs, "number", module)?;
                 let value = Value::Number(lprim.to_number().powf(rprim.to_number()));
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
 
             // ===== Unary =====
-            Opcode::Not => {
-                let value = self.get_value(operands[1])?;
+            Instr::Not { dst, src } => {
+                let value = self.get_value(src)?;
                 let result = Value::Bool(!value.to_boolean());
-                self.set_value(operands[0], result)?;
+                self.set_value(dst, result)?;
             }
-            Opcode::BitNot => {
+            Instr::BitNot { dst, src } => {
                 // Bitwise NOT: convert to 32-bit signed integer, flip bits
-                let value = self.get_value(operands[1])?;
+                let value = self.get_value(src)?;
                 let num = to_int32(value.to_number());
                 let result = Value::Number((!num) as f64);
-                self.set_value(operands[0], result)?;
+                self.set_value(dst, result)?;
             }
-            Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::BitAnd { dst: a0, lhs: a1, rhs: a2 }
+              | Instr::BitOr { dst: a0, lhs: a1, rhs: a2 }
+              | Instr::BitXor { dst: a0, lhs: a1, rhs: a2 } => {
+                let opcode = inst.opcode();
+                let lhs = self.get_value(a1)?;
+                let rhs = self.get_value(a2)?;
                 let a = to_int32(lhs.to_number());
                 let b = to_int32(rhs.to_number());
                 let result = match opcode {
@@ -2681,109 +2682,112 @@ impl VM {
                     Opcode::BitOr => a | b,
                     _ => a ^ b,
                 };
-                self.set_value(operands[0], Value::Number(result as f64))?;
+                self.set_value(a0, Value::Number(result as f64))?;
             }
-            Opcode::Shl | Opcode::Shr | Opcode::UShr => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::Shl { dst: a0, lhs: a1, rhs: a2 }
+              | Instr::Shr { dst: a0, lhs: a1, rhs: a2 }
+              | Instr::UShr { dst: a0, lhs: a1, rhs: a2 } => {
+                let opcode = inst.opcode();
+                let lhs = self.get_value(a1)?;
+                let rhs = self.get_value(a2)?;
                 let shift_count = (to_uint32(rhs.to_number()) & 0x1F) as u32;
                 let result = match opcode {
                     Opcode::Shl => to_int32(lhs.to_number()).wrapping_shl(shift_count),
                     Opcode::Shr => to_int32(lhs.to_number()).wrapping_shr(shift_count),
                     _ => (to_uint32(lhs.to_number()).wrapping_shr(shift_count)) as i32,
                 };
-                self.set_value(operands[0], Value::Number(result as f64))?;
+                self.set_value(a0, Value::Number(result as f64))?;
             }
-            Opcode::Neg => {
-                let value = self.get_value(operands[1])?;
+            Instr::Neg { dst, src } => {
+                let value = self.get_value(src)?;
                 let result = -value;
-                self.set_value(operands[0], result)?;
+                self.set_value(dst, result)?;
             }
 
             // ===== Logical =====
-            Opcode::And => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::And { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 // JS logical AND: returns first falsy or last value
                 let value = if !lhs.to_boolean() { lhs } else { rhs };
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::Or => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::Or { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 // JS logical OR: returns first truthy or last value
                 let value = if lhs.to_boolean() { lhs } else { rhs };
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
 
             // ===== Comparison =====
             // js_abstract_relational(x, y) returns x < y
-            Opcode::Greater => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::Greater { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 // lhs > rhs  ⟺  rhs < lhs
                 let (lhs, rhs) = self.coerce_for_relational(lhs, rhs, module)?;
                 let result = Self::js_abstract_relational(&rhs, &lhs)?;
-                self.set_value(operands[0], Value::Bool(result))?;
+                self.set_value(dst, Value::Bool(result))?;
             }
-            Opcode::GreaterEqual => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::GreaterEqual { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 // lhs >= rhs  ⟺  !(lhs < rhs)
                 let (lhs, rhs) = self.coerce_for_relational(lhs, rhs, module)?;
                 let less = Self::js_abstract_relational(&lhs, &rhs)?;
-                self.set_value(operands[0], Value::Bool(!less))?;
+                self.set_value(dst, Value::Bool(!less))?;
             }
-            Opcode::Less => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::Less { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let (lhs, rhs) = self.coerce_for_relational(lhs, rhs, module)?;
                 let result = Self::js_abstract_relational(&lhs, &rhs)?;
-                self.set_value(operands[0], Value::Bool(result))?;
+                self.set_value(dst, Value::Bool(result))?;
             }
-            Opcode::LessEqual => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::LessEqual { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 // lhs <= rhs  ⟺  !(rhs < lhs)
                 let (lhs, rhs) = self.coerce_for_relational(lhs, rhs, module)?;
                 let less = Self::js_abstract_relational(&rhs, &lhs)?;
-                self.set_value(operands[0], Value::Bool(!less))?;
+                self.set_value(dst, Value::Bool(!less))?;
             }
-            Opcode::Equal => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::Equal { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let result = self.abstract_eq(&lhs, &rhs, module)?;
-                self.set_value(operands[0], Value::Bool(result))?;
+                self.set_value(dst, Value::Bool(result))?;
             }
-            Opcode::NotEqual => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::NotEqual { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let result = !self.abstract_eq(&lhs, &rhs, module)?;
-                self.set_value(operands[0], Value::Bool(result))?;
+                self.set_value(dst, Value::Bool(result))?;
             }
-            Opcode::StrictEqual => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::StrictEqual { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let result = lhs.strict_eq(&rhs);
-                self.set_value(operands[0], Value::Bool(result))?;
+                self.set_value(dst, Value::Bool(result))?;
             }
-            Opcode::StrictNotEqual => {
-                let lhs = self.get_value(operands[1])?;
-                let rhs = self.get_value(operands[2])?;
+            Instr::StrictNotEqual { dst, lhs, rhs } => {
+                let lhs = self.get_value(lhs)?;
+                let rhs = self.get_value(rhs)?;
                 let result = !lhs.strict_eq(&rhs);
-                self.set_value(operands[0], Value::Bool(result))?;
+                self.set_value(dst, Value::Bool(result))?;
             }
 
             // ===== Type =====
-            Opcode::TypeOf => {
-                let value = self.get_value(operands[1])?;
+            Instr::TypeOf { dst, src } => {
+                let value = self.get_value(src)?;
                 let type_str = value.type_of().to_string();
-                self.set_value(operands[0], Value::String(Rc::new(type_str)))?;
+                self.set_value(dst, Value::String(Rc::new(type_str)))?;
             }
-            Opcode::TypeOfEnv => {
+            Instr::TypeOfEnv { dst, name } => {
                 // `typeof unresolvableName` is "undefined" — never a
                 // ReferenceError. The name is a constant-pool index.
-                let name_index = operands[1].as_immd();
+                let name_index = name.as_immd();
                 let name = match &module.constants[name_index as usize] {
                     Constant::String(s) => s.as_str().to_string(),
                 };
@@ -2794,11 +2798,11 @@ impl VM {
                     Some(v) => v.type_of().to_string(),
                     None => "undefined".to_string(),
                 };
-                self.set_value(operands[0], Value::String(Rc::new(type_str)))?;
+                self.set_value(dst, Value::String(Rc::new(type_str)))?;
             }
-            Opcode::InstanceOf => {
-                let obj = self.get_value(operands[1])?;
-                let ctor = self.get_value(operands[2])?;
+            Instr::InstanceOf { dst, lhs, rhs } => {
+                let obj = self.get_value(lhs)?;
+                let ctor = self.get_value(rhs)?;
                 // A bare `Value::Function(id)` must be boxed first so its
                 // (single, stable) `prototype` object is reachable.
                 let ctor = self.as_object_value(&ctor);
@@ -2861,11 +2865,11 @@ impl VM {
                     },
                 };
 
-                self.set_value(operands[0], Value::Bool(result))?;
+                self.set_value(dst, Value::Bool(result))?;
             }
-            Opcode::In => {
-                let key = self.resolve_property_key(operands[1], module)?;
-                let obj = self.get_value(operands[2])?;
+            Instr::In { dst, lhs, rhs } => {
+                let key = self.resolve_property_key(lhs, module)?;
+                let obj = self.get_value(rhs)?;
                 let obj = self.as_object_value(&obj);
                 let result = match obj {
                     Value::Object(obj_ref) => {
@@ -2889,41 +2893,41 @@ impl VM {
                         ));
                     }
                 };
-                self.set_value(operands[0], Value::Bool(result))?;
+                self.set_value(dst, Value::Bool(result))?;
             }
 
             // ===== Iteration =====
-            Opcode::DelegateOpen => {
-                let iter = self.get_value(operands[0])?;
+            Instr::DelegateOpen { iter } => {
+                let iter = self.get_value(iter)?;
                 self.delegate_stack.push(iter);
             }
-            Opcode::DelegateClose => {
+            Instr::DelegateClose { .. } => {
                 self.delegate_stack.pop();
             }
-            Opcode::MakeIter => {
-                let src = self.get_value(operands[1])?;
+            Instr::MakeIter { dst, src } => {
+                let src = self.get_value(src)?;
                 let iter_val = self.make_iterator(src, module)?;
-                self.set_value(operands[0], iter_val)?;
+                self.set_value(dst, iter_val)?;
             }
-            Opcode::IterNext => {
+            Instr::IterNext { dst, has_next, src } => {
                 // Operand order comes from codegen: (item, has_next, src).
-                let iter_val = self.get_value(operands[2])?;
+                let iter_val = self.get_value(src)?;
                 let (item, done) = self.iterator_next(iter_val, None, module)?;
-                self.set_value(operands[0], item)?;
-                self.set_value(operands[1], Value::Bool(!done))?;
+                self.set_value(dst, item)?;
+                self.set_value(has_next, Value::Bool(!done))?;
             }
-            Opcode::IterClose => {
-                let iter_val = self.get_value(operands[0])?;
+            Instr::IterClose { iter } => {
+                let iter_val = self.get_value(iter)?;
                 self.iterator_close(iter_val, None, false, module)?;
             }
-            Opcode::RequireObjectCoercible => {
-                let src = self.get_value(operands[0])?;
+            Instr::RequireObjectCoercible { src } => {
+                let src = self.get_value(src)?;
                 crate::builtins::require_object_coercible(&src)?;
             }
-            Opcode::MakeRest => {
+            Instr::MakeRest { dst, from } => {
                 // Collect the tail of the incoming arguments into a fresh
                 // array: args[from..] where arg i lives at [rbp - (i + 1)].
-                let from = operands[1].as_immd().max(0) as usize;
+                let from = from.as_immd().max(0) as usize;
                 let argc = self.state.frame_argc.last().copied().unwrap_or(0);
                 let rbp = self.state.rbp as isize;
                 let mut arr = ArrayObject::new();
@@ -2940,13 +2944,13 @@ impl VM {
                     }
                 }
                 arr.set_prototype(Some(Rc::clone(&self.builtins.array_prototype)));
-                self.set_value(operands[0], Value::Object(Rc::new(RefCell::new(arr))))?;
+                self.set_value(dst, Value::Object(Rc::new(RefCell::new(arr))))?;
             }
-            Opcode::CallSpread => {
+            Instr::CallSpread { callee, this, args } => {
                 // operands: (callee, this, args-array); result goes to Rv.
-                let callee = self.get_value(operands[0])?;
-                let this = self.get_value(operands[1])?;
-                let args_val = self.get_value(operands[2])?;
+                let callee = self.get_value(callee)?;
+                let this = self.get_value(this)?;
+                let args_val = self.get_value(args)?;
                 let args = self
                     .array_like_elements(&args_val)
                     .ok_or_else(|| {
@@ -2957,21 +2961,21 @@ impl VM {
                 let result = self.invoke(&callee, this, &args, module)?;
                 self.state.set_register(Register::Rv, result)?;
             }
-            Opcode::CallSuperSpread => {
+            Instr::CallSuperSpread { callee, this, args } => {
                 // `super(...)`: same shape as CallSpread, but the parent
                 // constructor inherits this frame's `new.target`.
-                let callee = self.get_value(operands[0])?;
+                let callee = self.get_value(callee)?;
                 // The receiver is normally the *frame's* `this`, not an operand
                 // (lowering a `load_this` would raise in a derived constructor,
                 // whose `this` is still uninitialized here). An arrow body that
                 // calls `super()` still carries it as an operand, though.
-                let operand_this = self.get_value(operands[1])?;
+                let operand_this = self.get_value(this)?;
                 let this = if operand_this.is_undefined() {
                     self.state.this_val.clone()
                 } else {
                     operand_this
                 };
-                let args_val = self.get_value(operands[2])?;
+                let args_val = self.get_value(args)?;
                 let args = self
                     .array_like_elements(&args_val)
                     .ok_or_else(|| {
@@ -3012,10 +3016,10 @@ impl VM {
                 }
                 self.state.set_register(Register::Rv, result)?;
             }
-            Opcode::NewSpread => {
+            Instr::NewSpread { dst, ctor, args } => {
                 // operands: (dst, constructor, args-array)
-                let ctor = self.get_value(operands[1])?;
-                let args_val = self.get_value(operands[2])?;
+                let ctor = self.get_value(ctor)?;
+                let args_val = self.get_value(args)?;
                 let args = self
                     .array_like_elements(&args_val)
                     .ok_or_else(|| {
@@ -3024,35 +3028,35 @@ impl VM {
                         )
                     })?;
                 let constructed = self.construct(&ctor, &args, module)?;
-                self.set_value(operands[0], constructed)?;
+                self.set_value(dst, constructed)?;
             }
-            Opcode::ToString => {
-                let src = self.get_value(operands[1])?;
+            Instr::ToString { dst, src } => {
+                let src = self.get_value(src)?;
                 let s = match self.to_primitive(&src, "string", module) {
                     Ok(v) => v.to_js_string(),
                     Err(_) => src.to_js_string(),
                 };
-                self.set_value(operands[0], Value::string(&s))?;
+                self.set_value(dst, Value::string(&s))?;
             }
-            Opcode::ToNumber => {
+            Instr::ToNumber { dst, src } => {
                 // ES 7.1.4 ToNumber: objects convert through
                 // ToPrimitive(hint "number"), which may run user code.
-                let src = self.get_value(operands[1])?;
+                let src = self.get_value(src)?;
                 let prim = match self.to_primitive(&src, "number", module) {
                     Ok(v) => v,
                     Err(_) => src.clone(),
                 };
-                self.set_value(operands[0], Value::Number(prim.to_number()))?;
+                self.set_value(dst, Value::Number(prim.to_number()))?;
             }
 
             // ===== Object/Array Operations =====
-            Opcode::MakeArray => {
+            Instr::MakeArray { dst } => {
                 let mut arr = crate::vm::object::ArrayObject::new();
                 arr.set_prototype(Some(Rc::clone(&self.builtins.array_prototype)));
                 let arr_val = Value::Object(Rc::new(RefCell::new(arr)));
-                self.set_value(operands[0], arr_val)?;
+                self.set_value(dst, arr_val)?;
             }
-            Opcode::ArrayPushSpread => {
+            Instr::ArrayPushSpread { array, src } => {
                 // `[...src]` / `f(...src)`: append every element of `src`. The
                 // loop runs here rather than in lowered bytecode so that no value
                 // has to stay live across a basic-block boundary.
@@ -3068,8 +3072,8 @@ impl VM {
                 // No `IteratorClose` is owed: the source is iterated to
                 // exhaustion, and an abrupt `next()` propagates as-is — ES
                 // 13.2.5.5 has no close step.
-                let array_val = self.get_value(operands[0])?;
-                let src = self.get_value(operands[1])?;
+                let array_val = self.get_value(array)?;
+                let src = self.get_value(src)?;
                 let iter = self.make_iterator(src, module)?;
                 let mut items: Vec<Value> = Vec::new();
                 loop {
@@ -3097,8 +3101,8 @@ impl VM {
                     )),
                 }?;
             }
-            Opcode::MarkHole => {
-                let Value::Object(obj_ref) = self.get_value(operands[0])? else {
+            Instr::MarkHole { array } => {
+                let Value::Object(obj_ref) = self.get_value(array)? else {
                     return Ok(());
                 };
                 let mut borrowed = obj_ref.borrow_mut();
@@ -3110,9 +3114,9 @@ impl VM {
                     arr.mark_hole(index);
                 }
             }
-            Opcode::ArrayPush => {
-                let array_val = self.get_value(operands[0])?;
-                let elem = self.get_value(operands[1])?;
+            Instr::ArrayPush { array, value } => {
+                let array_val = self.get_value(array)?;
+                let elem = self.get_value(value)?;
                 match array_val {
                     Value::Object(obj_ref) => {
                         let mut obj = obj_ref.borrow_mut();
@@ -3130,48 +3134,51 @@ impl VM {
                     )),
                 }?;
             }
-            Opcode::MakeObject => {
+            Instr::MakeObject { dst } => {
                 let mut obj = crate::vm::object::OrdinaryObject::new();
                 obj.set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
                 let obj_val = Value::Object(Rc::new(RefCell::new(obj)));
-                self.set_value(operands[0], obj_val)?;
+                self.set_value(dst, obj_val)?;
             }
-            Opcode::IndexGet | Opcode::PropGet => {
-                let obj = self.get_value(operands[1])?;
-                let key = self.resolve_property_key(operands[2], module)?;
+            Instr::IndexGet { dst: a0, object: a1, index: a2 }
+              | Instr::PropGet { dst: a0, object: a1, property: a2 } => {
+                let obj = self.get_value(a1)?;
+                let key = self.resolve_property_key(a2, module)?;
                 // Boxing a bare function reference has to be written back so that
                 // later uses of the same slot observe the same prototype object.
                 let obj = self.as_object_value(&obj);
                 // Only writable locations can cache the boxed function object;
                 // an inline `Value::Function` operand (e.g. `(function(){}).x`)
                 // is not addressable.
-                if is_addressable(operands[1]) {
-                    if matches!(self.get_value(operands[1])?, Value::Function(_)) {
-                        self.set_value(operands[1], obj.clone())?;
+                if is_addressable(a1) {
+                    if matches!(self.get_value(a1)?, Value::Function(_)) {
+                        self.set_value(a1, obj.clone())?;
                     }
                 }
                 let value = self.get_member(&obj, &key, module)?;
-                self.set_value(operands[0], value)?;
+                self.set_value(a0, value)?;
             }
-            Opcode::IndexSet | Opcode::PropSet => {
-                let obj = self.get_value(operands[0])?;
-                let key = self.resolve_property_key(operands[1], module)?;
-                let val = self.get_value(operands[2])?;
+            Instr::IndexSet { object: a0, index: a1, value: a2 }
+              | Instr::PropSet { object: a0, property: a1, value: a2 } => {
+                let obj = self.get_value(a0)?;
+                let key = self.resolve_property_key(a1, module)?;
+                let val = self.get_value(a2)?;
                 let obj = self.as_object_value(&obj);
                 self.set_member(&obj, key, val, module)?;
                 // Persist the boxed function object back into its slot.
-                if is_addressable(operands[0]) {
-                    self.set_value(operands[0], obj)?;
+                if is_addressable(a0) {
+                    self.set_value(a0, obj)?;
                 }
             }
-            Opcode::IndexDelete | Opcode::PropDelete => {
-                let obj = self.get_value(operands[1])?;
-                let key = self.resolve_property_key(operands[2], module)?;
+            Instr::IndexDelete { dst: a0, object: a1, index: a2 }
+              | Instr::PropDelete { dst: a0, object: a1, property: a2 } => {
+                let obj = self.get_value(a1)?;
+                let key = self.resolve_property_key(a2, module)?;
                 let obj = self.as_object_value(&obj);
                 let removed = self.delete_member(&obj, &key, module)?;
-                self.set_value(operands[0], Value::Bool(removed))?;
+                self.set_value(a0, Value::Bool(removed))?;
             }
-            Opcode::Arguments => {
+            Instr::Arguments { dst } => {
                 // The callee's arguments live just below its frame pointer:
                 // `arg i` sits at `rbp - argc + i` (see `enter_frame`).
                 let argc = self.state.frame_argc.last().copied().unwrap_or(0);
@@ -3193,14 +3200,14 @@ impl VM {
                     arr.push(val);
                 }
                 let obj = Value::Object(Rc::new(RefCell::new(arr)));
-                self.set_value(operands[0], obj)?;
+                self.set_value(dst, obj)?;
             }
-            Opcode::StoreEnv => {
-                let name_index = operands[0].as_immd();
+            Instr::StoreEnv { name, value } => {
+                let name_index = name.as_immd();
                 let name = match &module.constants[name_index as usize] {
                     Constant::String(s) => s.as_str().to_string(),
                 };
-                let value = self.get_value(operands[1])?;
+                let value = self.get_value(value)?;
                 match self.state.script_env.get_mut(&name) {
                     Some(slot @ Some(_)) => *slot = Some(value),
                     // Writing into a binding that has not been initialized is the
@@ -3216,24 +3223,24 @@ impl VM {
                     }
                 }
             }
-            Opcode::CallMethod => {
-                let mut obj_val = self.get_value(operands[0])?;
+            Instr::CallMethod { callee, property, argc } => {
+                let mut obj_val = self.get_value(callee)?;
                 // A bare function reference must be boxed before looking up the
                 // method, otherwise `F.method()` silently resolves to undefined.
                 obj_val = self.as_object_value(&obj_val);
-                if is_addressable(operands[0])
-                    && matches!(self.get_value(operands[0])?, Value::Function(_))
+                if is_addressable(callee)
+                    && matches!(self.get_value(callee)?, Value::Function(_))
                 {
-                    self.set_value(operands[0], obj_val.clone())?;
+                    self.set_value(callee, obj_val.clone())?;
                 }
-                let arg_count = operands[2].as_immd() as usize;
+                let arg_count = argc.as_immd() as usize;
 
-                let method_name = match operands[1] {
+                let method_name = match property {
                     Operand::Immd(id) => match &module.constants[id as usize] {
                         Constant::String(s) => s.as_str().to_string(),
                     },
                     _ => {
-                        let prop_val = self.get_value(operands[1])?;
+                        let prop_val = self.get_value(property)?;
                         prop_val.to_js_string()
                     }
                 };
@@ -3243,10 +3250,10 @@ impl VM {
                 // stringifying it (the default path below) would never match.
                 // The key value is read with the caller's frame pointer; the
                 // dispatch itself happens after the frame switch below.
-                let symbol_key = if matches!(operands[1], Operand::Immd(_)) {
+                let symbol_key = if matches!(property, Operand::Immd(_)) {
                     None
                 } else {
-                    match self.get_value(operands[1])? {
+                    match self.get_value(property)? {
                         Value::Symbol(sym) => Some(PropertyKey::Symbol(sym.id)),
                         _ => None,
                     }
@@ -3568,9 +3575,9 @@ impl VM {
             }
 
             // ===== Exception Handling =====
-            Opcode::Try => {
-                let catch_offset = operands[0].as_immd();
-                let finally_offset = operands[1].as_immd();
+            Instr::Try { catch_offset, finally_offset } => {
+                let catch_offset = catch_offset.as_immd();
+                let finally_offset = finally_offset.as_immd();
                 let catch_pc = if catch_offset != 0 {
                     (self.state.pc as isize + catch_offset) as usize
                 } else {
@@ -3599,32 +3606,32 @@ impl VM {
                 };
                 self.state.seh_stack.push(record);
             }
-            Opcode::EndTry => {
+            Instr::EndTry {  } => {
                 self.state.seh_stack.pop();
             }
-            Opcode::ThrowExc => {
-                let exc_val = match operands[0] {
+            Instr::ThrowExc { value } => {
+                let exc_val = match value {
                     Operand::Immd(id) => {
                         let constant = &module.constants[id as usize];
                         VM::from_constant(constant)
                     }
-                    _ => self.get_value(operands[0])?,
+                    _ => self.get_value(value)?,
                 };
                 return self.handle_throw(exc_val);
             }
-            Opcode::LoadException => {
+            Instr::LoadException { dst } => {
                 let exc_val = self.state.get_register(Register::Rv)?;
-                self.set_value(operands[0], exc_val)?;
+                self.set_value(dst, exc_val)?;
             }
 
             // ===== Function/Closure =====
-            Opcode::CreateClosure => {
-                let func_id = operands[1].as_immd();
-                self.set_value(operands[0], Value::Function(func_id as u32))?;
+            Instr::CreateClosure { dst, func } => {
+                let func_id = func.as_immd();
+                self.set_value(dst, Value::Function(func_id as u32))?;
             }
-            Opcode::New => {
-                let constructor_val = self.get_value(operands[0])?;
-                let arg_count = operands[1].as_immd() as usize;
+            Instr::New { callee, argc } => {
+                let constructor_val = self.get_value(callee)?;
+                let arg_count = argc.as_immd() as usize;
                 // Operands are read with the caller's frame pointer; the frame
                 // switch happens afterwards, before the arguments are collected.
                 self.state.rbp = self.state.rsp;
@@ -3658,7 +3665,7 @@ impl VM {
                                 .borrow()
                                 .property_get(&PropertyKey::from_str("prototype"));
                             // Update the constructor to point to the FunctionObject for future accesses
-                            self.set_value(operands[0], func_obj.clone())?;
+                            self.set_value(callee, func_obj.clone())?;
                             (id, proto.map(|d| d.value))
                         } else {
                             (id, None)
@@ -3771,14 +3778,14 @@ impl VM {
                     }
                 }
             }
-            Opcode::LoadThis => {
+            Instr::LoadThis { dst } => {
                 if self.state.this_state.last() == Some(&THIS_DERIVED_UNBOUND) {
                     return Err(self.this_not_initialized());
                 }
                 let value = self.state.this_val.clone();
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::LoadNewTarget => {
+            Instr::LoadNewTarget { dst } => {
                 // `new.target` is per frame: the constructor for a `[[Construct]]`
                 // frame, otherwise undefined (an arrow frame carries the value
                 // captured when the arrow object was created).
@@ -3788,14 +3795,14 @@ impl VM {
                     .last()
                     .cloned()
                     .unwrap_or(Value::Undefined);
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::LoadCurrentFunction => {
+            Instr::LoadCurrentFunction { dst } => {
                 let value = self.state.function_val.clone();
-                self.set_value(operands[0], value)?;
+                self.set_value(dst, value)?;
             }
-            Opcode::MakeFuncObj => {
-                let func_id = match operands[1] {
+            Instr::MakeFuncObj { dst, func } => {
+                let func_id = match func {
                     Operand::Symbol(sym) => sym,
                     Operand::Immd(val) => val as u32,
                     _ => {
@@ -3818,10 +3825,10 @@ impl VM {
                     // loop would otherwise share (and overwrite) one capture set.
                     self.make_capturing_function_object(func_id, captured_vars)
                 };
-                self.set_value(operands[0], obj_val)?;
+                self.set_value(dst, obj_val)?;
             }
-            Opcode::MakeArrowFuncObj => {
-                let func_id = match operands[1] {
+            Instr::MakeArrowFuncObj { dst, func, captured_this } => {
+                let func_id = match func {
                     Operand::Symbol(sym) => sym,
                     Operand::Immd(val) => val as u32,
                     _ => {
@@ -3830,7 +3837,7 @@ impl VM {
                         ));
                     }
                 };
-                let captured_this = match self.get_value(operands[2])? {
+                let captured_this = match self.get_value(captured_this)? {
                     // Lowering leaves the operand empty (see `lower_arrow_function`);
                     // the arrow captures whatever the frame's `this` is.
                     v if v.is_undefined() => self.state.this_val.clone(),
@@ -3887,22 +3894,22 @@ impl VM {
                         let _ = arrow_ref.borrow_mut().define_property(key, desc);
                     }
                 }
-                self.set_value(operands[0], obj_val)?;
+                self.set_value(dst, obj_val)?;
             }
-            Opcode::ClosureVar => {
-                let name_index = operands[0].as_immd() as usize;
+            Instr::ClosureVar { name, value } => {
+                let name_index = name.as_immd() as usize;
                 let name = match &module.constants[name_index] {
                     Constant::String(s) => s.as_str().to_string(),
                 };
-                let value = self.get_value(operands[1])?;
+                let value = self.get_value(value)?;
                 // Push as a single-entry map onto closure_var_stack
                 let mut map = HashMap::new();
                 map.insert(name, value);
                 self.state.closure_var_stack.push(map);
             }
-            Opcode::CallNative => {
-                let callable = self.get_value(operands[0])?;
-                let arg_count = operands[1].as_immd() as usize;
+            Instr::CallNative { callee, argc } => {
+                let callable = self.get_value(callee)?;
+                let arg_count = argc.as_immd() as usize;
                 // Same ordering rule as `CallEx`: read operands first, then
                 // switch to the frame that holds the outgoing arguments.
                 self.state.rbp = self.state.rsp;
@@ -3941,11 +3948,12 @@ impl VM {
                 }
             }
 
-            Opcode::Halt | Opcode::Ret => {
+            Instr::Halt {  }
+              | Instr::Ret {  } => {
                 // These are handled in run(), not here
                 unreachable!("Halt/Ret should be handled in run()")
             }
-            Opcode::ResumeExc => {
+            Instr::ResumeExc {  } => {
                 let action = if let Some(record) = self.state.seh_stack.last() {
                     if record.in_finally {
                         if record.pending_exception.is_some() {

@@ -185,8 +185,13 @@ macro_rules! define_instrs {
 
             /// 操作数按位置拷出，未用到的位置补 `Operand::Immd(0)`。
             ///
-            /// **过渡接口**：`run_instruction` 的 arm 目前仍按槽位下标读取操作数，
-            /// 逐条改为命名字段解构是 P0a-2（见 `docs/interpreter-refactor.md` §3.1）。
+            /// 给需要**泛型地**看待一条指令的消费者用：目前只有 `Display for Instr`
+            /// 与断言填充规则的单测。解释器主循环**不再**用它 —— `run_instruction`
+            /// 现在按命名字段解构（P0a-2），所以这次拷贝不在热路径上。
+            ///
+            /// （P0a 的原始计划是"P0a-2 做完就删掉它"。实际做下来 `Display` 仍需要
+            /// 一个统一的视图，否则要为 93 个变体各写一遍格式串 —— 那正是这张表要
+            /// 消灭的重复知识。于是保留，但把它的用途限定在工具侧。）
             pub fn slots(&self) -> [Operand; 4] {
                 match self {
                     $( Instr::$z {} => [Operand::Immd(0); 4], )*
@@ -1065,7 +1070,7 @@ mod tests {
         assert_eq!(inst.opcode(), Opcode::Push);
         assert_eq!(inst.arity(), 1);
         assert!(matches!(inst.slots()[0], Operand::Register(Register::R0)));
-        // `slots()` 只对"未声明的位置"补 `Immd(0)`（过渡接口的填充规则）。
+        // `slots()` 只对"未声明的位置"补 `Immd(0)`。
         assert!(inst.slots()[1..].iter().all(|op| matches!(op, Operand::Immd(0))));
     }
 

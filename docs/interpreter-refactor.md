@@ -185,7 +185,7 @@ oxc parser ─► AST ─► lowering(AST→IR, 4609 行) ─► ssabuilder(SSA+
 > | 半 | 内容 | 状态 | 代价 |
 > |----|------|------|------|
 > | **P0a-1** | 指令表（`define_instrs!`）+ `Instr` + `opcode()` / `arity()` / `arity_of()` / `slots()` / `from_parts()` / `unary()` / `binary()`；codegen 111 处发射点改成命名字段；`Module.instructions: Vec<Instr>`；7 处回填改成 `if let Instr::X { .. }` | **已完成** | 单片回归 +10.7%（`slots()` 的 64 字节拷贝 + 多一次 `opcode()` 匹配） |
-> | **P0a-2** | `run_instruction` 的 93 条 arm 从"`match opcode` + `slots()[i]`"改成"`match inst` + 命名字段解构"（182 处槽位读取 + 3 处 `operands.get()`），删掉 `slots()` 过渡接口 | 待做 | 预期把 P0a-1 的 +10.7% 收回 |
+> | **P0a-2** | `run_instruction` 的 85 条 arm 从"`match opcode` + `slots()[i]`"改成"`match *inst` + 命名字段解构"（含 6 条分组 arm、3 处 `operands.get/first()`）；`step()` 顺手去掉每步的克隆与 `opcode()` 匹配 | **已完成** | 单片回归 114.6s → **107.1s**（基线 103.5s，≈+3.5%）；`slots()` **保留**，理由见 §9.1 第 6 条 |
 >
 > 表按 **arity 分成四组**（`;` 分隔）：这样"这条指令有几个操作数"在定义处就看得见。
 > 两个运行期构造器（`unary` / `binary`）是为 `Instruction::UnaryOp` / `BinaryOp` 携带的
@@ -611,7 +611,7 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | 阶段 | 状态 | 提交 | 备注 |
 |------|------|------|------|
 | **P0a-1** 容器 enum + 指令表（codegen / Module / 回填） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 通过 16561 / 执行 19708 / 跳过 7843 **一个数未动**、零逐套件回退；单元 190→**194**；单片回归 +10.7%（待 P0a-2 收回） |
-| **P0a-2** `run_instruction` 逐 arm 命名解构（93 arm / 182 处槽位读取），删掉 `slots()` 过渡接口 | **待做** | | 这是收回那 +10.7% 的一步；分组 arm 用 `Instr::A { x: a0 } \| Instr::B { y: a0 }` 这类**重命名或模式**统一切到 `a0/a1/a2` |
+| **P0a-2** `run_instruction` 逐 arm 命名解构（85 arm，含 6 条分组） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单片 114.6s → 107.1s（基线 103.5s）；通过 16561 / 执行 19708 / 跳过 7843 **仍然一个数未动** |
 | P0b 类型收紧 + 互校 | 未开始 | | `desc()` 用 `Vec<Reg>`（不在热路径，勿加依赖） |
 | P1 调用归一 | 未开始 | | |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
@@ -619,7 +619,7 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |
 | 语义线：TypedArray 族入册解锁 | 未开始 | | 可随时插入；纯赚 test262 分数 |
 
-### 9.1 P0a-1 的实际改动（供 P0a-2 接手）
+### 9.1 P0a 的实际改动（P0a-1 + P0a-2，至此收口）
 
 | 文件 | 改了什么 | 规模 |
 |------|----------|------|
@@ -628,7 +628,39 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | `src/vm/mod.rs` | `inst: &Instr` + `let operands = inst.slots(); let opcode = inst.opcode();`（**93 条 arm 一行未改**，这是过渡桥接）；generator 恢复处那一处 `inst.operands[0]` 顺手改成 `if let Instr::Yield { dst, .. }`（P0a-2 的先例） | 129 行变动 |
 | `src/compiler/mod.rs` | `Vec<Bytecode>` → `Vec<Instr>`，`code.opcode` → `code.opcode()` | 4 行 |
 
-**P0a-2 的做法（已验证可行）**：把 `let operands = inst.slots(); let opcode = inst.opcode();` 换成
-`match inst { … }`，用编译器强制穷尽性找出所有该改的 arm；arm 体内的 `operands[N]` 替换成
-第 N 个字段名（`*` 在需要值的地方补上）。三处 `operands.get(N)`（`Yield` / `Await` 的 `-1` 约定）
-要单独处理：那正是 `Option<Operand>` 该替代的写法，可以在 P0a-2 顺手做掉。
+**P0a-2 的改动**（`src/vm/mod.rs` 588 行、`src/bytecode.rs` 注释）
+
+| 位置 | 改了什么 |
+|------|----------|
+| `run_instruction` | 85 条 arm 改成 `match *inst` + 命名字段解构；182 处 `operands[N]` 变成字段名；3 处 `operands.get/first()` 改成字段；2 条带嵌套 dispatch 的 arm 补了局部 `let opcode = inst.opcode();` |
+| `step()` | 指令改为**按引用**取出（去掉每步 48 字节克隆），并直接 `match *inst { Instr::Halt {} … }`（去掉每步的 `opcode()` 匹配） |
+| `Instr::slots()` | 保留，但用途改为工具侧（`Display` + 单测），文档里写明**不在热路径上** |
+
+**P0a-2 实际怎么做的（六条经验，都踩过）**
+
+1. **匹配 `*inst` 而不是 `inst`**：`Instr` 是 `Copy`，按值匹配后每个绑定都是 `Operand`
+   而不是 `&Operand` —— 于是 arm 体里原有表达式**一字不用改类型**（`get_value(dst)`、
+   `set_value(dst, v)`、`resolve_property_key(a2, …)` 都直接吃 `Operand`）。
+   若改成引用绑定，182 处都要补 `*`。
+2. **按基线缩进切 arm**，否则会把 `Instr::BitAnd | BitOr | BitXor` **体内那层**
+   `match opcode { Opcode::BitAnd => … }` 也当成同级 arm 切出来（第一版脚本就是这么错的：
+   85 条 arm 被切成了 89 段，且 `}` 配对全乱）。
+3. 那 2 条带嵌套 dispatch 的 arm 补了一行 `let opcode = inst.opcode();` —— 它们用 opcode
+   变量做二次分派，而外层已经不提供 `opcode` 了。（想彻底去掉的话，应把那层的两个分支
+   抽成一个带 `Opcode` 参数的辅助函数，属于 P1 的范畴。）
+4. **单变体 arm 绑定真实字段名**（`Instr::LoadConst { dst, index }` → `index.as_immd()`）；
+   **分组 arm 用位置别名** `a0/a1/a2`，因为 or-模式要求各分支绑定同名，而
+   `IndexGet { index }` 与 `PropGet { property }` 的字段名不同。
+5. `Yield` / `Await` / `Call` 的 3 处 `operands.get(N)` / `operands.first()` 改成命名字段。
+   其中两处是 `-1` 的"无操作数"标记：现在写成 `match value { Operand::Immd(-1) => … , src => … }`，
+   原来的 `None` 分支（永远不可达）随之消失。**这仍是 P0b 该换成 `Option<Operand>` 的地方。**
+6. **`slots()` 保留下来，没有按计划删掉**：`Display for Instr` 需要"泛型地看待一条指令"，
+   否则 93 个变体各写一遍格式串 —— 那正是这张表要消灭的重复知识。它已经不在热路径上
+   （`run_instruction` 改成命名字段解构了），所以留作**工具侧接口**。
+
+顺带修掉的一处：`step()` 原来每条指令 `module.instructions[pc].clone()`（48 字节拷贝）
+再 `inst.opcode()`（93 分支的匹配）。现在指令**按引用**取出，并直接 `match *inst { Instr::Halt {} … }`。
+
+**性能实测（单片，同一命令、同一环境，各测一次）**：基线 103.5s → P0a-1 114.6s →
+P0a-2 107.1s。剩余的 ≈+3.5% 大概率来自 `match *inst` 那次 48 字节拷贝（旧代码是按引用解构的），
+也可能是单次测量噪声 —— 没有做多次取样的方差分析，不声称更精确的数字。
