@@ -159,12 +159,98 @@ macro_rules! make_kind {
     };
 }
 
+/// 一个操作数在指令里的**角色**。由表里字段后面的标记生成（`Mov { dst: w, src: r }`）。
+///
+/// 与 [`Kind`] 正交：`Kind` 说这条指令**会做什么**，`Role` 说它**碰哪些操作数**。
+/// "跳转偏移当寄存器读"那类 bug 出在这一层，所以这里的每个字段都必须表态 ——
+/// 表里漏写角色键不入（宏的匹配器要求 `字段: 角色`），于是它是编译期错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// 读：值流的入口。
+    Read,
+    /// 写：值流的出口。
+    Write,
+    /// 先读后写（in/out）：`New.callee` / `CallMethod.callee` 这类 —— 读出来当 `this`，
+    /// 再把解析结果写回同一个位置。
+    ReadWrite,
+    /// **相对**偏移：`pc = pc + off`（`Jump` / `BrIf` / `Try`）。
+    RelPc,
+    /// **绝对** pc：`pc = off`（`DelayedJump` / `ResumeExc`）。
+    AbsPc,
+    /// 元数据：常量下标、`argc`、SEH 深度、名字符号、编译期栈指针……不参与值流。
+    Meta,
+}
+
+/// 表里的角色字母 → [`Role`]。
+macro_rules! role_of {
+    (r) => {
+        Role::Read
+    };
+    (w) => {
+        Role::Write
+    };
+    (rw) => {
+        Role::ReadWrite
+    };
+    (jr) => {
+        Role::RelPc
+    };
+    (ja) => {
+        Role::AbsPc
+    };
+    (n) => {
+        Role::Meta
+    };
+}
+
+/// 一条指令的操作数一览（[`Instr::desc`] 的返回值）。
+///
+/// 只服务**工具与测试**：回填校验、dump、以及与实现的互校。解释器主循环仍然直接
+/// 解构命名字段，所以这里可以放心用 `Vec`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Desc {
+    /// `(操作数, 角色)`，按表里的字段顺序。
+    pub fields: Vec<(Operand, Role)>,
+    /// 控制流类别（与 [`Instr::kind`] 一致）。
+    pub kind: Kind,
+}
+
+impl Desc {
+    /// 参与值流入口的操作数（`Read` 与 `ReadWrite`）。
+    pub fn reads(&self) -> impl Iterator<Item = Operand> + '_ {
+        self.fields
+            .iter()
+            .filter(|(_, r)| matches!(r, Role::Read | Role::ReadWrite))
+            .map(|(op, _)| *op)
+    }
+
+    /// 参与值流出口的操作数（`Write` 与 `ReadWrite`）。
+    pub fn writes(&self) -> impl Iterator<Item = Operand> + '_ {
+        self.fields
+            .iter()
+            .filter(|(_, r)| matches!(r, Role::Write | Role::ReadWrite))
+            .map(|(op, _)| *op)
+    }
+
+    /// 会被当作 pc 用的操作数，附带"相对还是绝对"。
+    pub fn targets(&self) -> impl Iterator<Item = (Operand, Role)> + '_ {
+        self.fields
+            .iter()
+            .filter(|(_, r)| matches!(r, Role::RelPc | Role::AbsPc))
+            .copied()
+    }
+}
+
 macro_rules! define_instrs {
     (
         $( $z:ident {} $( @$zk:ident )? ),* ;
-        $( $o1:ident { $f1:ident } $( @$k1:ident )? ),* ;
-        $( $o2:ident { $g1:ident, $g2:ident } $( @$k2:ident )? ),* ;
-        $( $o3:ident { $h1:ident, $h2:ident, $h3:ident } $( @$k3:ident )? ),*
+        $( $o1:ident { $f1:ident : $f1r:ident } $( @$k1:ident )? ),* ;
+        $( $o2:ident { $g1:ident : $g1r:ident, $g2:ident : $g2r:ident } $( @$k2:ident )? ),* ;
+        $( $o3:ident {
+            $h1:ident : $h1r:ident,
+            $h2:ident : $h2r:ident,
+            $h3:ident : $h3r:ident
+        } $( @$k3:ident )? ),*
     ) => {
         #[derive(Debug, Clone, Copy)]
         pub enum Instr {
@@ -226,6 +312,51 @@ macro_rules! define_instrs {
                     $( Opcode::$o1 => make_kind!($( $k1 )?), )*
                     $( Opcode::$o2 => make_kind!($( $k2 )?), )*
                     $( Opcode::$o3 => make_kind!($( $k3 )?), )*
+                }
+            }
+
+            /// 这条指令的操作数角色（按表里的字段顺序）。
+            pub fn roles_of(op: Opcode) -> Vec<Role> {
+                match op {
+                    $( Opcode::$z => vec![], )*
+                    $( Opcode::$o1 => vec![ role_of!($f1r) ], )*
+                    $( Opcode::$o2 => vec![ role_of!($g1r), role_of!($g2r) ], )*
+                    $( Opcode::$o3 => vec![
+                        role_of!($h1r),
+                        role_of!($h2r),
+                        role_of!($h3r),
+                    ], )*
+                }
+            }
+
+            /// 同上，但带上字段名 —— 互校测试要拿名字回源码里取证（见
+            /// `bytecode::tests::roles_match_the_vm_implementation`）。
+            pub fn field_roles(op: Opcode) -> Vec<(&'static str, Role)> {
+                match op {
+                    $( Opcode::$z => vec![], )*
+                    $( Opcode::$o1 => vec![ (stringify!($f1), role_of!($f1r)) ], )*
+                    $( Opcode::$o2 => vec![
+                        (stringify!($g1), role_of!($g1r)),
+                        (stringify!($g2), role_of!($g2r)),
+                    ], )*
+                    $( Opcode::$o3 => vec![
+                        (stringify!($h1), role_of!($h1r)),
+                        (stringify!($h2), role_of!($h2r)),
+                        (stringify!($h3), role_of!($h3r)),
+                    ], )*
+                }
+            }
+
+            /// 操作数一览 + 控制流类别。工具与测试用（见 [`Desc`]）。
+            pub fn desc(&self) -> Desc {
+                let slots = self.slots();
+                Desc {
+                    fields: slots[..self.arity()]
+                        .iter()
+                        .copied()
+                        .zip(Self::roles_of(self.opcode()))
+                        .collect(),
+                    kind: self.kind(),
                 }
             }
 
@@ -306,98 +437,98 @@ define_instrs! {
         PrologueEnd {} @Suspend
     ;
 // ── arity 1 ──
-        DeclareLexical { name },
-        Push { src },
-        Pop { dst },
-        PushC { src } @Bookkeeping,
-        PopC { dst } @Bookkeeping,
-        Jump { offset } @Jump,
-        DelegateOpen { iter },
-        DelegateClose { iter },
-        MakeArray { dst },
-        MarkHole { array },
-        MakeObject { dst },
-        ThrowExc { value } @Throw,
-        LoadException { dst },
-        LoadThis { dst },
-        LoadNewTarget { dst },
-        LoadCurrentFunction { dst },
-        Arguments { dst },
-        IterClose { iter },
-        RequireObjectCoercible { src }
+        DeclareLexical { name: n },
+        Push { src: r },
+        Pop { dst: w },
+        PushC { src: n } @Bookkeeping,
+        PopC { dst: n } @Bookkeeping,
+        Jump { offset: jr } @Jump,
+        DelegateOpen { iter: r },
+        DelegateClose { iter: n },
+        MakeArray { dst: w },
+        MarkHole { array: r },
+        MakeObject { dst: w },
+        ThrowExc { value: r } @Throw,
+        LoadException { dst: w },
+        LoadThis { dst: w },
+        LoadNewTarget { dst: w },
+        LoadCurrentFunction { dst: w },
+        Arguments { dst: w },
+        IterClose { iter: r },
+        RequireObjectCoercible { src: r }
     ;
 // ── arity 2 ──
-        LoadConst { dst, index },
-        InitLexical { name, value },
-        SetFunctionName { func, name },
-        LoadEnv { dst, name },
-        MovC { dst, src } @Bookkeeping,
-        Call { func, argc } @Call,
-        CallEx { callee, argc } @Call,
-        CallNative { callee, argc } @Call,
-        Mov { dst, src },
-        Not { dst, src },
-        BitNot { dst, src },
-        Neg { dst, src },
-        TypeOf { dst, src },
-        TypeOfEnv { dst, name },
-        MakeIter { dst, src },
-        ArrayPush { array, value },
-        ArrayPushSpread { array, src },
-        StoreEnv { name, value },
-        Try { catch_offset, finally_offset },
-        DelayedJump { target, seh_depth } @Jump,
-        CreateClosure { dst, func },
-        New { callee, argc } @Call,
-        MakeFuncObj { dst, func },
-        ClosureVar { name, value },
-        Yield { dst, value } @Suspend,
-        Await { dst, src } @Suspend,
-        ToString { dst, src },
-        ToNumber { dst, src },
-        MakeRest { dst, from }
+        LoadConst { dst: w, index: n },
+        InitLexical { name: n, value: r },
+        SetFunctionName { func: r, name: r },
+        LoadEnv { dst: w, name: n },
+        MovC { dst: n, src: n } @Bookkeeping,
+        Call { func: n, argc: n } @Call,
+        CallEx { callee: r, argc: n } @Call,
+        CallNative { callee: r, argc: n } @Call,
+        Mov { dst: w, src: r },
+        Not { dst: w, src: r },
+        BitNot { dst: w, src: r },
+        Neg { dst: w, src: r },
+        TypeOf { dst: w, src: r },
+        TypeOfEnv { dst: w, name: n },
+        MakeIter { dst: w, src: r },
+        ArrayPush { array: r, value: r },
+        ArrayPushSpread { array: r, src: r },
+        StoreEnv { name: n, value: r },
+        Try { catch_offset: jr, finally_offset: jr },
+        DelayedJump { target: ja, seh_depth: n } @Jump,
+        CreateClosure { dst: w, func: n },
+        New { callee: rw, argc: n } @Call,
+        MakeFuncObj { dst: w, func: n },
+        ClosureVar { name: n, value: r },
+        Yield { dst: w, value: r } @Suspend,
+        Await { dst: w, src: r } @Suspend,
+        ToString { dst: w, src: r },
+        ToNumber { dst: w, src: r },
+        MakeRest { dst: w, from: n }
     ;
 // ── arity 3 ──
-        MakeRegExp { dst, source, flags },
-        AddC { dst, src, value } @Bookkeeping,
-        SubC { dst, src, value } @Bookkeeping,
-        BrIf { condition, true_target, false_target } @Jump,
-        BitAnd { dst, lhs, rhs },
-        BitOr { dst, lhs, rhs },
-        BitXor { dst, lhs, rhs },
-        Shl { dst, lhs, rhs },
-        Shr { dst, lhs, rhs },
-        UShr { dst, lhs, rhs },
-        Addx { dst, lhs, rhs },
-        Subx { dst, lhs, rhs },
-        Mulx { dst, lhs, rhs },
-        Divx { dst, lhs, rhs },
-        Remx { dst, lhs, rhs },
-        Pow { dst, lhs, rhs },
-        And { dst, lhs, rhs },
-        Or { dst, lhs, rhs },
-        Less { dst, lhs, rhs },
-        LessEqual { dst, lhs, rhs },
-        Greater { dst, lhs, rhs },
-        GreaterEqual { dst, lhs, rhs },
-        Equal { dst, lhs, rhs },
-        NotEqual { dst, lhs, rhs },
-        StrictEqual { dst, lhs, rhs },
-        StrictNotEqual { dst, lhs, rhs },
-        InstanceOf { dst, lhs, rhs },
-        In { dst, lhs, rhs },
-        IterNext { dst, has_next, src },
-        IndexGet { dst, object, index },
-        IndexSet { object, index, value },
-        PropGet { dst, object, property },
-        PropSet { object, property, value },
-        PropDelete { dst, object, property },
-        IndexDelete { dst, object, index },
-        CallMethod { callee, property, argc } @Call,
-        MakeArrowFuncObj { dst, func, captured_this },
-        CallSpread { callee, this, args } @Call,
-        CallSuperSpread { callee, this, args } @Call,
-        NewSpread { dst, ctor, args } @Call
+        MakeRegExp { dst: w, source: n, flags: n },
+        AddC { dst: n, src: n, value: n } @Bookkeeping,
+        SubC { dst: n, src: n, value: n } @Bookkeeping,
+        BrIf { condition: r, true_target: jr, false_target: jr } @Jump,
+        BitAnd { dst: w, lhs: r, rhs: r },
+        BitOr { dst: w, lhs: r, rhs: r },
+        BitXor { dst: w, lhs: r, rhs: r },
+        Shl { dst: w, lhs: r, rhs: r },
+        Shr { dst: w, lhs: r, rhs: r },
+        UShr { dst: w, lhs: r, rhs: r },
+        Addx { dst: w, lhs: r, rhs: r },
+        Subx { dst: w, lhs: r, rhs: r },
+        Mulx { dst: w, lhs: r, rhs: r },
+        Divx { dst: w, lhs: r, rhs: r },
+        Remx { dst: w, lhs: r, rhs: r },
+        Pow { dst: w, lhs: r, rhs: r },
+        And { dst: w, lhs: r, rhs: r },
+        Or { dst: w, lhs: r, rhs: r },
+        Less { dst: w, lhs: r, rhs: r },
+        LessEqual { dst: w, lhs: r, rhs: r },
+        Greater { dst: w, lhs: r, rhs: r },
+        GreaterEqual { dst: w, lhs: r, rhs: r },
+        Equal { dst: w, lhs: r, rhs: r },
+        NotEqual { dst: w, lhs: r, rhs: r },
+        StrictEqual { dst: w, lhs: r, rhs: r },
+        StrictNotEqual { dst: w, lhs: r, rhs: r },
+        InstanceOf { dst: w, lhs: r, rhs: r },
+        In { dst: w, lhs: r, rhs: r },
+        IterNext { dst: w, has_next: w, src: r },
+        IndexGet { dst: w, object: r, index: r },
+        IndexSet { object: r, index: r, value: r },
+        PropGet { dst: w, object: r, property: r },
+        PropSet { object: r, property: r, value: r },
+        PropDelete { dst: w, object: r, property: r },
+        IndexDelete { dst: w, object: r, index: r },
+        CallMethod { callee: rw, property: r, argc: n } @Call,
+        MakeArrowFuncObj { dst: w, func: n, captured_this: r },
+        CallSpread { callee: r, this: r, args: r } @Call,
+        CallSuperSpread { callee: r, this: r, args: r } @Call,
+        NewSpread { dst: w, ctor: r, args: r } @Call
 }
 
 impl fmt::Display for Instr {
@@ -1457,6 +1588,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 从一条 arm 头里解出每个变体绑定了哪些字段：`opcode → [(字段名或别名, 绑定名)]`。
+    ///
+    /// 位置不在这里定 —— `Instr::Yield { value, .. }` 里的 `value` 是第 1 个字段，
+    /// 光看模式看不出来（裸字段名既是字段名也是绑定名），所以位置留给调用方按表解析。
+    fn arm_bindings(head: &str) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        for seg in head.split('|') {
+            let Some(name_start) = seg.find("Instr::") else {
+                continue;
+            };
+            let name: String = seg[name_start + "Instr::".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let Some(open) = seg.find('{') else { continue };
+            let Some(close) = seg.rfind('}') else { continue };
+            let mut binds: Vec<String> = Vec::new();
+            for item in seg[open + 1..close].split(',') {
+                let item = item.trim();
+                if item.is_empty() || item == ".." {
+                    continue;
+                }
+                let bind = match item.split_once(':') {
+                    Some((_, b)) => b.trim(),
+                    None => item,
+                };
+                binds.push(bind.to_string());
+            }
+            out.push((name, binds));
+        }
+        out
+    }
+
+    /// **元测试**：字段角色（`Mov { dst: w, src: r }`）与 `run_instruction` 的实际用法
+    /// 必须一致 —— 判据是那个 arm 到底有没有 `get_value` / `set_value` 这个字段。
+    ///
+    /// 这样一来 `desc()` 里的读写集**不是**第三份人肉维护的知识，而是被实现校验过的派生。
+    #[test]
+    fn roles_match_the_vm_implementation() {
+        let arms = run_instruction_arms(include_str!("vm/mod.rs"));
+
+        // 两处例外：`-1`（"无操作数"）约定让 VM 先 match 字段再取值，于是证据长成
+        //     match value { Operand::Immd(-1) => …, src => self.get_value(src)? }
+        // 名字对不上，但语义就是"读这个字段"。P0b 的类型收紧会把它换成
+        // `Option<Operand>`，届时这条豁免可以删掉。
+        let marker_read_arms = ["Yield", "Await"];
+
+        let mut checked = 0;
+        for (_, arm) in &arms {
+            let head = &arm[..arm.find("=>").expect("arm 没有 =>")];
+            for (opcode_name, binds) in arm_bindings(head) {
+                let op = Instr::ALL
+                    .iter()
+                    .copied()
+                    .find(|o| format!("{o:?}") == opcode_name)
+                    .unwrap_or_else(|| panic!("表里没有 {opcode_name}"));
+                let fields = Instr::field_roles(op);
+                let names: Vec<&str> = fields.iter().map(|(f, _)| *f).collect();
+                for (idx, (field, role)) in fields.iter().enumerate() {
+                    // 某个绑定的位置：`a2` 这类别名自带下标；否则按"绑定名 = 字段名"
+                    // 在表里的位置找（裸字段名既是字段名也是绑定名）。
+                    let bind = binds.iter().find(|b| {
+                        match b.strip_prefix('a').filter(|n| {
+                            !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+                        }) {
+                            Some(n) => n.parse::<usize>().ok() == Some(idx),
+                            None => names.get(idx).is_some_and(|f| f == &b.as_str()),
+                        }
+                    });
+                    let Some(bind) = bind else { continue };
+                    let bind = bind.clone();
+                    let reads = arm.contains(&format!("self.get_value({bind})"))
+                        || arm.contains(&format!("self.resolve_property_key({bind}"))
+                        || arm.contains(&format!("self.raw_stack_value({bind})"));
+                    let writes = arm.contains(&format!("self.set_value({bind},"));
+                    let name = format!("{opcode_name}.{field}");
+                    let ok = match role {
+                        Role::Read => reads || marker_read_arms.contains(&opcode_name.as_str()),
+                        Role::Write => writes,
+                        Role::ReadWrite => {
+                            (reads || marker_read_arms.contains(&opcode_name.as_str())) && writes
+                        }
+                        // 元数据 / pc：不该出现在值流的读写里。
+                        Role::Meta | Role::RelPc | Role::AbsPc => !reads && !writes,
+                    };
+                    assert!(
+                        ok,
+                        "{name} 标成 {role:?}，但实现与之不符（读过={reads}、写过={writes}）；\
+                         这段 arm 是：\n{arm}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 150, "只核对了 {checked} 个字段，切分器大概坏了");
+    }
+
+    /// `desc()` 的口径：字段顺序 = 表顺序，角色 = 表里的标记，`kind` 是同一个。
+    #[test]
+    fn desc_reports_the_table() {
+        let d = Instr::Mov {
+            dst: Operand::Register(Register::R0),
+            src: Operand::Register(Register::R1),
+        }
+        .desc();
+        assert_eq!(d.kind, Kind::Normal);
+        assert_eq!(d.reads().collect::<Vec<_>>(), vec![Operand::Register(Register::R1)]);
+        assert_eq!(d.writes().collect::<Vec<_>>(), vec![Operand::Register(Register::R0)]);
+        assert_eq!(d.targets().count(), 0);
+
+        let jump = Instr::Jump { offset: Operand::Immd(7) }.desc();
+        assert_eq!(jump.kind, Kind::Jump);
+        assert_eq!(jump.reads().count(), 0);
+        assert_eq!(
+            jump.targets().collect::<Vec<_>>(),
+            vec![(Operand::Immd(7), Role::RelPc)],
+            "Jump 是相对偏移"
+        );
+
+        let call = Instr::Call {
+            func: Operand::Immd(3),
+            argc: Operand::Immd(2),
+        }
+        .desc();
+        assert_eq!(call.kind, Kind::Call);
+        assert_eq!((call.reads().count(), call.writes().count()), (0, 0), "参数在栈上，callee 是函数号");
     }
 
     /// 跳转类指令的偏移**相对还是绝对**：`Jump` / `BrIf` 是相对（`jump_offset`），

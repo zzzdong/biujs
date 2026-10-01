@@ -340,6 +340,51 @@ Rust 的 `match` 穷尽性让"新增变体忘了登记 desc"变成**编译错误
 
 ---
 
+### 3.2.2 P0b-1b 实际做法（操作数角色 + `desc()`）
+
+**表里每个字段都带角色**（`Mov { dst: w, src: r }`），字母表：
+
+| 标记 | `Role` | 含义 |
+|------|--------|------|
+| `r` | `Read` | 值流入口 |
+| `w` | `Write` | 值流出口 |
+| `rw` | `ReadWrite` | 先读后写（in/out） |
+| `jr` | `RelPc` | **相对**偏移：`pc = pc + off`（`Jump` / `BrIf` / `Try`） |
+| `ja` | `AbsPc` | **绝对** pc：`pc = off`（`DelayedJump` / `ResumeExc`） |
+| `n` | `Meta` | 常量下标 / `argc` / SEH 深度 / 名字符号 / 编译期栈指针 |
+
+角色是**必填**的（宏的匹配器要求 `字段 : 角色`），所以"漏标"不是疏忽，是编译错误。
+
+**角色是怎么定下来的（两步，都不是"人肉维护"）**
+
+1. **从实现反推**：脚本扫 `run_instruction` 的每条 arm，看每个字段有没有被
+   `get_value` / `set_value` / `resolve_property_key` 碰过 → 得到第一稿；
+   跳转、元数据、in/out 这些"访问器看不出来"的由人工补（第一稿只留 1 个字段没定，
+   `DelegateClose.iter` —— 它在 VM 里被 `..` 整个忽略，所以是 `n`）。
+2. **回实现取证**：`roles_match_the_vm_implementation` 直接读 `vm/mod.rs`，对每个字段断言
+   "标的角色"与"实际有没有 `get_value` / `set_value` 这个字段"一致（`Meta`/`RelPc`/`AbsPc`
+   反过来断言**不**出现在值流里）。这样 `desc()` 的读写集就是**被实现校验过的派生**。
+
+**测试本身也被证伪过**：故意把 `Mov { dst: w }` 改成 `dst: r`，测试立刻红，并打出
+"标成 Read，但实现与之不符（读过=false、写过=true）"；改回来即绿。守卫不是摆设。
+
+**形状上的两个修正**（原设计 §3.2 的 `Desc { writes: Option<Reg> }` 表达不了）：
+
+- 写集必须是 `Vec`：`New.callee` / `CallMethod.callee` 是 **in/out** —— 先读出来当 `this`、
+  再把解析结果写回同一个操作数，于是新角色 `rw`。
+- 除了读写，还要把 pc 目标单列（`RelPc` / `AbsPc`）：`Jump` 与 `Try` **都是相对**偏移，
+  但 `DelayedJump` / `ResumeExc` 是绝对 pc —— 这正是 P0b-2 类型收紧要分开的两个类型。
+
+**两处豁免**：`Yield.value` / `Await.src` 走 `-1`（"无操作数"）约定，VM 先 `match` 字段再取值，
+于是证据长成 `match value { Operand::Immd(-1) => …, src => self.get_value(src)? }` ——
+名字对不上，测试里显式列了这两个 arm 并写明理由。**P0b 把 `-1` 换成 `Option<Operand>` 后，
+这条豁免就该删掉**（否则它就成了新的历史包袱）。
+
+**`desc()` 的实现顺带证明了 `slots()` 值得留**：它就是 `slots()` 与 `roles_of(opcode())`
+的 zip，不需要为 93 个变体再写一遍"字段 × 角色"的 match。
+
+---
+
 ### 3.3 P1：调用路径归一
 
 **现状**：5 个调用 opcode（`Call` / `CallEx` / `CallNative` / `CallMethod` / `New` + `CallSpread`）
@@ -658,12 +703,13 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 |------|------|------|------|
 | **P0a-1** 容器 enum + 指令表（codegen / Module / 回填） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 通过 16561 / 执行 19708 / 跳过 7843 **一个数未动**、零逐套件回退；单元 190→**194**；单片回归 +10.7%（待 P0a-2 收回） |
 | **P0a-2** `run_instruction` 逐 arm 命名解构（85 arm，含 6 条分组） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单片 114.6s → 107.1s（基线 103.5s）；通过 16561 / 执行 19708 / 跳过 7843 **仍然一个数未动** |
-| **P0b-1a** `Kind` 分类（表里 `@Kind` 标记 + 穷尽 `kind()`）+ VM 源码元测试 | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单元 194→**198**；新增 4 条测试，其中 1 条直接读 `vm/mod.rs` 取证 |
+| **P0b-1a** `Kind` 分类（表里 `@Kind` 标记 + 穷尽 `kind()`）+ VM 源码元测试 | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单元 194→**198**；4 条测试，其中 1 条直接读 `vm/mod.rs` 取证 |
+| **P0b-1b** 操作数角色（表里 `dst: w` / `index: r` / `target: jr`）+ `desc()` + 同款元测试 | **已完成**（2026-10-01） | 同上 | 单元 →**200**；角色用"从实现反推 + 回实现取证"两步定下来 |
 | P1 调用归一 | 未开始 | | |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
 | P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |
-| P0b 剩余：操作数角色 + `desc()` + 类型收紧 | 未开始 | | 形状要改（见 §3.2.1）：`Desc.writes` 得是 `Vec`；偏移要分 `RelPc` / `AbsPc` |
+| P0b-2 类型收紧（`RelPc`/`AbsPc`、`Reg`/`ConstIndex`/`SymbolId`） | 未开始 | | 证据已在 §3.2.1：偏移必须分相对/绝对；`New.callee` 是 in/out 不能收成 `Option` |
 | 语义线：TypedArray 族入册解锁 | 未开始 | | 可随时插入；纯赚 test262 分数 |
 
 ### 9.1 P0a 的实际改动（P0a-1 + P0a-2，至此收口）
