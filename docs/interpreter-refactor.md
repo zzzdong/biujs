@@ -444,6 +444,41 @@ fn enter_call(&mut self, kind: CallKind, callee: &Value, this: Value,
 **验收**：`Proxy` 与 `Reflect` 两套件的通过数不减；新增一条 feature 断言
 "新增一种可调用体只改一处"（可以是一个把代理当构造器用的用例）。
 
+### 3.3.1 P1-1 实际做了什么：帧驱动先合一
+
+动手前先量了一遍面：**6 个入口 × 72 个调用点**（69 个在 `vm/mod.rs`），
+所以 P1 拆成两刀：**P1-1 先把"帧驱动"合一，P1-2 再把 5 个调用 opcode 汇进单一入口。**
+
+**为什么先做帧驱动**：读代码时发现 `drive_bytecode_frame`（`[[Call]]`）与 `invoke_construct`
+（`[[Construct]]`）是**同一段 100 行的两份拷贝** —— 保存/恢复 11 项执行上下文、压参数、
+`enter_frame`、装闭包变量、`pushc` 三项、`jump`、跑嵌套 `step`、再逐项 `truncate`。
+两份的差别只有四处：
+
+| | `[[Call]]` | `[[Construct]]` |
+|---|---|---|
+| `this` | 传入的（绑定/箭头解析之后） | 新建的实例 |
+| `function_val` / `new.target` | 被调方 / `override.or(captured)` | `new_target`（`Reflect.construct` 的第三参） |
+| `construct_stack` | `false` | `true` |
+| `Rv` 初值 | 不动 | 先清成 `undefined`（"返回对象才覆盖 `this`"要靠它） |
+
+现在这四处差异在**一处**算清（`FrameMode` 枚举），下面就是同一段驱动；
+`invoke_construct` 缩成"算出一个构造帧"再委托过去（100 行 → 20 行）。
+
+**证伪**：把驱动里的 `construct_stack.push(is_construct)` 改回恒为 `false`，
+新加的 `call_and_construct_frames_share_one_driver` 与
+`reflect::construct_honours_new_target_and_rejects_non_constructors` 立刻红 ——
+说明这条验收断言真的覆盖了这个差异位。（还原时踩过一次坑：`construct_stack.push(false)`
+在别处也有，用 `sed` 批量还原会误改 7 处无关站点；最后按"只保留 `drive_bytecode_frame`
+体内那处"精确还原，并用 `git diff` 复核只剩预期的一处改动。**批量还原要用精确匹配，
+不要用行尾模式的 sed。**）
+
+**数字**：通过 16561 / 执行 19708 / 跳过 7843 与基线逐字节一致，零逐套件回退；
+单元 201、feature **523→524**（+1 条验收断言）、护栏 7 全绿；告警数 25→24（重复代码消失）。
+
+**P1-2 剩下的**：`Call`/`CallEx`/`CallNative`/`CallMethod`/`CallSpread`/`New` 这 6 个 opcode
+仍然各自做"取 callee → 判种类 → 开帧"，要把它们也汇到 `enter_call`
+（届时 `dst: Option<Reg>` 与 native 快路径一并处理）。
+
 ---
 
 ### 3.4 P2：`CodeBlock` per function
@@ -736,7 +771,8 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | **P0b-1a** `Kind` 分类（表里 `@Kind` 标记 + 穷尽 `kind()`）+ VM 源码元测试 | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 单元 194→**198**；4 条测试，其中 1 条直接读 `vm/mod.rs` 取证 |
 | **P0b-1b** 操作数角色（表里 `dst: w` / `index: r` / `target: jr`）+ `desc()` + 同款元测试 | **已完成**（2026-10-01） | 同上 | 单元 →**200**；角色用"从实现反推 + 回实现取证"两步定下来 |
 | **P0b-2a** pc 字段类型收紧（`jr`→`RelPc`、`ja`→`AbsPc`，由角色派生） | **已完成**（2026-10-01） | 同上 | 单元 →**201**；`AbsPc` 喂给相对字段已被证实是编译错误 |
-| P1 调用归一 | 未开始 | | |
+| **P1-1** 帧驱动合一（`FrameMode`：`[[Call]]` / `[[Construct]]` 共用一份驱动） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 删掉 `invoke_construct` 的 100 行拷贝；feature +1 验收断言；数字未动 |
+| P1-2 六个调用 opcode 汇进 `enter_call` | 未开始 | | 面：6 个 opcode × 取 callee/判种类/开帧；届时处理 `dst: Option<Reg>` 与 native 快路径 |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
 | P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |

@@ -253,6 +253,27 @@ struct BoundFunction {
     bound_args: Vec<Value>,
 }
 
+/// 一帧是怎么开的：`[[Call]]` 还是 `[[Construct]]`。
+///
+/// 差别只有四处，见 [`Self::drive_bytecode_frame`] 的说明。把"哪种模式"做成枚举
+/// （而不是再抄一份 100 行的驱动代码）就是 P1 的目的。
+enum FrameMode {
+    Call {
+        /// 传进来的 `this`（绑定函数/箭头函数解析之后的）。
+        this_val: Value,
+        /// 箭头函数捕获的 `new.target`（ES 9.2.2）。
+        captured_new_target: Option<Value>,
+        /// `super(...)` 带来的显式 `new.target`。
+        new_target_override: Option<Value>,
+    },
+    Construct {
+        /// 新建的实例，也就是构造器的 `this`。
+        new_obj: Value,
+        /// 帧的 `function_val` 与 `new.target`（`Reflect.construct` 的第三个参数）。
+        new_target: Value,
+    },
+}
+
 impl VM {
     pub fn new() -> Self {
         let mut state = State::new();
@@ -686,6 +707,7 @@ impl VM {
     /// Turn a VM error into the JS value user code would catch.
     ///
     /// Returns `None` for errors that are *not* part of the language (internal
+
     /// errors, unimplemented features) — those must abort execution.
     fn as_js_exception(&self, err: &RuntimeError) -> Option<Value> {
         match err {
@@ -989,9 +1011,11 @@ impl VM {
                 callee,
                 args,
                 &captured_vars,
-                effective_this,
-                captured_this_new_target,
-                new_target_override,
+                FrameMode::Call {
+                    this_val: effective_this.clone(),
+                    captured_new_target: captured_this_new_target.clone(),
+                    new_target_override: new_target_override.clone(),
+                },
                 module,
             );
             match outcome {
@@ -1009,9 +1033,11 @@ impl VM {
             callee,
             args,
             &captured_vars,
-            effective_this,
-            captured_this_new_target,
-            new_target_override,
+            FrameMode::Call {
+                this_val: effective_this,
+                captured_new_target: captured_this_new_target,
+                new_target_override,
+            },
             module,
         )
     }
@@ -1021,6 +1047,12 @@ impl VM {
     ///
     /// The frame is driven by a nested `step` loop that stops at the sentinel
     /// return address one past the last instruction.
+    ///
+    /// **两种模式共用这一份实现**（P1）：`[[Call]]` 与 `[[Construct]]` 的差别只有四处 ——
+    /// `this`（传入的 vs 新建的实例）、`function_val`/`new.target`、`construct_stack`
+    /// 的标志位、以及构造帧先把 `Rv` 清成 `undefined`。以前这四处差异是靠**两份 100 行
+    /// 的拷贝**表达的（`drive_bytecode_frame` 与 `invoke_construct`），改一处忘一处就是
+    /// B45/B46 那种"为了一个特性到处打补丁"。
     #[allow(clippy::too_many_arguments)]
     fn drive_bytecode_frame(
         &mut self,
@@ -1028,9 +1060,7 @@ impl VM {
         callee: &Value,
         args: &[Value],
         captured_vars: &[(String, Value)],
-        effective_this: Value,
-        captured_this_new_target: Option<Value>,
-        new_target_override: Option<Value>,
+        mode: FrameMode,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         let saved_pc = self.state.pc;
@@ -1062,11 +1092,37 @@ impl VM {
         let return_pc = module.instructions.len();
 
         self.state.enter_frame(args.len())?;
-        self.state.this_val = effective_this;
-        self.state.function_val = match callee {
-            Value::Function(id) => self.materialize_function(*id),
-            other => other.clone(),
+        // 模式差异在一处算清，下面就是同一段帧驱动。
+        let (this_val, function_val, new_target_val, is_construct) = match mode {
+            FrameMode::Call {
+                this_val,
+                captured_new_target,
+                new_target_override,
+            } => (
+                this_val,
+                match callee {
+                    Value::Function(id) => self.materialize_function(*id),
+                    other => other.clone(),
+                },
+                new_target_override
+                    .or(captured_new_target)
+                    .unwrap_or(Value::Undefined),
+                false,
+            ),
+            // 构造帧的 `this` 是刚建好的实例，`function_val` 与 `new.target` 都是
+            // `new_target`（`Reflect.construct` 会把它换成第三个参数）。
+            FrameMode::Construct {
+                new_obj,
+                new_target,
+            } => (new_obj, new_target.clone(), new_target, true),
         };
+        self.state.this_val = this_val;
+        self.state.function_val = function_val;
+        if is_construct {
+            // 构造器不显式返回对象时，结果就是 `this` —— 先把 `Rv` 清成
+            // `undefined`，让"看 `Rv` 是不是对象"这一步能成立。
+            self.state.set_register(Register::Rv, Value::Undefined)?;
+        }
         for (name, value) in captured_vars {
             let mut map = std::collections::HashMap::new();
             map.insert(name.clone(), value.clone());
@@ -1078,12 +1134,8 @@ impl VM {
                 self.state.pushc(self.state.closure_var_stack.len())?;
                 self.state.pushc(self.state.seh_stack.len())?;
                 self.state.pushc(return_pc)?;
-                self.state.construct_stack.push(false);
-                self.state.new_target_stack.push(
-                    new_target_override
-                        .or(captured_this_new_target)
-                        .unwrap_or(Value::Undefined),
-                );
+                self.state.construct_stack.push(is_construct);
+                self.state.new_target_stack.push(new_target_val);
                 self.state.jump(*location);
             }
             None => {
@@ -9304,35 +9356,6 @@ impl VM {
             _ => return Err(RuntimeError::TypeError("not a constructor".to_string())),
         };
 
-        let saved_pc = self.state.pc;
-        let saved_rsp = self.state.rsp;
-        let saved_rbp = self.state.rbp;
-        let saved_closure = self.state.closure_var_stack.len();
-        let saved_seh = self.state.seh_stack.len();
-        let saved_this = self.state.this_val.clone();
-        let saved_this_depth = self.state.this_stack.len();
-        let saved_construct = self.state.construct_stack.len();
-        let saved_new_target = self.state.new_target_stack.len();
-        let saved_function = self.state.function_val.clone();
-        // See `invoke_with_new_target`: exceptions escaping this frame must be
-        // propagated to the caller rather than handled from inside this loop.
-        let saved_ctrl = self.state.ctrl_stack.len();
-        self.invoke_boundaries.push(saved_ctrl);
-
-        for arg in args.iter().rev() {
-            self.state.push(arg.clone())?;
-        }
-        self.state.rbp = self.state.rsp;
-        let return_pc = module.instructions.len();
-
-        self.state.enter_frame(args.len())?;
-        self.state.this_val = new_obj;
-        for (name, value) in &captured_vars {
-            let mut map = std::collections::HashMap::new();
-            map.insert(name.clone(), value.clone());
-            self.state.closure_var_stack.push(map);
-        }
-
         // `new.target` of a `[[Construct]]` frame is the constructor itself —
         // unless `Reflect.construct(F, args, newTarget)` said otherwise.
         let new_target_value = match new_target_override {
@@ -9342,51 +9365,18 @@ impl VM {
                 other => other.clone(),
             },
         };
-        self.state.function_val = new_target_value.clone();
-
-        match module.symtab.get(&FunctionId::new(func_id)) {
-            Some(location) => {
-                self.state.set_register(Register::Rv, Value::Undefined)?;
-                self.state.pushc(self.state.closure_var_stack.len())?;
-                self.state.pushc(self.state.seh_stack.len())?;
-                self.state.pushc(return_pc)?;
-                self.state.construct_stack.push(true);
-                self.state.new_target_stack.push(new_target_value);
-                self.state.jump(*location);
-            }
-            None => {
-                return Err(RuntimeError::ReferenceError(format!(
-                    "undefined function: {func_id}"
-                )));
-            }
-        }
-
-        let outcome = (|| -> Result<(), RuntimeError> {
-            while self.step(module)? {}
-            Ok(())
-        })();
-
-        self.invoke_boundaries.pop();
-
-        // Rewind this frame's control-stack entries on the exception path, as
-        // in `invoke_with_new_target` (a normal return did it in `Ret`).
-        self.state.ctrl_stack.truncate(saved_ctrl);
-        self.state.pc = saved_pc;
-        self.state.rsp = saved_rsp;
-        self.state.rbp = saved_rbp;
-        self.state.closure_var_stack.truncate(saved_closure);
-        self.state.seh_stack.truncate(saved_seh);
-        self.state.this_stack.truncate(saved_this_depth);
-        self.state.this_state.truncate(saved_this_depth);
-        self.state.frame_argc.truncate(saved_this_depth);
-        self.state.this_val = saved_this;
-        self.state.function_val = saved_function;
-        self.state.construct_stack.truncate(saved_construct);
-        self.state.new_target_stack.truncate(saved_new_target);
-
-        outcome?;
-        let rv = self.state.get_register(Register::Rv)?;
-        Ok(rv)
+        // 帧驱动只有一份实现（P1）：这里只负责算出"这是个构造帧"。
+        self.drive_bytecode_frame(
+            func_id,
+            callee,
+            args,
+            &captured_vars,
+            FrameMode::Construct {
+                new_obj,
+                new_target: new_target_value,
+            },
+            module,
+        )
     }
 
     /// ES 7.3.20 `IsConstructor`: whether `value` can be used with `new` — and,
