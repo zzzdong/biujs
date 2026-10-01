@@ -21,7 +21,7 @@ use crate::builtins::Builtins;
 use crate::vm::object::{PromiseObject, PromiseReaction, PromiseState};
 use crate::vm::iterator::iterator_symbol_key;
 use crate::bytecode::{
-    Bytecode, Constant, FunctionId, Module, Opcode, Operand, Primitive, Register,
+    Constant, FunctionId, Instr, Module, Opcode, Operand, Primitive, Register,
 };
 
 /// Size of the pre-allocated value stack. Slots are addressed directly, so the
@@ -552,10 +552,7 @@ impl VM {
                 return Err(RuntimeError::RangeError(fired.message(self.timeout)));
             }
         }
-        let Bytecode {
-            opcode,
-            operands: _,
-        } = inst;
+        let opcode = inst.opcode();
 
         match opcode {
             Opcode::Halt => {
@@ -2108,8 +2105,12 @@ impl VM {
         crate::builtins::call_native(name, args)
     }
 
-    fn run_instruction(&mut self, inst: &Bytecode, module: &Module) -> Result<(), RuntimeError> {
-        let Bytecode { opcode, operands } = inst;
+    fn run_instruction(&mut self, inst: &Instr, module: &Module) -> Result<(), RuntimeError> {
+        // 过渡接口：`slots()` 把操作数按位置拷出，未用到的位置是 `Immd(0)`（与旧编码的
+        // 填充槽一致，所以语义不变）。逐条 arm 改成命名字段解构是 P0a-2，
+        // 见 `docs/interpreter-refactor.md` §3.1。
+        let operands = inst.slots();
+        let opcode = inst.opcode();
 
         match opcode {
             // `yield expr`: suspend the enclosing generator. The frame stays on
@@ -8423,9 +8424,10 @@ impl VM {
             // instruction itself does not run again, so the destination is read
             // from the bytecode and written here, with the restored `rbp`.
             if let Some(inst) = module.instructions.get(resume_pc) {
-                if matches!(inst.opcode, Opcode::Yield) {
-                    let dst = inst.operands[0];
-                    self.set_value(dst, send)?;
+                // 命名字段解构：目的寄存器是 `Yield` 声明的第一个操作数，
+                // 不再依赖"槽位 0"这个位置约定。
+                if let Instr::Yield { dst, .. } = inst {
+                    self.set_value(*dst, send)?;
                 }
             }
             self.state.jump(resume_pc + 1);
@@ -10341,7 +10343,7 @@ impl std::error::Error for RuntimeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::{Bytecode, Constant, Opcode, Operand, Primitive, Register};
+    use crate::bytecode::{Constant, Instr, Opcode, Operand, Primitive, Register};
 
     // ──────────────────────── State ────────────────────────
 
@@ -10616,7 +10618,7 @@ mod tests {
 
     /// Helper to build a minimal module with given instructions
     fn make_module(
-        instructions: Vec<Bytecode>,
+        instructions: Vec<Instr>,
         constants: Vec<Constant>,
     ) -> crate::bytecode::Module {
         crate::bytecode::Module::new(
@@ -10634,7 +10636,7 @@ mod tests {
 
     #[test]
     fn test_vm_run_halt() {
-        let module = make_module(vec![Bytecode::empty(Opcode::Halt)], vec![]);
+        let module = make_module(vec![Instr::Halt {}], vec![]);
         let mut vm = VM::new();
         let result = vm.run(&module).unwrap();
         assert_eq!(result, Value::Undefined);
@@ -10644,12 +10646,8 @@ mod tests {
     fn test_vm_run_mov_halt() {
         let module = make_module(
             vec![
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::Rv),
-                    Operand::Primitive(Primitive::Boolean(true)),
-                ),
-                Bytecode::empty(Opcode::Halt),
+                Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(true)) },
+                Instr::Halt {},
             ],
             vec![],
         );
@@ -10663,12 +10661,8 @@ mod tests {
         // Load constant into Rv, halt
         let module = make_module(
             vec![
-                Bytecode::double(
-                    Opcode::LoadConst,
-                    Operand::Register(Register::Rv),
-                    Operand::Immd(0),
-                ),
-                Bytecode::empty(Opcode::Halt),
+                Instr::LoadConst { dst: Operand::Register(Register::Rv), index: Operand::Immd(0) },
+                Instr::Halt {},
             ],
             vec![Constant::from("hello")],
         );
@@ -10682,28 +10676,11 @@ mod tests {
         // R0 = 10, R1 = 3, R2 = R0 + R1, Rv = R2, halt
         let module = make_module(
             vec![
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::R0),
-                    Operand::Primitive(Primitive::Float(10.0)),
-                ),
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::R1),
-                    Operand::Primitive(Primitive::Float(3.0)),
-                ),
-                Bytecode::triple(
-                    Opcode::Addx,
-                    Operand::Register(Register::R2),
-                    Operand::Register(Register::R0),
-                    Operand::Register(Register::R1),
-                ),
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::Rv),
-                    Operand::Register(Register::R2),
-                ),
-                Bytecode::empty(Opcode::Halt),
+                Instr::Mov { dst: Operand::Register(Register::R0), src: Operand::Primitive(Primitive::Float(10.0)) },
+                Instr::Mov { dst: Operand::Register(Register::R1), src: Operand::Primitive(Primitive::Float(3.0)) },
+                Instr::Addx { dst: Operand::Register(Register::R2), lhs: Operand::Register(Register::R0), rhs: Operand::Register(Register::R1) },
+                Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Register(Register::R2) },
+                Instr::Halt {},
             ],
             vec![],
         );
@@ -10720,18 +10697,10 @@ mod tests {
         // 3: halt
         let module = make_module(
             vec![
-                Bytecode::single(Opcode::Jump, Operand::Immd(2)),
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::Rv),
-                    Operand::Primitive(Primitive::Boolean(false)),
-                ),
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::Rv),
-                    Operand::Primitive(Primitive::Boolean(true)),
-                ),
-                Bytecode::empty(Opcode::Halt),
+                Instr::Jump { offset: Operand::Immd(2) },
+                Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(false)) },
+                Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(true)) },
+                Instr::Halt {},
             ],
             vec![],
         );
@@ -10748,23 +10717,10 @@ mod tests {
         // 3: halt
         let module = make_module(
             vec![
-                Bytecode::triple(
-                    Opcode::BrIf,
-                    Operand::Primitive(Primitive::Boolean(true)),
-                    Operand::Immd(2),
-                    Operand::Immd(1),
-                ),
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::Rv),
-                    Operand::Primitive(Primitive::Boolean(false)),
-                ),
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::Rv),
-                    Operand::Primitive(Primitive::Boolean(true)),
-                ),
-                Bytecode::empty(Opcode::Halt),
+                Instr::BrIf { condition: Operand::Primitive(Primitive::Boolean(true)), true_target: Operand::Immd(2), false_target: Operand::Immd(1) },
+                Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(false)) },
+                Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(true)) },
+                Instr::Halt {},
             ],
             vec![],
         );
@@ -10781,23 +10737,10 @@ mod tests {
         // 3: halt
         let module = make_module(
             vec![
-                Bytecode::triple(
-                    Opcode::BrIf,
-                    Operand::Primitive(Primitive::Boolean(false)),
-                    Operand::Immd(1),
-                    Operand::Immd(2),
-                ),
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::Rv),
-                    Operand::Primitive(Primitive::Boolean(true)),
-                ),
-                Bytecode::double(
-                    Opcode::Mov,
-                    Operand::Register(Register::Rv),
-                    Operand::Primitive(Primitive::Boolean(false)),
-                ),
-                Bytecode::empty(Opcode::Halt),
+                Instr::BrIf { condition: Operand::Primitive(Primitive::Boolean(false)), true_target: Operand::Immd(1), false_target: Operand::Immd(2) },
+                Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(true)) },
+                Instr::Mov { dst: Operand::Register(Register::Rv), src: Operand::Primitive(Primitive::Boolean(false)) },
+                Instr::Halt {},
             ],
             vec![],
         );

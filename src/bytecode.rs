@@ -34,7 +34,7 @@ pub struct Module {
     /// `default_instructions()` is the fallback when a function has no `Ret`
     /// at all (a module built by hand, as the unit tests do).
     pub exit_pc: HashMap<u32, usize>,
-    pub instructions: Vec<Bytecode>,
+    pub instructions: Vec<Instr>,
     pub debug_instructions: BTreeMap<usize, crate::compiler::ir::Instruction>,
 }
 
@@ -48,7 +48,7 @@ impl Module {
         asyncs: std::collections::HashSet<u32>,
         derived_ctors: std::collections::HashSet<u32>,
         exit_pc: HashMap<u32, usize>,
-        instructions: Vec<Bytecode>,
+        instructions: Vec<Instr>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -96,48 +96,228 @@ impl fmt::Display for Module {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Bytecode {
-    pub opcode: Opcode,
-    pub operands: [Operand; 3],
+/// 指令的**唯一定义处**。
+///
+/// 一行 = 一个 opcode + 它按位置排列的操作数（按语义命名）；表按 **arity 分成四组**，
+/// 于是"这条指令有几个操作数"在定义处就看得见，而不是靠变体上方的一行注释。
+///
+/// 由这张表生成 `Instr` 本身与 `opcode()` / `arity()` / `arity_of()` / `slots()` / `from_parts()`。
+/// P0b 会把读写集与跳转/调用性质（`desc()`）也挂在这里。**新增一条指令 = 加一行。**
+///
+/// 表里的 arity 是**权威值**：取发射端（`compiler/codegen.rs`）与执行端
+/// （`vm/mod.rs` 的 `run_instruction`）实际使用的槽位数的较大者。逐条核对的结果是
+/// **没有一条指令的操作数超过 3 个**，而 `Try` / `Halt` / `Ret` / `EndTry` / `ResumeExc` /
+/// `PrologueEnd` 在旧编码里都带着无意义的填充槽（`Try` 甚至得用 `triple` 才装得下两个偏移，
+/// 第三个槽永远是 0）。
+macro_rules! define_instrs {
+    (
+        $( $z:ident {} ),* ;
+        $( $o1:ident { $f1:ident } ),* ;
+        $( $o2:ident { $g1:ident, $g2:ident } ),* ;
+        $( $o3:ident { $h1:ident, $h2:ident, $h3:ident } ),*
+    ) => {
+        #[derive(Debug, Clone, Copy)]
+        pub enum Instr {
+            $( $z {}, )*
+            $( $o1 { $f1: Operand }, )*
+            $( $o2 { $g1: Operand, $g2: Operand }, )*
+            $( $o3 { $h1: Operand, $h2: Operand, $h3: Operand }, )*
+        }
+
+        impl Instr {
+            /// 这条指令是什么（诊断，以及既有按 opcode 分支的代码）。
+            pub fn opcode(&self) -> Opcode {
+                match self {
+                    $( Instr::$z {} => Opcode::$z, )*
+                    $( Instr::$o1 { .. } => Opcode::$o1, )*
+                    $( Instr::$o2 { .. } => Opcode::$o2, )*
+                    $( Instr::$o3 { .. } => Opcode::$o3, )*
+                }
+            }
+
+            /// 本变体声明的操作数个数 —— 由表决定，不再是"永远 3 个"。
+            pub fn arity(&self) -> usize {
+                match self {
+                    $( Instr::$z {} => 0, )*
+                    $( Instr::$o1 { .. } => 1, )*
+                    $( Instr::$o2 { .. } => 2, )*
+                    $( Instr::$o3 { .. } => 3, )*
+                }
+            }
+
+            /// 某个 opcode 声明的操作数个数（`Instr` 还没有实例时用）。
+            pub fn arity_of(op: Opcode) -> usize {
+                match op {
+                    $( Opcode::$z => 0, )*
+                    $( Opcode::$o1 => 1, )*
+                    $( Opcode::$o2 => 2, )*
+                    $( Opcode::$o3 => 3, )*
+                }
+            }
+
+            /// 按 opcode 组装。`Instruction::UnaryOp` / `BinaryOp` 携带**运行时 opcode**，
+            /// 所以必须有这条路径；调用方请用 [`Self::unary`] / [`Self::binary`]，它们核对 arity。
+            /// （旧编码下这两种写法完全不做检查：任何 opcode 都能配上任何数量的槽位。）
+            pub fn from_parts(op: Opcode, a: Operand, b: Operand, c: Operand) -> Self {
+                match op {
+                    $( Opcode::$z => Instr::$z {}, )*
+                    $( Opcode::$o1 => Instr::$o1 { $f1: a }, )*
+                    $( Opcode::$o2 => Instr::$o2 { $g1: a, $g2: b }, )*
+                    $( Opcode::$o3 => Instr::$o3 { $h1: a, $h2: b, $h3: c }, )*
+                }
+            }
+
+            pub fn unary(op: Opcode, dst: Operand, src: Operand) -> Self {
+                assert_eq!(
+                    Self::arity_of(op), 2,
+                    "{op:?} is not a unary (2-operand) instruction"
+                );
+                Self::from_parts(op, dst, src, Operand::Immd(0))
+            }
+
+            pub fn binary(op: Opcode, dst: Operand, lhs: Operand, rhs: Operand) -> Self {
+                assert_eq!(
+                    Self::arity_of(op), 3,
+                    "{op:?} is not a binary (3-operand) instruction"
+                );
+                Self::from_parts(op, dst, lhs, rhs)
+            }
+
+            /// 操作数按位置拷出，未用到的位置补 `Operand::Immd(0)`。
+            ///
+            /// **过渡接口**：`run_instruction` 的 arm 目前仍按槽位下标读取操作数，
+            /// 逐条改为命名字段解构是 P0a-2（见 `docs/interpreter-refactor.md` §3.1）。
+            pub fn slots(&self) -> [Operand; 4] {
+                match self {
+                    $( Instr::$z {} => [Operand::Immd(0); 4], )*
+                    $( Instr::$o1 { $f1 } => Instr::pack(&[*$f1]), )*
+                    $( Instr::$o2 { $g1, $g2 } => Instr::pack(&[*$g1, *$g2]), )*
+                    $( Instr::$o3 { $h1, $h2, $h3 } => Instr::pack(&[*$h1, *$h2, *$h3]), )*
+                }
+            }
+
+            /// `slots()` 的填充规则：不足 4 个的位置补 `Operand::Immd(0)`。
+            #[inline]
+            fn pack(used: &[Operand]) -> [Operand; 4] {
+                let mut slots = [Operand::Immd(0); 4];
+                slots[..used.len()].copy_from_slice(used);
+                slots
+            }
+        }
+    };
 }
 
-impl Bytecode {
-    pub fn empty(opcode: Opcode) -> Self {
-        Self {
-            opcode,
-            operands: [Operand::Immd(0); 3],
-        }
-    }
-
-    pub fn single(opcode: Opcode, operand: Operand) -> Self {
-        Self {
-            opcode,
-            operands: [operand, Operand::Immd(0), Operand::Immd(0)],
-        }
-    }
-
-    pub fn double(opcode: Opcode, dst: Operand, src: Operand) -> Self {
-        Self {
-            opcode,
-            operands: [dst, src, Operand::Immd(0)],
-        }
-    }
-
-    pub fn triple(opcode: Opcode, dst: Operand, src1: Operand, src2: Operand) -> Self {
-        Self {
-            opcode,
-            operands: [dst, src1, src2],
-        }
-    }
+define_instrs! {
+// ── arity 0 ──
+        Halt {},
+        Ret {},
+        EndTry {},
+        ResumeExc {},
+        PrologueEnd {}
+    ;
+// ── arity 1 ──
+        DeclareLexical { name },
+        Push { src },
+        Pop { dst },
+        PushC { src },
+        PopC { dst },
+        Jump { offset },
+        DelegateOpen { iter },
+        DelegateClose { iter },
+        MakeArray { dst },
+        MarkHole { array },
+        MakeObject { dst },
+        ThrowExc { value },
+        LoadException { dst },
+        LoadThis { dst },
+        LoadNewTarget { dst },
+        LoadCurrentFunction { dst },
+        Arguments { dst },
+        IterClose { iter },
+        RequireObjectCoercible { src }
+    ;
+// ── arity 2 ──
+        LoadConst { dst, index },
+        InitLexical { name, value },
+        SetFunctionName { func, name },
+        LoadEnv { dst, name },
+        MovC { dst, src },
+        Call { func, argc },
+        CallEx { callee, argc },
+        CallNative { callee, argc },
+        Mov { dst, src },
+        Not { dst, src },
+        BitNot { dst, src },
+        Neg { dst, src },
+        TypeOf { dst, src },
+        TypeOfEnv { dst, name },
+        MakeIter { dst, src },
+        ArrayPush { array, value },
+        ArrayPushSpread { array, src },
+        StoreEnv { name, value },
+        Try { catch_offset, finally_offset },
+        DelayedJump { target, seh_depth },
+        CreateClosure { dst, func },
+        New { callee, argc },
+        MakeFuncObj { dst, func },
+        ClosureVar { name, value },
+        Yield { dst, value },
+        Await { dst, src },
+        ToString { dst, src },
+        ToNumber { dst, src },
+        MakeRest { dst, from }
+    ;
+// ── arity 3 ──
+        MakeRegExp { dst, source, flags },
+        AddC { dst, src, value },
+        SubC { dst, src, value },
+        BrIf { condition, true_target, false_target },
+        BitAnd { dst, lhs, rhs },
+        BitOr { dst, lhs, rhs },
+        BitXor { dst, lhs, rhs },
+        Shl { dst, lhs, rhs },
+        Shr { dst, lhs, rhs },
+        UShr { dst, lhs, rhs },
+        Addx { dst, lhs, rhs },
+        Subx { dst, lhs, rhs },
+        Mulx { dst, lhs, rhs },
+        Divx { dst, lhs, rhs },
+        Remx { dst, lhs, rhs },
+        Pow { dst, lhs, rhs },
+        And { dst, lhs, rhs },
+        Or { dst, lhs, rhs },
+        Less { dst, lhs, rhs },
+        LessEqual { dst, lhs, rhs },
+        Greater { dst, lhs, rhs },
+        GreaterEqual { dst, lhs, rhs },
+        Equal { dst, lhs, rhs },
+        NotEqual { dst, lhs, rhs },
+        StrictEqual { dst, lhs, rhs },
+        StrictNotEqual { dst, lhs, rhs },
+        InstanceOf { dst, lhs, rhs },
+        In { dst, lhs, rhs },
+        IterNext { dst, has_next, src },
+        IndexGet { dst, object, index },
+        IndexSet { object, index, value },
+        PropGet { dst, object, property },
+        PropSet { object, property, value },
+        PropDelete { dst, object, property },
+        IndexDelete { dst, object, index },
+        CallMethod { callee, property, argc },
+        MakeArrowFuncObj { dst, func, captured_this },
+        CallSpread { callee, this, args },
+        CallSuperSpread { callee, this, args },
+        NewSpread { dst, ctor, args }
 }
 
-impl fmt::Display for Bytecode {
+impl fmt::Display for Instr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.opcode)?;
-        if let Some((last, operands)) = self.operands.split_last() {
-            for operand in operands {
-                write!(f, " {operand},")?;
+        write!(f, "{}", self.opcode())?;
+        // 只打印本变体真正声明的操作数：旧实现固定打印三个槽位，其中可能是填充值。
+        let slots = self.slots();
+        if let Some((last, rest)) = slots[..self.arity()].split_last() {
+            for slot in rest {
+                write!(f, " {slot},")?;
             }
             write!(f, " {last}")?;
         }
@@ -145,7 +325,8 @@ impl fmt::Display for Bytecode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+// `PartialEq`/`Eq` 是 P0a 加的：表与测试都要能比较"这条指令是什么"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
     /// load_const dst, const_id
     LoadConst,
@@ -869,57 +1050,106 @@ mod tests {
 
     #[test]
     fn test_bytecode_empty() {
-        let inst = Bytecode::empty(Opcode::Halt);
-        assert!(matches!(inst.opcode, Opcode::Halt));
-        for op in &inst.operands {
-            assert!(matches!(op, Operand::Immd(0)));
-        }
+        let inst = Instr::Halt {};
+        assert_eq!(inst.opcode(), Opcode::Halt);
+        assert_eq!(inst.arity(), 0);
+        // 没有操作数就是没有：旧编码在这里是三个填充槽 `Immd(0)`。
+        assert!(inst.slots().iter().all(|op| matches!(op, Operand::Immd(0))));
     }
 
     #[test]
     fn test_bytecode_single() {
-        let inst = Bytecode::single(Opcode::Push, Operand::Register(Register::R0));
-        assert!(matches!(inst.opcode, Opcode::Push));
-        assert!(matches!(inst.operands[0], Operand::Register(Register::R0)));
-        assert!(matches!(inst.operands[1], Operand::Immd(0)));
-        assert!(matches!(inst.operands[2], Operand::Immd(0)));
+        let inst = Instr::Push {
+            src: Operand::Register(Register::R0),
+        };
+        assert_eq!(inst.opcode(), Opcode::Push);
+        assert_eq!(inst.arity(), 1);
+        assert!(matches!(inst.slots()[0], Operand::Register(Register::R0)));
+        // `slots()` 只对"未声明的位置"补 `Immd(0)`（过渡接口的填充规则）。
+        assert!(inst.slots()[1..].iter().all(|op| matches!(op, Operand::Immd(0))));
     }
 
     #[test]
     fn test_bytecode_double() {
-        let inst = Bytecode::double(
-            Opcode::Mov,
-            Operand::Register(Register::R0),
-            Operand::Register(Register::R1),
-        );
-        assert!(matches!(inst.opcode, Opcode::Mov));
-        assert!(matches!(inst.operands[0], Operand::Register(Register::R0)));
-        assert!(matches!(inst.operands[1], Operand::Register(Register::R1)));
-        assert!(matches!(inst.operands[2], Operand::Immd(0)));
+        let inst = Instr::Mov {
+            dst: Operand::Register(Register::R0),
+            src: Operand::Register(Register::R1),
+        };
+        assert_eq!(inst.opcode(), Opcode::Mov);
+        assert_eq!(inst.arity(), 2);
+        assert!(matches!(inst.slots()[0], Operand::Register(Register::R0)));
+        assert!(matches!(inst.slots()[1], Operand::Register(Register::R1)));
     }
 
     #[test]
     fn test_bytecode_triple() {
-        let inst = Bytecode::triple(
-            Opcode::Addx,
-            Operand::Register(Register::R0),
-            Operand::Register(Register::R1),
-            Operand::Register(Register::R2),
+        let inst = Instr::Addx {
+            dst: Operand::Register(Register::R0),
+            lhs: Operand::Register(Register::R1),
+            rhs: Operand::Register(Register::R2),
+        };
+        assert_eq!(inst.opcode(), Opcode::Addx);
+        assert_eq!(inst.arity(), 3);
+        assert!(matches!(inst.slots()[0], Operand::Register(Register::R0)));
+        assert!(matches!(inst.slots()[1], Operand::Register(Register::R1)));
+        assert!(matches!(inst.slots()[2], Operand::Register(Register::R2)));
+    }
+
+    /// `Try` 曾经必须用 `triple` 才装得下两个偏移，第三个槽永远是 0；
+    /// 现在它有且只有两个操作数。这是"固定三槽"消失后最直接的一个证据。
+    #[test]
+    fn test_try_has_no_padding_slot() {
+        let inst = Instr::Try {
+            catch_offset: Operand::Immd(11),
+            finally_offset: Operand::Immd(22),
+        };
+        assert_eq!(inst.arity(), 2);
+        assert_eq!(Instr::arity_of(Opcode::Try), 2);
+        assert_eq!(format!("{inst}"), "try 11, 22");
+    }
+
+    /// 表是 arity 的唯一来源：`unary` / `binary` 只接受操作数个数对得上的 opcode。
+    #[test]
+    fn test_dynamic_opcode_constructors_check_arity() {
+        let dst = Operand::Register(Register::R0);
+        let src = Operand::Register(Register::R1);
+        assert!(matches!(
+            Instr::unary(Opcode::Not, dst, src),
+            Instr::Not { .. }
+        ));
+        assert!(matches!(
+            Instr::binary(Opcode::Addx, dst, src, src),
+            Instr::Addx { .. }
+        ));
+        assert_eq!(Instr::arity_of(Opcode::Addx), 3);
+        assert_eq!(Instr::arity_of(Opcode::Not), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a binary")]
+    fn test_binary_rejects_a_two_operand_opcode() {
+        let op = Operand::Register(Register::R0);
+        Instr::binary(Opcode::Mov, op, op, op);
+    }
+
+    /// Display 只打印本变体声明的操作数：旧实现固定打印三个槽位。
+    #[test]
+    fn test_display_omits_padding() {
+        assert_eq!(format!("{}", Instr::Halt {}), "halt");
+        assert_eq!(
+            format!(
+                "{}",
+                Instr::Push {
+                    src: Operand::Register(Register::R0)
+                }
+            ),
+            "push r0"
         );
-        assert!(matches!(inst.opcode, Opcode::Addx));
-        assert!(matches!(inst.operands[0], Operand::Register(Register::R0)));
-        assert!(matches!(inst.operands[1], Operand::Register(Register::R1)));
-        assert!(matches!(inst.operands[2], Operand::Register(Register::R2)));
     }
 
     #[test]
     fn test_bytecode_display() {
-        let inst = Bytecode::triple(
-            Opcode::Addx,
-            Operand::Register(Register::R0),
-            Operand::Register(Register::R1),
-            Operand::Register(Register::R2),
-        );
+        let inst = Instr::Addx { dst: Operand::Register(Register::R0), lhs: Operand::Register(Register::R1), rhs: Operand::Register(Register::R2) };
         assert_eq!(format!("{}", inst), "addx r0, r1, r2");
     }
 
@@ -989,7 +1219,7 @@ mod tests {
             std::collections::HashSet::new(),
             std::collections::HashSet::new(),
             HashMap::new(),
-            vec![Bytecode::empty(Opcode::Halt)],
+            vec![Instr::Halt {}],
         );
         let display = format!("{}", module);
         assert!(display.contains("Module main"));

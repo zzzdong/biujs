@@ -75,7 +75,7 @@ impl Compiler {
 
         // 6. Run SSA + Codegen for ALL functions in the unit
         let registers = Register::general();
-        let mut all_codes: Vec<crate::bytecode::Bytecode> = Vec::new();
+        let mut all_codes: Vec<crate::bytecode::Instr> = Vec::new();
         let mut symtab = HashMap::new();
 
         let function_count = unit.functions.len();
@@ -141,7 +141,7 @@ impl Compiler {
             // `Module::exit_pc`).
             if let Some(idx) = func_codes
                 .iter()
-                .rposition(|code| matches!(code.opcode, crate::bytecode::Opcode::Ret))
+                .rposition(|code| matches!(code.opcode(), crate::bytecode::Opcode::Ret))
             {
                 exit_pc.insert(func_id.as_usize() as u32, offset + idx);
             }

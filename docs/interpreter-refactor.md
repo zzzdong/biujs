@@ -35,6 +35,15 @@
 
 ### 0.1 第一次开工的顺序（P0a）
 
+> **已执行，见 §3.1 的施工结果与 §9 的进度表。** 下面这段保留为**最初的计划**，
+> 其中两处事后被证伪，施工时不要再照抄：
+> 1. 第 2 步的 `Opcode::Add` **不存在**——算术指令是 `Addx`（对象加法）/ `AddC`（栈调整）；
+> 2. 第 6 步"删掉 `debug_instructions`"是**错的**，理由见 §1.1 的订正。
+>
+> 实际路径是"**用脚本按指令表一次性铺开**"（93 个变体、111 处 codegen 发射点、
+> 22 处测试发射点），而不是先做 5 个变体试水——因为枚举的穷尽性能让编译器把遗漏点全列出来，
+> 分批的收益小于它带来的"半迁移状态"成本。真正需要分批的是 **P0a-2**（见 §3.1）。
+
 ```bash
 git checkout -b refactor/interpreter-p0a
 # 1) 先确认起点干净：单元/feature/护栏全绿 + 逐套件零回退
@@ -62,15 +71,21 @@ MEM_LIMIT_KB=4000000 ./scripts/phase2-status.sh
 
 ### 1.1 字节码层（`src/bytecode.rs`，999 行）
 
-- `Opcode`：**113 个变体**，全部是无数据的 unit 变体。
+- `Opcode`：**93 个变体**，全部是无数据的 unit 变体。
+  （P0a 施工时订正：本文档早先写的"113"是把 `Register` 的 19 个变体一起数进去了。）
 - `Operand`：**5 个变体** —— `Primitive(Primitive)` / `Register(Register)` / `Stack(isize)` /
   `Immd(isize)` / `Symbol(u32)`，尺寸 16 B。
 - `Bytecode { opcode: Opcode, operands: [Operand; 3] }`，**尺寸 56 B**。
   - **固定 3 槽**：这条指令实际用几个、哪个是目的、是否跳转/调用/返回，只写在变体上方的一行注释里
     （如 `/// load_const dst, const_id`）。
-  - 3 槽对齐到 8 字节后浪费 5 B；enum 版反而更小（**48 B**，见 §3.1 实测）。
+  - 3 槽对齐到 8 字节后浪费 5 B；enum 版反而更小（**实测 48 B**）。
+  - 实测的"没用的第三槽"：`Try`（两个偏移 + 一个恒为 0 的填充）、`Halt` / `Ret` / `EndTry` /
+    `ResumeExc` / `PrologueEnd`（0 个操作数却是 3 槽）、`DelegateClose`（1 个操作数）。
 - `Module` 一把梭：`constants` / `symtab` / `func_info` / `generators` / `asyncs` / `derived_ctors` /
-  `exit_pc` / `instructions` / `debug_instructions`（每条字节码再存一份 IR 副本）。
+  `exit_pc` / `instructions` / `debug_instructions`。
+  （P0a 施工时订正：`debug_instructions` **不要删**。它带的是这一条指令对应的 **IR** 行
+  （SSA 变量名、块名），而 `Instr` 只带字节码层的操作数——删了会丢掉 dump 里唯一能看懂
+  数据流的那半信息。本文档早先"enum 自带全部信息"的判断是错的。）
 
 ### 1.2 编译管线（**这一层不要动**）
 
@@ -162,7 +177,19 @@ oxc parser ─► AST ─► lowering(AST→IR, 4609 行) ─► ssabuilder(SSA+
 > 每个阶段都遵循同一条验收线：定向套件通过率不降 + `./scripts/phase2-status.sh` **逐套件零回退** +
 > feature 全绿 + 新增 ≥5 条断言（§4）。
 
-### 3.1 P0a：指令容器改 enum
+### 3.1 P0a：指令容器改 enum（**P0a-1 已完成**，见 §9）
+
+> **施工结果（2026-10-01）**：P0a 拆成了两半，因为"容器替换"和"逐条 arm 改成命名解构"
+> 的风险与收益都不在同一量级：
+>
+> | 半 | 内容 | 状态 | 代价 |
+> |----|------|------|------|
+> | **P0a-1** | 指令表（`define_instrs!`）+ `Instr` + `opcode()` / `arity()` / `arity_of()` / `slots()` / `from_parts()` / `unary()` / `binary()`；codegen 111 处发射点改成命名字段；`Module.instructions: Vec<Instr>`；7 处回填改成 `if let Instr::X { .. }` | **已完成** | 单片回归 +10.7%（`slots()` 的 64 字节拷贝 + 多一次 `opcode()` 匹配） |
+> | **P0a-2** | `run_instruction` 的 93 条 arm 从"`match opcode` + `slots()[i]`"改成"`match inst` + 命名字段解构"（182 处槽位读取 + 3 处 `operands.get()`），删掉 `slots()` 过渡接口 | 待做 | 预期把 P0a-1 的 +10.7% 收回 |
+>
+> 表按 **arity 分成四组**（`;` 分隔）：这样"这条指令有几个操作数"在定义处就看得见。
+> 两个运行期构造器（`unary` / `binary`）是为 `Instruction::UnaryOp` / `BinaryOp` 携带的
+> **运行时 opcode** 准备的——旧编码下这两处完全不做 arity 检查，现在 `arity_of` 兜住了。
 
 **目标**：`[Operand; 3]` → 命名字段的 enum。**语义零变化**，只换容器。
 
@@ -583,10 +610,25 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 
 | 阶段 | 状态 | 提交 | 备注 |
 |------|------|------|------|
-| P0a 容器 enum | 未开始 | | |
-| P0b 类型收紧 + 互校 | 未开始 | | |
+| **P0a-1** 容器 enum + 指令表（codegen / Module / 回填） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 通过 16561 / 执行 19708 / 跳过 7843 **一个数未动**、零逐套件回退；单元 190→**194**；单片回归 +10.7%（待 P0a-2 收回） |
+| **P0a-2** `run_instruction` 逐 arm 命名解构（93 arm / 182 处槽位读取），删掉 `slots()` 过渡接口 | **待做** | | 这是收回那 +10.7% 的一步；分组 arm 用 `Instr::A { x: a0 } \| Instr::B { y: a0 }` 这类**重命名或模式**统一切到 `a0/a1/a2` |
+| P0b 类型收紧 + 互校 | 未开始 | | `desc()` 用 `Vec<Reg>`（不在热路径，勿加依赖） |
 | P1 调用归一 | 未开始 | | |
-| P2 CodeBlock per function | 未开始 | | |
-| P3a 帧结构归一 | 未开始 | | |
+| P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
+| P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |
-| 语义线：TypedArray 族入册解锁 | 未开始 | | 可随时插入 |
+| 语义线：TypedArray 族入册解锁 | 未开始 | | 可随时插入；纯赚 test262 分数 |
+
+### 9.1 P0a-1 的实际改动（供 P0a-2 接手）
+
+| 文件 | 改了什么 | 规模 |
+|------|----------|------|
+| `src/bytecode.rs` | 新增 `define_instrs!` 指令表（93 行、按 arity 分四组）+ `Instr` + `opcode()` / `arity()` / `arity_of()` / `slots()` / `from_parts()` / `unary()` / `binary()` / `Display`；删除 `Bytecode` 及其构造器与 `Display`；`Opcode` 加 `PartialEq, Eq`；自带单测改为断言新契约（`arity` / `slots` 填充 / `Display` 不再打印填充 / `unary`·`binary` 的 arity 校验） | +374 / −… |
+| `src/compiler/codegen.rs` | 111 处 `Bytecode::single/double/triple/empty(Opcode::X, …)` → `Instr::X { … }`（`Try` 的第三槽被丢弃）；7 处回填改成 `if let Instr::X { .. }` / `match &this.codes[pos]`（**类型安全**：往非跳转指令塞偏移现在是编译错/`unreachable!`）；2 处运行期 opcode → `Instr::unary` / `Instr::binary` | 499 行变动 |
+| `src/vm/mod.rs` | `inst: &Instr` + `let operands = inst.slots(); let opcode = inst.opcode();`（**93 条 arm 一行未改**，这是过渡桥接）；generator 恢复处那一处 `inst.operands[0]` 顺手改成 `if let Instr::Yield { dst, .. }`（P0a-2 的先例） | 129 行变动 |
+| `src/compiler/mod.rs` | `Vec<Bytecode>` → `Vec<Instr>`，`code.opcode` → `code.opcode()` | 4 行 |
+
+**P0a-2 的做法（已验证可行）**：把 `let operands = inst.slots(); let opcode = inst.opcode();` 换成
+`match inst { … }`，用编译器强制穷尽性找出所有该改的 arm；arm 体内的 `operands[N]` 替换成
+第 N 个字段名（`*` 在需要值的地方补上）。三处 `operands.get(N)`（`Yield` / `Await` 的 `-1` 约定）
+要单独处理：那正是 `Option<Operand>` 该替代的写法，可以在 P0a-2 顺手做掉。
