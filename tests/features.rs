@@ -77,3 +77,5 @@ mod variables;
 mod weak_collections;
 #[path = "features/well_known_symbols.rs"]
 mod well_known_symbols;
+#[path = "features/known_bugs.rs"]
+mod known_bugs;
