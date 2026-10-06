@@ -40,16 +40,34 @@ pub struct Module {
 
 /// 一个函数的字节码体（深改第 2 步的第一步）：它的**指令范围**。
 ///
-/// 现在它是 `Module::symtab` + `Module::exit_pc` 的**派生视图**，不存新状态 ——
-/// 因此不可能和那两张表不一致。下一步把 EH 元数据（try/catch/finally 的 pc 区间）
-/// 填进来时，它才变成真正的新数据；那时改的是这里，而不是再散到 VM 的各条 arm 里。
+/// 现在它是 `Module::symtab` 的**派生视图**，不存新状态 —— 因此不可能与那张表不一致。
+/// 下一步把 EH 元数据（try/catch/finally 的 pc 区间）填进来时，它才变成真正的新数据；
+/// 那时改的是这里，而不是再散到 VM 的各条 arm 里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FunctionBody {
     /// 入口 pc（来自 `Module::symtab`）。
     pub start: usize,
-    /// 尾 `Ret` 的**后一位**（来自 `Module::exit_pc`）：代码范围是 `start..end`，
-    /// 落在 `end` 上就算越过了函数边界。
+    /// 下一个函数的入口（或程序末尾）。**注意它不等于"尾 `Ret` 的后一位"**：
+    /// catch / finally 块发射在尾 `Ret` 之后，所以范围必须覆盖它们。
     pub end: usize,
+}
+
+/// 一个 try 区域（对应 ChakraCore 的 EH 表）。
+///
+/// **由编译期发射的 `Try` 指令派生**，不是另一张手写表：`Try` 的 catch/finally 是
+/// 相对偏移，配上它自己的 pc 就是绝对地址；区域边界由配对的 `EndTry` 定（嵌套时用
+/// 深度计数）。所以用 [`Module::eh_regions_of`] 扫一遍指令流就能得到它，
+/// 不可能与"实际发射了什么"不一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EhRegion {
+    /// `Try` 指令自己的 pc。
+    pub start: usize,
+    /// 受保护范围的**结束**（不含）：配对的 `EndTry` 的 pc。
+    pub end: usize,
+    /// catch 处理器的 pc（没有 catch 块时为 `None`）。
+    pub catch: Option<usize>,
+    /// finally 块的 pc（没有 finally 块时为 `None`）。
+    pub finally: Option<usize>,
 }
 
 impl Module {
@@ -85,8 +103,58 @@ impl Module {
     /// 见 `VM::drive_bytecode_frame` 里哨兵返回地址的处理。
     pub fn body_of(&self, func_id: u32) -> Option<FunctionBody> {
         let start = *self.symtab.get(&FunctionId::new(func_id))?;
-        let exit = *self.exit_pc.get(&func_id)?;
-        Some(FunctionBody { start, end: exit + 1 })
+        // 结束 = 下一个函数的起点（函数按入口 pc 顺序排在指令流里），最后一个则到程序末尾。
+        //
+        // **不能用 `exit_pc + 1`**：catch / finally 块是发射在函数尾 `Ret` **之后**的，
+        // 那样算出来的范围会把处理器切在函数外面（实测抓到过：handler pc 51 而 end 51）。
+        let end = self
+            .symtab
+            .values()
+            .copied()
+            .filter(|pc| *pc > start)
+            .min()
+            .unwrap_or(self.instructions.len());
+        Some(FunctionBody { start, end })
+    }
+
+    /// 某个函数的 EH 区域表：从它自己发射的 `Try` / `EndTry` **派生**。
+    ///
+    /// 嵌套的 try 用深度计数配对（`EnterTry` 加一、`EndTry` 减一，回到 0 即本区域的
+    /// 结束）。catch/finally 的 0 偏移表示"没有这一块"（`Try` 指令的约定）。
+    pub fn eh_regions_of(&self, func_id: u32) -> Vec<EhRegion> {
+        let Some(body) = self.body_of(func_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut open: Vec<EhRegion> = Vec::new();
+        for pc in body.start..body.end.min(self.instructions.len()) {
+            match &self.instructions[pc] {
+                Instr::Try {
+                    catch_offset,
+                    finally_offset,
+                } => {
+                    let catch = catch_offset.as_immd();
+                    let finally = finally_offset.as_immd();
+                    open.push(EhRegion {
+                        start: pc,
+                        // 先写函数边界；真正结束时用配对的 `EndTry` 修正。
+                        end: body.end,
+                        catch: (catch != 0).then_some((pc as isize + catch) as usize),
+                        finally: (finally != 0).then_some((pc as isize + finally) as usize),
+                    });
+                }
+                Instr::EndTry {} => {
+                    if let Some(mut region) = open.pop() {
+                        region.end = pc;
+                        out.push(region);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 没配对的 `Try`（掉出函数边界）：仍按函数边界收尾，宁可多报也不漏。
+        out.extend(open);
+        out
     }
 
     /// 所有函数的体，按入口 pc 排序。给"逐条过一遍"的工具与测试用。
@@ -1659,7 +1727,8 @@ mod tests {
                  async function asy() { return 2; }
                  function outer() { var x = 1; return function inner() { return x; }; }
                  class C { constructor() { this.v = 1; } m() { return this.v; } }
-                 plain(1)",
+                 function withTry() { try { return 1; } finally { return 2; } }
+                 plain(1); withTry();",
             )
             .expect("compilation failed");
 
@@ -1676,7 +1745,26 @@ mod tests {
                 "{id} 的出口不是 Ret，而是 {last}"
             );
             assert!(body.end <= module.instructions.len(), "{id} 的范围越过了程序末尾");
+            // 尾 `Ret` 必须在范围内 —— 而范围**还要覆盖它之后的 catch/finally**：
+            // 早先用 `exit_pc + 1` 当 end，正好把处理器切在了函数外面（实测抓到过）。
+            if let Some(exit) = module.exit_pc.get(id) {
+                assert!(
+                    (body.start..body.end).contains(exit),
+                    "{id} 的尾 Ret pc {exit} 不在范围 {body:?} 内"
+                );
+            }
         }
+        // 带 finally 的那个函数：范围必须比它的尾 `Ret` 更大（处理器在后面）。
+        let with_try = module
+            .bodies()
+            .into_iter()
+            .find(|(id, _)| module.eh_regions_of(*id).iter().any(|r| r.finally.is_some()));
+        let (id, body) = with_try.expect("至少要有一个带 finally 的函数");
+        let exit = module.exit_pc[&id];
+        assert!(
+            body.end >= exit + 1,
+            "{id} 的范围 {body:?} 连尾 Ret({exit}) 都没包住"
+        );
 
         // 所有函数都顺序排在指令流里，因此范围两两不重叠。
         for pair in bodies.windows(2) {
@@ -1688,6 +1776,73 @@ mod tests {
                 pair[1].0,
                 pair[1].1
             );
+        }
+    }
+
+    /// EH 区域表是从指令流**派生**的，所以有一条强不变量可验：
+    /// **区域数 == 实际发射的 `Try` 条数**（不漏也不多），且每条区域自洽、catch/finally
+    /// 落在函数自己的范围内。这比"手写一张表然后祈祷它对"可靠得多。
+    #[test]
+    fn eh_regions_are_derived_from_the_emitted_try_instructions() {
+        let mut compiler = crate::compiler::Compiler::new();
+        let module = compiler
+            .compile(
+                "function a() { try { 1 } catch (e) { 2 } }
+                 function b() { try { 3 } finally { 4 } }
+                 function c() { try { 5 } catch (e) { 6 } finally { 7 } }
+                 function d() { try { try { 8 } catch (e) { 9 } } finally { 10 } }
+                 a(); b(); c(); d();",
+            )
+            .expect("compilation failed");
+
+        let emitted_tries = module
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instr::Try { .. }))
+            .count();
+        assert!(emitted_tries >= 5, "至少要 5 个 try（含一个嵌套），实际 {emitted_tries}");
+
+        let mut regions = Vec::new();
+        for (id, body) in module.bodies() {
+            for region in module.eh_regions_of(id) {
+                assert!(region.start < region.end, "{id} 的区域是空的: {region:?}");
+                assert!(
+                    region.end <= body.end,
+                    "{id} 的区域越过了函数边界: {region:?} vs {body:?}"
+                );
+                for pc in region.catch.into_iter().chain(region.finally) {
+                    assert!(
+                        (body.start..body.end).contains(&pc),
+                        "{id} 的处理器 pc {pc} 不在函数范围内 {body:?}"
+                    );
+                }
+                regions.push(region);
+            }
+        }
+        assert_eq!(
+            regions.len(),
+            emitted_tries,
+            "派生的区域数必须等于实际发射的 Try 条数 —— 差一个就是推导漏了或多了"
+        );
+
+        // 嵌套的那个：内层区域必须被外层包含。
+        let nested = module
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instr::Try { .. }))
+            .count();
+        assert!(nested >= 5);
+        regions.sort_by_key(|r| r.start);
+        for pair in regions.windows(2) {
+            if pair[1].start < pair[0].end {
+                // 后一个在前一个里面：要么它被包含，要么两者起点相同（不可能）
+                assert!(
+                    pair[1].end <= pair[0].end,
+                    "区域没有正确嵌套: {:?} 与 {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
     }
 
