@@ -2452,7 +2452,10 @@ impl VM {
                             // `var it = (function* () {})()` was `undefined` and
                             // every parameter pattern that iterated it died with
                             // `GetMethod(undefined, @@iterator)`.
-                            if module.generators.contains(&id) {
+                            // `callee` 在这个分支里已被 `match` 移动走，所以按
+                            // 下面的 invoke 那样重新拼一份（`generator_of` 认两种拼法）。
+                            let boxed_callee = Value::Object(Rc::clone(&obj_ref));
+                            if self.generator_of(&boxed_callee, module).is_some() {
                                 let args = self.collect_call_args(arg_count)?;
                                 let gobj = self.create_generator(
                                     id,
@@ -2469,7 +2472,7 @@ impl VM {
                             // `async` in its *boxed* spelling (a method taken
                             // off its object, or a function expression): the call
                             // answers a promise.
-                            if module.asyncs.contains(&id) {
+                            if self.async_of(&boxed_callee, module).is_some() {
                                 let args = self.collect_call_args(arg_count)?;
                                 let this = captured_this.unwrap_or(Value::Undefined);
                                 let result = self.invoke(

@@ -553,6 +553,65 @@ function_val, captured_vars, construct, new_target, return_pc, module)`：
 **剩下的**：`Control` 协议与 `dst: Option<Reg>`（6 个调用 opcode 各自的记账仍在调用点，
 `CallEx` 里 4 处遗留的裸判定也在那里）。
 
+### 3.3.4 P1-2c 的协议草案（先定形状，再动代码）
+
+**先前的计划有一处想错了**：原方案说"6 个调用 opcode 都调 `enter_call`"，仿佛差别只在
+控制流。读代码后发现**差别首先在参数的约定上**：
+
+| | 参数从哪来 | 栈的效果 |
+|---|---|---|
+| **内联路径**（`Call` / `CallEx` / `CallMethod` / `New` 的字节码分支） | **完全不碰参数** —— 参数是 lowering 事先 `Push` 到数据栈上的，帧按 `arg0 = [rbp-1]` 原地读 | 参数留在栈上，`argc` 只作记账 |
+| **重入路径**（代理陷阱 / 原生 / 生成器 / async / `invoke`） | `collect_call_args(argc)` 把它们**弹出来**成 `Vec<Value>` | 栈被清空，返回值另写进 `Rv` |
+
+所以协议必须同时表达"帧已压好，回到分派循环"和"参数在哪"，大致是：
+
+```rust
+/// 一次调用/构造在解释器里的下一步。
+enum Control {
+    /// 帧已压好（`open_frame` 做过）：**回到分派循环**去跑被调方。普通调用走这里，
+    /// 所以没有额外开销 —— 这些 arm 里 `drive_bytecode_frame` 出现 0 次就是为了它。
+    Entered,
+    /// 这条指令已经算完（代理陷阱 / 原生 / 生成器 / async：都必须重入）。
+    Done,
+}
+
+/// 参数从哪来（协议里最容易被忽略、也最要命的一半）。
+enum CallArgs<'a> {
+    /// 已在数据栈上（opcode 的内联路径）：开帧不碰它们。
+    OnStack(usize),
+    /// 已收集（`invoke` / 原生回调 / 代理陷阱转发）。
+    Collected(&'a [Value]),
+}
+
+fn enter_call(
+    &mut self,
+    kind: CallKind,          // Call { this } | Construct { new_obj, new_target }
+    callee: &Value,
+    args: CallArgs<'_>,
+    return_pc: usize,        // opcode 用 pc+1；invoke 用哨兵 instructions.len()
+    module: &Module,
+) -> Result<Control, RuntimeError>;
+```
+
+规则就三条：
+1. `Bytecode` 分支**不收集参数**（`OnStack` 原样带下去），其余分支需要 `&[Value]` 时才
+   `collect`（`OnStack(n)` → `collect_call_args(n)`）。
+2. 返回 `Control::Entered` 时，调用点只做自己的记账（`set_register(Rv, …)` /
+   `jump_offset(1)`）——`dst: Option<Reg>` 就是把"写哪个寄存器"从每处 arm 提到签名里。
+3. `Construct` 的构造帧必须先清 `Rv`（"返回对象才覆盖 `this`"），这是 `New` 与
+   `drive_bytecode_frame` 已经一致、但**与内联 `Call` 分支的记账不同**的一处 ——
+   协议要把它做成参数而不是让每个 arm 自己记得。
+
+**还没动手的原因**：这个协议一旦落地，`CallEx` / `CallMethod` 里"两个 callee 形状各写一遍
+分支"的结构也会随之重写（它们是同一个 `match` 的两个分支，判定与记账都一样），所以这一刀
+比前两刀大；而且它会动到 `Ret` 收尾与 `new.target` 的交互（`New` 那处顺序异常正好在
+这条链上，见 §3.3.3）。**先把协议写定，再一次性落地**，避免"改一半发现协议不对"的返工。
+
+**P1-2a 至此收口**：`CallEx` 里最后 2 处裸判定也换成了 `generator_of`/`async_of`，
+生成器/async 的判定现在只有 `vm/mod.rs` 顶部那三个函数一处。剩下的 `is_constructor`
+里那处是**另一个问题**（"生成器/async 能不能当构造器"，ES 7.3.20 的语义），不是调用路径
+的判定，保持独立。
+
 ---
 
 ### 3.4 P2：`CodeBlock` per function
@@ -846,9 +905,9 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | **P0b-1b** 操作数角色（表里 `dst: w` / `index: r` / `target: jr`）+ `desc()` + 同款元测试 | **已完成**（2026-10-01） | 同上 | 单元 →**200**；角色用"从实现反推 + 回实现取证"两步定下来 |
 | **P0b-2a** pc 字段类型收紧（`jr`→`RelPc`、`ja`→`AbsPc`，由角色派生） | **已完成**（2026-10-01） | 同上 | 单元 →**201**；`AbsPc` 喂给相对字段已被证实是编译错误 |
 | **P1-1** 帧驱动合一（`FrameMode`：`[[Call]]` / `[[Construct]]` 共用一份驱动） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 删掉 `invoke_construct` 的 100 行拷贝；feature +1 验收断言；数字未动 |
-| **P1-2a** 可调用体种类判定收成一处（`generator_of` / `async_of` / `callee_kind`） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 五个站点各不相同的判定写法统一；`CallEx` 另有 4 处与 `is_constructor` 1 处留给 P1-2b |
+| **P1-2a** 可调用体种类判定收成一处（`generator_of` / `async_of` / `callee_kind`） | **已完成并收口**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 六个站点统一；`is_constructor` 那处是 ES 7.3.20 的另一问题，刻意独立 |
 | P1-2b `enter_call(...) -> Control`（把 `CallEx` 的两份内联开帧搬过去） | **进行中**（`open_frame` 已落，5 处调用点） | 同上 | 单片 106–108s（噪声内）、数字未动；`New` 与 generator/async 帧驱动**故意不换**（顺序/记账不同，见 §3.3.3） |
-| P1-2c 其余调用 opcode 汇进 `enter_call` | 未开始 | | 届时处理 `dst: Option<Reg>` 与 native 快路径 |
+| P1-2c `enter_call(kind, callee, args: CallArgs, …) -> Control` | **协议已写定**（§3.3.4），代码未动 | | 关键发现：两条路径的**参数约定**不同（内联不碰参数 / 重入要收集），协议必须同时表达 `Control` 与 `CallArgs` |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
 | P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |
