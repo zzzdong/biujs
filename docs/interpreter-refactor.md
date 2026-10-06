@@ -652,6 +652,37 @@ fn enter_call(
 里那处是**另一个问题**（"生成器/async 能不能当构造器"，ES 7.3.20 的语义），不是调用路径
 的判定，保持独立。
 
+### 3.3.6 重构途中撞到的真 bug：捕获变量的生成器方法拿到垃圾
+
+做 `CallMethod` 改道前的差异核对时，用 node 对照跑了一组探针，撞出一个**语义 bug**：
+
+```js
+function outer() { var x = 42; return { *g() { yield x; } }; }
+outer().g().next().value
+// node:    42
+// biujs:  [object Function]      ← 连类型都不对
+```
+
+**根因**：`CallMethod` 的生成器分支把闭包变量**丢掉了** ——
+`create_generator(id, obj_val, args, Vec::new(), module)` 里那个 `Vec::new()`；
+而 `CallEx` 的对应分支传的是真的 `captured_vars`。所以同一个生成器方法，走
+`o.g()`（`CallMethod`）丢、走 `mk().g()`（`CallEx`）不丢 —— 只是不丢的那条平时看不出来，
+因为**不捕获变量**时丢不丢都一样（`{ *g() { yield 1; } }` 这种样例两条路径都对）。
+一旦方法体引用了外层变量，读到的是错的作用域，于是连 `value` 的类型都变了。
+
+**test262 没抓到**（`built-ins/Generator` / `Function` 套件里没有"生成器方法 + 闭包捕获"这个
+组合）。
+
+**与 P1-2c 的关系**：`enter_call` 的生成器分支（照 `CallEx` 的原样）传真的 `captured_vars`，
+所以 **`CallMethod` 一改道就会顺手修掉它**。那一刀因此不再是"纯重构"，而是一次
+**带验证的 bug 修复**：探针要变成 feature 测试钉住（"生成器方法能看到外层变量"），
+提交信息里写明"这是修 bug，不是重构副作用，别当纯重构悄悄带过"。
+
+**教训**：这次是靠"和 node 逐条对照探针"抓到的，当时全量 test262 是绿的。
+重构途中做**差异核对**（同一个语义、两条路径各写一遍）比事后补测试更早暴露这类问题。
+
+---
+
 ---
 
 ### 3.4 P2：`CodeBlock` per function
