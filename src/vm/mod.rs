@@ -293,8 +293,13 @@ enum CallArgs<'a> {
     /// 已在数据栈上：opcode 的内联路径。参数是 lowering 事先 `Push` 上去的，
     /// 帧按 `arg0 = [rbp-1]` 原地读，**开帧时一个都不能碰**。
     OnStack(usize),
-    /// 已经收集成切片（`invoke` / 原生回调 / 代理陷阱转发）。下一刀 `invoke` 侧
-    /// 改道到这里时才会构造，所以现在还没有调用点。
+    /// 同样留在栈上（`argc` 个），但调用方**已经备好一份收集好的副本**给重入分支用。
+    ///
+    /// `CallMethod` 需要这个：它把每个参数 `as_object_value` 装箱了（内建层按
+    /// `Value::Object` 匹配），而装箱不能发生在"帧原地读"的那条路上。
+    OnStackWithCopy { argc: usize, args: &'a [Value] },
+    /// 已经收集成切片（`invoke` / 原生回调 / 代理陷阱转发）。`invoke` 侧改道到这里
+    /// 时才会有调用点。
     #[allow(dead_code)]
     Collected(&'a [Value]),
 }
@@ -1032,7 +1037,7 @@ impl VM {
                     return Ok(Control::Done);
                 }
                 // 内联开帧：参数**留在栈上**，只记个数。
-                let CallArgs::OnStack(argc) = args else {
+                let Some(argc) = Self::call_args_argc(args) else {
                     return Err(RuntimeError::InternalError(
                         "enter_call: 内联开帧要求参数仍在栈上".to_string(),
                     ));
@@ -1069,22 +1074,26 @@ impl VM {
                 let captured_new_target = func_obj.captured_new_target.clone();
                 let captured_vars = func_obj.captured_vars.clone();
                 drop(borrowed);
-                // 装箱的那份可能捕获了 `this`（箭头函数 / 绑定函数）。
+                // 装箱的那份可能捕获了 `this`（箭头函数 / 绑定函数）；没有就用调用方
+                // 传进来的 —— 普通调用是 `undefined`（`CallEx`），方法调用是接收者
+                // （`CallMethod`）。**这里必须用调用方给的那个**：早先写成
+                // `captured_this.unwrap_or(Value::Undefined)` 就把方法调用的 `this`
+                // 弄丢了（`f.getX()` 里 `this.x` 变成在 `undefined` 上取属性）。
                 let boxed = Value::Object(Rc::clone(&obj_ref));
-                let this = captured_this.clone().unwrap_or(this);
+                let frame_this = captured_this.clone().unwrap_or(this);
                 if self.generator_of(&boxed, module).is_some() {
                     let args = self.call_args_vec(args)?;
-                    let gobj = self.create_generator(id, this, args, captured_vars, module)?;
+                    let gobj = self.create_generator(id, frame_this, args, captured_vars, module)?;
                     self.set_value(target, gobj)?;
                     return Ok(Control::Done);
                 }
                 if self.async_of(&boxed, module).is_some() {
                     let args = self.call_args_vec(args)?;
-                    let result = self.invoke(&boxed, this, &args, module)?;
+                    let result = self.invoke(&boxed, frame_this, &args, module)?;
                     self.set_value(target, result)?;
                     return Ok(Control::Done);
                 }
-                let CallArgs::OnStack(argc) = args else {
+                let Some(argc) = Self::call_args_argc(args) else {
                     return Err(RuntimeError::InternalError(
                         "enter_call: 内联开帧要求参数仍在栈上".to_string(),
                     ));
@@ -1092,7 +1101,7 @@ impl VM {
                 self.open_frame(
                     id,
                     argc,
-                    captured_this.unwrap_or(Value::Undefined),
+                    frame_this,
                     boxed,
                     &captured_vars,
                     false,
@@ -1111,7 +1120,18 @@ impl VM {
     fn call_args_vec(&mut self, args: CallArgs<'_>) -> Result<Vec<Value>, RuntimeError> {
         match args {
             CallArgs::OnStack(n) => self.collect_call_args(n),
+            CallArgs::OnStackWithCopy { args, .. } => Ok(args.to_vec()),
             CallArgs::Collected(values) => Ok(values.to_vec()),
+        }
+    }
+
+    /// 内联开帧要的"参数个数"——只有参数**仍在栈上**时才有。
+    fn call_args_argc(args: CallArgs<'_>) -> Option<usize> {
+        match args {
+            CallArgs::OnStack(n) => Some(n),
+            CallArgs::OnStackWithCopy { argc, .. } => Some(argc),
+            // `Collected` 的参数已经被弹走（或根本不在栈上），开帧会读到别人的东西。
+            CallArgs::Collected(_) => None,
         }
     }
 
@@ -3610,105 +3630,45 @@ impl VM {
                 // Look up user-defined method on the object's prototype chain
                 let method_val = self.lookup_property_on_object(&obj_val, &method_name, module)?;
 
-                // A native prototype method (e.g. a method reached through the
-                // prototype chain rather than the fast dispatch above).
-                if let Some(name) = crate::builtins::native_function_name(&method_val) {
-                    let result = self.call_native_by_name(&name, obj_val, &args, module)?;
-                    self.state.set_register(Register::Rv, result)?;
+                // 方法没找到：`obj.missing()` 不抛，`Rv = undefined`（保持原样；
+                // 原来这条是靠落到分派循环尾部的 `jump_offset(1)` 推进 pc）。
+                if matches!(method_val, Value::Undefined) {
+                    self.state.set_register(Register::Rv, Value::Undefined)?;
                     self.state.jump_offset(1);
                     return Ok(());
                 }
-
-                // `function*` reached as a *method* (`class C { *m() {} }`,
-                // `obj.m` where `m` is a generator): build the generator object
-                // instead of running the body, exactly like the `Call` opcode
-                // and `invoke` do. Without this the body ran in the *caller's*
-                // frame: its `Ret` returned to the top level, so the module
-                // itself produced a generator object as its result and
-                // `it.next()` was `undefined` — which is what made every
-                // `class { *m() {} }` test fail.
-                if let Some(id) = self.generator_of(&method_val, module) {
-                    let gobj = self.create_generator(
-                        id,
-                        obj_val.clone(),
-                        args.clone(),
-                        Vec::new(),
-                        module,
-                    )?;
-                    self.state.set_register(Register::Rv, gobj)?;
-                    self.state.jump_offset(1);
-                    return Ok(());
-                }
-                // An `async` method (`obj.m()`): the call answers a promise.
-                if self.async_of(&method_val, module).is_some() {
-                    let result =
-                        self.invoke(&method_val, obj_val.clone(), &args, module)?;
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(());
-                }
-
-                match method_val {
-                    Value::Function(id) => {
-                        // User-defined bytecode function - call it with this = obj_val
-                        let return_pc = self.state.pc + 1;
-                        let function_val = self.materialize_function(id);
-                        self.open_frame(
-                            id,
-                            arg_count,
-                            obj_val,
-                            function_val,
-                            &[],
-                            false,
-                            Value::Undefined,
-                            return_pc,
-                            module,
-                        )?;
+                // 其余全部交给统一入口（P1-2c）：原生原型方法 / 生成器方法 /
+                // async 方法 / 两种 callee 形状的开帧。`this` 是接收者；参数是
+                // "栈上原地读 + 已备好一份装箱副本" —— 装箱必须发生在进入口之前
+                // （内建层按 `Value::Object` 匹配），见 §3.3.5 的方案 A。
+                //
+                // 顺带**修掉一个既有 bug**：原来这条 arm 的生成器分支传 `Vec::new()`，
+                // 把闭包变量丢了 ——
+                // `function outer() { var x = 42; return { *g() { yield x; } }; }`
+                // 的 `outer().g().next().value` 会返回 `[object Function]`（node 是 42）。
+                // 统一入口按 `CallEx` 的原样传真 `captured_vars`。
+                //
+                // 唯一的错误信息变化：不是可调用物时，原文说
+                // `"{method_name} is not a function"`，现在统一入口说 `"not a function"`
+                // —— 错误类型不变，只是少了方法名。
+                let return_pc = self.state.pc + 1;
+                match self.enter_call(
+                    &method_val,
+                    obj_val.clone(),
+                    CallArgs::OnStackWithCopy {
+                        argc: arg_count,
+                        args: &args,
+                    },
+                    Register::Rv,
+                    return_pc,
+                    module,
+                )? {
+                    // 帧已压好：接着跑被调方（不递归）。
+                    Control::Entered => return Ok(()),
+                    // 结果已写进 `Rv`，跳过下一条指令。
+                    Control::Done => {
+                        self.state.jump_offset(1);
                         return Ok(());
-                    }
-                    Value::Object(obj_ref) => {
-                        let borrowed = obj_ref.borrow();
-                        if borrowed.kind() == ObjectKind::Function {
-                            if let Some(func_obj) =
-                                borrowed.as_any().downcast_ref::<FunctionObject>()
-                            {
-                                let id = func_obj.func_id;
-                                // Check if this is an arrow function with captured this
-                                let captured_this = func_obj.captured_this.clone();
-                                let captured_new_target = func_obj.captured_new_target.clone();
-                                let captured_vars = func_obj.captured_vars.clone();
-                                drop(borrowed);
-                                // For arrow functions, use captured this; for regular methods, use obj_val
-                                let return_pc = self.state.pc + 1;
-                                let this_val = captured_this.unwrap_or(obj_val);
-                                self.open_frame(
-                                    id,
-                                    arg_count,
-                                    this_val,
-                                    Value::Object(Rc::clone(&obj_ref)),
-                                    &captured_vars,
-                                    false,
-                                    captured_new_target.unwrap_or(Value::Undefined),
-                                    return_pc,
-                                    module,
-                                )?;
-                                return Ok(());
-                            } else {
-                                return Err(RuntimeError::TypeError("not a function".to_string()));
-                            }
-                        } else {
-                            return Err(RuntimeError::TypeError("not a function".to_string()));
-                        }
-                    }
-                    Value::Undefined => {
-                        // Method not found
-                        self.state.set_register(Register::Rv, Value::Undefined)?;
-                    }
-                    _ => {
-                        return Err(RuntimeError::TypeError(format!(
-                            "{} is not a function",
-                            method_name
-                        )));
                     }
                 }
             }

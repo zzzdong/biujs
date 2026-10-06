@@ -6,6 +6,27 @@
 > **以符号名（`fn` / `struct` / 枚举变体名）为准，行号只作初次导航**。
 > **度量基线**：通过 16561 / 执行 19708 / 失败 3147 / 跳过 7843；单元 190、feature 523、护栏 7。
 
+> ## ⚠️ 上位方案已存在，施工前先读它
+>
+> 见 **`docs/architecture-redesign.md`**（GC / Value 模型 / 帧与异常处理的重新设计）。
+> 它以本地的 ChakraCore 为参照逐块核对过，结论是**走深改（Track B）**，并给出新的顺序：
+>
+> ```
+> 1. 语义 bug 钉成测试  2. FunctionBody + EH 元数据化  3. Value/GC  4. 重写帧与解释器循环
+> ```
+>
+> 由此对本方案的裁决：
+>
+> | 本方案的阶段 | 裁决 |
+> |---|---|
+> | P0（已全部完成） | **保留** —— 与 ChakraCore 的 `OpCodes.h` macro-list 同构，任何新字节码都靠它 |
+> | **P1**（进行中：`CallEx` 已改道，`CallMethod`/`New` 未完） | **暂停代码、保留结论** —— 种类判定 / 参数约定 / `this` 约定三条结论（§3.3.4）要留；剩下的实现在重写路线里是重复劳动 |
+> | P2 | **提前做** —— EH 元数据与 per-function 字节码是后两步的先决，且无生命周期风险 |
+> | **P3** | **增量版作废，改走重写版**（重写版 = ChakraCore 的 `InterpreterStackFrame`） |
+>
+> 另外，**过程约束已变更**：重构未完成前允许破坏性变更（不再要求每步零回退/零性能倒退），
+> 但改为"快照 + 允许回归清单"的验证协议，见上位方案 §7。
+
 ---
 
 ## 0. 一页速览
@@ -663,12 +684,16 @@ outer().g().next().value
 // biujs:  [object Function]      ← 连类型都不对
 ```
 
-**根因**：`CallMethod` 的生成器分支把闭包变量**丢掉了** ——
-`create_generator(id, obj_val, args, Vec::new(), module)` 里那个 `Vec::new()`；
-而 `CallEx` 的对应分支传的是真的 `captured_vars`。所以同一个生成器方法，走
-`o.g()`（`CallMethod`）丢、走 `mk().g()`（`CallEx`）不丢 —— 只是不丢的那条平时看不出来，
-因为**不捕获变量**时丢不丢都一样（`{ *g() { yield 1; } }` 这种样例两条路径都对）。
-一旦方法体引用了外层变量，读到的是错的作用域，于是连 `value` 的类型都变了。
+**根因（按实测订正过一次）**：
+
+- 我最初写的是"`CallMethod` 的生成器分支传 `Vec::new()` 把闭包变量丢了"。**那是读代码
+  得出的错判**：实测 `function mk(){var x=7; return function*(){yield x}}; mk()().next().value`
+  —— **根本不经过任何方法调用** —— 同样是 `[object Function]`（node 是 7）。
+- 于是真根因在**闭包槽位本身**：`x` 读出来是个 function，说明生成器帧读闭包变量时
+  **读错了槽位**（`create_generator` 之后的闭包栈设置，或生成器恢复时的作用域装配）。
+  `CallMethod` 传 `Vec::new()` 是这个 bug 的**又一个实例**，不是唯一实例。
+- 表现：`it` 本身是对的（`[object Generator]`），`next()` 返回 `{done:false}`，只是
+  `value` 拿到了错槽位里的东西。
 
 **test262 没抓到**（`built-ins/Generator` / `Function` 套件里没有"生成器方法 + 闭包捕获"这个
 组合）。
