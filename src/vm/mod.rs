@@ -274,6 +274,31 @@ enum FrameMode {
     },
 }
 
+/// 一次 `[[Call]]` 的结果（P1-2c，见 `docs/interpreter-refactor.md` §3.3.4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    /// 帧已压好（`open_frame` 做过）：**回到分派循环**去跑被调方。
+    ///
+    /// 普通调用走这一条 —— 所以它不能变成"起一层嵌套 `step` 循环"：这些 opcode
+    /// 的 arm 里 `drive_bytecode_frame` 出现 0 次就是为了这个。
+    Entered,
+    /// 这条指令已经算完（代理陷阱 / 原生 / 生成器 / async：这些都必须重入）。
+    /// 结果已由 `enter_call` 写进 `dst`。
+    Done,
+}
+
+/// 参数从哪来。**这是统一调用路径时最容易忽略、也最要命的一半**（§3.3.4）。
+#[derive(Debug, Clone, Copy)]
+enum CallArgs<'a> {
+    /// 已在数据栈上：opcode 的内联路径。参数是 lowering 事先 `Push` 上去的，
+    /// 帧按 `arg0 = [rbp-1]` 原地读，**开帧时一个都不能碰**。
+    OnStack(usize),
+    /// 已经收集成切片（`invoke` / 原生回调 / 代理陷阱转发）。下一刀 `invoke` 侧
+    /// 改道到这里时才会构造，所以现在还没有调用点。
+    #[allow(dead_code)]
+    Collected(&'a [Value]),
+}
+
 /// 一个可调用体的种类（P1-2a）。判定的**唯一**出口是 [`VM::callee_kind`]。
 ///
 /// 以前"是不是原生 / 代理 / 生成器 / async"这套判断散在 `invoke_with_new_target`、
@@ -952,6 +977,141 @@ impl VM {
             Some(id) if module.asyncs.contains(&id) => CalleeKind::Async,
             Some(_) => CalleeKind::Bytecode,
             None => CalleeKind::NotCallable,
+        }
+    }
+
+    /// `[[Call]]` 的统一入口（P1-2c）：`CallEx`（以及接下来的 `CallMethod` /
+    /// `CallNative` / `CallSpread`）都走这里，可调用体种类的分支只有**这一份**。
+    ///
+    /// 分支顺序与原来 `CallEx` 那条 arm 一字不差：代理 → 原生内建 → 字节码函数
+    /// （生成器 / async / 开帧）。差别只在"结果写哪儿"（`dst`）与"参数从哪来"
+    /// （`CallArgs`），而 `this` 由调用方给：普通调用给 `Undefined`，方法调用给对象 ——
+    /// 这正是 `CallEx` 与 `CallMethod` 原本各写一遍的那份分支结构的全部差异。
+    ///
+    /// `Construct` 形态**不在这里**：`New` 的开帧顺序（`this_val` 先被覆盖、
+    /// `enter_frame` 后跑）至今是个待查项（§3.3.3），在弄清楚之前不动它。
+    fn enter_call(
+        &mut self,
+        callee: &Value,
+        this: Value,
+        args: CallArgs<'_>,
+        dst: Register,
+        return_pc: usize,
+        module: &Module,
+    ) -> Result<Control, RuntimeError> {
+        let target = Operand::Register(dst);
+        // 1. 代理的 `apply` 陷阱决定整次调用（ES 10.5.12）。
+        if Self::is_proxy(callee) {
+            let args = self.call_args_vec(args)?;
+            let result = self.invoke(callee, this, &args, module)?;
+            self.set_value(target, result)?;
+            return Ok(Control::Done);
+        }
+        // 2. 原生内建：按名字分发（`Function.prototype.bind` 的产物也在其中）。
+        if let Some(name) = crate::builtins::native_function_name(callee) {
+            let args = self.call_args_vec(args)?;
+            let result = self.call_native_by_name(&name, this, &args, module)?;
+            self.set_value(target, result)?;
+            return Ok(Control::Done);
+        }
+        // 3. 字节码函数。两种拼写（`Value::Function` / 装箱后的 `FunctionObject`）
+        //    的差别只有 `this` 怎么定 —— 装箱的那份可能捕获了 `this`。
+        match callee {
+            Value::Function(id) => {
+                if self.generator_of(callee, module).is_some() {
+                    let args = self.call_args_vec(args)?;
+                    let gobj =
+                        self.create_generator(*id, this, args, Vec::new(), module)?;
+                    self.set_value(target, gobj)?;
+                    return Ok(Control::Done);
+                }
+                if self.async_of(callee, module).is_some() {
+                    let args = self.call_args_vec(args)?;
+                    let result = self.invoke(callee, this, &args, module)?;
+                    self.set_value(target, result)?;
+                    return Ok(Control::Done);
+                }
+                // 内联开帧：参数**留在栈上**，只记个数。
+                let CallArgs::OnStack(argc) = args else {
+                    return Err(RuntimeError::InternalError(
+                        "enter_call: 内联开帧要求参数仍在栈上".to_string(),
+                    ));
+                };
+                let function_val = self.materialize_function(*id);
+                self.open_frame(
+                    *id,
+                    argc,
+                    this,
+                    function_val,
+                    &[],
+                    false,
+                    Value::Undefined,
+                    return_pc,
+                    module,
+                )?;
+                Ok(Control::Entered)
+            }
+            Value::Object(obj_ref) => {
+                // 类构造器不能被直接调用。
+                self.check_class_ctor(&Value::Object(Rc::clone(&obj_ref)))?;
+                let borrowed = obj_ref.borrow();
+                if borrowed.kind() != ObjectKind::Function {
+                    return Err(RuntimeError::TypeError("not a function".to_string()));
+                }
+                let Some(func_obj) = borrowed
+                    .as_any()
+                    .downcast_ref::<crate::vm::object::FunctionObject>()
+                else {
+                    return Err(RuntimeError::TypeError("not a constructor".to_string()));
+                };
+                let id = func_obj.func_id;
+                let captured_this = func_obj.captured_this.clone();
+                let captured_new_target = func_obj.captured_new_target.clone();
+                let captured_vars = func_obj.captured_vars.clone();
+                drop(borrowed);
+                // 装箱的那份可能捕获了 `this`（箭头函数 / 绑定函数）。
+                let boxed = Value::Object(Rc::clone(&obj_ref));
+                let this = captured_this.clone().unwrap_or(this);
+                if self.generator_of(&boxed, module).is_some() {
+                    let args = self.call_args_vec(args)?;
+                    let gobj = self.create_generator(id, this, args, captured_vars, module)?;
+                    self.set_value(target, gobj)?;
+                    return Ok(Control::Done);
+                }
+                if self.async_of(&boxed, module).is_some() {
+                    let args = self.call_args_vec(args)?;
+                    let result = self.invoke(&boxed, this, &args, module)?;
+                    self.set_value(target, result)?;
+                    return Ok(Control::Done);
+                }
+                let CallArgs::OnStack(argc) = args else {
+                    return Err(RuntimeError::InternalError(
+                        "enter_call: 内联开帧要求参数仍在栈上".to_string(),
+                    ));
+                };
+                self.open_frame(
+                    id,
+                    argc,
+                    captured_this.unwrap_or(Value::Undefined),
+                    boxed,
+                    &captured_vars,
+                    false,
+                    captured_new_target.unwrap_or(Value::Undefined),
+                    return_pc,
+                    module,
+                )?;
+                Ok(Control::Entered)
+            }
+            _ => Err(RuntimeError::TypeError("not a function".to_string())),
+        }
+    }
+
+    /// `CallArgs` → `Vec<Value>`。**只有需要 `&[Value]` 的分支才调它**；内联开帧
+    /// 那条分支一个参数都不许碰（它们还留在数据栈上，帧要原地读）。
+    fn call_args_vec(&mut self, args: CallArgs<'_>) -> Result<Vec<Value>, RuntimeError> {
+        match args {
+            CallArgs::OnStack(n) => self.collect_call_args(n),
+            CallArgs::Collected(values) => Ok(values.to_vec()),
         }
     }
 
@@ -2349,161 +2509,25 @@ impl VM {
                 // callee's frame. The frame switch happens once they are read.
                 let callee = self.get_value(callee)?;
                 self.state.rbp = self.state.rsp;
-
-                // A proxy is callable when its target is, and the call itself is
-                // the `apply` trap — JavaScript either way, so `invoke` drives it.
-                if Self::is_proxy(&callee) {
-                    let args = self.collect_call_args(arg_count)?;
-                    let result = self.invoke(&callee, Value::Undefined, &args, module)?;
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(());
-                }
-
-                // Native (built-in) function: dispatch by name. This makes every
-                // registered builtin callable without keeping a static whitelist
-                // in sync with the lowering pass.
-                if let Some(name) = crate::builtins::native_function_name(&callee) {
-                    let args = self.collect_call_args(arg_count)?;
-                    let result = self.call_native_by_name(&name, Value::Undefined, &args, module)?;
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(());
-                }
-
-                match callee {
-                    Value::Function(id) => {
-                        // `function*`: calling it only builds the generator;
-                        // the body starts at the first `next()`.
-                        if self.generator_of(&callee, module).is_some() {
-                            let args = self.collect_call_args(arg_count)?;
-                            let gobj = self.create_generator(
-                                id,
-                                Value::Undefined,
-                                args,
-                                Vec::new(),
-                                module,
-                            )?;
-                            self.state.set_register(Register::Rv, gobj)?;
-                            self.state.jump_offset(1);
-                            return Ok(());
-                        }
-                        // `async` in its bare spelling: the call answers a
-                        // promise (see `invoke_with_new_target`).
-                        if self.async_of(&callee, module).is_some() {
-                            let args = self.collect_call_args(arg_count)?;
-                            let result = self.invoke(
-                                &Value::Function(id),
-                                Value::Undefined,
-                                &args,
-                                module,
-                            )?;
-                            self.state.set_register(Register::Rv, result)?;
-                            self.state.jump_offset(1);
-                            return Ok(());
-                        }
-                        // Strict mode: this = undefined for regular calls
-                        // `return_pc` 与 `function_val` 先算出来：`open_frame` 要 `&mut self`，
-                        // 调用参数里就不能再有别的 `self` 借用。
-                        let return_pc = self.state.pc + 1;
-                        let function_val = self.materialize_function(id);
-                        self.open_frame(
-                            id,
-                            arg_count,
-                            Value::Undefined,
-                            function_val,
-                            &[],
-                            false,
-                            Value::Undefined,
-                            return_pc,
-                            module,
-                        )?;
+                // 统一入口（P1-2c）：代理 / 原生 / 字节码（生成器 / async / 开帧）
+                // 的分支只有一份；`this` 由这里给 —— 普通调用是 `undefined`，
+                // 方法调用要给对象（`CallMethod` 走同一个入口，只是 `this` 不同）。
+                let return_pc = self.state.pc + 1;
+                match self.enter_call(
+                    &callee,
+                    Value::Undefined,
+                    CallArgs::OnStack(arg_count),
+                    Register::Rv,
+                    return_pc,
+                    module,
+                )? {
+                    // 帧已压好：接着跑被调方（不递归 —— 普通调用没有额外开销）。
+                    Control::Entered => return Ok(()),
+                    // 结果已写进 `Rv`，跳过下一条指令。
+                    Control::Done => {
+                        self.state.jump_offset(1);
                         return Ok(());
                     }
-                    Value::Object(obj_ref) => {
-                        // A class constructor cannot be called without `new`.
-                        self.check_class_ctor(&Value::Object(Rc::clone(&obj_ref)))?;
-                        // A FunctionObject coming from class/closure lowering.
-                        let borrowed = obj_ref.borrow();
-                        if borrowed.kind() == ObjectKind::Function {
-                            let Some(func_obj) = borrowed
-                                .as_any()
-                                .downcast_ref::<crate::vm::object::FunctionObject>()
-                            else {
-                                return Err(RuntimeError::TypeError(
-                                    "not a constructor".to_string(),
-                                ));
-                            };
-                            let id = func_obj.func_id;
-                            // Arrow functions capture `this`; others use undefined.
-                            let captured_this = func_obj.captured_this.clone();
-                            // Arrows also inherit the enclosing `new.target`.
-                            let captured_new_target = func_obj.captured_new_target.clone();
-                            let captured_vars = func_obj.captured_vars.clone();
-                            drop(borrowed);
-
-                            // `function*` in its *boxed* spelling: a generator
-                            // method taken off its object (`var g = C.prototype.m; g()`),
-                            // or a generator function expression materialized by
-                            // `MakeFuncObj`. Like the bare arm above and
-                            // `invoke`, this only builds the generator object —
-                            // running the body here executed it eagerly and
-                            // returned its (empty) `rv`, so
-                            // `var it = (function* () {})()` was `undefined` and
-                            // every parameter pattern that iterated it died with
-                            // `GetMethod(undefined, @@iterator)`.
-                            // `callee` 在这个分支里已被 `match` 移动走，所以按
-                            // 下面的 invoke 那样重新拼一份（`generator_of` 认两种拼法）。
-                            let boxed_callee = Value::Object(Rc::clone(&obj_ref));
-                            if self.generator_of(&boxed_callee, module).is_some() {
-                                let args = self.collect_call_args(arg_count)?;
-                                let gobj = self.create_generator(
-                                    id,
-                                    captured_this.unwrap_or(Value::Undefined),
-                                    args,
-                                    captured_vars,
-                                    module,
-                                )?;
-                                self.state.set_register(Register::Rv, gobj)?;
-                                self.state.jump_offset(1);
-                                return Ok(());
-                            }
-
-                            // `async` in its *boxed* spelling (a method taken
-                            // off its object, or a function expression): the call
-                            // answers a promise.
-                            if self.async_of(&boxed_callee, module).is_some() {
-                                let args = self.collect_call_args(arg_count)?;
-                                let this = captured_this.unwrap_or(Value::Undefined);
-                                let result = self.invoke(
-                                    &Value::Object(Rc::clone(&obj_ref)),
-                                    this,
-                                    &args,
-                                    module,
-                                )?;
-                                self.state.set_register(Register::Rv, result)?;
-                                self.state.jump_offset(1);
-                                return Ok(());
-                            }
-
-                            // `return_pc` 先算出来：`open_frame` 要 `&mut self`，不能再读 `self.state`。
-                            let return_pc = self.state.pc + 1;
-                            self.open_frame(
-                                id,
-                                arg_count,
-                                captured_this.unwrap_or(Value::Undefined),
-                                Value::Object(Rc::clone(&obj_ref)),
-                                &captured_vars,
-                                false,
-                                captured_new_target.unwrap_or(Value::Undefined),
-                                return_pc,
-                                module,
-                            )?;
-                            return Ok(());
-                        }
-                        return Err(RuntimeError::TypeError("not a function".to_string()));
-                    }
-                    _ => return Err(RuntimeError::TypeError("not a function".to_string())),
                 }
             }
             Instr::Jump { offset } => {

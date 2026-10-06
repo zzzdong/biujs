@@ -602,10 +602,24 @@ fn enter_call(
    `drive_bytecode_frame` 已经一致、但**与内联 `Call` 分支的记账不同**的一处 ——
    协议要把它做成参数而不是让每个 arm 自己记得。
 
-**还没动手的原因**：这个协议一旦落地，`CallEx` / `CallMethod` 里"两个 callee 形状各写一遍
-分支"的结构也会随之重写（它们是同一个 `match` 的两个分支，判定与记账都一样），所以这一刀
-比前两刀大；而且它会动到 `Ret` 收尾与 `new.target` 的交互（`New` 那处顺序异常正好在
-这条链上，见 §3.3.3）。**先把协议写定，再一次性落地**，避免"改一半发现协议不对"的返工。
+**落地进度**：`CallEx` 已改道（`enter_call` + `Control` + `CallArgs::OnStack`）。两处与草案
+的偏差，都有理由：
+
+1. **签名里没有 `kind: CallKind`**：`Construct` 形态**故意不做** —— `New` 的开帧顺序
+   （`this_val` 先被覆盖、`enter_frame` 后跑）还是 §3.3.3 里那个待查项，在弄清楚之前动它
+   等于在没有依据的情况下换语义。所以 `enter_call` 现在只接 `this`（调用形态）。
+2. **`CallArgs::Collected` 还没有调用点**：它要等 `invoke` 侧也改道进来才有意义，
+   现在标着 `#[allow(dead_code)]` 并写了原因 —— 与其塞一个假的调用点，不如让它空着。
+
+**`CallEx` 改道后最值得记的一件事**：元测试 `kind_matches_the_vm_implementation` **当场
+抓住了这次改动** —— 它的规则是"`@Call` 类 opcode 的 arm 里必须有调用证据"，而证据搬进了
+`enter_call`，于是测试报"`CallEx` 标了 Call，但它的 arm 里找不到…"。这正是它该做的：
+规则没变，是代码换了地方，于是规则**显式**加上了 `self.enter_call(` 这条证据并写明
+"调用类 opcode 的证据现在主要是它把活交给统一入口"。守卫不是摆设，因为它会在重构
+改变"证据在哪"时提醒人更新判据，而不是默默放过。
+
+**数字**：通过 16561 / 执行 19708 / 跳过 7843 与基线逐字节一致，零逐套件回退；
+单片回归 **105.7s**（前两刀 106.3s / 107.8s，噪声内）；单元 201 / feature 524 / 护栏 7 全绿。
 
 **P1-2a 至此收口**：`CallEx` 里最后 2 处裸判定也换成了 `generator_of`/`async_of`，
 生成器/async 的判定现在只有 `vm/mod.rs` 顶部那三个函数一处。剩下的 `is_constructor`
@@ -907,7 +921,7 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | **P1-1** 帧驱动合一（`FrameMode`：`[[Call]]` / `[[Construct]]` 共用一份驱动） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 删掉 `invoke_construct` 的 100 行拷贝；feature +1 验收断言；数字未动 |
 | **P1-2a** 可调用体种类判定收成一处（`generator_of` / `async_of` / `callee_kind`） | **已完成并收口**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 六个站点统一；`is_constructor` 那处是 ES 7.3.20 的另一问题，刻意独立 |
 | P1-2b `enter_call(...) -> Control`（把 `CallEx` 的两份内联开帧搬过去） | **进行中**（`open_frame` 已落，5 处调用点） | 同上 | 单片 106–108s（噪声内）、数字未动；`New` 与 generator/async 帧驱动**故意不换**（顺序/记账不同，见 §3.3.3） |
-| P1-2c `enter_call(kind, callee, args: CallArgs, …) -> Control` | **协议已写定**（§3.3.4），代码未动 | | 关键发现：两条路径的**参数约定**不同（内联不碰参数 / 重入要收集），协议必须同时表达 `Control` 与 `CallArgs` |
+| P1-2c `enter_call(callee, this, args: CallArgs, dst, return_pc) -> Control` | **进行中**：`CallEx` 已改道 | 同上 | 关键发现：两条路径的**参数约定**不同（内联不碰参数 / 重入要收集），协议必须同时表达 `Control` 与 `CallArgs`；`Construct` 形态待 §3.3.3 的待查项澄清后再做 |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
 | P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |
 | P3b 堆帧 + 单层循环 | 未开始 | | Go/No-Go：见 §3.6 |

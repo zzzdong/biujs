@@ -1684,6 +1684,9 @@ mod tests {
             (
                 Kind::Call,
                 &[
+                    // P1-2c 起，调用类 opcode 的证据主要是它把活交给统一入口；
+                    // 其余几条是还没改道的路径（`CallNative` / `CallSpread` 等）。
+                    "self.enter_call(",
                     "self.invoke(",
                     "self.construct(",
                     "self.invoke_with_new_target(",
