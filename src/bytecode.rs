@@ -1825,13 +1825,56 @@ mod tests {
             "派生的区域数必须等于实际发射的 Try 条数 —— 差一个就是推导漏了或多了"
         );
 
-        // 嵌套的那个：内层区域必须被外层包含。
-        let nested = module
-            .instructions
-            .iter()
-            .filter(|i| matches!(i, Instr::Try { .. }))
-            .count();
-        assert!(nested >= 5);
+        // 逐个函数核对表格的**语义**（迁移运行时之前先把"表该长什么样"钉死）：
+        // 名字 → id 走 `func_info`。
+        let id_of = |name: &str| -> u32 {
+            *module
+                .func_info
+                .iter()
+                .find(|(_, (n, _))| n == name)
+                .unwrap_or_else(|| panic!("没有函数 {name}"))
+                .0
+        };
+        let one = |name: &str| -> EhRegion {
+            let mut rs = module.eh_regions_of(id_of(name));
+            assert_eq!(rs.len(), 1, "{name} 应该只有一个 try，实际 {:?}", rs);
+            rs.pop().unwrap()
+        };
+        // try/catch
+        let r = one("a");
+        assert!(r.catch.is_some() && r.finally.is_none(), "a: {r:?}");
+        // try/finally：**catch 与 finally 指向同一个块** —— 没有 catch 时，finally 兼作
+        // handler（先进 finally，再 rethrow）。这是发射端的事实，不是表的推断。
+        let r = one("b");
+        assert!(
+            r.catch.is_some() && r.catch == r.finally,
+            "b（try/finally）的 catch 应与 finally 同址: {r:?}"
+        );
+        // try/catch/finally：两者都有，且**不同址**
+        let r = one("c");
+        assert!(
+            r.catch.is_some() && r.finally.is_some() && r.catch != r.finally,
+            "c（try/catch/finally）的 catch 与 finally 应不同址: {r:?}"
+        );
+        // 嵌套：外层 finally、内层 catch，内层被外层包含
+        let mut nested = module.eh_regions_of(id_of("d"));
+        assert_eq!(nested.len(), 2, "d 应该有嵌套的两个 try，实际 {:?}", nested);
+        nested.sort_by_key(|r| r.start);
+        let (outer, inner) = (nested[0], nested[1]);
+        // 外层是 try/finally（catch 与 finally 同址，同上），内层是 try/catch。
+        assert!(
+            outer.catch.is_some() && outer.catch == outer.finally,
+            "d 的外层是 try/finally，catch 应与 finally 同址: {outer:?}"
+        );
+        assert!(
+            inner.catch.is_some() && inner.finally.is_none(),
+            "d 的内层: {inner:?}"
+        );
+        assert!(
+            outer.start < inner.start && inner.end <= outer.end,
+            "d 的内层没被外层包含: {outer:?} / {inner:?}"
+        );
+
         regions.sort_by_key(|r| r.start);
         for pair in regions.windows(2) {
             if pair[1].start < pair[0].end {
