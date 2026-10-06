@@ -556,14 +556,23 @@ function_val, captured_vars, construct, new_target, return_pc, module)`：
 ### 3.3.4 P1-2c 的协议草案（先定形状，再动代码）
 
 **先前的计划有一处想错了**：原方案说"6 个调用 opcode 都调 `enter_call`"，仿佛差别只在
-控制流。读代码后发现**差别首先在参数的约定上**：
+控制流。读代码后发现差别在**参数的读法**上：
 
-| | 参数从哪来 | 栈的效果 |
+| | 参数怎么读 | 栈的效果 |
 |---|---|---|
-| **内联路径**（`Call` / `CallEx` / `CallMethod` / `New` 的字节码分支） | **完全不碰参数** —— 参数是 lowering 事先 `Push` 到数据栈上的，帧按 `arg0 = [rbp-1]` 原地读 | 参数留在栈上，`argc` 只作记账 |
-| **重入路径**（代理陷阱 / 原生 / 生成器 / async / `invoke`） | `collect_call_args(argc)` 把它们**弹出来**成 `Vec<Value>` | 栈被清空，返回值另写进 `Rv` |
+| **内联路径**（`Call` / `CallEx` / `CallMethod` / `New` 的字节码分支） | **完全不读** —— 参数是 lowering 事先 `Push` 到数据栈上的，帧按 `arg0 = [rbp-1]` 原地读 | `argc` 只作记账 |
+| **重入路径**（代理陷阱 / 原生 / 生成器 / async / `invoke`） | `collect_call_args(argc)` 读一份 `Vec<Value>` | **只读不弹**：它是 `&self` + `raw_stack_value`；参数由调用方 epilogue 的 `movc rsp, rbp` 回收 |
 
-所以协议必须同时表达"帧已压好，回到分派循环"和"参数在哪"，大致是：
+> **订正**：这一节最初写的是"`collect_call_args` 把它们弹出来 / 栈被清空"——**那是错的**
+> （`collect_call_args(&self, …)` 只读不弹）。错误的方向性在于：以为"重入路径要弹栈、
+> 内联路径不弹"，于是把协议设计成要处理两种栈纪律；实际上两条都不弹，差别只是
+> "帧原地读"与"读一份副本"。
+
+而 `CallMethod` 与 `CallEx` 的差别也就只剩一点：**它把每个参数 `as_object_value` 装箱**
+（内建层按 `Value::Object` 匹配，否则 `Object.keys(fn)` 会收到一个 `Value::Function`）。
+`CallEx` 不装箱。
+
+所以协议要表达的是"帧已压好，回到分派循环"和"参数是原地读还是已有一份副本"：
 
 ```rust
 /// 一次调用/构造在解释器里的下一步。
@@ -620,6 +629,23 @@ fn enter_call(
 
 **数字**：通过 16561 / 执行 19708 / 跳过 7843 与基线逐字节一致，零逐套件回退；
 单片回归 **105.7s**（前两刀 106.3s / 107.8s，噪声内）；单元 201 / feature 524 / 护栏 7 全绿。
+
+### 3.3.5 下一刀（`CallMethod` 改道）要决定的一件事：参数装箱放在哪
+
+`CallMethod` 与 `CallEx` 现在唯一的差别是**它把每个参数 `as_object_value` 装箱**
+（`Object.keys(fn)` 这类内建按 `Value::Object` 匹配）。改道时有两条路：
+
+| | 做法 | 后果 |
+|---|---|---|
+| **A（倾向）** | 装箱留在 `CallMethod`：`enter_call` 增加 `CallArgs::OnStackWithCopy { argc, args }`（帧按 `argc` 原地读，重入分支用 `args`） | `CallEx` 行为**不变**；代价是 `CallArgs` 多一个变体 |
+| B | 装箱搬进 `enter_call`（重入分支统一 `collect_call_args` + 装箱） | API 更干净，但 `CallEx` 也会被装箱 —— **这是行为变更**（也许是修 bug，但得单独立项、单独验证，不能混在重构里） |
+
+**选 A**：重构不改语义这条纪律比 API 好看重要。B 那个"顺便修一下"很诱人，但要单独做、
+单独测（`Object.keys(fn)`、`Array.prototype.map(fn)`、`new Map(fn)`…），别混进来。
+
+另外 `CallMethod` 的静态方法前置（`native_function_name(&obj_val)` → `"Name.method"`、
+`Object.assign` 特判、`try_promise_method`）**留在 arm 里** —— 那是"接收者是什么"的问题，
+不属于"被调方是什么"，塞进 `enter_call` 会把两个问题搅在一起。
 
 **P1-2a 至此收口**：`CallEx` 里最后 2 处裸判定也换成了 `generator_of`/`async_of`，
 生成器/async 的判定现在只有 `vm/mod.rs` 顶部那三个函数一处。剩下的 `is_constructor`
