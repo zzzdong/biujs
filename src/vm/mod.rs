@@ -3697,22 +3697,24 @@ impl VM {
                         0
                     },
                 );
-                // 深改第 2 步：处理器地址**以 EH 表为准**（`Module` 上的 O(1) 派生索引）；
-                // 手搭的 Module 没有表，退回指令自己的相对偏移。
-                // `debug_assert` 继续守着两者等价 —— 两条路径的算法完全不同，
-                // 所以它是一条真检查而不是同义反复（release 下不跑）。
-                let (catch_pc, finally_pc) = match module.eh_region_starting_at(self.state.pc) {
-                    Some(region) => {
-                        let from_table = (region.catch.unwrap_or(0), region.finally.unwrap_or(0));
-                        debug_assert_eq!(
-                            from_table,
-                            from_operands,
-                            "EH 表与 Try 指令自己算出的处理器地址不一致: {region:?}"
-                        );
-                        from_table
-                    }
-                    None => from_operands,
-                };
+                // 深改第 2 步：**地址仍以指令自己的相对偏移为准**（O(1)，无查表），
+                // EH 表只做等价性校验（debug）。
+                //
+                // 试过改成"以表为准"（`eh_region_starting_at`），两条理由又退回来了：
+                // 1. 每次执行 try 都要一次哈希查找，性能 A/B 落在噪声带上限（108.6s vs
+                //    历次 105.7–108.6），无法证明无代价；
+                // 2. 表的 `end` 本来就不可靠（§10.3：EndTry 与 Try 不是一一配对），
+                //    所以现在"以表为准"买不到任何收益。
+                // 等区域边界改由发射端给出（§10.3 的下一步）之后，再切到查表。
+                let (catch_pc, finally_pc) = from_operands;
+                #[cfg(debug_assertions)]
+                if let Some(region) = module.eh_region_starting_at(self.state.pc) {
+                    debug_assert_eq!(
+                        (region.catch.unwrap_or(0), region.finally.unwrap_or(0)),
+                        (catch_pc, finally_pc),
+                        "EH 表与 Try 指令自己算出的处理器地址不一致: {region:?}"
+                    );
+                }
                 let record = SehRecord {
                     handler_pc: catch_pc,
                     finally_pc,
