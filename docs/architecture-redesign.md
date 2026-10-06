@@ -195,23 +195,31 @@ test262 是绿的。差异核对（同一个语义、两条路径各写一遍）
 
 ---
 
-### 10.3 待查：有一条 `EndTry` 不在派生表的任何区域终点上
+### 10.3 待查：`EndTry` 与 `Try` 不是一一配对（已用实测定位）
 
 给 `EndTry` 加 `debug_assert!(eh_region_ending_at(pc).is_some())` 时，在
-"嵌套 try，且 catch 里再 throw" 的程序上**直接响**：
+"嵌套 try，且 catch 里再 throw" 的程序上响：`EndTry(pc=73) 关掉的不是 EH 表里的任何区域`。
+
+临时加了个诊断把指令流打出来（已删），同一段程序（四个函数 a/b/c/d）的实际发射是：
 
 ```
-EndTry(pc=73) 关掉的不是 EH 表里的任何区域
+id 1 a:  Try 36                       → regions: [36..56, catch 50]        （没有 EndTry）
+id 2 b:  Try 64, EndTry 75            → regions: [64..75, catch/finally 77]
+id 3 c:  Try 101                      → regions: [101..113, catch 108]     （没有 EndTry）
+id 4 d:  Try 117, EndTry 119, Try 122 → regions: [117..119 catch 145], [122..150 catch 134]
 ```
 
-含义：**运行时的进出配对，与静态派生的区域，在某处不一致**。两种可能：
+⇒ **根因清楚了**：`EndTry` 的发射与 `Try` **不是一一配对** —— 有的 try 根本没有对应的
+`EndTry`（a、c），嵌套时那条 `EndTry`(119) 也不是外层 try 的收尾。而运行时的语义是
+`Try` push / `EndTry` pop，靠帧收尾时的 `saved_seh` 截断兜底。
 
-- 有 `EndTry` 没有配对的 `Try`（发射端多发了一条）；
-- 我的区域 `end` 算法在"处理器块里再嵌 try"时算错了（深度计数把内外的 `EndTry` 配错，
-  或那条 `EndTry` 落在我算出的 `body.end` 之外）。
+所以我那个"深度计数找配对 `EndTry`"的派生规则，与运行时实际的进出**不是同一件事**，
+`EhRegion::end` 目前不能当作"受保护范围"来用。
 
-**这一条必须先查清，才能把 `seh_stack` 退掉** —— 否则退掉就等于把异常路径悄悄改一遍。
-断言已撤（不能留一条会响的断言），现象与位置写在 `vm/mod.rs` 的 `EndTry` arm 里。
+**下一步要做的**（退 `seh_stack` 之前必须解决）：区域边界不能靠扫 `EndTry`，得让**发射端**
+在 `Try` 指令里直接带上受保护块的结束地址（那是发射端才知道的块结构），或者给 `Try`/
+`EndTry` 补上真正的配对信息。在那之前，`EhRegion` 只有 catch/finally 地址这一个字段
+是可信的（已由 `Try` arm 的 debug_assert 证明与指令操作数等价）。
 
 ## 11. 分支与提交约定
 
