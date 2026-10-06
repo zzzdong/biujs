@@ -21,7 +21,7 @@ use crate::builtins::Builtins;
 use crate::vm::object::{PromiseObject, PromiseReaction, PromiseState};
 use crate::vm::iterator::iterator_symbol_key;
 use crate::bytecode::{
-    Constant, EhRegion, FunctionId, Instr, Module, Opcode, Operand, Primitive, Register,
+    Constant, FunctionId, Instr, Module, Opcode, Operand, Primitive, Register,
 };
 
 /// Size of the pre-allocated value stack. Slots are addressed directly, so the
@@ -983,19 +983,6 @@ impl VM {
             Some(_) => CalleeKind::Bytecode,
             None => CalleeKind::NotCallable,
         }
-    }
-
-    /// 以 `pc` 开头的那个 try 区域（深改第 2 步：给运行时与派生表的**一致性检查**用）。
-    ///
-    /// 只在 `debug_assert` 里调用：`O(函数数 × 区域数)`，不进热路径。两边算法完全不同
-    /// （一边是"pc + 回填后的相对偏移"，一边是"扫指令流找配对的 `EndTry`"），
-    /// 所以这条检查能真正抓到漂移。
-    fn eh_region_starting_at(&self, pc: usize, module: &Module) -> Option<EhRegion> {
-        module
-            .bodies()
-            .into_iter()
-            .flat_map(|(id, _)| module.eh_regions_of(id))
-            .find(|region| region.start == pc)
     }
 
     /// `[[Call]]` 的统一入口（P1-2c）：`CallEx`（以及接下来的 `CallMethod` /
@@ -3698,26 +3685,34 @@ impl VM {
             Instr::Try { catch_offset, finally_offset } => {
                 let catch_offset = catch_offset.as_immd();
                 let finally_offset = finally_offset.as_immd();
-                let catch_pc = if catch_offset != 0 {
-                    (self.state.pc as isize + catch_offset) as usize
-                } else {
-                    0
+                let from_operands = (
+                    if catch_offset != 0 {
+                        (self.state.pc as isize + catch_offset) as usize
+                    } else {
+                        0
+                    },
+                    if finally_offset != 0 {
+                        (self.state.pc as isize + finally_offset) as usize
+                    } else {
+                        0
+                    },
+                );
+                // 深改第 2 步：处理器地址**以 EH 表为准**（`Module` 上的 O(1) 派生索引）；
+                // 手搭的 Module 没有表，退回指令自己的相对偏移。
+                // `debug_assert` 继续守着两者等价 —— 两条路径的算法完全不同，
+                // 所以它是一条真检查而不是同义反复（release 下不跑）。
+                let (catch_pc, finally_pc) = match module.eh_region_starting_at(self.state.pc) {
+                    Some(region) => {
+                        let from_table = (region.catch.unwrap_or(0), region.finally.unwrap_or(0));
+                        debug_assert_eq!(
+                            from_table,
+                            from_operands,
+                            "EH 表与 Try 指令自己算出的处理器地址不一致: {region:?}"
+                        );
+                        from_table
+                    }
+                    None => from_operands,
                 };
-                let finally_pc = if finally_offset != 0 {
-                    (self.state.pc as isize + finally_offset) as usize
-                } else {
-                    0
-                };
-                // 深改第 2 步：这里算出的地址必须与派生出来的 EH 表一致。两条路径的算法
-                // 完全不同，所以它是一条真检查而不是同义反复 —— 迁移到"完全查表"之前，
-                // 先用它证明两者等价（release 下不跑，不影响性能）。
-                if let Some(region) = self.eh_region_starting_at(self.state.pc, module) {
-                    debug_assert_eq!(
-                        (region.catch.unwrap_or(0), region.finally.unwrap_or(0)),
-                        (catch_pc, finally_pc),
-                        "EH 表与 Try 指令自己算出的处理器地址不一致: {region:?}"
-                    );
-                }
                 let record = SehRecord {
                     handler_pc: catch_pc,
                     finally_pc,
