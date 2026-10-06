@@ -521,7 +521,23 @@ function_val, captured_vars, construct, new_target, return_pc, module)`：
 的来源、`construct` 标志，以及**要不要先清 `Rv`**（那是记账，留在调用点，因为各 opcode
 的 `Rv` 约定不同）。
 
-本刀落地：`drive_bytecode_frame`（P1-1 的统一驱动）与 `CallEx` 的两处内联开帧，共 3 处。
+本刀落地：第一刀 3 处（`drive_bytecode_frame` + `CallEx` 两处），第二刀 2 处
+（`CallMethod` 的 `Value::Function` 与 `Value::Object` 两个分支）—— 5 个调用点共用一份开帧。
+
+**两处故意没换，各有原因（登记为待查，不是"漏了"）**
+
+1. **`New` 的开帧顺序与其它 5 处相反**：它是先
+   `this_val = new_obj_val; function_val = new_target`，**再** `enter_frame`；而
+   `enter_frame` 会把 `self.this_val.clone()` 快照进 `this_stack` —— 于是这一帧的
+   `this_stack` 顶上是**新对象**而不是调用方。`Ret` 的收尾（`vm/mod.rs:665`）与帧恢复
+   助手（`:7683`）都会 `pop` `this_stack`，所以这个差异是**可观察的**。今天全量绿，
+   说明有别的机制在兜着，但本轮**不动它**：在一次"纯重构"里改这个等于偷偷换语义。
+   **待查项**：`New` 的这个顺序是有意（比如为了 `mark_this_uninitialized` 的时序）还是历史遗留。
+2. **generator / async 的两个帧驱动**（`:8366`、`:9004` 附近）压的是自己的控制栈内容
+   （`seh_depth`、闭包深度、哨兵 pc），与普通调用帧不是同一套记账，保持原样。
+
+**数字**：通过 16561 / 执行 19708 / 跳过 7843 与基线逐字节一致，零逐套件回退；
+单片回归 107.8s（上一刀 106.3s / P1-2a 基线 107.1s，噪声内）。
 
 **两个必须记住的坑**（都是这次踩的）：
 
@@ -534,9 +550,8 @@ function_val, captured_vars, construct, new_target, return_pc, module)`：
 单片回归 **106.3s**（P1-2a 基线 107.1s，无倒退 —— 每次 JS 调用多一次函数调用，
 相对整条路径可以忽略）。
 
-**剩下的**：`CallMethod`（2 处）、`New`（1 处）以及 generator/async 的两个帧驱动
-（`8345`/`8983` 附近）仍各写一份开帧；下一刀把它们也换成 `open_frame`，再往后才是
-`Control` 协议与 `dst: Option<Reg>`。
+**剩下的**：`Control` 协议与 `dst: Option<Reg>`（6 个调用 opcode 各自的记账仍在调用点，
+`CallEx` 里 4 处遗留的裸判定也在那里）。
 
 ---
 
@@ -832,7 +847,7 @@ Parser 54,214 / ByteCode 40,559 / Types 26,164。
 | **P0b-2a** pc 字段类型收紧（`jr`→`RelPc`、`ja`→`AbsPc`，由角色派生） | **已完成**（2026-10-01） | 同上 | 单元 →**201**；`AbsPc` 喂给相对字段已被证实是编译错误 |
 | **P1-1** 帧驱动合一（`FrameMode`：`[[Call]]` / `[[Construct]]` 共用一份驱动） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 删掉 `invoke_construct` 的 100 行拷贝；feature +1 验收断言；数字未动 |
 | **P1-2a** 可调用体种类判定收成一处（`generator_of` / `async_of` / `callee_kind`） | **已完成**（2026-10-01） | 见 `git log --oneline refactor/interpreter-p0a` | 五个站点各不相同的判定写法统一；`CallEx` 另有 4 处与 `is_constructor` 1 处留给 P1-2b |
-| P1-2b `enter_call(...) -> Control`（把 `CallEx` 的两份内联开帧搬过去） | **进行中**（第一刀已落：`open_frame`，3 处调用点） | 同上 | 单片 106.3s（基线 107.1s）、数字未动；剩 `CallMethod`(2) / `New`(1) / generator+async 帧驱动 |
+| P1-2b `enter_call(...) -> Control`（把 `CallEx` 的两份内联开帧搬过去） | **进行中**（`open_frame` 已落，5 处调用点） | 同上 | 单片 106–108s（噪声内）、数字未动；`New` 与 generator/async 帧驱动**故意不换**（顺序/记账不同，见 §3.3.3） |
 | P1-2c 其余调用 opcode 汇进 `enter_call` | 未开始 | | 届时处理 `dst: Option<Reg>` 与 native 快路径 |
 | P2 CodeBlock per function | 未开始 | | `vm/mod.rs` 里 `module.` 访问点 44 处 |
 | P3a 帧结构归一 | 未开始 | | 平行栈 ≈171 个引用点 |

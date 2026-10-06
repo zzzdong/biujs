@@ -3623,26 +3623,21 @@ impl VM {
 
                 match method_val {
                     Value::Function(id) => {
-                        self.state.enter_frame(arg_count)?;
                         // User-defined bytecode function - call it with this = obj_val
-                        self.state.this_val = obj_val;
-                        self.state.function_val = self.materialize_function(id);
-                        match module.symtab.get(&FunctionId::new(id)) {
-                            Some(location) => {
-                                self.state.pushc(self.state.closure_var_stack.len())?;
-                                self.state.pushc(self.state.seh_stack.len())?;
-                                self.state.pushc(self.state.pc + 1)?;
-                                self.state.construct_stack.push(false);
-                                self.state.new_target_stack.push(Value::Undefined);
-                                self.state.jump(*location);
-                                return Ok(());
-                            }
-                            None => {
-                                return Err(RuntimeError::ReferenceError(format!(
-                                    "undefined function: {id}"
-                                )));
-                            }
-                        }
+                        let return_pc = self.state.pc + 1;
+                        let function_val = self.materialize_function(id);
+                        self.open_frame(
+                            id,
+                            arg_count,
+                            obj_val,
+                            function_val,
+                            &[],
+                            false,
+                            Value::Undefined,
+                            return_pc,
+                            module,
+                        )?;
+                        return Ok(());
                     }
                     Value::Object(obj_ref) => {
                         let borrowed = obj_ref.borrow();
@@ -3656,34 +3651,21 @@ impl VM {
                                 let captured_new_target = func_obj.captured_new_target.clone();
                                 let captured_vars = func_obj.captured_vars.clone();
                                 drop(borrowed);
-                                self.state.enter_frame(arg_count)?;
                                 // For arrow functions, use captured this; for regular methods, use obj_val
-                                self.state.this_val = captured_this.unwrap_or(obj_val);
-                                self.state.function_val = Value::Object(Rc::clone(&obj_ref));
-                                // Push captured variables onto closure_var_stack
-                                for (name, value) in &captured_vars {
-                                    let mut map = std::collections::HashMap::new();
-                                    map.insert(name.clone(), value.clone());
-                                    self.state.closure_var_stack.push(map);
-                                }
-                                match module.symtab.get(&FunctionId::new(id)) {
-                                    Some(location) => {
-                                        self.state.pushc(self.state.closure_var_stack.len())?;
-                                        self.state.pushc(self.state.seh_stack.len())?;
-                                        self.state.pushc(self.state.pc + 1)?;
-                                        self.state.construct_stack.push(false);
-                                        self.state
-                                            .new_target_stack
-                                            .push(captured_new_target.unwrap_or(Value::Undefined));
-                                        self.state.jump(*location);
-                                        return Ok(());
-                                    }
-                                    None => {
-                                        return Err(RuntimeError::ReferenceError(format!(
-                                            "undefined function: {id}"
-                                        )));
-                                    }
-                                }
+                                let return_pc = self.state.pc + 1;
+                                let this_val = captured_this.unwrap_or(obj_val);
+                                self.open_frame(
+                                    id,
+                                    arg_count,
+                                    this_val,
+                                    Value::Object(Rc::clone(&obj_ref)),
+                                    &captured_vars,
+                                    false,
+                                    captured_new_target.unwrap_or(Value::Undefined),
+                                    return_pc,
+                                    module,
+                                )?;
+                                return Ok(());
                             } else {
                                 return Err(RuntimeError::TypeError("not a function".to_string()));
                             }
