@@ -1374,6 +1374,14 @@ impl VM {
 
         // Sentinel return address one past the last instruction: when the callee
         // returns, `Ret` lands here and the nested loop stops.
+        // 哨兵返回地址 = **整个模块的下一位**，而不是被调函数自己的出口。
+        //
+        // 嵌套 `step` 循环的终止条件是 `module.instructions.get(pc) == None`，即
+        // **pc 越界**；它不是"pc == 某个返回值"。所以哨兵必须是一个**不存在的 pc**。
+        // （试过用 `module.body_of(func_id).end` 当哨兵 —— 那是个合法的 pc，于是
+        // `Ret` 之后循环接着跑下一段函数的代码，array / async / promise 一片红。
+        // 要改成 per-function 哨兵，得先让循环在"pc == 本帧哨兵"时停止 —— 那是
+        // 深改第 4 步（帧模型重写）的事，见 `docs/architecture-redesign.md`。）
         let return_pc = module.instructions.len();
 
         // 模式差异在一处算清；开帧那 15 行在 `open_frame` 里，与各 opcode 内联开帧共用。

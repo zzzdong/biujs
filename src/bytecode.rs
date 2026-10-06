@@ -38,6 +38,20 @@ pub struct Module {
     pub debug_instructions: BTreeMap<usize, crate::compiler::ir::Instruction>,
 }
 
+/// 一个函数的字节码体（深改第 2 步的第一步）：它的**指令范围**。
+///
+/// 现在它是 `Module::symtab` + `Module::exit_pc` 的**派生视图**，不存新状态 ——
+/// 因此不可能和那两张表不一致。下一步把 EH 元数据（try/catch/finally 的 pc 区间）
+/// 填进来时，它才变成真正的新数据；那时改的是这里，而不是再散到 VM 的各条 arm 里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionBody {
+    /// 入口 pc（来自 `Module::symtab`）。
+    pub start: usize,
+    /// 尾 `Ret` 的**后一位**（来自 `Module::exit_pc`）：代码范围是 `start..end`，
+    /// 落在 `end` 上就算越过了函数边界。
+    pub end: usize,
+}
+
 impl Module {
     pub fn new(
         name: impl Into<Option<String>>,
@@ -62,6 +76,33 @@ impl Module {
             instructions,
             debug_instructions: BTreeMap::new(),
         }
+    }
+
+    /// 某个函数的字节码体：它的指令范围（`symtab` 的入口 + `exit_pc` 的尾 `Ret`）。
+    ///
+    /// **派生视图，不存新状态**，所以不可能与那两张表不一致。手搭的 `Module`
+    /// （单测里常见）可能既没有 `Ret` 也没有入口，那时返回 `None` —— 调用方各自兜底，
+    /// 见 `VM::drive_bytecode_frame` 里哨兵返回地址的处理。
+    pub fn body_of(&self, func_id: u32) -> Option<FunctionBody> {
+        let start = *self.symtab.get(&FunctionId::new(func_id))?;
+        let exit = *self.exit_pc.get(&func_id)?;
+        Some(FunctionBody { start, end: exit + 1 })
+    }
+
+    /// 所有函数的体，按入口 pc 排序。给"逐条过一遍"的工具与测试用。
+    pub fn bodies(&self) -> Vec<(u32, FunctionBody)> {
+        let mut out: Vec<(u32, FunctionBody)> = self
+            .func_info
+            .keys()
+            .chain(self.generators.iter())
+            .chain(self.asyncs.iter())
+            .copied()
+            .collect::<std::collections::BTreeSet<u32>>()
+            .into_iter()
+            .filter_map(|id| self.body_of(id).map(|body| (id, body)))
+            .collect();
+        out.sort_by_key(|(_, body)| body.start);
+        out
     }
 }
 
@@ -1602,6 +1643,52 @@ mod tests {
             + count_of(Kind::Suspend)
             + count_of(Kind::Bookkeeping);
         assert_eq!(count_of(Kind::Normal), Instr::ALL.len() - marked);
+    }
+
+    /// 每个函数的字节码体都得是自洽的一段（深改第 2 步的守卫）。
+    ///
+    /// 这三条断言看着显而易见，但它们是后面把 EH 元数据挂进 `FunctionBody` 的前提：
+    /// 在那之前必须先确认"一个函数的代码范围"这个概念本身是可靠的。
+    #[test]
+    fn function_bodies_are_well_formed() {
+        let mut compiler = crate::compiler::Compiler::new();
+        let module = compiler
+            .compile(
+                "function plain(a) { return a + 1; }
+                 function* gen() { yield 1; }
+                 async function asy() { return 2; }
+                 function outer() { var x = 1; return function inner() { return x; }; }
+                 class C { constructor() { this.v = 1; } m() { return this.v; } }
+                 plain(1)",
+            )
+            .expect("compilation failed");
+
+        let bodies = module.bodies();
+        assert!(!bodies.is_empty(), "至少要解析出几个函数");
+
+        for (id, body) in &bodies {
+            assert!(body.start < body.end, "{id} 的范围是空的: {body:?}");
+            // 最后一条必须是 `Ret`：函数的出口由它定义（`exit_pc` 就是它的 pc）。
+            let last = module.instructions[body.end - 1];
+            assert_eq!(
+                last.kind(),
+                Kind::Return,
+                "{id} 的出口不是 Ret，而是 {last}"
+            );
+            assert!(body.end <= module.instructions.len(), "{id} 的范围越过了程序末尾");
+        }
+
+        // 所有函数都顺序排在指令流里，因此范围两两不重叠。
+        for pair in bodies.windows(2) {
+            assert!(
+                pair[0].1.end <= pair[1].1.start,
+                "{} 的范围 {:?} 与 {} 的 {:?} 重叠了 —— 函数边界的假设不成立",
+                pair[0].0,
+                pair[0].1,
+                pair[1].0,
+                pair[1].1
+            );
+        }
     }
 
     /// 表的顺序与 `ALL` 一致（`ALL` 是拿来做工具/测试的，顺序即表顺序）。

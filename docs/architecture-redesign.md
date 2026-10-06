@@ -166,7 +166,36 @@ test262 是绿的。差异核对（同一个语义、两条路径各写一遍）
 
 ---
 
-## 10. 分支与提交约定
+## 10. 第 2 步的实测发现（开工前必读）
+
+### 10.1 已落地：per-function 代码范围（派生视图）
+
+`Module` 里 `symtab`（入口 pc）与 `exit_pc`（尾 `Ret` 的 pc）**早就都算好了**，所以
+"一个函数的字节码体"可以做成它们的**派生视图**，不需要新增状态、也就不可能与那两张表
+不一致：`Module::body_of(func_id) -> Option<FunctionBody { start, end }>`，`end = exit_pc + 1`。
+
+附带一条守卫测试 `function_bodies_are_well_formed`：编译一段含普通函数 / 生成器 / async /
+闭包 / 类方法的程序，断言每个体 `start < end`、最后一条是 `Ret`、范围两两不重叠。
+**这三条看着显而易见，却是把 EH 元数据挂进 `FunctionBody` 的前提** —— 在那之前必须先确认
+"函数代码范围"这个概念本身可靠（已确认）。
+
+### 10.2 哨兵返回地址不能提前改成 per-function（试过，一片红）
+
+想顺手让 `drive_bytecode_frame` 用 `body.end` 当哨兵返回地址，结果
+**array / async / promise / date 一大片 feature 测试失败**。原因：
+
+- 嵌套 `step` 循环的终止条件是 `module.instructions.get(pc) == None`，即 **pc 越界**，
+  **不是**"pc == 某个返回地址"；
+- 所以哨兵必须是一个**不存在的 pc**（现为 `instructions.len()`）。换成 `body.end` ——
+  那是个**合法的 pc**，属于下一段函数的代码 —— `Ret` 之后循环就接着跑下一段函数去了。
+
+⇒ **per-function 哨兵必须配套改循环契约**：让循环在"pc == 本帧哨兵"时停止。
+这是**第 4 步（帧模型重写）**的内容，不该在 P2 先做。已把这段结论写在代码注释里
+（`vm/mod.rs` 的 `return_pc` 处），免得下一个人再试一次。
+
+---
+
+## 11. 分支与提交约定
 
 - 深改开**独立分支** `refactor/deep-arch`，与 `refactor/interpreter-p0a`（P0/P1 已落地部分）
   分开，便于随时回到可发布状态。
