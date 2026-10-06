@@ -1098,6 +1098,55 @@ impl VM {
         )
     }
 
+    /// 开一帧：压好参数之后的全部准备工作。
+    ///
+    /// `enter_frame` → `this` / `function_val` → 闭包捕获变量 → 控制栈三项 →
+    /// `construct_stack` / `new_target` → `jump` 到函数入口。**顺序有讲究**：
+    /// `enter_frame` 要先把**调用方**的 `this` / `function_val` 快照进 `this_stack` /
+    /// `function_stack`，所以它必须在覆盖这两个字段之前跑。
+    ///
+    /// 这段以前出现在 7 个地方（`drive_bytecode_frame` 与 `CallEx` / `CallMethod` /
+    /// `New` 的内联开帧），差别只有 `return_pc`（opcode 用 `pc + 1`，被 `invoke`
+    /// 调用时用哨兵 `instructions.len()`）、`this` / `function_val` 的来源、
+    /// `construct` 标志，以及各自要不要先清 `Rv`（那是记账，留在调用点）。
+    #[allow(clippy::too_many_arguments)]
+    fn open_frame(
+        &mut self,
+        func_id: u32,
+        argc: usize,
+        this: Value,
+        function_val: Value,
+        captured_vars: &[(String, Value)],
+        construct: bool,
+        new_target: Value,
+        return_pc: usize,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        self.state.enter_frame(argc)?;
+        self.state.this_val = this;
+        self.state.function_val = function_val;
+        for (name, value) in captured_vars {
+            let mut map = std::collections::HashMap::new();
+            map.insert(name.clone(), value.clone());
+            self.state.closure_var_stack.push(map);
+        }
+        let location = match module.symtab.get(&FunctionId::new(func_id)) {
+            Some(location) => *location,
+            None => {
+                return Err(RuntimeError::ReferenceError(format!(
+                    "undefined function: {func_id}"
+                )));
+            }
+        };
+        self.state.pushc(self.state.closure_var_stack.len())?;
+        self.state.pushc(self.state.seh_stack.len())?;
+        self.state.pushc(return_pc)?;
+        self.state.construct_stack.push(construct);
+        self.state.new_target_stack.push(new_target);
+        self.state.jump(location);
+        Ok(())
+    }
+
     /// Push the callee's frame, run it to completion, then restore the caller's
     /// execution context and answer the frame's `Rv`.
     ///
@@ -1147,8 +1196,7 @@ impl VM {
         // returns, `Ret` lands here and the nested loop stops.
         let return_pc = module.instructions.len();
 
-        self.state.enter_frame(args.len())?;
-        // 模式差异在一处算清，下面就是同一段帧驱动。
+        // 模式差异在一处算清；开帧那 15 行在 `open_frame` 里，与各 opcode 内联开帧共用。
         let (this_val, function_val, new_target_val, is_construct) = match mode {
             FrameMode::Call {
                 this_val,
@@ -1172,34 +1220,22 @@ impl VM {
                 new_target,
             } => (new_obj, new_target.clone(), new_target, true),
         };
-        self.state.this_val = this_val;
-        self.state.function_val = function_val;
         if is_construct {
             // 构造器不显式返回对象时，结果就是 `this` —— 先把 `Rv` 清成
             // `undefined`，让"看 `Rv` 是不是对象"这一步能成立。
             self.state.set_register(Register::Rv, Value::Undefined)?;
         }
-        for (name, value) in captured_vars {
-            let mut map = std::collections::HashMap::new();
-            map.insert(name.clone(), value.clone());
-            self.state.closure_var_stack.push(map);
-        }
-
-        match module.symtab.get(&FunctionId::new(func_id)) {
-            Some(location) => {
-                self.state.pushc(self.state.closure_var_stack.len())?;
-                self.state.pushc(self.state.seh_stack.len())?;
-                self.state.pushc(return_pc)?;
-                self.state.construct_stack.push(is_construct);
-                self.state.new_target_stack.push(new_target_val);
-                self.state.jump(*location);
-            }
-            None => {
-                return Err(RuntimeError::ReferenceError(format!(
-                    "undefined function: {func_id}"
-                )));
-            }
-        }
+        self.open_frame(
+            func_id,
+            args.len(),
+            this_val,
+            function_val,
+            captured_vars,
+            is_construct,
+            new_target_val,
+            return_pc,
+            module,
+        )?;
 
         // Drive the nested frame. On error the caller's context is restored
         // first, so an enclosing `try` still sees the exception: unwinding has
@@ -2366,26 +2402,23 @@ impl VM {
                             self.state.jump_offset(1);
                             return Ok(());
                         }
-                        self.state.enter_frame(arg_count)?;
                         // Strict mode: this = undefined for regular calls
-                        self.state.this_val = Value::Undefined;
-                        self.state.function_val = self.materialize_function(id);
-                        match module.symtab.get(&FunctionId::new(id)) {
-                            Some(location) => {
-                                self.state.pushc(self.state.closure_var_stack.len())?;
-                                self.state.pushc(self.state.seh_stack.len())?;
-                                self.state.pushc(self.state.pc + 1)?;
-                                self.state.construct_stack.push(false);
-                                self.state.new_target_stack.push(Value::Undefined);
-                                self.state.jump(*location);
-                                return Ok(());
-                            }
-                            None => {
-                                return Err(RuntimeError::ReferenceError(format!(
-                                    "undefined function: {id}"
-                                )));
-                            }
-                        }
+                        // `return_pc` 与 `function_val` 先算出来：`open_frame` 要 `&mut self`，
+                        // 调用参数里就不能再有别的 `self` 借用。
+                        let return_pc = self.state.pc + 1;
+                        let function_val = self.materialize_function(id);
+                        self.open_frame(
+                            id,
+                            arg_count,
+                            Value::Undefined,
+                            function_val,
+                            &[],
+                            false,
+                            Value::Undefined,
+                            return_pc,
+                            module,
+                        )?;
+                        return Ok(());
                     }
                     Value::Object(obj_ref) => {
                         // A class constructor cannot be called without `new`.
@@ -2450,32 +2483,20 @@ impl VM {
                                 return Ok(());
                             }
 
-                            self.state.enter_frame(arg_count)?;
-                            self.state.this_val = captured_this.unwrap_or(Value::Undefined);
-                            self.state.function_val = Value::Object(Rc::clone(&obj_ref));
-                            for (name, value) in &captured_vars {
-                                let mut map = std::collections::HashMap::new();
-                                map.insert(name.clone(), value.clone());
-                                self.state.closure_var_stack.push(map);
-                            }
-                            match module.symtab.get(&FunctionId::new(id)) {
-                                Some(location) => {
-                                    self.state.pushc(self.state.closure_var_stack.len())?;
-                                    self.state.pushc(self.state.seh_stack.len())?;
-                                    self.state.pushc(self.state.pc + 1)?;
-                                    self.state.construct_stack.push(false);
-                                    self.state
-                                        .new_target_stack
-                                        .push(captured_new_target.unwrap_or(Value::Undefined));
-                                    self.state.jump(*location);
-                                    return Ok(());
-                                }
-                                None => {
-                                    return Err(RuntimeError::ReferenceError(format!(
-                                        "undefined function: {id}"
-                                    )));
-                                }
-                            }
+                            // `return_pc` 先算出来：`open_frame` 要 `&mut self`，不能再读 `self.state`。
+                            let return_pc = self.state.pc + 1;
+                            self.open_frame(
+                                id,
+                                arg_count,
+                                captured_this.unwrap_or(Value::Undefined),
+                                Value::Object(Rc::clone(&obj_ref)),
+                                &captured_vars,
+                                false,
+                                captured_new_target.unwrap_or(Value::Undefined),
+                                return_pc,
+                                module,
+                            )?;
+                            return Ok(());
                         }
                         return Err(RuntimeError::TypeError("not a function".to_string()));
                     }
