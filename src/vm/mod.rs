@@ -3732,6 +3732,16 @@ impl VM {
                 self.state.seh_stack.push(record);
             }
             Instr::EndTry {  } => {
+                // 深改第 2 步·待查：**不能**假设这条 `EndTry` 就是派生表里某个区域的终点。
+                //
+                // 试过加 `debug_assert!(module.eh_region_ending_at(pc).is_some())`，结果在
+                // "嵌套 try + catch 里再 throw" 的程序上直接响：`EndTry(pc=73) 关掉的不是
+                // EH 表里的任何区域`。也就是：**运行时的进出配对与静态派生的区域在某处
+                // 不一致** —— 要么有 EndTry 没有配对的 Try，要么我的深度计数/边界算法在
+                // 处理器里再嵌 try 时算错了。
+                //
+                // 这一条必须先查清才能把 seh_stack 退掉（否则退掉就等于把异常路径改一遍）。
+                // 登记见 `docs/architecture-redesign.md` §10.3。
                 self.state.seh_stack.pop();
             }
             Instr::ThrowExc { value } => {

@@ -195,6 +195,24 @@ test262 是绿的。差异核对（同一个语义、两条路径各写一遍）
 
 ---
 
+### 10.3 待查：有一条 `EndTry` 不在派生表的任何区域终点上
+
+给 `EndTry` 加 `debug_assert!(eh_region_ending_at(pc).is_some())` 时，在
+"嵌套 try，且 catch 里再 throw" 的程序上**直接响**：
+
+```
+EndTry(pc=73) 关掉的不是 EH 表里的任何区域
+```
+
+含义：**运行时的进出配对，与静态派生的区域，在某处不一致**。两种可能：
+
+- 有 `EndTry` 没有配对的 `Try`（发射端多发了一条）；
+- 我的区域 `end` 算法在"处理器块里再嵌 try"时算错了（深度计数把内外的 `EndTry` 配错，
+  或那条 `EndTry` 落在我算出的 `body.end` 之外）。
+
+**这一条必须先查清，才能把 `seh_stack` 退掉** —— 否则退掉就等于把异常路径悄悄改一遍。
+断言已撤（不能留一条会响的断言），现象与位置写在 `vm/mod.rs` 的 `EndTry` arm 里。
+
 ## 11. 分支与提交约定
 
 - 深改开**独立分支** `refactor/deep-arch`，与 `refactor/interpreter-p0a`（P0/P1 已落地部分）

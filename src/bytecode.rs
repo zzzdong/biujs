@@ -37,10 +37,18 @@ pub struct Module {
     pub exit_pc: HashMap<u32, usize>,
     pub instructions: Vec<Instr>,
     pub debug_instructions: BTreeMap<usize, crate::compiler::ir::Instruction>,
-    /// `pc` → 以它开头的 try 区域。**惰性构建的派生索引**：`Module` 编译后不可变，
+    /// try 区域的**惰性派生索引**（按起止两端都能查）：`Module` 编译后不可变，
     /// 所以缓存不会失效；而内容仍是 `eh_regions_of` 派生出来的，不会与指令流不一致。
     /// 存在的理由：查表要能在热路径上用，不能每次扫一遍指令流。
-    eh_index: OnceCell<HashMap<usize, EhRegion>>,
+    eh_index: OnceCell<EhIndex>,
+}
+
+/// try 区域的两张派生索引：按区域的**起点**（`Try` 的 pc）与**终点**（配对的 `EndTry`
+/// 的 pc）各一张。两端都要查：`Try` 用起点取处理器地址，`EndTry` 用终点验配对。
+#[derive(Default, Debug, Clone)]
+struct EhIndex {
+    by_start: HashMap<usize, EhRegion>,
+    by_end: HashMap<usize, EhRegion>,
 }
 
 /// 一个函数的字节码体（深改第 2 步的第一步）：它的**指令范围**。
@@ -102,20 +110,28 @@ impl Module {
         }
     }
 
-    /// 以 `pc` 开头的那个 try 区域（派生索引，只构建一次）。
-    pub fn eh_region_starting_at(&self, pc: usize) -> Option<EhRegion> {
-        self.eh_index
-            .get_or_init(|| {
-                let mut map = HashMap::new();
-                for (id, _) in self.bodies() {
-                    for region in self.eh_regions_of(id) {
-                        map.insert(region.start, region);
-                    }
+    /// EH 索引（惰性构建一次，之后都是 O(1) 查询）。
+    fn eh_index(&self) -> &EhIndex {
+        self.eh_index.get_or_init(|| {
+            let mut index = EhIndex::default();
+            for (id, _) in self.bodies() {
+                for region in self.eh_regions_of(id) {
+                    index.by_start.insert(region.start, region);
+                    index.by_end.insert(region.end, region);
                 }
-                map
-            })
-            .get(&pc)
-            .copied()
+            }
+            index
+        })
+    }
+
+    /// 以 `pc` 开头的那个 try 区域。
+    pub fn eh_region_starting_at(&self, pc: usize) -> Option<EhRegion> {
+        self.eh_index().by_start.get(&pc).copied()
+    }
+
+    /// 以 `pc` **结尾**的那个 try 区域（即：这条 `EndTry` 关的是哪个区域）。
+    pub fn eh_region_ending_at(&self, pc: usize) -> Option<EhRegion> {
+        self.eh_index().by_end.get(&pc).copied()
     }
 
     /// 某个函数的字节码体：它的指令范围（`symtab` 的入口 + `exit_pc` 的尾 `Ret`）。
