@@ -570,6 +570,10 @@ pub struct Frame {
 
 ### 7.7 M2-1 的迁移机制（先证等价，再切换 —— 沿用 M1 的做法）
 
+> **订正（A 步实测后）**：下面把"可变字段"只列成 `pc` / `this_state`。实测 `this`
+> 与 `func` 也在其中 —— `super()` 会按 ES `BindThisValue` 在**中帧**绑定派生 `this`
+> （`CallSuperSpread` 里那处写 `this_val`）。详见 §8.3 第 3 条。
+
 110 处搬运如果"改一处删一处"，中途任何一次提交都处在半迁移状态，回归噪声无法归因。
 所以**每个切片走两步**：
 
@@ -601,3 +605,74 @@ pub struct Frame {
 - **新增守卫**：`frames` 与已删除字段的"此刻一致"断言在 M2-1 期间可临时保留
   （旧的平行栈先不删、只在末尾断言与 `frames` 同步），最后一片再删旧字段 ——
   这是 M1 用过的"先证等价再切换"，本轮继续用。
+
+---
+
+## 8. M2-1a 的 A 步：`frames` 镜面 + 互校（2026-10-07）
+
+### 8.1 做了什么
+
+- 新增 `struct Frame { argc, construct, new_target, closure_depth, seh_depth, return_pc, ctrl_base }`
+  与 `State::frames: Vec<Frame>`。
+- 5 个开帧点（`open_frame` / `Call` / `New` / `push_generator_frame` /
+  `restore_generator_frame`）在三连 `pushc` 与 `construct`/`new_target` 的 push **之后**
+  调 `note_frame(closure_depth, seh_depth, return_pc)` —— **传的就是刚 push 进
+  `ctrl_stack` 的那三个值**，不重新算一遍。
+- 5 个收帧点（`Ret` / `unwind_frames_to` / `discard_generator_frame` /
+  `drive_bytecode_frame` / `restore_execution_state`）同步 `frames`。
+- `State::assert_frame_mirror()` 在 `step` 每条指令前跑（debug）：
+  `frames.len() == this_stack.len()`、`argc` / `construct` / `new_target` /
+  三连（按 `ctrl_base` 取）逐项相等。
+- **读点一个没改** ⇒ 行为零变化。
+
+### 8.2 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元（debug+release） | 205 | **205** | 不变 |
+| feature（debug+release） | 525 / 4 | **525 / 4** | 不变；**debug 下互校在全部 525 条上成立**（覆盖生成器 / `super()` / proxy / try-finally） |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | 逐字节一致 |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | 第五次同值 |
+| 告警 | lib 24 / lib test 26 / features 8 | **同** | 无新增 |
+
+`assert_frame_mirror` 每次 `step` 都跑，debug 下 525 条 feature 约 6.2s
+（不开时约 5.2s）—— 约 +20% 的 debug 时间，换来"开/收帧记账不分叉"的**全部**路径覆盖。
+这个代价只在 debug，可以接受。
+
+### 8.3 三个实测教训（都值得写下来）
+
+**1. 帧组的三项不是 `ctrl_stack` 的末三项。**
+第一版互校按"末三项"写，一跑就被打红：`镜面 return_pc 与 ctrl_stack 末项不一致
+left: 4 / right: 2`。原因：`PushC`/`PopC` 这对**指令**会把 `rsp`/`rbp` 压在**本帧三连
+之上**（它们是插在帧中间执行的）。所以镜面必须记下**本帧三连的起始下标** `ctrl_base`
+（`PushC`/`PopC` 成对出现 ⇒ 只要本帧活跃，这个下标就仍然指向它的三连）。
+⇒ 这是 §7.7 那条"`ctrl_stack` 里混着两种长度的条目"的具体后果。
+
+**2. `debug_assert_eq!` 在失败时会格式化 `Value`，而 `Value` 的 `Debug` 会递归进对象图
+—— 真正的失配被"栈溢出"掩盖了。**
+现象：`class C extends Error` 的用例变成 `has overflowed its stack`（把测试线程栈加到
+256MB 也照炸 ⇒ 无界递归）。实际原因只是互校断言失败，而**失败信息本身**把栈打爆。
+二分（先关掉断言）才定位到是断言。
+
+⇒ **通用教训（不只 M2）**：在这份代码里，任何可能失败并打印 `Value` 的断言都要写成
+`debug_assert!(a == b, "…")`，不要用 `debug_assert_eq!(a, b)`。已写进
+`assert_frame_mirror` 的文档注释。
+
+**3. `this`（与 `func`）属于"中帧也会写"那一组，不能进 A 步的镜面。**
+断言在 `class C extends Error` 与 `proxy::apply_and_construct_traps` 上报
+"非帧边界的写入"。根因：`CallSuperSpread` 在 `super()` 返回后按 ES 12.3.5.1
+`BindThisValue` 把派生类的 `this` 换成父构造器产出的对象 —— 它和 `this_state` 的
+BOUND 回填是同一件事的两半。
+
+⇒ 这**修正了 §7.7 的分类**：可变字段不只是 `pc` / `this_state`，`this` 也在其中。
+所以 `Frame` 现在只放能严格互校的集合（水位 + 返回地址 + 每帧 flag/argc），
+`pc` / `this` / `func` / `this_state` 留到 B 步**直接搬**（那时以字节码不变为证，
+而不是靠镜面）。已在 `CallSuperSpread` 那处写 `this_val` 的地方留了注释：
+**B 步要把这一处一起改**。
+
+### 8.4 下一步
+
+B 步：把读点从平行栈翻到 `frames`，按 §7.6 的切片顺序（1a 先做 `pc` + 三连 + `func`；
+`pc`/`this`/`func`/`this_state` 直接搬，其余翻读点）。全组翻完后删旧字段与互校断言。

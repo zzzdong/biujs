@@ -633,6 +633,9 @@ impl VM {
                 return Err(RuntimeError::RangeError(fired.message(self.timeout)));
             }
         }
+        // M2-1 互校：镜面与各平行栈必须一致。放在每条指令之前跑（debug 下），
+        // 所以任何一处开/收帧的分叉都会在下一条指令上被抓到，而不是等到很久以后。
+        self.state.assert_frame_mirror();
         match *inst {
             Instr::Halt {} => {
                 return Ok(false);
@@ -716,6 +719,8 @@ impl VM {
                         }
                     }
                     self.state.new_target_stack.pop();
+                    // M2-1 镜面：本帧收掉了（`frames` 与 `this_stack` 必须同长）。
+                    self.state.frames.pop();
                     self.state.closure_var_stack.truncate(saved_closure_depth);
                     self.state.seh_stack.truncate(saved_seh_depth);
                     // ES 9.2.2 step 13c: a derived constructor that returns a
@@ -1324,11 +1329,15 @@ impl VM {
                 )));
             }
         };
-        self.state.pushc(self.state.closure_var_stack.len())?;
-        self.state.pushc(self.state.seh_stack.len())?;
+        let closure_depth = self.state.closure_var_stack.len();
+        let seh_depth = self.state.seh_stack.len();
+        self.state.pushc(closure_depth)?;
+        self.state.pushc(seh_depth)?;
         self.state.pushc(return_pc)?;
         self.state.construct_stack.push(construct);
         self.state.new_target_stack.push(new_target);
+        // M2-1 镜面：与上面那三条 `pushc` 用**同一批值**（不是重新算一遍）。
+        self.state.note_frame(closure_depth, seh_depth, return_pc);
         self.state.jump(location);
         Ok(())
     }
@@ -1459,6 +1468,8 @@ impl VM {
         self.state.this_stack.truncate(saved_this_depth);
         self.state.this_state.truncate(saved_this_depth);
         self.state.frame_argc.truncate(saved_this_depth);
+        // M2-1 镜面：异常逃出被调帧时它的镜面条目也要收掉。
+        self.state.frames.truncate(saved_this_depth);
         self.state.this_val = saved_this;
         self.state.function_val = saved_function;
         self.state.construct_stack.truncate(saved_construct);
@@ -2521,11 +2532,15 @@ impl VM {
                         // Strict mode: this = undefined for regular function calls
                         self.state.this_val = Value::Undefined;
                         self.state.function_val = self.materialize_function(func_id as u32);
-                        self.state.pushc(self.state.closure_var_stack.len())?;
-                        self.state.pushc(self.state.seh_stack.len())?;
-                        self.state.pushc(self.state.pc + 1)?;
+                        let closure_depth = self.state.closure_var_stack.len();
+                        let seh_depth = self.state.seh_stack.len();
+                        let return_pc = self.state.pc + 1;
+                        self.state.pushc(closure_depth)?;
+                        self.state.pushc(seh_depth)?;
+                        self.state.pushc(return_pc)?;
                         self.state.construct_stack.push(false);
                         self.state.new_target_stack.push(Value::Undefined);
+                        self.state.note_frame(closure_depth, seh_depth, return_pc);
                         self.state.jump(location);
                         return Ok(());
                     }
@@ -3206,6 +3221,10 @@ impl VM {
                 // replaced by it; a bytecode parent hands the same one back.
                 if result.is_object() {
                     self.state.this_val = result.clone();
+                    // M2-1 实测：这里是一处**中帧写** `this_val`（不是帧边界的恢复）。
+                    // 它与 `this_state` 的 BOUND 回填是同一件事的两半，
+                    // 也是"`this` 不能进 A 步镜面"的直接证据（见 `assert_frame_mirror`）。
+                    // B 步把 `this` 搬进 `Frame` 时，**这一处要跟着改**。
                 }
                 self.state.set_register(Register::Rv, result)?;
             }
@@ -3916,11 +3935,15 @@ impl VM {
                         // via the [[Construct]] logic in `Ret`. This also avoids leaking a
                         // stale Rv value from a previous call.
                         self.state.set_register(Register::Rv, Value::Undefined)?;
-                        self.state.pushc(self.state.closure_var_stack.len())?;
-                        self.state.pushc(self.state.seh_stack.len())?;
-                        self.state.pushc(self.state.pc + 1)?;
+                        let closure_depth = self.state.closure_var_stack.len();
+                        let seh_depth = self.state.seh_stack.len();
+                        let return_pc = self.state.pc + 1;
+                        self.state.pushc(closure_depth)?;
+                        self.state.pushc(seh_depth)?;
+                        self.state.pushc(return_pc)?;
                         self.state.construct_stack.push(true);
                         self.state.new_target_stack.push(new_target_value);
+                        self.state.note_frame(closure_depth, seh_depth, return_pc);
                         self.state.jump(location);
                         return Ok(());
                     }
@@ -7731,6 +7754,8 @@ impl VM {
         self.state.construct_stack.truncate(construct_depth);
         self.state.new_target_stack.truncate(new_target_depth);
         self.state.closure_var_stack.truncate(closure_depth);
+        // M2-1 镜面：`this_depth` 就是"回退到第几帧"，与 `this_stack` 同一个水位。
+        self.state.frames.truncate(this_depth);
     }
 
     fn handle_throw(&mut self, exc_val: Value) -> Result<(), RuntimeError> {
@@ -8388,11 +8413,15 @@ impl VM {
             map.insert(name.clone(), value.clone());
             self.state.closure_var_stack.push(map);
         }
-        self.state.pushc(self.state.closure_var_stack.len())?;
-        self.state.pushc(self.state.seh_stack.len())?;
-        self.state.pushc(self.resume_sentinel(module))?;
+        let closure_depth = self.state.closure_var_stack.len();
+        let seh_depth = self.state.seh_stack.len();
+        let return_pc = self.resume_sentinel(module);
+        self.state.pushc(closure_depth)?;
+        self.state.pushc(seh_depth)?;
+        self.state.pushc(return_pc)?;
         self.state.construct_stack.push(false);
         self.state.new_target_stack.push(Value::Undefined);
+        self.state.note_frame(closure_depth, seh_depth, return_pc);
         self.state.jump(location);
         Ok(())
     }
@@ -8865,6 +8894,8 @@ impl VM {
         let _ = self.state.popc();
         let _ = self.state.popc();
         self.state.function_stack.pop();
+        // M2-1 镜面：`Ret` 没跑，这个帧的镜面条目同样要丢掉。
+        self.state.frames.pop();
     }
 
     /// Report what a finished run means for the generator object.
@@ -9025,11 +9056,15 @@ impl VM {
         // The body's live exception handlers come back with the frame; a
         // `finally` that had not run yet must still run.
         self.state.seh_stack.extend(frame.seh.iter().cloned());
-        self.state.pushc(self.state.closure_var_stack.len())?;
-        self.state.pushc(self.state.seh_stack.len())?;
-        self.state.pushc(self.resume_sentinel(module))?;
+        let closure_depth = self.state.closure_var_stack.len();
+        let seh_depth = self.state.seh_stack.len();
+        let return_pc = self.resume_sentinel(module);
+        self.state.pushc(closure_depth)?;
+        self.state.pushc(seh_depth)?;
+        self.state.pushc(return_pc)?;
         self.state.construct_stack.push(false);
         self.state.new_target_stack.push(Value::Undefined);
+        self.state.note_frame(closure_depth, seh_depth, return_pc);
         // The register file is global, not per frame, so the body's in-flight
         // values have to come back before anything else runs.
         for (slot, value) in self.state.registers.iter_mut().zip(frame.registers.iter()) {
@@ -9081,6 +9116,8 @@ impl VM {
         self.state.this_stack.truncate(saved.this_depth);
         self.state.this_state.truncate(saved.this_depth);
         self.state.frame_argc.truncate(saved.this_depth);
+        // M2-1 镜面：与 `this_stack` 同一个水位。
+        self.state.frames.truncate(saved.this_depth);
         self.state.this_val = saved.this.clone();
         self.state.function_val = saved.function.clone();
         self.state.construct_stack.truncate(saved.construct);
@@ -9814,6 +9851,44 @@ impl Default for VM {
     }
 }
 
+/// 一个活跃的调用帧（M2-1 的**镜面**阶段）。
+///
+/// **只镜像"开帧时写一次、之后只读"的字段。** 这个前提是实测出来的，不是设计时假设的：
+/// - `pc` 每条指令都改（`jump` / `step` 自增）；
+/// - `this_state` 被 `CallSuperSpread` 按帧回填；
+/// - `this` 被 `super()` 绑定（ES `BindThisValue`，`CallSuperSpread` 里那处中帧写）——
+///   最初把 `this` / `func` 也放进镜面，互校在 `class C extends Error` 与
+///   `proxy::apply_and_construct_traps` 上立刻报"非帧边界的写入"。
+///
+/// 把它们也镜像就等于把读点一起翻掉 —— 那不是"证等价"，是"直接切换"。
+/// 所以 A 步只覆盖能**严格互校**的集合（水位 + 返回地址 + 每帧的 flag/argc）：
+/// 互校失败只可能来自开/收帧的记账分叉，正是要抓的东西。
+/// `pc` / `this` / `func` / `this_state` 在 B 步直接搬进 `Frame`。
+///
+/// 与 `Vec<Frame>` 并列存在的那 9 条平行栈**先不删**：本阶段的目标是
+/// "证明镜面被正确维护"，切换是下一阶段的事（`deep-arch-log.md` §7.7）。
+#[derive(Debug, Clone, PartialEq)]
+struct Frame {
+    /// 实参个数（`State::frame_argc` 栈顶的镜像）。
+    argc: usize,
+    /// 是否 `[[Construct]]` 帧（`State::construct_stack` 栈顶的镜像）。
+    construct: bool,
+    /// `new.target`（`State::new_target_stack` 栈顶的镜像）。
+    new_target: Value,
+    /// 收帧时要回退到的水位（**绝对值**，ctl_stack 三连里的前两项）。
+    closure_depth: usize,
+    seh_depth: usize,
+    /// 返回地址（ctl_stack 三连里的第三项）。
+    return_pc: usize,
+    /// 本帧那三连在 `ctrl_stack` 里的**起始下标**。
+    ///
+    /// 为什么需要它：`PushC`/`PopC` 会把 `rsp`/`rbp` 压在本帧三连**之上**
+    /// （它们是插在帧中间的），所以"末三项"根本不是本帧的三连 ——
+    /// 第一版互校就是照"末三项"写的，一跑就被打红（实测 `left 4 / right 2`）。
+    /// `PushC`/`PopC` 成对出现 ⇒ 只要本帧还活跃，这个下标就仍指向它的三连。
+    ctrl_base: usize,
+}
+
 /// VM execution state
 struct State {
     data_stack: Vec<Value>,
@@ -9882,6 +9957,11 @@ struct State {
     /// `this_stack`. This is what `Opcode::Arguments` reads to build the
     /// `arguments` object: the callee has no other way to learn its arity.
     frame_argc: Vec<usize>,
+    /// **M2-1 的镜面**：每个活跃调用帧一条，与 `this_stack` 一一对应
+    /// （`frames.len() == this_stack.len()` 是本阶段断言的不变量之一）。
+    /// 它暂时只是平行栈的第二种存放；等读点翻完之后，平行栈会被删掉，
+    /// 它就变成唯一来源。
+    frames: Vec<Frame>,
     rsp: usize,
     rbp: usize,
     pc: usize,
@@ -9917,6 +9997,7 @@ impl State {
             this_stack: Vec::new(),
             this_state: Vec::new(),
             frame_argc: Vec::new(),
+            frames: Vec::new(),
             rsp: 0,
             rbp: 0,
             pc: 0,
@@ -10076,6 +10157,97 @@ impl State {
         self.function_stack.push(self.function_val.clone());
         self.frame_argc.push(argc);
         Ok(())
+    }
+
+    /// **M2-1 镜面**：把一个新帧记进 `frames`。
+    ///
+    /// 必须在 `enter_frame` + `this_val`/`function_val` 赋值 + 三条 `pushc` +
+    /// `construct_stack`/`new_target_stack` 的 push **之后**调用 —— 它读的就是那些栈顶。
+    /// 三个水位参数**故意由调用点传入**（就是刚 push 进 `ctrl_stack` 的那三个值），
+    /// 这样镜面与真值不可能来自两次不同的计算。
+    fn note_frame(&mut self, closure_depth: usize, seh_depth: usize, return_pc: usize) {
+        self.frames.push(Frame {
+            argc: self.frame_argc.last().copied().unwrap_or(0),
+            construct: self.construct_stack.last().copied().unwrap_or(false),
+            new_target: self
+                .new_target_stack
+                .last()
+                .cloned()
+                .unwrap_or(Value::Undefined),
+            closure_depth,
+            seh_depth,
+            return_pc,
+            // 三条 `pushc` 刚做完，本帧三连就是最上面三项。
+            ctrl_base: self.ctrl_stack.len() - 3,
+        });
+    }
+
+    /// **M2-1 的互校**：镜面必须与各平行栈此刻的顶部一致。
+    ///
+    /// 只在 debug 下跑（`step` 每次调用）。它抓的是"开/收帧的两套记账分叉" ——
+    /// 而那正是本阶段唯一新引入的风险。
+    ///
+    /// **一律用 `debug_assert!(a == b, "…")` 而不是 `debug_assert_eq!(a, b)`**：
+    /// 后者在失败时会格式化两个 `Value`，而 `Value::Debug` 会递归进对象图
+    /// （实测：在 `class C extends Error` 的用例上，真正失配的那次断言被
+    /// **栈溢出**掩盖了 —— 失败信息本身把栈打爆，看不到原始原因）。
+    fn assert_frame_mirror(&self) {
+        debug_assert!(
+            self.frames.len() == self.this_stack.len(),
+            "frames 与 this_stack 长度不一致（一帧一条；差一条就是开/收帧漏了一处）"
+        );
+        let Some(frame) = self.frames.last() else {
+            return;
+        };
+        debug_assert!(
+            frame.argc == self.frame_argc.last().copied().unwrap_or(0),
+            "镜面 argc 与 frame_argc 栈顶不一致"
+        );
+        debug_assert!(
+            frame.construct == self.construct_stack.last().copied().unwrap_or(false),
+            "镜面 construct 与 construct_stack 栈顶不一致"
+        );
+        debug_assert!(
+            frame.new_target
+                == self
+                    .new_target_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or(Value::Undefined),
+            "镜面 new_target 与 new_target_stack 栈顶不一致"
+        );
+        // `this` / `func` 只在帧边界写（`Ret` 从 `this_stack`/`function_stack` 恢复，
+        // `open_frame` / `Call` / `New` / 生成器两处在这里赋值），所以镜面可信。
+        // `this` / `func` **故意不在这里校验**：实测它们属于"中帧也会写"的那一组 ——
+        // `CallSuperSpread` 会在 `super()` 返回后把派生类的 `this` 绑成父构造器的结果
+        // （ES 12.3.5.1 `BindThisValue`），`this_state` 的 BOUND 回填是同一件事的另一半。
+        // 所以它们不满足"开帧时写一次、之后只读"这个前提，不属于 A 步能严格互校的集合；
+        // B 步直接把它们搬进 `Frame`（那时以字节码不变为证，而不是靠镜面）。
+        // `ctrl_stack` 的三连：`PushC`/`PopC` 会插在它**之上**，所以按本帧记录的
+        // `ctrl_base` 取，不能按"末三项"取。
+        debug_assert!(
+            frame.ctrl_base + 3 <= self.ctrl_stack.len(),
+            "本帧的三连已被弹掉（ctrl_base {} 越界，ctrl_stack 长 {}）",
+            frame.ctrl_base,
+            self.ctrl_stack.len()
+        );
+        if frame.ctrl_base + 3 <= self.ctrl_stack.len() {
+            debug_assert_eq!(
+                frame.closure_depth,
+                self.ctrl_stack[frame.ctrl_base],
+                "镜面 closure_depth 与本帧三连首项不一致"
+            );
+            debug_assert_eq!(
+                frame.seh_depth,
+                self.ctrl_stack[frame.ctrl_base + 1],
+                "镜面 seh_depth 与本帧三连第二项不一致"
+            );
+            debug_assert_eq!(
+                frame.return_pc,
+                self.ctrl_stack[frame.ctrl_base + 2],
+                "镜面 return_pc 与本帧三连第三项不一致"
+            );
+        }
     }
 
     /// Resolve `name` in the environment.
