@@ -119,3 +119,88 @@ fn calling_a_missing_method_throws_type_error() {
         "TypeError"
     );
 }
+
+/// #4 内层 catch **实际执行过**之后，外层的 handler 就丢了。
+///
+/// ```js
+/// function f() {
+///   try {
+///     try { throw 1; } catch (e) {}   // 这一次真的被内层抓住了
+///     throw 2;                        // 这个却逃到了顶层
+///   } catch (e2) { return 'caught:' + e2; }
+/// }
+/// f()
+/// ```
+/// - node：`caught:2`
+/// - 我们：抛到顶层（`Runtime error: 2`）
+///
+/// **根因（2026-10-07 定位）**：`handle_throw` 在 **catch 路径**上
+/// `self.state.seh_stack.pop()` 之后**没有把记录压回去**就跳进 `handler_pc`
+/// （`vm/mod.rs` 的 `handle_throw`：`pop()` → `handler_pc != 0` 分支只写 `Rv` + `jump`）。
+/// 而 `lower_try` 在 catch 末尾**还会发射一条 `EndTry`**（也 pop 一次）。
+/// 于是这次 catch **多弹了一层**，把**外层**的记录吃掉了。
+///
+/// 为什么常见写法侥幸正确：当被抓住的区域就是最外层时，多出来的那次 pop 是空操作
+/// （空栈 `pop()` 返回 `None`，被忽略）。所以它只在**嵌套**且**内层真的捕获过**时才现形。
+///
+/// 与 `lower_try` 里"catch 处不 pop SEH 记录"的注释直接矛盾 —— 那条注释描述的才是设计意图：
+/// 记录应当活过整个 catch，由 catch 末尾的 `EndTry` 收尾（一次 push 对一次 pop）。
+/// `SehRecord.catch_executed` 这个字段在当前行为下也几乎不会置位。
+///
+/// **归属**：这是运行期 `seh_stack` 记账的缺陷，`architecture-redesign.md` §4.6 的
+/// M2（`Frame.try_stack` + completion 传递）按构造消除它（没有"什么时候 pop"这个问题，
+/// 因为 handler 查找不再依赖一条栈）。在此之前它是已知偏差。
+#[test]
+#[ignore = "已知 bug #4：内层 catch 执行后外层 handler 丢失（handle_throw 在 catch 路径多弹一次）"]
+fn an_executed_inner_catch_does_not_swallow_the_outer_handler() {
+    // 最小复现：内层真的捕获过一次之后，外层 catch 必须还能接住后续的 throw。
+    assert_eq!(
+        eval_string(
+            "function f() {
+               try {
+                 try { throw 1; } catch (e) { 'inner'; }
+                 throw 2;
+               } catch (e2) { return 'caught:' + e2; }
+             }
+             f()"
+        ),
+        "caught:2"
+    );
+    // 同一件事在有 finally 的形状下（内层 catch + finally，外层 catch）：
+    assert_eq!(
+        eval_string(
+            "function g() {
+               var log = [];
+               try {
+                 try { throw 'a'; } catch (e) { log.push('c'); }
+                 throw 'b';
+               } catch (e2) { log.push('outer'); }
+               log.join(',')
+             }
+             g()"
+        ),
+        "c,outer"
+    );
+    // 内层 catch 里抛出的值要继续走外层（而不是被吞掉）：
+    assert_eq!(
+        eval_string(
+            "function h() {
+               try {
+                 try { throw 'first'; } catch (e) { throw 'second'; }
+               } catch (e2) { return 'caught:' + e2; }
+             }
+             h()"
+        ),
+        "caught:second"
+    );
+    // 界定范围：**没有嵌套**时一切正常（所以这条现在是绿的 —— 它证明问题只在嵌套下出现）。
+    assert_eq!(
+        eval_string(
+            "function k() {
+               try { throw 1; } catch (e) { return 'caught:' + e; }
+             }
+             k()"
+        ),
+        "caught:1"
+    );
+}

@@ -1,6 +1,6 @@
 use petgraph::{algo::dominators::Dominators, graph::NodeIndex};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::compiler::ir::instruction::Variable;
 use crate::compiler::ir::{BlockId, ControlFlowGraph, Instruction, Value};
@@ -100,9 +100,89 @@ impl<'a> SSABuilder<'a> {
         result
     }
 
+    /// 计算每个块**入口**处活跃的 SEH 区域集合（`may` 分析：任一条到达路径上活跃即算活跃）。
+    ///
+    /// **为什么不能用"按块顺序线性维护一条作用域栈"**：块的**物理顺序不是嵌套顺序**
+    /// （布局是 RPO，`catch` / `finally` 靠异常边到达）。实测：给旧的盲目 `pop()` 加上
+    /// "栈顶应当就是 `PopSeh` 声称要关的那条区域"的断言，一碰嵌套 try 立刻响 ——
+    /// `PopSeh(region block5) 弹到的是 region block1`。弹错作用域的直接后果是后面的
+    /// `Throw` 少收一条 handler 边，而那条边正是 `throw_to_handlers` 用来决定
+    /// "往哪个块写 phi 参数"的依据：**少 = 静默错编（读到旧值）**。
+    ///
+    /// 这里改成 CFG 数据流：`in[b] = ∪ out[pred]`，`out[b] = transfer(b, in[b])`，
+    /// `transfer` 就是块内按指令顺序 `PushSeh` 加、`PopSeh` 删。区域数有限、转移单调，
+    /// 所以迭代必然收敛（起步全空、逐轮只增）。
+    ///
+    /// **并集而不是交集是刻意的**：多一条边只会让 phi 参数多写一份（写进一个本来就会
+    /// 被覆盖的槽），少一条边才是错的。
+    fn compute_active_regions(&self) -> HashMap<BlockId, BTreeSet<BlockId>> {
+        fn transfer(block: &crate::compiler::ir::cfg::Block, mut set: BTreeSet<BlockId>) -> BTreeSet<BlockId> {
+            for inst in block.instructions() {
+                match inst {
+                    Instruction::PushSeh { body, .. } => {
+                        set.insert(*body);
+                    }
+                    Instruction::PopSeh { region } => {
+                        set.remove(region);
+                    }
+                    _ => {}
+                }
+            }
+            set
+        }
+
+        let entry = self.cfg.entry();
+        let mut in_sets: HashMap<BlockId, BTreeSet<BlockId>> = HashMap::new();
+        let mut out_sets: HashMap<BlockId, BTreeSet<BlockId>> = HashMap::new();
+
+        loop {
+            let mut changed = false;
+            for block in self.cfg.blocks() {
+                let mut incoming: BTreeSet<BlockId> = BTreeSet::new();
+                if entry != Some(block.id()) {
+                    for pred in self.cfg.get_precedences(block.id()) {
+                        if let Some(out) = out_sets.get(pred) {
+                            incoming.extend(out.iter().copied());
+                        }
+                    }
+                }
+                let outgoing = transfer(block, incoming.clone());
+                if in_sets.get(&block.id()) != Some(&incoming) {
+                    in_sets.insert(block.id(), incoming);
+                    changed = true;
+                }
+                if out_sets.get(&block.id()) != Some(&outgoing) {
+                    out_sets.insert(block.id(), outgoing);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        in_sets
+    }
+
     /// 预处理：扫描所有块，为每个Throw指令添加从throw块到对应SEH handler的异常边
     fn add_exception_edges_for_throws(&mut self) {
-        let mut seh_scope: Vec<(BlockId, Option<BlockId>)> = Vec::new();
+        // 区域身份 → `(handler, finally)`：`PushSeh` 声明，`PopSeh`/`Throw` 只用身份引用。
+        let mut region_handler: HashMap<BlockId, (BlockId, Option<BlockId>)> = HashMap::new();
+        for block in self.cfg.blocks() {
+            for inst in block.instructions() {
+                if let Instruction::PushSeh {
+                    handler,
+                    finally,
+                    body,
+                } = inst
+                {
+                    region_handler.insert(*body, (*handler, *finally));
+                }
+            }
+        }
+
+        // 每个块入口的活跃区域集合来自 **CFG 数据流**（见 `compute_active_regions`）。
+        let active_at_entry = self.compute_active_regions();
+
         let mut throw_edges: Vec<(BlockId, BlockId)> = Vec::new();
 
         // Track the outer SEH scope for each finally block (the scope BEFORE its PushSeh)
@@ -112,24 +192,37 @@ impl<'a> SSABuilder<'a> {
             HashMap::new();
 
         for block in self.cfg.blocks() {
+            // 块内的运行集合：**从数据流给出的入口集合开始，不跨块携带**。
+            // 这是本函数与旧实现唯一的实质差别 —— 旧实现把一条栈线性地带过所有块。
+            let mut scope: BTreeSet<BlockId> = active_at_entry
+                .get(&block.id())
+                .cloned()
+                .unwrap_or_default();
+            // 把集合还原成 handler 列表。`BTreeSet` 保证顺序确定 ⇒ 同一份源码生成同一份字节码。
+            let handlers_of = |scope: &BTreeSet<BlockId>| -> Vec<(BlockId, Option<BlockId>)> {
+                scope
+                    .iter()
+                    .filter_map(|r| region_handler.get(r).copied())
+                    .collect()
+            };
+
             for inst in block.instructions() {
                 match inst {
-                    Instruction::PushSeh {
-                        handler, finally, ..
-                    } => {
+                    Instruction::PushSeh { finally, body, .. } => {
                         if let Some(finally_blk) = finally {
-                            finally_outer_scope.insert(*finally_blk, seh_scope.clone());
+                            // 这条 finally 的"外层作用域"= 此刻已活跃的集合（**不含它自己**）。
+                            finally_outer_scope.insert(*finally_blk, handlers_of(&scope));
                         }
-                        seh_scope.push((*handler, *finally));
+                        scope.insert(*body);
                     }
-                    Instruction::PopSeh { .. } => {
-                        seh_scope.pop();
+                    Instruction::PopSeh { region } => {
+                        scope.remove(region);
                     }
                     Instruction::Throw { .. } => {
-                        for (catch_handler, finally_handler) in &seh_scope {
-                            throw_edges.push((block.id(), *catch_handler));
+                        for (catch_handler, finally_handler) in handlers_of(&scope) {
+                            throw_edges.push((block.id(), catch_handler));
                             if let Some(finally_blk) = finally_handler {
-                                throw_edges.push((block.id(), *finally_blk));
+                                throw_edges.push((block.id(), finally_blk));
                             }
                         }
                         break;

@@ -775,3 +775,51 @@ fn while_and_do_while_break_inside_try() {
         1.0
     );
 }
+
+/// 嵌套 try **之后**抛出的异常，外层 catch 必须看到 try 体里写入的当前值。
+///
+/// **回归（实测是静默错编，不是"看起来应该对"）**：`ssabuilder` 为每个 `Throw` 收集
+/// "往哪些 handler 加异常边"时，曾用一条**按块的物理顺序线性维护**的作用域栈 + 盲目
+/// `pop()`。而块的物理顺序**不是** SEH 嵌套顺序（布局是 RPO，`catch`/`finally` 靠异常边
+/// 到达），于是**内层**区域的 `PopSeh` 会把**外层**区域弹掉；此后在外层 try 体里抛出的
+/// 异常就收不到"外层 catch"这条边 —— 外层 catch 的 SSA phi 参数不被写入，它读到的是旧
+/// 版本（第一例实测 `x` 是 `1` 而不是 `2`）。
+///
+/// 现在活跃区域集合由 CFG 数据流给出（`compute_active_regions`）。**全量 test262
+/// 覆盖不到这个 bug**，是 feature 断言抓到的 —— 与 `interpreter-refactor.md` §3.3.6
+/// 那次"test262 全绿但语义错"同一类。
+///
+/// 注意这两个用例内层都不**实际捕获**异常：一旦内层 catch 在运行期真的跑起来，
+/// 会撞上另一个独立的既有 bug（`handle_throw` 在 catch 路径上多弹一次 `seh_stack`），
+/// 那条登记在 `known_bugs.rs` #4。
+#[test]
+fn a_throw_after_a_nested_try_reaches_the_outer_catch_with_the_current_value() {
+    // 1) 嵌套 try/catch（内层没抛），之后 throw：
+    assert_eq!(
+        eval_number(
+            "function f() {
+               var x = 1;
+               try {
+                 try { x = 2; } catch (e) {}
+                 throw 0;
+               } catch (e2) { return x; }
+             }
+             f()"
+        ),
+        2.0
+    );
+    // 2) 内层是 try/finally（无 catch）时同样成立，且 finally 的修改可见：
+    assert_eq!(
+        eval_number(
+            "function f() {
+               var y = 3;
+               try {
+                 try { y = 4; } finally { y = y + 1; }
+                 throw 0;
+               } catch (e) { return y; }
+             }
+             f()"
+        ),
+        5.0
+    );
+}
