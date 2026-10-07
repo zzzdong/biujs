@@ -10216,13 +10216,28 @@ impl State {
                     .unwrap_or(Value::Undefined),
             "镜面 new_target 与 new_target_stack 栈顶不一致"
         );
-        // `this` / `func` 只在帧边界写（`Ret` 从 `this_stack`/`function_stack` 恢复，
-        // `open_frame` / `Call` / `New` / 生成器两处在这里赋值），所以镜面可信。
-        // `this` / `func` **故意不在这里校验**：实测它们属于"中帧也会写"的那一组 ——
+        // 已实测：`this` 与 `func` **都**不满足"只在帧边界写"这个前提，所以都不在镜面里。
+        // 两者都不因此被放弃 —— 它们在 B 步**直接搬进 `Frame`**：
+        // 搬完之后"当前的 `this` / 当前函数是谁"由帧唯一决定，下面这两种分叉按构造消失。
+        // `func` **与 `this` 一样，故意不在这里校验**：实测它也属于"中帧也会写"的那一组。
+        // 实测数据（pc=380、frames=1、function_stack=1）：
+        //   frames.last().func = objFn#5（func_id 5）
+        //   state.function_val = objFn#1（func_id 1）
+        //   function_stack 栈顶 = undefined（说明这一帧是从脚本层开的）
+        // ⇒ 九处 `function_val =` 全在帧边界上，所以分叉不可能来自那些写点；
+        //   根因是 **`SavedExecutionState` 独立保存/恢复 `function_val` 却不保存帧身份**
+        //   （`save_execution_state` 的 `function` 字段 / `restore_execution_state` 的赋值）：
+        //   一次嵌套运行之后，`function_val` 可以与当前帧对不上。
+        //   这是既有代码里的一处**潜伏记账分叉**（无观测影响，但它是真的）。
+        //
+        // 这件事本身是"把 `func` 搬进 `Frame`"的**理由**：搬完之后调用方是谁由帧决定，
+        // 分叉按构造消失。所以 B 步直接搬（以字节码不变 + 套件为证），不靠镜面。
+        //
+        // `this` **故意不在这里校验**：实测它属于"中帧也会写"的那一组 ——
         // `CallSuperSpread` 会在 `super()` 返回后把派生类的 `this` 绑成父构造器的结果
         // （ES 12.3.5.1 `BindThisValue`），`this_state` 的 BOUND 回填是同一件事的另一半。
-        // 所以它们不满足"开帧时写一次、之后只读"这个前提，不属于 A 步能严格互校的集合；
-        // B 步直接把它们搬进 `Frame`（那时以字节码不变为证，而不是靠镜面）。
+        // 所以它不满足"开帧时写一次、之后只读"这个前提，不属于 A 步能严格互校的集合；
+        // B 步直接把它搬进 `Frame`（那时以字节码不变为证，而不是靠镜面）。
         // `ctrl_stack` 的三连：`PushC`/`PopC` 会插在它**之上**，所以按本帧记录的
         // `ctrl_base` 取，不能按"末三项"取。
         debug_assert!(

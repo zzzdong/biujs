@@ -570,6 +570,10 @@ pub struct Frame {
 
 ### 7.7 M2-1 的迁移机制（先证等价，再切换 —— 沿用 M1 的做法）
 
+> **订正（B 步开工后）**：本节的 §7.6 切片顺序已被 **§9.5** 取代 ——
+> B 步又证伪了两个字段（`func` / `pc`），并发现 **`pc` 必须与"顶层脚本变成帧"一起做**。
+> 以 §9.5 的顺序为准。
+
 > **订正（A 步实测后）**：下面把"可变字段"只列成 `pc` / `this_state`。实测 `this`
 > 与 `func` 也在其中 —— `super()` 会按 ES `BindThisValue` 在**中帧**绑定派生 `this`
 > （`CallSuperSpread` 里那处写 `this_val`）。详见 §8.3 第 3 条。
@@ -676,3 +680,68 @@ BOUND 回填是同一件事的两半。
 
 B 步：把读点从平行栈翻到 `frames`，按 §7.6 的切片顺序（1a 先做 `pc` + 三连 + `func`；
 `pc`/`this`/`func`/`this_state` 直接搬，其余翻读点）。全组翻完后删旧字段与互校断言。
+
+---
+
+## 9. M2-1a/B 开工前：又两个字段被证伪进不了镜面，并**定位到一处潜伏记账分叉**（2026-10-07）
+
+### 9.1 做了什么
+
+按 §7.6 的切片 1a，先把 `function_val` 加进镜面试互校（它与 `this` 一起被移出过镜面，
+但 `this` 才是那次失败的那个，`func` 从未被单独证实）。**它也不成立** —— 于是回退这次试探，
+把结论与根因记下来，**不留半迁移状态**（树保持绿：单元 205 / feature 525）。
+
+### 9.2 实测数据（不是推测）
+
+`proxy::apply_and_construct_traps` 上互校报错，加临时诊断（不格式化 `Value`）打出函数号：
+
+```
+M2-1 诊断(func): pc=380 frames=1 function_stack=1
+                 mirror=objFn#5   state=objFn#1   fn_stack_top=undef
+```
+
+即：`frames.last().func` 是 `func_id = 5` 的那个函数对象，而 `state.function_val` 是
+`func_id = 1` 的，且 `function_stack` 栈顶是 `undefined`（说明这一帧是从**脚本层**开的）。
+
+### 9.3 根因：`SavedExecutionState` 独立保存/恢复 `function_val`，却不保存帧身份
+
+关键推理：`function_val` 在全文件**只有 9 处赋值，且全部在帧边界上**
+（`Ret` / `open_frame` / `Call` / `New` / 两处生成器 / `unwind_frames_to` /
+`drive_bytecode_frame` 的恢复 / `restore_execution_state`）。所以分叉**不可能**来自那些写点。
+
+真正的原因在最后那一处：`save_execution_state` 把 `function_val` 快照进
+`SavedExecutionState.function`，`restore_execution_state` 再把它写回来 ——
+**但它只快照了这个值，没有快照帧身份**。于是一次嵌套运行（生成器体 / `invoke` /
+`drive_bytecode_frame`）之后，`function_val` 可以与"当前帧是谁"对不上。
+
+⇒ 这是一处既有的**潜伏记账分叉**：当前无观测影响（`function_val` 只被
+`LoadCurrentFunction` / `MakeArrowFuncObj` / `current_function_id` 读，都不是控制流依据），
+但它是真的，而且它正好说明**为什么 `func` 应该进 `Frame`** ——
+搬完之后"调用方是谁"由帧决定，分叉按构造消失。
+
+### 9.4 由此修正的施工口径
+
+| 字段 | 能否进 A 步镜面 | 理由 | B 步怎么搬 |
+|---|---|---|---|
+| `argc` / `construct` / `new_target` / `closure_depth` / `seh_depth` / `return_pc` | **能**（已落，全绿） | 只在帧边界写 | 翻读点 |
+| `this` | **不能** | `super()` 按 `BindThisValue` 中帧绑定 | **直接搬**（已在那处写好注释提醒） |
+| `func` | **不能** | `SavedExecutionState` 的独立恢复（§9.3） | **直接搬**，顺带删掉 `function_stack`（调用方是谁改由 `frames[len-2]` 给） |
+| `pc` | **不能** | 每条指令都改 | **直接搬**；前提是先把**顶层脚本也变成一个帧**（否则 pc 无处可放） |
+| `this_state` | **不能** | `CallSuperSpread` 按帧回填 BOUND | **直接搬** |
+
+⇒ **`pc` 与"顶层脚本也是一个帧"必须一起做**（§4.3 陷阱 5 早就写了这一条，现在有了硬理由：
+不先把脚本变成帧，`pc` 就没有唯一的家）。
+
+### 9.5 对切片顺序的影响（更新 §7.6）
+
+原顺序是 1a（`pc`+三连+`func`）→ 1b → 1c → 1d → 1e。按上面的证伪结果，
+**1a 应当拆开、并把"脚本帧"提到最前**：
+
+| 新顺序 | 内容 | 说明 |
+|---|---|---|
+| **1a** | **顶层脚本变成帧** + `pc` 进 `Frame` | 两者必须同时做；`Ret` 的"是不是最外层"改判 `frames.len() == 1`；`ctrl_stack_reached_bottom()` 退役 |
+| **1b** | `ctrl_stack` 的三连退役（只留 `PushC`/`PopC`） | 三连**已经**被镜面证明正确，所以这一片是纯翻读点；顺带把 `invoke_boundaries` / `SehRecord.saved_ctrl_depth` 改成帧深度 |
+| **1c** | `func` 直接搬 + 删 `function_stack` + 删 `SavedExecutionState.function` | 顺带消掉 §9.3 那处分叉 |
+| **1d** | `this` / `this_state` 直接搬（含 `super()` 那处中帧写） | 与 1c 同批也可，但 `this_state` 有"按帧回填"语义，单独更清楚 |
+| **1e** | `construct` / `new_target` / `argc` 的读点翻到 `frames`，删这三条栈 | 已镜面证明 |
+| **1f** | `closure_depth` / `seh_depth` 水位翻到 `frames`，删对应簿记 | 已镜面证明；这一片之后三路收帧可以合并成助手 |
