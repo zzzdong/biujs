@@ -642,7 +642,6 @@ impl VM {
         }
         // M2-1 互校：镜面与各平行栈必须一致。放在每条指令之前跑（debug 下），
         // 所以任何一处开/收帧的分叉都会在下一条指令上被抓到，而不是等到很久以后。
-        self.state.assert_frame_mirror();
         match *inst {
             Instr::Halt {} => {
                 return Ok(false);
@@ -714,18 +713,19 @@ impl VM {
                     // would replace a primitive return value with `this`.
                     let returned = self.state.get_register(Register::Rv)?;
                     // 调用方的 `this` 与构造器状态随 `frames.pop()` 一起回来 —— 它们在帧里。
-                    self.state.frame_argc.pop();
                     // If this frame was invoked via `new`, apply [[Construct]] return
                     // semantics: a returned object becomes the result, otherwise the
                     // newly created `this` object is used.
-                    if let Some(true) = self.state.construct_stack.pop() {
+                    // `[[Construct]]` 语义用的 flag 也在帧里（以前要 pop 一条平行栈）。
+                    let frame_construct = self.state.frames.last().is_some_and(|f| f.construct);
+                    if frame_construct {
                         let rv = self.state.get_register(Register::Rv)?;
                         if !rv.is_object() {
                             self.state.set_register(Register::Rv, frame_this)?;
                         }
                     }
-                    self.state.new_target_stack.pop();
-                    // 本帧收掉了（`frames` 与 `frame_argc` 必须同长 —— 镜面断言之一）。
+                    // 本帧收掉了；帧自己带着 `argc` / `construct` / `new.target`，
+                    // 所以没有平行栈要跟它一起退。
                     self.state.frames.pop();
                     self.state.closure_var_stack.truncate(saved_closure_depth);
                     self.state.seh_stack.truncate(saved_seh_depth);
@@ -1295,7 +1295,7 @@ impl VM {
     /// 开一帧：压好参数之后的全部准备工作。
     ///
     /// `enter_frame` → `this` / 函数对象 → 闭包捕获变量 →
-    /// `construct_stack` / `new_target` → `jump` 到函数入口。**顺序有讲究**：
+    /// 组装出生值 → `note_frame` → `jump` 到函数入口。**顺序有讲究**：
     /// `this` 与函数对象都是**出生参数**（直接进新帧），所以这里不再有"先快照调用方的值"
     /// 这一步 —— 调用方那一帧里本来就有它自己的 `this` 与函数对象。
     ///
@@ -1315,7 +1315,7 @@ impl VM {
         new_target: Value,
         module: &Module,
     ) -> Result<(), RuntimeError> {
-        self.state.enter_frame(argc)?;
+        self.state.enter_frame()?;
         for (name, value) in captured_vars {
             let mut map = std::collections::HashMap::new();
             map.insert(name.clone(), value.clone());
@@ -1331,9 +1331,17 @@ impl VM {
         };
         let closure_depth = self.state.closure_var_stack.len();
         let seh_depth = self.state.seh_stack.len();
-        self.state.construct_stack.push(construct);
-        self.state.new_target_stack.push(new_target);
-        self.state.note_frame(location, function_val.clone(), this, THIS_NONE, closure_depth, seh_depth);
+        self.state.note_frame(FrameBirth {
+            pc: location,
+            func: function_val.clone(),
+            this,
+            this_state: THIS_NONE,
+            argc,
+            construct,
+            new_target,
+            closure_depth,
+            seh_depth,
+        });
         Ok(())
     }
 
@@ -1344,7 +1352,7 @@ impl VM {
     /// return address one past the last instruction.
     ///
     /// **两种模式共用这一份实现**（P1）：`[[Call]]` 与 `[[Construct]]` 的差别只有四处 ——
-    /// `this`（传入的 vs 新建的实例）、函数对象/`new.target`、`construct_stack`
+    /// `this`（传入的 vs 新建的实例）、函数对象/`new.target`、`construct` 标志
     /// 的标志位、以及构造帧先把 `Rv` 清成 `undefined`。以前这四处差异是靠**两份 100 行
     /// 的拷贝**表达的（`drive_bytecode_frame` 与 `invoke_construct`），改一处忘一处就是
     /// B45/B46 那种"为了一个特性到处打补丁"。
@@ -1362,8 +1370,6 @@ impl VM {
         let saved_rbp = self.state.rbp;
         let saved_closure = self.state.closure_var_stack.len();
         let saved_seh = self.state.seh_stack.len();
-        let saved_construct = self.state.construct_stack.len();
-        let saved_new_target = self.state.new_target_stack.len();
         // **边界 = 调用方的帧深度**，一个值同时回答两个问题：
         // 1. 嵌套循环什么时候停（`frames.len() <= boundary`）；
         // 2. 哪些 SEH 记录属于外层帧、必须让异常穿出去（`handle_throw`）。
@@ -1459,15 +1465,13 @@ impl VM {
         // 所以在这里把它的保存项都丢掉。没有这一步，一个 *接住* 异常并继续
         // 在同一帧里跑的原生（`Promise` 的执行器）会 `PopC` 到过期的 `rbp`。
         self.state.reg_saves.truncate(saved_reg_saves);
-        // 调用方的 `pc` 由 `frames.truncate(saved_this_depth)` 恢复（它在帧里）。
+        // 调用方的 `pc` / `this` / `func` / `argc` / `new.target` 都由下面这条
+        // `frames.truncate(boundary)` 一起恢复 —— 它们全在帧里。
         self.state.rsp = saved_rsp;
         self.state.rbp = saved_rbp;
         self.state.closure_var_stack.truncate(saved_closure);
         self.state.seh_stack.truncate(saved_seh);
-        self.state.frame_argc.truncate(boundary);
         self.state.frames.truncate(boundary);
-        self.state.construct_stack.truncate(saved_construct);
-        self.state.new_target_stack.truncate(saved_new_target);
 
         outcome?;
         let rv = self.state.get_register(Register::Rv)?;
@@ -2522,22 +2526,23 @@ impl VM {
                 }
                 match module.entry_pc(func_id as u32) {
                     Some(location) => {
-                        self.state.enter_frame(arg_count)?;
+                        self.state.enter_frame()?;
                         let callee_func = self.materialize_function(func_id as u32);
                         let closure_depth = self.state.closure_var_stack.len();
                         let seh_depth = self.state.seh_stack.len();
                         // 调用点自己把**调用方**的 pc 推进一步（以前由 `Ret` 的 jump(return_pc) 做）。
                         self.state.jump_offset(1);
-                        self.state.construct_stack.push(false);
-                        self.state.new_target_stack.push(Value::Undefined);
-                        self.state.note_frame(
-                            location,
-                            callee_func,
-                            Value::Undefined,
-                            THIS_NONE,
+                                                                        self.state.note_frame(FrameBirth {
+                            pc: location,
+                            func: callee_func,
+                            this: Value::Undefined,
+                            this_state: THIS_NONE,
+                            argc: arg_count,
+                            construct: false,
+                            new_target: Value::Undefined,
                             closure_depth,
                             seh_depth,
-                        );
+                        });
                         return Ok(());
                     }
                     None => {
@@ -3132,7 +3137,7 @@ impl VM {
                 // Collect the tail of the incoming arguments into a fresh
                 // array: args[from..] where arg i lives at [rbp - (i + 1)].
                 let from = from.as_immd().max(0) as usize;
-                let argc = self.state.frame_argc.last().copied().unwrap_or(0);
+                let argc = self.current_argc();
                 let rbp = self.state.rbp as isize;
                 let mut arr = ArrayObject::new();
                 if argc > from {
@@ -3187,12 +3192,7 @@ impl VM {
                             "CallSuperSpread: arguments must be array-like".to_string(),
                         )
                     })?;
-                let new_target = self
-                    .state
-                    .new_target_stack
-                    .last()
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
+                let new_target = self.current_new_target();
                 // ES 12.3.5.1: `super()` binds the derived constructor's `this`.
                 // Cleared *before* the call runs, because the parent's own frame
                 // pushes an entry onto the same stack.
@@ -3391,7 +3391,7 @@ impl VM {
             Instr::Arguments { dst } => {
                 // The callee's arguments live just below its frame pointer:
                 // `arg i` sits at `rbp - argc + i` (see `enter_frame`).
-                let argc = self.state.frame_argc.last().copied().unwrap_or(0);
+                let argc = self.current_argc();
                 let rbp = self.state.rbp;
                 let mut arr = ArrayObject::new();
                 for i in 0..argc {
@@ -3756,8 +3756,6 @@ impl VM {
                     saved_closure_depth: self.state.closure_var_stack.len(),
                     saved_reg_saves: self.state.reg_saves.len(),
                     saved_frame_depth: self.state.frames.len(),
-                    saved_construct_depth: self.state.construct_stack.len(),
-                    saved_new_target_depth: self.state.new_target_stack.len(),
                 };
                 self.state.seh_stack.push(record);
             }
@@ -3921,7 +3919,7 @@ impl VM {
                 // 5. Save closure depth, SEH depth and return PC, then jump to constructor
                 match module.entry_pc(func_id) {
                     Some(location) => {
-                        self.state.enter_frame(arg_count)?;
+                        self.state.enter_frame()?;
                         // 派生构造器的 `this` 出生即"未绑定"（ES 9.2.2 / 12.3.5.1）。
                         // 以前这是 `enter_frame` 之后一次单独的 `mark_this_uninitialized`；
                         // 现在它是帧的**出生参数** —— 不必先建一个半成品再去改它。
@@ -3940,16 +3938,17 @@ impl VM {
                         let seh_depth = self.state.seh_stack.len();
                         // 调用点自己把**调用方**的 pc 推进一步（以前由 `Ret` 的 jump(return_pc) 做）。
                         self.state.jump_offset(1);
-                        self.state.construct_stack.push(true);
-                        self.state.new_target_stack.push(new_target_value);
-                        self.state.note_frame(
-                            location,
-                            callee_func,
-                            new_obj_val,
-                            initial_this_state,
+                                                                        self.state.note_frame(FrameBirth {
+                            pc: location,
+                            func: callee_func,
+                            this: new_obj_val,
+                            this_state: initial_this_state,
+                            argc: arg_count,
+                            construct: true,
+                            new_target: new_target_value.clone(),
                             closure_depth,
                             seh_depth,
-                        );
+                        });
                         return Ok(());
                     }
                     None => {
@@ -3970,12 +3969,7 @@ impl VM {
                 // `new.target` is per frame: the constructor for a `[[Construct]]`
                 // frame, otherwise undefined (an arrow frame carries the value
                 // captured when the arrow object was created).
-                let value = self
-                    .state
-                    .new_target_stack
-                    .last()
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
+                let value = self.current_new_target();
                 self.set_value(dst, value)?;
             }
             Instr::LoadCurrentFunction { dst } => {
@@ -4028,12 +4022,7 @@ impl VM {
                 // An arrow has no `[[Construct]]`: it inherits `new.target` from
                 // the frame that created it, so capture that value here (the
                 // same create-time snapshot rule used for `this`).
-                let captured_new_target = self
-                    .state
-                    .new_target_stack
-                    .last()
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
+                let captured_new_target = self.current_new_target();
                 // `fn.length` / `fn.name` come from the compiler's per-function
                 // metadata, exactly as for ordinary functions.
                 let (arrow_name, arrow_arity) = self
@@ -7720,8 +7709,6 @@ impl VM {
         &mut self,
         reg_saves_depth: usize,
         frame_depth: usize,
-        construct_depth: usize,
-        new_target_depth: usize,
         closure_depth: usize,
     ) {
         // 被回退的那些帧可能留下没来得及 `PopC` 的保存项 —— 它们必须一起丢，
@@ -7730,9 +7717,6 @@ impl VM {
         // **切片 1b 之前这件事是顺手做的**（帧的簿记与 `PushC` 的簿记同挤在
         // 一条 `ctrl_stack` 上，一次 truncate 清两样）—— 分开之后就必须显式记两次。
         self.state.reg_saves.truncate(reg_saves_depth);
-        self.state.frame_argc.truncate(frame_depth);
-        self.state.construct_stack.truncate(construct_depth);
-        self.state.new_target_stack.truncate(new_target_depth);
         self.state.closure_var_stack.truncate(closure_depth);
         // 帧自己带着 `this` / `this_state` / `argc`，所以"回退到第几帧"一步到位 ——
         // 以前这里要分别 truncate `this_stack` / `this_state` / `frame_argc` 三条平行栈。
@@ -7759,8 +7743,6 @@ impl VM {
                 self.unwind_frames_to(
                     record.saved_reg_saves,
                     record.saved_frame_depth,
-                    record.saved_construct_depth,
-                    record.saved_new_target_depth,
                     record.saved_closure_depth,
                 );
 
@@ -8386,7 +8368,7 @@ impl VM {
             self.state.push(arg.clone())?;
         }
         self.state.rbp = self.state.rsp;
-        self.state.enter_frame(args.len())?;
+        self.state.enter_frame()?;
         let callee_func = self.materialize_function(func_id);
         for (name, value) in captured_vars {
             let mut map = std::collections::HashMap::new();
@@ -8395,16 +8377,17 @@ impl VM {
         }
         let closure_depth = self.state.closure_var_stack.len();
         let seh_depth = self.state.seh_stack.len();
-        self.state.construct_stack.push(false);
-        self.state.new_target_stack.push(Value::Undefined);
-        self.state.note_frame(
-            location,
-            callee_func,
-            this.clone(),
-            THIS_NONE,
+                        self.state.note_frame(FrameBirth {
+            pc: location,
+            func: callee_func,
+            this: this.clone(),
+            this_state: THIS_NONE,
+            argc: args.len(),
+            construct: false,
+            new_target: Value::Undefined,
             closure_depth,
             seh_depth,
-        );
+        });
         Ok(())
     }
 
@@ -8844,6 +8827,21 @@ impl VM {
             .unwrap_or(Value::Undefined)
     }
 
+    /// 当前帧的实参个数（`Opcode::Arguments` / `MakeRest` 与"没传的形参读 undefined"
+    /// 那条规则都靠它）。
+    fn current_argc(&self) -> usize {
+        self.state.frames.last().map_or(0, |frame| frame.argc)
+    }
+
+    /// 当前帧的 `new.target`。箭头函数在创建时快照这个值，所以它也是每帧的。
+    fn current_new_target(&self) -> Value {
+        self.state
+            .frames
+            .last()
+            .map(|frame| frame.new_target.clone())
+            .unwrap_or(Value::Undefined)
+    }
+
     fn current_function_id(&self) -> Option<u32> {
         match &self.current_func() {
             Value::Function(id) => Some(*id),
@@ -9086,7 +9084,7 @@ impl VM {
         self.state.rbp = base + frame.argc;
         self.state.rsp = self.state.rbp + frame.bp_offset;
         let callee_func = frame.function_val.clone();
-        self.state.enter_frame(frame.argc)?;
+        self.state.enter_frame()?;
         for map in &frame.closure_maps {
             self.state.closure_var_stack.push(map.clone());
         }
@@ -9095,16 +9093,17 @@ impl VM {
         self.state.seh_stack.extend(frame.seh.iter().cloned());
         let closure_depth = self.state.closure_var_stack.len();
         let seh_depth = self.state.seh_stack.len();
-        self.state.construct_stack.push(false);
-        self.state.new_target_stack.push(Value::Undefined);
-        self.state.note_frame(
-            module.instructions.len(),
-            callee_func,
-            frame.this.clone(),
-            THIS_NONE,
+                        self.state.note_frame(FrameBirth {
+            pc: module.instructions.len(),
+            func: callee_func,
+            this: frame.this.clone(),
+            this_state: THIS_NONE,
+            argc: frame.argc,
+            construct: false,
+            new_target: Value::Undefined,
             closure_depth,
             seh_depth,
-        );
+        });
         // The register file is global, not per frame, so the body's in-flight
         // values have to come back before anything else runs.
         for (slot, value) in self.state.registers.iter_mut().zip(frame.registers.iter()) {
@@ -9136,8 +9135,6 @@ impl VM {
             closure: self.state.closure_var_stack.len(),
             seh: self.state.seh_stack.len(),
             frame_depth: self.state.frames.len(),
-            construct: self.state.construct_stack.len(),
-            new_target: self.state.new_target_stack.len(),
             delegate: self.delegate_stack.len(),
             registers: std::array::from_fn(|i| self.state.registers[i].clone()),
         }
@@ -9148,10 +9145,7 @@ impl VM {
         self.state.rbp = saved.rbp;
         self.state.closure_var_stack.truncate(saved.closure);
         self.state.seh_stack.truncate(saved.seh);
-        self.state.frame_argc.truncate(saved.frame_depth);
         self.state.frames.truncate(saved.frame_depth);
-        self.state.construct_stack.truncate(saved.construct);
-        self.state.new_target_stack.truncate(saved.new_target);
         self.delegate_stack.truncate(saved.delegate);
         // The register file is *global*, not per frame: a nested run (a
         // generator body, an `invoke`) overwrites values the caller still has
@@ -9192,7 +9186,7 @@ impl VM {
         delegate_depth: usize,
         seh_depth: usize,
     ) -> crate::vm::object::SuspendedFrame {
-        let argc = self.state.frame_argc.last().copied().unwrap_or(0);
+        let argc = self.current_argc();
         let start = self.state.rbp.saturating_sub(argc);
         let end = self.state.rsp.min(self.state.data_stack.len());
         let data = if end > start {
@@ -9881,12 +9875,32 @@ impl Default for VM {
     }
 }
 
+/// 一个**新帧的出生值**：全部由开帧点显式给出。
+///
+/// 为什么是具名字段而不是九个位置参数：镜面互校（`assert_frame_mirror`）在切片 1e
+/// 就要退役了 —— 它以前正是靠"帧 vs 平行栈"的交叉校验兜住"搬错行"这类错误。
+/// 守卫退场的同时把参数改成**具名**的，是为了让这类错误在代码上就直接看得出来。
+///
+/// 字段与 `Frame` 一一对应（少 `closure_depth` / `seh_depth` 之外的东西？不 —— 就是
+/// `Frame` 的全部字段），`note_frame` 把它整体搬进 `Frame`。
+struct FrameBirth {
+    pc: usize,
+    func: Value,
+    this: Value,
+    this_state: u8,
+    argc: usize,
+    construct: bool,
+    new_target: Value,
+    closure_depth: usize,
+    seh_depth: usize,
+}
+
 /// 一个活跃的调用帧。
 ///
 /// **迁移进度**（`deep-arch-log.md` §7.7 / §13 / §14）：`pc` 与
 /// `closure_depth` / `seh_depth` 已经是**权威记录**（不再是别处的镜像）；
-/// `argc` / `construct` / `new_target` 目前还是 `frame_argc` /
-/// `construct_stack` / `new_target_stack` 栈顶的**镜像**（切片 1e 收口）。
+/// 切片 1e 之后 `argc` / `construct` / `new_target` 也进了帧 ——
+/// 那三条平行栈与 `assert_frame_mirror` 随之整套退役。
 ///
 /// **为什么有些字段不能先进镜面**：镜面阶段要求"开帧时写一次、之后只读"，
 /// 而这个前提是**实测**出来的，不是设计时假设的：
@@ -9922,11 +9936,12 @@ struct Frame {
     /// **取代了 `State::function_val` + 平行的 `function_stack`**：那两套记账
     /// 与帧身份是分离的，嵌套运行之后可以对不上（§9.3 实测）。现在由帧回答。
     func: Value,
-    /// 实参个数（`State::frame_argc` 栈顶的镜像）。
+    /// 实参个数（`Opcode::Arguments` / `MakeRest` 与"没传的形参读 undefined"靠它）。
     argc: usize,
-    /// 是否 `[[Construct]]` 帧（`State::construct_stack` 栈顶的镜像）。
+    /// 是否 `[[Construct]]` 帧：`Ret` 用它决定"返回值不是对象时改用 `this`"。
     construct: bool,
-    /// `new.target`（`State::new_target_stack` 栈顶的镜像）。
+    /// `new.target`：构造帧是构造器，否则 `undefined`
+    /// （箭头帧带着创建时快照下来的那个值）。
     new_target: Value,
     /// 收帧时要回退到的水位（**绝对值**）—— 与 `state.closure_var_stack` /
     /// `state.seh_stack` 的长度对应。切片 1b 之后它们是这两个水位的**唯一**记录
@@ -9976,19 +9991,9 @@ struct State {
     next_finally_id: u64,
     /// Stack of captured variable maps for active closure scopes
     closure_var_stack: Vec<HashMap<String, Value>>,
-    /// Per-frame flag: true if the current frame was invoked via `new` ([[Construct]]).
-    /// Used to decide whether a returned value should be replaced by `this`.
-    construct_stack: Vec<bool>,
-    /// Per-frame `new.target`: the constructor when the frame was entered
-    /// through `new`, `undefined` otherwise. A frame entered for an arrow
-    /// function inherits the value captured when the arrow was created.
-    new_target_stack: Vec<Value>,
-    /// Number of arguments passed to each active frame, parallel to `frames`.
-    /// This is what `Opcode::Arguments` reads to build the
-    /// `arguments` object: the callee has no other way to learn its arity.
-    frame_argc: Vec<usize>,
-    /// **M2-1 的镜面**：每个活跃调用帧一条，与 `frame_argc` 一一对应
-    /// （`frames.len() == frame_argc.len()` 是当前阶段断言的不变量之一）。
+    /// 每个活跃调用帧一条。切片 1e 之后它是**唯一的**按帧状态 ——
+    /// 以前并存的那些平行栈（`ctrl_stack` / `function_stack` / `this_stack` /
+    /// `this_state` / `frame_argc` / `construct_stack` / `new_target_stack`）全部退役。
     /// 它暂时只是平行栈的第二种存放；等读点翻完之后，平行栈会被删掉，
     /// 它就变成唯一来源。
     frames: Vec<Frame>,
@@ -10018,9 +10023,6 @@ impl State {
             finally_handlers: HashMap::new(),
             next_finally_id: 0,
             closure_var_stack: Vec::new(),
-            construct_stack: Vec::new(),
-            new_target_stack: Vec::new(),
-            frame_argc: Vec::new(),
             frames: Vec::new(),
             rsp: 0,
             rbp: 0,
@@ -10036,17 +10038,20 @@ impl State {
     /// （切片 1b 之前这里还要在控制栈上凑齐"每帧三项"，那套簿记已退役。）
     /// 现在脚本帧就是普通的一员。
     fn open_script_frame(&mut self) -> Result<(), RuntimeError> {
-        self.enter_frame(0)?;
+        self.enter_frame()?;
         let closure_depth = self.closure_var_stack.len();
         let seh_depth = self.seh_stack.len();
-        self.note_frame(
-            0,
-            Value::Undefined,
-            Value::Undefined,
-            THIS_NONE,
+        self.note_frame(FrameBirth {
+            pc: 0,
+            func: Value::Undefined,
+            this: Value::Undefined,
+            this_state: THIS_NONE,
+            argc: 0,
+            construct: false,
+            new_target: Value::Undefined,
             closure_depth,
             seh_depth,
-        );
+        });
         self.jump(0);
         Ok(())
     }
@@ -10170,11 +10175,11 @@ impl State {
         // were *not* passed; they must read as `undefined` instead of stale
         // values left over from an earlier frame.
         //
-        // Only the callee reads those slots, so `frame_argc` is the current
-        // frame's arity here. Call sites read their outgoing arguments through
+        // Only the callee reads those slots, so the current frame's `argc` is the
+        // one to consult here. Call sites read their outgoing arguments through
         // `raw_stack_value`, which bypasses this check.
         if offset < 0 {
-            let argc = self.frame_argc.last().copied().unwrap_or(0);
+            let argc = self.frames.last().map(|f| f.argc).unwrap_or(0);
             if (-offset) as usize > argc {
                 return Ok(Value::Undefined);
             }
@@ -10200,7 +10205,7 @@ impl State {
         // Never write below the argument region: those slots belong to the
         // caller's frame and writing them would corrupt it.
         if offset < 0 {
-            let argc = self.frame_argc.last().copied().unwrap_or(0);
+            let argc = self.frames.last().map(|f| f.argc).unwrap_or(0);
             if (-offset) as usize > argc {
                 return Ok(());
             }
@@ -10210,9 +10215,8 @@ impl State {
         Ok(())
     }
 
-    /// Enter a JS call frame: save the caller's `this`, record the argument
-    /// count (used by `Opcode::Arguments`) and guard recursion depth.
-    fn enter_frame(&mut self, argc: usize) -> Result<(), RuntimeError> {
+    /// 开始一帧：只做递归深度的护栏（`this` / `argc` / `new.target` 都是出生参数）。
+    fn enter_frame(&mut self) -> Result<(), RuntimeError> {
         // 深度按**调用帧**数算：`frames[0]` 是顶层脚本帧，不算一次调用。
         // 以前读控制栈长度 / 3（每帧三项）—— 那还混着 `PushC`/`PopC` 的条目，
         // 只有"它们最多两项、整数除法恰好不出错"才成立，是个侥幸。
@@ -10221,42 +10225,24 @@ impl State {
                 "Maximum call stack size exceeded".to_string(),
             ));
         }
-        self.frame_argc.push(argc);
         Ok(())
     }
 
-    /// **M2-1 镜面**：把一个新帧记进 `frames`。
-    ///
-    /// 必须在 `enter_frame` + `this_val` 赋值 +
-    /// `construct_stack`/`new_target_stack` 的 push **之后**调用 —— 它读的就是那些栈顶。
-    /// 两个水位参数由调用点传入；切片 1b 之后它们是这两个水位的**唯一**记录。
-    /// （切片 1b 之前调用点还要把同样的值再 `pushc` 三份，两份必须一致 —— 那套簿记已退役。）
-    /// `pc` 是**新帧的初始指令指针**，必须由调用点给：
-    /// 入口 pc（4 个 opcode 调用点 / `open_frame` / `push_generator_frame`）
-    /// 或哨兵（`restore_generator_frame`）。理由见 `Frame::pc`。
-    fn note_frame(
-        &mut self,
-        pc: usize,
-        func: Value,
-        this: Value,
-        this_state: u8,
-        closure_depth: usize,
-        seh_depth: usize,
-    ) {
+    /// 把一个新帧记进 `frames`。**它的全部字段都由调用点作为"出生值"给出**
+    /// （见 `FrameBirth`）—— 所以调用点不需要先摆好任何平行栈：
+    /// 切片 1e 之后那些平行栈（`frame_argc` / `construct_stack` / `new_target_stack`）
+    /// 已经不存在了，`frames` 是唯一的按帧状态。
+    fn note_frame(&mut self, birth: FrameBirth) {
         self.frames.push(Frame {
-            pc,
-            func,
-            this,
-            this_state,
-            argc: self.frame_argc.last().copied().unwrap_or(0),
-            construct: self.construct_stack.last().copied().unwrap_or(false),
-            new_target: self
-                .new_target_stack
-                .last()
-                .cloned()
-                .unwrap_or(Value::Undefined),
-            closure_depth,
-            seh_depth,
+            pc: birth.pc,
+            func: birth.func,
+            this: birth.this,
+            this_state: birth.this_state,
+            argc: birth.argc,
+            construct: birth.construct,
+            new_target: birth.new_target,
+            closure_depth: birth.closure_depth,
+            seh_depth: birth.seh_depth,
         });
     }
 
@@ -10269,44 +10255,7 @@ impl State {
     /// 后者在失败时会格式化两个 `Value`，而 `Value::Debug` 会递归进对象图
     /// （实测：在 `class C extends Error` 的用例上，真正失配的那次断言被
     /// **栈溢出**掩盖了 —— 失败信息本身把栈打爆，看不到原始原因）。
-    fn assert_frame_mirror(&self) {
-        debug_assert!(
-            self.frames.len() == self.frame_argc.len(),
-            "frames 与 frame_argc 长度不一致（一帧一条；差一条就是开/收帧漏了一处）"
-        );
-        let Some(frame) = self.frames.last() else {
-            return;
-        };
-        debug_assert!(
-            frame.argc == self.frame_argc.last().copied().unwrap_or(0),
-            "镜面 argc 与 frame_argc 栈顶不一致"
-        );
-        debug_assert!(
-            frame.construct == self.construct_stack.last().copied().unwrap_or(false),
-            "镜面 construct 与 construct_stack 栈顶不一致"
-        );
-        debug_assert!(
-            frame.new_target
-                == self
-                    .new_target_stack
-                    .last()
-                    .cloned()
-                    .unwrap_or(Value::Undefined),
-            "镜面 new_target 与 new_target_stack 栈顶不一致"
-        );
-        // 已实测：`this` 与 `func` **都**不满足"只在帧边界写"这个前提，所以都进不了镜面。
-        // `func` 已经**直接搬进** `Frame`（切片 1c）——那处潜伏分叉（`SavedExecutionState`
-        // 独立恢复 `function_val` 却不恢复帧身份，实测 `frames.last().func = objFn#5`
-        // 而 `function_val = objFn#1`）**按构造消失**：现在只有帧回答"当前函数是谁"。
-        // `State::function_val` / `State::function_stack` / `SavedExecutionState::function`
-        // 三个字段已随之删除。
-        //
-        // `this` **故意不在这里校验**：实测它属于"中帧也会写"的那一组 ——
-        // `CallSuperSpread` 会在 `super()` 返回后把派生类的 `this` 绑成父构造器的结果
-        // （ES 12.3.5.1 `BindThisValue`），`this_state` 的 BOUND 回填是同一件事的另一半。
-        // 所以它不满足"开帧时写一次、之后只读"这个前提，不属于 A 步能严格互校的集合；
-        // B 步直接把它搬进 `Frame`（那时以字节码不变为证，而不是靠镜面）。
-    }
+
 
     /// Resolve `name` in the environment.
     ///
@@ -10470,8 +10419,6 @@ struct SehRecord {
     /// 还是抛出者那一帧（`pc` 就在抛出点上），会接着跑错的地方。
     /// 切片 1b 之前这里记的是控制栈深度 —— 那是同一个事实的另一种编码。
     saved_frame_depth: usize,
-    saved_construct_depth: usize,
-    saved_new_target_depth: usize,
 }
 
 /// Per-frame constructor states, stored in [`Frame::this_state`].
@@ -10502,8 +10449,6 @@ struct SavedExecutionState {
     closure: usize,
     seh: usize,
     frame_depth: usize,
-    construct: usize,
-    new_target: usize,
     delegate: usize,
     registers: [Value; 19],
 }
@@ -10769,8 +10714,18 @@ mod tests {
         let mut state = state_with_script_frame();
         state.jump(7);
         // 压一个"被调帧"：它有自己的 pc，**由开帧点显式给**。
-        state.enter_frame(1).expect("enter_frame");
-        state.note_frame(42, Value::Undefined, Value::Undefined, THIS_NONE, 0, 0);
+        state.enter_frame().expect("enter_frame");
+        state.note_frame(FrameBirth {
+            pc: 42,
+            func: Value::Undefined,
+            this: Value::Undefined,
+            this_state: THIS_NONE,
+            argc: 1,
+            construct: false,
+            new_target: Value::Undefined,
+            closure_depth: 0,
+            seh_depth: 0,
+        });
         assert_eq!(state.pc(), 42, "被调帧的出生 pc 就是入口");
         assert_eq!(state.frames[0].pc, 7, "调用方那帧的 pc 必须没被动过");
         state.frames.pop();
@@ -10786,9 +10741,9 @@ mod tests {
         let state = state_with_script_frame();
         assert_eq!(state.frames.len(), 1, "脚本帧");
         assert_eq!(
-            state.frame_argc.len(),
+            state.frames.len(),
             1,
-            "它与其它帧同构：`frame_argc` 也有一条（否则镜面不变量不成立）"
+            "它自己就把 argc 带着（不再有平行的 frame_argc 栈）"
         );
         // 脚本帧不是"一次调用"：深度按 `frames.len() - 1` 算。
         assert_eq!(state.frames.len().saturating_sub(1), 0);

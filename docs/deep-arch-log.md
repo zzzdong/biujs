@@ -1283,3 +1283,91 @@ let initial_this_state = if module.is_derived_ctor(func_id) {
 
 **1e**：`argc` / `construct` / `new_target` 翻到帧上 —— 这三条栈消失之后，
 `assert_frame_mirror` 与"镜面"这套机制**整套退役**（它存在的意义就是安全地把这些字段搬过去）。
+
+---
+
+## 17. M2-1e：`argc` / `construct` / `new_target` 翻到帧上 —— **镜面机制整套退役**（2026-10-07）
+
+### 17.1 做了什么
+
+| 改动 | 说明 |
+|---|---|
+| 三个字段从"镜像"变**权威** | `Frame.argc` / `Frame.construct` / `Frame.new_target` |
+| **删** `State.frame_argc` / `State.construct_stack` / `State.new_target_stack` | 三条平行栈从此不存在 |
+| **删 `assert_frame_mirror` 与它在 `step` 里的调用** | 见 17.2 |
+| 新增 `FrameBirth`（具名字段） | 见 17.3 |
+| `enter_frame` 只剩递归深度护栏 | `this` / `argc` / `func` / `new.target` 都是出生参数，它不用再保存任何东西 |
+| 水位一并减少 | `SehRecord` 少 2 个（`saved_construct_depth` / `saved_new_target_depth`）、`SavedExecutionState` 少 2 个（`construct` / `new_target`）、`unwind_frames_to` 少 2 个参数 |
+
+### 17.2 守卫为什么**可以和它守卫的东西一起退役**
+
+`assert_frame_mirror` 的存在意义是"交叉校验帧与平行栈"，兜住"搬错行"这类错误。
+切片 1e 把最后三条平行栈删掉，它就**没有对照物了** —— 于是整套退役。
+
+**为什么这时切换是安全的**：A 步（`d3241e2`）建立的互校在全量语料与 526 条 feature
+断言上跑了**全程绿**。也就是说"帧里那三个值 == 栈里那三个值"已经被**证明**过，
+现在只是把读点切到帧上。这正是当初先建镜面的理由 —— 它换来的是"切换这一步不需要
+再赌一次"。
+
+（对比：1c/1d 的 `func` / `this` **进不了**镜面，所以那两步走的是"直接搬"，
+证明方式是字节码逐字节不变 —— §15.3 / §16.4 用的都是这个口径。）
+
+### 17.3 为什么出生值改成**具名字段**（`FrameBirth`）
+
+`note_frame` 的出生值到 1d 末已经有 6 个位置参数，1e 要加到 9 个。
+九个位置参数 × 六个开帧点 = 54 个位置 —— 而**唯一能抓"搬错行"的守卫本步正好退役**。
+
+所以改成具名字段：
+
+```rust
+struct FrameBirth { pc, func, this, this_state, argc, construct, new_target, … }
+
+self.state.note_frame(FrameBirth {
+    pc: location,
+    func: callee_func,
+    this: new_obj_val,
+    this_state: initial_this_state,
+    argc: arg_count,
+    construct: true,
+    new_target: new_target_value.clone(),
+    closure_depth,
+    seh_depth,
+});
+```
+
+⇒ 一般规律记下来：**守卫退场的时候，要把"它原来防的错"变成结构上不可能**
+（这里是具名字段），而不是让它变成"只能靠细心"。
+
+### 17.4 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元 | 206 | **206** | 不变 |
+| feature（debug） | 526 / 4 ignored | **526 / 4 ignored** | 不变 |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | **逐字节一致** |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | —— |
+| 告警 | lib 24 / lib test 26 / features 8 | **同** | 无新增 |
+
+### 17.5 `State` 现在的形状
+
+按帧的**平行栈已经一条不剩**：`ctrl_stack`(→`reg_saves`，只管 `PushC`) /
+`function_stack` / `this_stack` / `this_state` / `frame_argc` /
+`construct_stack` / `new_target_stack` 全部退役（1b/1c/1d/1e）。
+
+**剩下的**两条长度水位栈不是"按帧取值"，而是"按帧存集合"：
+`closure_var_stack`（帧的闭包映射）与 `seh_stack`（帧的 try 记录）——
+它们各自的深度已经是 `Frame.closure_depth` / `Frame.seh_depth`。
+
+### 17.6 下一步
+
+**1f**：三路收帧合并成一个助手。现在"收掉一帧"分散在四处，每处各自 truncate：
+
+- `Ret`（正常返回）
+- `unwind_frames_to`（异常回退）
+- `drive_bytecode_frame` 的恢复块（Rust 驱动的调用）
+- `restore_execution_state` / `discard_generator_frame`（生成器）
+
+它们的动作已经**趋同**（把 `frames` / `closure_var_stack` / `seh_stack` 截到某个水位），
+差别只剩各自的附带动作。合并之后"收帧"只有一个实现，也只有一个水位概念。
