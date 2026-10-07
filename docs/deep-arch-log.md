@@ -835,3 +835,101 @@ M2-1 诊断(func): pc=380 frames=1 function_stack=1
 | 1f | `closure_depth` / `seh_depth` 水位翻帧；三路收帧合并成助手 |
 
 **脚本帧已经就位**（本步），所以 1a′ 只剩"`pc` + 边界循环"。
+
+---
+
+## 11. 1a′ 试做后**回退**：`pc` 进帧 + 边界循环（2026-10-07）—— 记录全部证据
+
+### 11.1 做了什么（已回退）
+
+1. `Frame.pc` + `State::pc()/set_pc()`（`pc` 进帧）；删 `State.pc`。
+2. `Ret` 不再 `jump(return_pc)`；改由**调用点在开帧前自己 `jump_offset(1)`**
+   （4 处：`Call` / `CallEx` / `CallMethod` / `New`）。
+3. 两个嵌套循环改成边界驱动：`drive_bytecode_frame` 与 `run_generator_frame`
+   （`loop { if frames.len() <= boundary { break } if !step()? { break } }`）。
+4. 删 `drive_bytecode_frame` 的 `saved_pc` 与 `SavedExecutionState.pc`。
+
+### 11.2 结果：单元/feature 全绿，但**全量 test262 出现 4 条回退**
+
+| 项 | 结果 |
+|---|---|
+| 单元 | **206 通过**（新增 `pc_is_per_frame`） |
+| feature（debug，镜面互校激活） | **525 / 4** 全绿 |
+| 全量 test262 | 通过 16561 → **16557**；`language/statements/for-of` **621 → 617**（失败 97 → 101） |
+
+4 条新失败全是 `RangeError: stack access out of bounds`：
+`break.js` / `break-from-try.js` / `break-from-catch.js` / `break-from-finally.js`。
+
+**归属已实测判定**：在父提交上跑同一个套件 —— 621 通过、且 `stack access out of bounds`
+出现 **0 次**。⇒ 是本次改动引入的，不是既有问题。
+
+### 11.3 最小复现（二分出来）
+
+```js
+function* values() { yield 1; throw new Error('u'); }   // 关键：yield 之后有 throw
+var i = 0;
+for (var x of values()) { try { i++; break; } catch (err) {} }   // 关键：try 里 break
+i
+```
+
+- 去掉生成器里的 `throw`（`function* values() { yield 1; }`）→ **通过**
+- 去掉 `try`（`for (var x of values()) { break; }`）→ **通过**
+- 普通的 `for(...){ try { break } }`、数组 for-of + `try{break}` → **通过**
+- 两个条件同时满足 → `RangeError: stack access out of bounds`
+
+### 11.4 症状与实测数据（都是打印出来的，不是推测）
+
+**帧与值栈同时泄漏**：
+
+```
+M2-1 诊断(note): 调用方 pc=13 frames=7 ... 各帧 pc=[21, 21, 21, 21, 21, 21, 13]
+M2-1 诊断(note): 调用方 pc=19 frames=7 ... 各帧 pc=[21, 21, 21, 21, 21, 21, 19]
+M2-1 诊断(note): 调用方 pc=21 frames=7 ... 各帧 pc=[21, 21, 21, 21, 21, 21, 21]
+M2-1 诊断(note): 调用方 pc=13 frames=8 ... 各帧 pc=[21, 21, 21, 21, 21, 21, 21, 13]
+```
+
+- 每轮泄漏**一个帧**（7→8→9…，实测涨到 15）；
+- `rsp` 每轮翻倍（1797 → 3566 → 7150 → 14318 → 28654 → 57326），最终
+  `rbp = 262144 = STACK_MAX`、`rsp = 262150`，在 `ensure`/`set_value_to_stack` 上抛错；
+- 帧栈里**一大串 pc 全是 21** —— 而 pc 21 是 `iter_close`。
+
+对照 dump 出来的字节码（`BIUJS_DUMP=1`）：`values()` 的调用在 **pc 12**（循环之外），
+循环体是 19 `iter_next` / 21 `iter_close` / 29 `try` / 35 `delayed_jump`（break）。
+
+⇒ 所以"一串 pc=21"**不是**同一个函数在递归，而是**脚本帧自己停在 pc 21 被当成被调方
+反复重入**：某个嵌套运行把调用方（脚本）当成了它要驱动的那一帧，而脚本的 pc 恰好停在
+`iter_close` 上，于是它再执行一次 `iter_close` → 再回调 → 再泄漏一层。
+
+### 11.5 排查过的、**排除**的假设
+
+- **边界算错？** 两个循环的边界实测都对：`drive_bytecode_frame` 是"开帧前的深度"；
+  `run_generator_frame` 用 `frames.len()-1` 与改用 `saved.this_depth` **实测等价**
+  （打印出来都是 `frames=2 boundary=1`、`frames=3 boundary=2`）。**不是它。**
+- **哨兵泊车？** `Yield`/`PrologueEnd` 把 pc 停在哨兵上，此时写的是**生成器自己**那一帧，
+  逻辑上仍然成立（帧留着是刻意的）。**不是它。**
+
+### 11.6 未收敛的假设（下一步从这里开始）
+
+`iter_close` / `iter_next` 是**原生**：它们会**在调用方的 pc 还没推进时**回调 JS
+（pc 的推进发生在 `run_instruction` 的尾部，而原生调用发生在 arm 中间）。
+所以"嵌套运行期间，调用方帧的 pc 仍指着那条调用指令"是**常态**。
+
+在旧的全局 pc 模型下这没关系：嵌套循环只有一种退出方式（pc 越界），而且**没有第二帧
+可以跑**（`pc` 只有一个）。改成每帧一个 pc 之后，"调用方被当被调方驱动"第一次成为**可能** ——
+只要有一个嵌套运行的边界取成"调用方的深度"，它就会从调用方的 pc 继续跑，
+而那个 pc 正好在调用指令上 ⇒ 自递归 ⇒ 帧/栈泄漏。
+
+**下一步该先做的不是继续找这一处，而是把"边界"这个概念做成取不错的形式**：
+- 由**调用方**在开帧前把 boundary 传进去（像 `drive_bytecode_frame` 现在这样），
+  而不是让每个嵌套运行自己从 `frames.len()` 推；
+- 更好的形态是 `Frame.return_frame`（目标帧的**下标**）：嵌套循环的退出条件是
+  "当前帧下标 < 我进来的下标"，而不是比较长度 —— 长度在异常回退/生成器摘帧时会变。
+
+### 11.7 处置
+
+**回退 1a′ 的全部改动**，保留已提交的脚本帧（`cd88dd3`）。
+树回到绿：单元 205 / feature 525 / 无残留诊断代码（`grep -c 诊断 src/vm/mod.rs` = 0）。
+
+**结论**：1a′ 不是"机械搬运"—— 它把"谁拥有 pc"换了主人，而**哨兵泊车**与
+**指令中途回调原生**这两种用法都建立在旧的全局 pc 上。这一类改动必须一次做对
+（因为它同时动了控制流的三个前提），所以它值得先花一轮把边界形式定死，再动手。
