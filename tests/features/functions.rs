@@ -329,6 +329,10 @@ fn an_anonymous_function_takes_the_name_of_what_it_is_assigned_to() {
     assert_eq!(eval_string("({ m: function () {} }).m.name"), "m");
     assert_eq!(eval_string("({ m() {} }).m.name"), "m");
     assert_eq!(eval_string("({ ['k' + 1]: function () {} }).k1.name"), "k1");
+    // …including a **generator** method, whose name is assigned at run time too
+    // (the compile-time `CodeBlock::name` is empty for it — that is not a bug,
+    // `SetFunctionName` fills it in; see `bytecode::CodeBlock::name`).
+    assert_eq!(eval_string("({ *g() {} }).g.name"), "g");
 
     // A *named* function expression keeps its own name — that one is not a
     // NamedEvaluation site.
@@ -347,6 +351,8 @@ fn an_anonymous_function_takes_the_name_of_what_it_is_assigned_to() {
     // `<anonymous>` placeholder.
     assert_eq!(eval_string("(function () {}).name"), "");
     assert_eq!(eval_string("(class {}).name"), "");
+    // An array element is not a NamedEvaluation site either.
+    assert_eq!(eval_string("[function () {}][0].name"), "");
 }
 
 #[test]

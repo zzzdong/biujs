@@ -9,7 +9,7 @@ pub mod symbol;
 
 use std::collections::HashMap;
 
-use crate::bytecode::{EhRegion, FunctionId, Module, Register};
+use crate::bytecode::{CodeBlock, EhRegion, FnFlags, FunctionId, Module, Register};
 use crate::compiler::error::CompileError;
 use crate::compiler::ir::{FuncSignature, FunctionBuilder, IrFunction, IrUnit, SSABuilder};
 use crate::compiler::lowering::JSASTLower;
@@ -76,38 +76,29 @@ impl Compiler {
         // 6. Run SSA + Codegen for ALL functions in the unit
         let registers = Register::general();
         let mut all_codes: Vec<crate::bytecode::Instr> = Vec::new();
-        let mut symtab = HashMap::new();
 
         let function_count = unit.functions.len();
-        // Function metadata (declared name + arity) travels with the module so
-        // function objects can expose `name` and `length`.
-        let mut func_info: HashMap<u32, (String, usize)> = HashMap::new();
-        let mut exit_pc: HashMap<u32, usize> = HashMap::new();
-        let mut generators: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut asyncs: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut derived_ctors: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        // EH 区域表：每个函数一份，**由 codegen 声明**（见 `bytecode::EhRegion` 的说明）。
-        let mut eh_regions: HashMap<u32, Vec<EhRegion>> = HashMap::new();
-        for func in &unit.functions {
-            func_info.insert(
-                func.id.as_usize() as u32,
+        // 每个函数的**声明属性**：先一次性读出来，免得与下面的可变借用来回交错。
+        // 匿名函数的 `name` 是 `""`，不是 `Name` 的 *debug* `Display` 打的占位符。
+        let metas: Vec<(String, usize, FnFlags)> = unit
+            .functions
+            .iter()
+            .map(|func| {
                 (
-                    // An anonymous function's `name` property is `""`, not the
-                    // placeholder the *debug* `Display` of `Name` prints.
                     func.signature.name.0.clone().unwrap_or_default(),
                     func.signature.arity,
-                ),
-            );
-            if func.signature.is_generator {
-                generators.insert(func.id.as_usize() as u32);
-            }
-            if func.signature.is_async {
-                asyncs.insert(func.id.as_usize() as u32);
-            }
-            if func.signature.is_derived_ctor {
-                derived_ctors.insert(func.id.as_usize() as u32);
-            }
-        }
+                    FnFlags {
+                        generator: func.signature.is_generator,
+                        r#async: func.signature.is_async,
+                        derived_ctor: func.signature.is_derived_ctor,
+                    },
+                )
+            })
+            .collect();
+        // EH 区域表：每个函数一份，**由 codegen 声明**（见 `bytecode::EhRegion` 的说明）。
+        let mut eh_regions: HashMap<u32, Vec<EhRegion>> = HashMap::new();
+        // 每个函数的描述：**下标 = 函数 id**（`ir` 层保证 0..n 连续）。
+        let mut code_blocks: Vec<CodeBlock> = Vec::with_capacity(function_count);
 
         for idx in 0..function_count {
             let func_id = FunctionId::new(idx as u32);
@@ -148,7 +139,6 @@ impl Compiler {
 
             // Record offset and append bytecodes
             let offset = all_codes.len();
-            symtab.insert(func_id, offset);
             eh_regions.insert(
                 func_id.as_usize() as u32,
                 func_eh
@@ -164,17 +154,23 @@ impl Compiler {
             // The function's exit is its trailing `Ret` — the one the lowering
             // appends after sealing the last block. A suspended generator
             // resumed with a return completion re-enters here (see
-            // `Module::exit_pc`).
+            // `CodeBlock::exit_pc`).
             //
             // Deliberately `Opcode::Ret` and not `Kind::Return`: the module-level
             // code ends with `Halt`, which is also `Kind::Return` (`bytecode.rs`),
             // but its pc is not a function exit.
-            if let Some(idx) = func_codes
+            let exit_pc = func_codes
                 .iter()
                 .rposition(|code| matches!(code.opcode(), crate::bytecode::Opcode::Ret))
-            {
-                exit_pc.insert(func_id.as_usize() as u32, offset + idx);
-            }
+                .map(|idx| offset + idx);
+            let (name, arity, flags) = metas[idx].clone();
+            code_blocks.push(CodeBlock {
+                start: offset,
+                name,
+                arity,
+                flags,
+                exit_pc,
+            });
             all_codes.extend(func_codes);
         }
 
@@ -182,12 +178,7 @@ impl Compiler {
         Ok(Module::new(
             Some("main".to_string()),
             unit.constants,
-            symtab,
-            func_info,
-            generators,
-            asyncs,
-            derived_ctors,
-            exit_pc,
+            code_blocks,
             all_codes,
             eh_regions,
         ))

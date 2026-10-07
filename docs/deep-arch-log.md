@@ -376,3 +376,83 @@ passed（两个方向都实测过，不是只跑了一次绿）。
    但若将来 CFG 变大应换 worklist + 只重访受影响的块。
 3. 数据流只服务 `throw_to_handlers`。M2 之后"某块在哪个区域里"会由
    `Frame.try_stack` 在运行期直接给出，这份编译期计算届时可删。
+
+---
+
+## 6. M1.3 `CodeBlock` per function（2026-10-07）—— 六张按函数建的表并成一个
+
+### 6.1 勘察结论（先量再动）
+
+文档里写的"44 处 `module.` 扇出"实测**只有 38 处**，而要迁移的四个字段
+（`generators` / `asyncs` / `derived_ctors` / `exit_pc`）在 `vm/mod.rs` 里**一共只有 10 处引用**。
+加上 `func_info`（1 处）与 `symtab`（5 处），工作量比预想小一个量级。
+
+### 6.2 做到哪一步，以及为什么**没有**做得更多
+
+**做了**：`Module` 上"按函数属性"的六张表（入口 pc、名字/arity、生成器 / async /
+派生构造器三个 id 集合、尾 `Ret` 的 pc）**并成一个 `Vec<CodeBlock>`**（下标 = 函数 id）。
+`Module` 的公开字段从 10 个降到 6 个；运行期一律走 `Module::code_block(id)` 与四个
+具名谓词（`is_generator` / `is_async` / `is_derived_ctor` / `func_exit_pc`）。
+
+**没做，以及理由**（都记下来，免得下次以为是漏了）：
+
+| 没做 | 理由 |
+|---|---|
+| 把 `instructions` / `constants` 搬进 `CodeBlock` | **pc 现在是全局的**（`Frame.pc` 直接索引 `module.instructions`，哨兵是 `instructions.len()`）。搬进去就要先让 pc 变成函数内局部 —— 那是 M2 帧模型的内容（§4.3 / §4.10） |
+| 彻底删掉 `module: &Module` 参数 | `materialize_function` 的 16 个调用点里，`as_object_value` / `get_member` / `set_member` / `delete_member` 都没有 `module`，穿进去会经 `get_member`/`set_member` 级联成几十处。文档 §3.4 许可的中间态是"先放一个 `current_code`，再删参数"，所以 VM 上留了一份 `current_code: Vec<CodeBlock>` 快照 —— **类型与 `Module::code_blocks` 完全一致**（不再是 `HashMap<u32,(String,usize)>` 那种另一种形状）。M2 让帧持有 `code` 之后删掉它 |
+| 把 EH 表挂进 `FunctionBody` | `FunctionBody` 仍是 `{start,end}` 派生视图；EH 表在 `Module.eh_regions`。合并要等 M2 决定"区域在帧里长什么样" |
+
+### 6.3 一个**不是 bug 的**观察（写进文档与测试，免得后人误改）
+
+`CodeBlock.name` 对**对象字面量方法**是**空串**：
+
+```js
+var obj = { *m() { yield 2; } };
+obj.m.name        // "m" ← 运行期 SetFunctionName 补的（实测）
+```
+
+即"编译期声明的名字"与"最终的 `fn.name`"不是一回事：NamedEvaluation（ES 15.2.3 的
+`SetFunctionName`）在运行期给属性方法 / 赋值目标补名。所以 `CodeBlock.name` 为空的**两种**
+含义必须分清：
+
+- **空串是最终答案**：匿名函数表达式、数组元素（`[function(){}][0].name === ""`，实测）；
+- **空串是中间态**：对象字面量方法（运行期会补成 `"m"`）。
+
+已写进 `CodeBlock::name` 的文档注释，并在 `tests/features/functions.rs` 补了
+生成器方法名与数组元素名两条断言（原本只覆盖普通方法）。
+
+**新守卫**：`code_blocks_describe_every_function`（单元）—— 钉住"每一项都描述的是
+**它自己那个**函数"。归并多张表最容易出的错不是漏搬，而是**搬错行**（把 A 的标志挂到 B 上），
+而那类错在别处全绿。它验：三类标志各自只落在自己身上、方法形态的生成器也带标志
+（B24 的根因类别）、入口 pc 两两不同且落在指令流内、`exit_pc` 有值 ⇔ 那个 pc 上真是 `Ret`。
+
+### 6.4 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元 | 204 | **205** | +1（`code_blocks_describe_every_function`） |
+| feature | 525 / 4 ignored | **525 / 4 ignored** | +2 条断言（并进既有测试，不新增 test 函数） |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | 逐字节一致 |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | 第四次同值 |
+| 告警 | lib 24 / lib test 26 / features 8 | **同** | 无新增 |
+
+本步是**纯数据布局**改动（同一份数据换了一种组织方式），运行期行为不应变 —— 数字印证了这一点。
+
+### 6.5 已知未解 / 下一步
+
+1. `VM::current_code` 是**过渡态**（见 6.2），M2 删。
+2. `Module::code_blocks` 与 `symtab` 的职责已经分出：前者是"每个函数是什么"，
+   后者连入口 pc 都在 `CodeBlock.start` 里了 —— 所以 `symtab` 这个名字已经不存在了。
+   注意 `FunctionId` 仍在 `bytecode.rs` 里（`Display` 与 `FunctionBody` 的文档提到它），
+   但运行期不再有"用 HashMap 查函数入口"这件事。
+3. **M1 到此收口**。下一步是 **M2（执行模型）**：寄存器 arena + `Frame{base,len}` +
+   单层主循环 + 唯一调用入口。它是深改里收益最大、也是唯一需要重写 `run_instruction`
+   的一步。进入 M2 的前置清单（都已经就位）：
+   - 区域表可信 + VM 以表为准（M1.1/M1.2-a）；
+   - 异常边不是靠物理顺序猜的（M1.2-b）；
+   - 每个函数的属性自包含（M1.3）；
+   - 尚未处理：known bug #4（`handle_throw` 在 catch 路径多弹一次）——
+     M2 的 `Frame.try_stack` 按构造消除它，但**要在 M2 里显式验**（那条 `#[ignore]` 测试
+     就是验收标准：去掉 `ignore` 应当变绿）。

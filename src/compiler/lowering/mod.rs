@@ -3089,7 +3089,7 @@ impl<'a> JSASTLower<'a> {
         // An anonymous function expression has an **empty** name: ES 15.2.3
         // creates it with `""`, and only a later `SetFunctionName` (inferred from
         // the binding it lands in) gives it one. `None` is what the signature
-        // carries for that — `func_info` turns it back into `""`, because the
+        // carries for that — `CodeBlock::name` turns it back into `""`, because the
         // `name` property must be `""`, not a placeholder like `<anonymous>`.
         let name = func.id.as_ref().map(|id| id.name.to_string());
 

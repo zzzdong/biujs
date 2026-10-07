@@ -21,7 +21,7 @@ use crate::builtins::Builtins;
 use crate::vm::object::{PromiseObject, PromiseReaction, PromiseState};
 use crate::vm::iterator::iterator_symbol_key;
 use crate::bytecode::{
-    Constant, FunctionId, Instr, Module, Opcode, Operand, Primitive, Register,
+    CodeBlock, Constant, Instr, Module, Opcode, Operand, Primitive, Register,
 };
 
 /// Size of the pre-allocated value stack. Slots are addressed directly, so the
@@ -156,10 +156,18 @@ pub struct VM {
     /// Iterators opened by `yield*` in the frames currently running, innermost
     /// last. An abrupt completion of a generator closes everything it opened.
     delegate_stack: Vec<Value>,
-    /// Function metadata (`name`, parameter count) of the module being run.
-    /// Kept here so `materialize_function` can set `fn.name` / `fn.length`
-    /// without threading the module through every call site.
-    current_module_info: Option<HashMap<u32, (String, usize)>>,
+    /// 本次运行所用模块的**每函数描述**（`CodeBlock` 的副本）。
+    ///
+    /// 存在的理由：`materialize_function` / `make_capturing_function_object` 需要
+    /// "这个函数叫什么、几个形参"，而它们的调用点会经 `get_member` / `set_member` /
+    /// `delete_member` 级联出去 —— 把 `module: &Module` 穿进那条链是一次几十处的扇出。
+    /// 所以先留一份**运行期快照**：它的类型与 `Module::code_blocks` 完全一致，
+    /// 于是"按函数属性"只有一个类型、一种形状。
+    ///
+    /// **迁移中的中间态**：M2 让帧自己持有 `code: Rc<CodeBlock>` 之后，
+    /// 这份快照就该删掉（那时 `self.code()` 读当前帧，不再需要 VM 级副本）。
+    /// 见 `architecture-redesign.md` §3.4 / §4.10。
+    current_code: Option<Vec<CodeBlock>>,
     /// Memoized `FunctionObject` per bytecode function id.
     ///
     /// `Value::Function(id)` is a bare function *reference*; whenever it is used
@@ -347,7 +355,7 @@ impl VM {
             generator_yielded: None,
             generator_yield_pc: 0,
             delegate_stack: Vec::new(),
-            current_module_info: None,
+            current_code: None,
             func_objs: HashMap::new(),
             step_limit: Some(DEFAULT_STEP_LIMIT),
             steps: 0,
@@ -404,7 +412,7 @@ impl VM {
             }
         }
         self.func_objs.clear();
-        self.current_module_info = Some(module.func_info.clone());
+        self.current_code = Some(module.code_blocks.clone());
         self.bound_functions.clear();
         self.next_bound_id = 0;
         // Same reason as above: a revoked proxy from the previous run must not
@@ -501,17 +509,20 @@ impl VM {
     /// memoized object (`materialize_function`) is keyed by `func_id` and stands
     /// for "the" object of a declaration, which cannot carry per-evaluation
     /// captures.
+    /// 本次运行的每函数描述（`CodeBlock` 的运行期快照，见 `current_code`）。
+    fn code(&self, func_id: u32) -> Option<&CodeBlock> {
+        self.current_code.as_ref()?.get(func_id as usize)
+    }
+
     fn make_capturing_function_object(
         &mut self,
         func_id: u32,
         captured_vars: Vec<(String, Value)>,
     ) -> Value {
         let (name, arity) = self
-            .current_module_info
-            .as_ref()
-            .and_then(|info| info.get(&func_id))
-            .cloned()
-            .unwrap_or((String::new(), 0));
+            .code(func_id)
+            .map(|block| (block.name.clone(), block.arity))
+            .unwrap_or_default();
         let obj = crate::vm::object::new_function_object(func_id, &name, arity);
         if let Value::Object(ref obj_ref) = obj {
             let mut borrowed = obj_ref.borrow_mut();
@@ -527,15 +538,10 @@ impl VM {
         if let Some(v) = self.func_objs.get(&id) {
             return v.clone();
         }
-        let name = self
-            .current_module_info
-            .as_ref()
-            .and_then(|info| info.get(&id))
-            .cloned();
-        let (name, arity) = match name {
-            Some((name, arity)) => (name, arity),
-            None => (String::new(), 0),
-        };
+        let (name, arity) = self
+            .code(id)
+            .map(|block| (block.name.clone(), block.arity))
+            .unwrap_or_default();
         // `fn.length` / `fn.name` / `fn.prototype` are installed by the
         // constructor (non-writable, non-enumerable, configurable).
         let obj = crate::vm::object::new_function_object(id, &name, arity);
@@ -953,19 +959,19 @@ impl VM {
 
     /// 生成器函数的函数号（`None` = 不是生成器）。
     ///
-    /// **判定的唯一来源**：`callable_func_id` + `module.generators`。代理、原生内建、
-    /// 绑定函数都没有字节码函数号，所以这里不必再判它们是不是 —— 而以前五个调用点
-    /// 各写一遍这套组合（写法还各不相同：`CallMethod` 先 `callable_func_id` 再查集合，
-    /// `New` 反过来用"生成器不是构造器"，`Call` 只有裸函数号直接查集合）。
+    /// **判定的唯一来源**：`callable_func_id` + 那个函数自己的 `FnFlags::generator`。
+    /// 代理、原生内建、绑定函数都没有字节码函数号，所以这里不必再判它们是不是 ——
+    /// 而以前五个调用点各写一遍这套组合（写法还各不相同：`CallMethod` 先
+    /// `callable_func_id` 再查集合，`New` 反过来用"生成器不是构造器"，`Call` 只有裸函数号）。
     fn generator_of(&self, callee: &Value, module: &Module) -> Option<u32> {
         self.callable_func_id(callee)
-            .filter(|id| module.generators.contains(id))
+            .filter(|id| module.is_generator(*id))
     }
 
     /// `async` 函数的函数号（`None` = 不是 async）。判定同样只有这一处。
     fn async_of(&self, callee: &Value, module: &Module) -> Option<u32> {
         self.callable_func_id(callee)
-            .filter(|id| module.asyncs.contains(id))
+            .filter(|id| module.is_async(*id))
     }
 
     /// 一个可调用体的种类（[`CalleeKind`]）。给需要"一眼看全"的地方用
@@ -978,8 +984,8 @@ impl VM {
             return CalleeKind::Native;
         }
         match self.callable_func_id(callee) {
-            Some(id) if module.generators.contains(&id) => CalleeKind::Generator,
-            Some(id) if module.asyncs.contains(&id) => CalleeKind::Async,
+            Some(id) if module.is_generator(id) => CalleeKind::Generator,
+            Some(id) if module.is_async(id) => CalleeKind::Async,
             Some(_) => CalleeKind::Bytecode,
             None => CalleeKind::NotCallable,
         }
@@ -1310,8 +1316,8 @@ impl VM {
             map.insert(name.clone(), value.clone());
             self.state.closure_var_stack.push(map);
         }
-        let location = match module.symtab.get(&FunctionId::new(func_id)) {
-            Some(location) => *location,
+        let location = match module.entry_pc(func_id) {
+            Some(location) => location,
             None => {
                 return Err(RuntimeError::ReferenceError(format!(
                     "undefined function: {func_id}"
@@ -2509,7 +2515,7 @@ impl VM {
                     self.state.jump_offset(1);
                     return Ok(());
                 }
-                match module.symtab.get(&FunctionId::new(func_id as u32)) {
+                match module.entry_pc(func_id as u32) {
                     Some(location) => {
                         self.state.enter_frame(arg_count)?;
                         // Strict mode: this = undefined for regular function calls
@@ -2520,7 +2526,7 @@ impl VM {
                         self.state.pushc(self.state.pc + 1)?;
                         self.state.construct_stack.push(false);
                         self.state.new_target_stack.push(Value::Undefined);
-                        self.state.jump(*location);
+                        self.state.jump(location);
                         return Ok(());
                     }
                     None => {
@@ -3797,10 +3803,8 @@ impl VM {
                     {
                         return Err(RuntimeError::TypeError(format!(
                             "{} is not a constructor",
-                            self.current_module_info
-                                .as_ref()
-                                .and_then(|info| info.get(&id))
-                                .map(|(name, _)| name.as_str())
+                            self.code(id)
+                                .map(|block| block.name.as_str())
                                 .unwrap_or("Generator")
                         )));
                     }
@@ -3900,12 +3904,13 @@ impl VM {
                 self.state.function_val = new_target_value.clone();
 
                 // 5. Save closure depth, SEH depth and return PC, then jump to constructor
-                match module.symtab.get(&FunctionId::new(func_id)) {
+                match module.entry_pc(func_id) {
                     Some(location) => {
                         self.state.enter_frame(arg_count)?;
-                        if module.derived_ctors.contains(&func_id) {
+                        if module.is_derived_ctor(func_id) {
                             self.mark_this_uninitialized();
                         }
+                        // 下面 `jump(location)` 用的是 `CodeBlock::start`（= 原来的 `symtab` 入口 pc）
                         // Reset Rv before invoking the constructor so that a constructor
                         // with no explicit `return` (Rv stays undefined) yields `this`
                         // via the [[Construct]] logic in `Ret`. This also avoids leaking a
@@ -3916,7 +3921,7 @@ impl VM {
                         self.state.pushc(self.state.pc + 1)?;
                         self.state.construct_stack.push(true);
                         self.state.new_target_stack.push(new_target_value);
-                        self.state.jump(*location);
+                        self.state.jump(location);
                         return Ok(());
                     }
                     None => {
@@ -4004,11 +4009,9 @@ impl VM {
                 // `fn.length` / `fn.name` come from the compiler's per-function
                 // metadata, exactly as for ordinary functions.
                 let (arrow_name, arrow_arity) = self
-                    .current_module_info
-                    .as_ref()
-                    .and_then(|info| info.get(&func_id))
-                    .cloned()
-                    .unwrap_or((String::new(), 0));
+                    .code(func_id)
+                    .map(|block| (block.name.clone(), block.arity))
+                    .unwrap_or_default();
                 let obj_val = crate::vm::object::new_arrow_function_object(
                     func_id,
                     &arrow_name,
@@ -4186,7 +4189,7 @@ impl VM {
                         self.state.seh_stack.pop();
                         if let Some(pc) = self
                             .current_function_id()
-                            .and_then(|id| module.exit_pc.get(&id).copied())
+                            .and_then(|id| module.func_exit_pc(id))
                         {
                             self.state.jump(pc);
                         }
@@ -8368,7 +8371,7 @@ impl VM {
         captured_vars: &[(String, Value)],
         module: &Module,
     ) -> Result<(), RuntimeError> {
-        let Some(location) = module.symtab.get(&FunctionId::new(func_id)).copied() else {
+        let Some(location) = module.entry_pc(func_id) else {
             return Err(RuntimeError::ReferenceError(format!(
                 "undefined function: {func_id}"
             )));
@@ -8535,7 +8538,7 @@ impl VM {
                     .as_any()
                     .downcast_ref::<crate::vm::object::GeneratorObject>()
                     .unwrap();
-                match module.symtab.get(&FunctionId::new(gobj.func_id)) {
+                match module.entry_pc(gobj.func_id) {
                     Some(_) => (gobj.func_id, gobj.args.clone(), gobj.this.clone(), gobj.captured_vars.clone()),
                     None => {
                         return Err(RuntimeError::ReferenceError(format!(
@@ -8606,7 +8609,7 @@ impl VM {
     /// The body *is* resumed, which is the whole point:
     ///
     /// * a **return** completion re-enters the frame at the function's trailing
-    ///   `Ret` (`Module::exit_pc`). That is what makes `Opcode::Ret`'s `finally`
+    ///   `Ret` (`CodeBlock::exit_pc`). That is what makes `Opcode::Ret`'s `finally`
     ///   dispatch fire, and it is why the body cannot simply be abandoned — a
     ///   `finally` that pushes to a log has to run;
     /// * a **throw** completion is handed to the resumed frame's SEH machinery,
@@ -8683,7 +8686,7 @@ impl VM {
                         // The function's trailing `Ret` is what makes
                         // `Opcode::Ret`'s `finally` dispatch run on the way out.
                         // `None` only for a hand-built module without any `Ret`.
-                        module.exit_pc.get(&func_id).copied()
+                        module.func_exit_pc(func_id)
                     }
                     Err(err) => match self.deliver_into_frame(err, saved.ctrl) {
                         Ok(()) => None,
@@ -9002,7 +9005,7 @@ impl VM {
     ///
     /// Everything except the program counter: `generator_next` continues after
     /// the `Yield`, an abrupt completion re-enters at the function's `Ret` (see
-    /// `Module::exit_pc`).
+    /// `CodeBlock::exit_pc`).
     fn restore_generator_frame(
         &mut self,
         frame: &crate::vm::object::SuspendedFrame,
@@ -9509,7 +9512,7 @@ impl VM {
             }
             // Generators and `async` functions are callable but not new-able.
             Value::Function(id) => {
-                !module.generators.contains(id) && !module.asyncs.contains(id)
+                !module.is_generator(*id) && !module.is_async(*id)
             }
             _ => false,
         }
@@ -10718,12 +10721,9 @@ mod tests {
         crate::bytecode::Module::new(
             Some("test".to_string()),
             constants,
-            HashMap::new(),
-            HashMap::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            HashMap::new(),
+            // 手搭的模块没有"按函数的属性"；调用方要走 `entry_pc` / `is_generator`
+            // 之类的地方各自兜底（与空 Hash…… 的旧行为一致）。
+            Vec::new(),
             instructions,
             HashMap::new(),
         )

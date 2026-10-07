@@ -1476,7 +1476,7 @@ M4 之后不再有 `Rc` 的引用计数增减，才会看到收益。
 | 里程碑 | 状态 | 备注 |
 |---|---|---|
 | **M0** 前置 | **已完成**（2026-10-01 起） | `refactor/interpreter-p0a`：3 个语义 bug 钉测试；`FunctionBody`/`EhRegion` 派生视图；`Instr` enum（93）；`Kind`/`Role`/`RelPc`·`AbsPc`；`open_frame`（5 处共用）；`enter_call`（`CallEx` 已改道）；`FrameMode` 合一。通过 16561 / 执行 19708 / 跳过 7843；单元 >201 / feature 524 / 护栏 7 |
-| **M1** 编译期自包含 | **进行中**。M1.1 / M1.2-a / M1.2-b **已完成**（2026-10-07，`docs/deep-arch-log.md` §3–§5）。M1.1：`PushSeh.body` / `PopSeh.region` / `Module.eh_regions` / `EhRegion.exits`；M1.2-a：VM 改以 EH 表为准；M1.2-b：异常边集合改由 **CFG 数据流**给出，**修掉一个 test262 覆盖不到的静默错编**（外层 catch 读到旧值）| 下一步 = **M1.3（`CodeBlock` per function）**；另登记 known bug #4（`handle_throw` 在 catch 路径多弹一次 `seh_stack`，M2 按构造消除） |
+| **M1** 编译期自包含 | **已完成**（2026-10-07，`docs/deep-arch-log.md` §3–§6）。M1.1：`PushSeh.body` / `PopSeh.region` / `Module.eh_regions` / `EhRegion.exits`；M1.2-a：VM 改以 EH 表为准；M1.2-b：异常边集合改由 **CFG 数据流**给出，**修掉一个 test262 覆盖不到的静默错编**；M1.3：六张按函数建的表并成 `Vec<CodeBlock>`（`Module` 公开字段 10→6），运行期一律读函数自己的属性 | 下一步 = **M2（执行模型）**。进入 M2 的前置都已就位；known bug #4（`handle_throw` 在 catch 路径多弹一次 `seh_stack`）由 M2 的 `Frame.try_stack` 按构造消除，**M2 里要以"去掉那条 `#[ignore]` 后变绿"为验收** |
 | **M2** 执行模型 | 未开始 | 见 §5.2 的六步顺序 |
 | **M3** 堆与句柄 | 未开始 | 见 §5.3 |
 | **M4** 收集器 | 未开始 | 见 §5.4；验收靠 GC stress |

@@ -7,34 +7,64 @@ use std::{
 
 pub const MIN_REQUIRED_REGISTER: usize = 3;
 
+/// 一个字节码函数的**声明属性**（`CodeBlock` 的一半）。
+///
+/// 用显式结构而不是三个 `HashSet<u32>`：以前"这个函数是不是生成器 / async /
+/// 派生类构造器"要分别查三张按函数 id 建的表，加一种函数类别就再加一张表。
+/// 现在它们是一个函数自己的属性，跟着 `CodeBlock` 走。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FnFlags {
+    /// `function*`：调用只造迭代器，不跑函数体；而且**不是构造器**。
+    pub generator: bool,
+    /// `async`：调用答一个 promise，体里可以 `await`。
+    pub r#async: bool,
+    /// 带 `extends` 的类的构造器：`this` 在 `super()` 之前是未绑定的。
+    pub derived_ctor: bool,
+}
+
+/// 一个函数的自包含描述。
+///
+/// **这一版是"属性的自包含"**：`Module` 仍在编译期把 `CodeBlock` 装进函数对象，
+/// 而指令流与常量仍是**全模块共享**的一段（pc 也是全局的）—— 把 `instructions`
+/// 搬进 `CodeBlock`、让 pc 变成函数内局部，是 M2（帧模型）的事，
+/// 见 `architecture-redesign.md` §4.3 / §4.10。
+///
+/// 此前散在 `Module` 上的 `symtab` / `func_info` / `generators` / `asyncs` /
+/// `derived_ctors` / `exit_pc` 六张表全部并入这里（见 `Module::code_blocks`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeBlock {
+    /// 入口 pc（就是原来的 `symtab[func_id]`）。
+    pub start: usize,
+    /// **编译期能确定的**声明名（`fn.name` 的第一来源）。
+    ///
+    /// 不是空就一定对，是空也不一定错：对象字面量方法、属性赋值、变量初始化
+    /// 这类场合的名字由运行期的 `SetFunctionName` 补上（ES 的 NamedEvaluation），
+    /// 所以这里会是空串 —— 而 `{ *m(){} }.m.name` 仍然是 `"m"`（实测）。
+    /// 匿名函数表达式、以及数组元素这类不会被 NamedEvaluation 取名的场合，
+    /// 空串就是**最终**答案（`arr[0].name === ""`）。
+    pub name: String,
+    /// 形参个数（`fn.length` 的来源）。
+    pub arity: usize,
+    pub flags: FnFlags,
+    /// 尾 `Ret` 的 pc。
+    ///
+    /// 被 *return* 完成恢复的挂起生成器要重入函数体到一个 `Ret`，好让 `Opcode::Ret`
+    /// 的 `finally` 分发跑起来（也好让 finally 的 `ResumeExc` 收尾时有一个 `Ret` 可落）。
+    /// 挂起点是 `Yield`，它自己没有 `Ret`，所以要到这里查函数的出口。
+    ///
+    /// `None` = 这个函数没有尾 `Ret`（手搭的 `Module`，单测里常见）。
+    pub exit_pc: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Module {
     pub name: Option<String>,
     pub constants: Vec<Constant>,
-    pub symtab: HashMap<FunctionId, usize>,
-    /// Declared name and parameter count of every bytecode function, keyed by
-    /// function id. Function objects expose these as `name` / `length`.
-    pub func_info: HashMap<u32, (String, usize)>,
-    /// Ids of the functions declared as `function*`. A call to one of these
-    /// creates a generator object instead of pushing a frame.
-    pub generators: std::collections::HashSet<u32>,
-    /// Ids of the functions declared `async`. A call to one of these runs the
-    /// body (which may `await`) and answers a promise settled with its outcome.
-    pub asyncs: std::collections::HashSet<u32>,
-    /// Ids of constructors declared in a class with an `extends` clause. Their
-    /// `this` is uninitialized until `super()` runs.
-    pub derived_ctors: std::collections::HashSet<u32>,
-    /// The pc of every function's trailing `Ret`.
+    /// 每个函数的描述，**下标就是函数 id**（编译期保证 0..n 连续）。
     ///
-    /// A suspended generator that is resumed with a *return* completion has to
-    /// re-enter its body at a `Ret` so that `Opcode::Ret`'s `finally` dispatch
-    /// runs (and so that the finally's `ResumeExc` epilogue finds a `Ret` to
-    /// fall through to). The suspension point is a `Yield`, which has no `Ret`
-    /// of its own, so the function's exit is looked up here instead.
-    ///
-    /// `default_instructions()` is the fallback when a function has no `Ret`
-    /// at all (a module built by hand, as the unit tests do).
-    pub exit_pc: HashMap<u32, usize>,
+    /// 这是"按函数属性"的唯一来源：以前那六张表（入口 pc、名字/arity、
+    /// 生成器 / async / 派生构造器三个 id 集合、尾 `Ret` 的 pc）都并进了这里。
+    pub code_blocks: Vec<CodeBlock>,
     pub instructions: Vec<Instr>,
     pub debug_instructions: BTreeMap<usize, crate::compiler::ir::Instruction>,
     /// 每个函数的 try 区域表，**由编译期（`codegen`）声明**，不再是扫指令流派生出来的。
@@ -61,12 +91,12 @@ struct EhIndex {
 
 /// 一个函数的字节码体（深改第 2 步的第一步）：它的**指令范围**。
 ///
-/// 现在它是 `Module::symtab` 的**派生视图**，不存新状态 —— 因此不可能与那张表不一致。
+/// 现在它是 `Module::code_blocks` 的**派生视图**，不存新状态 —— 因此不可能与那张表不一致。
 /// 下一步把 EH 元数据（try/catch/finally 的 pc 区间）填进来时，它才变成真正的新数据；
 /// 那时改的是这里，而不是再散到 VM 的各条 arm 里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FunctionBody {
-    /// 入口 pc（来自 `Module::symtab`）。
+    /// 入口 pc（来自 `CodeBlock::start`）。
     pub start: usize,
     /// 下一个函数的入口（或程序末尾）。**注意它不等于"尾 `Ret` 的后一位"**：
     /// catch / finally 块发射在尾 `Ret` 之后，所以范围必须覆盖它们。
@@ -110,29 +140,66 @@ impl Module {
     pub fn new(
         name: impl Into<Option<String>>,
         constants: Vec<Constant>,
-        symtab: HashMap<FunctionId, usize>,
-        func_info: HashMap<u32, (String, usize)>,
-        generators: std::collections::HashSet<u32>,
-        asyncs: std::collections::HashSet<u32>,
-        derived_ctors: std::collections::HashSet<u32>,
-        exit_pc: HashMap<u32, usize>,
+        code_blocks: Vec<CodeBlock>,
         instructions: Vec<Instr>,
         eh_regions: HashMap<u32, Vec<EhRegion>>,
     ) -> Self {
         Self {
             name: name.into(),
             constants,
-            symtab,
-            func_info,
-            generators,
-            asyncs,
-            derived_ctors,
-            exit_pc,
+            code_blocks,
             instructions,
             eh_regions,
             debug_instructions: BTreeMap::new(),
             eh_index: OnceCell::new(),
         }
+    }
+
+    /// 某个函数的描述。**运行期一切"按函数属性"的问题都由它回答。**
+    ///
+    /// 手搭的 `Module`（单测）可以没有 `code_blocks`，那时返回 `None` ——
+    /// 调用方各自兜底（`is_some_and(...)` 对空的旧 `HashSet` 与 `HashMap` 是等价的）。
+    pub fn code_block(&self, func_id: u32) -> Option<&CodeBlock> {
+        self.code_blocks.get(func_id as usize)
+    }
+
+    /// 这个函数是不是生成器（`function*`）。
+    ///
+    /// **判定的唯一出口**：以前要查 `Module::generators` 那张 id 集合（M1.3 已删），
+    /// 现在读函数自己的属性（`FnFlags`）。
+    pub fn is_generator(&self, func_id: u32) -> bool {
+        self.code_block(func_id)
+            .is_some_and(|block| block.flags.generator)
+    }
+
+    /// 这个函数是不是 `async`。
+    pub fn is_async(&self, func_id: u32) -> bool {
+        self.code_block(func_id)
+            .is_some_and(|block| block.flags.r#async)
+    }
+
+    /// 这个函数是不是带 `extends` 的类的构造器。
+    pub fn is_derived_ctor(&self, func_id: u32) -> bool {
+        self.code_block(func_id)
+            .is_some_and(|block| block.flags.derived_ctor)
+    }
+
+    /// 这个函数的尾 `Ret` 的 pc。
+    pub fn func_exit_pc(&self, func_id: u32) -> Option<usize> {
+        self.code_block(func_id).and_then(|block| block.exit_pc)
+    }
+
+    /// 这个函数的入口 pc。
+    pub fn entry_pc(&self, func_id: u32) -> Option<usize> {
+        self.code_block(func_id).map(|block| block.start)
+    }
+
+    /// 按声明名找函数 id（工具与测试用；名字可能重复，返回第一个）。
+    pub fn func_id_by_name(&self, name: &str) -> Option<u32> {
+        self.code_blocks
+            .iter()
+            .position(|block| block.name == name)
+            .map(|idx| idx as u32)
     }
 
     /// EH 索引（惰性构建一次，之后都是 O(1) 查询）。
@@ -169,21 +236,21 @@ impl Module {
         self.eh_index().by_exit.get(&pc).cloned()
     }
 
-    /// 某个函数的字节码体：它的指令范围（`symtab` 的入口 + `exit_pc` 的尾 `Ret`）。
+    /// 某个函数的字节码体：它的指令范围（入口 pc + 下一个函数的入口）。
     ///
-    /// **派生视图，不存新状态**，所以不可能与那两张表不一致。手搭的 `Module`
+    /// **派生视图，不存新状态**，所以不可能与 `code_blocks` 不一致。手搭的 `Module`
     /// （单测里常见）可能既没有 `Ret` 也没有入口，那时返回 `None` —— 调用方各自兜底，
     /// 见 `VM::drive_bytecode_frame` 里哨兵返回地址的处理。
     pub fn body_of(&self, func_id: u32) -> Option<FunctionBody> {
-        let start = *self.symtab.get(&FunctionId::new(func_id))?;
+        let start = self.entry_pc(func_id)?;
         // 结束 = 下一个函数的起点（函数按入口 pc 顺序排在指令流里），最后一个则到程序末尾。
         //
         // **不能用 `exit_pc + 1`**：catch / finally 块是发射在函数尾 `Ret` **之后**的，
         // 那样算出来的范围会把处理器切在函数外面（实测抓到过：handler pc 51 而 end 51）。
         let end = self
-            .symtab
-            .values()
-            .copied()
+            .code_blocks
+            .iter()
+            .map(|block| block.start)
             .filter(|pc| *pc > start)
             .min()
             .unwrap_or(self.instructions.len());
@@ -201,14 +268,7 @@ impl Module {
 
     /// 所有函数的体，按入口 pc 排序。给"逐条过一遍"的工具与测试用。
     pub fn bodies(&self) -> Vec<(u32, FunctionBody)> {
-        let mut out: Vec<(u32, FunctionBody)> = self
-            .func_info
-            .keys()
-            .chain(self.generators.iter())
-            .chain(self.asyncs.iter())
-            .copied()
-            .collect::<std::collections::BTreeSet<u32>>()
-            .into_iter()
+        let mut out: Vec<(u32, FunctionBody)> = (0..self.code_blocks.len() as u32)
             .filter_map(|id| self.body_of(id).map(|body| (id, body)))
             .collect();
         out.sort_by_key(|(_, body)| body.start);
@@ -229,9 +289,25 @@ impl fmt::Display for Module {
             writeln!(f, "{i}\t: {constant}")?;
         }
 
-        writeln!(f, "=== symtab ===")?;
-        for (function_id, &index) in &self.symtab {
-            writeln!(f, "{function_id}: {index}")?;
+        writeln!(f, "=== code blocks ===")?;
+        for (function_id, block) in self.code_blocks.iter().enumerate() {
+            write!(f, "{function_id}: start {} .. {:?}", block.start, block.exit_pc)?;
+            if !block.name.is_empty() {
+                write!(f, " name {:?}", block.name)?;
+            }
+            if block.arity != 0 {
+                write!(f, " arity {}", block.arity)?;
+            }
+            if block.flags.generator {
+                write!(f, " [generator]")?;
+            }
+            if block.flags.r#async {
+                write!(f, " [async]")?;
+            }
+            if block.flags.derived_ctor {
+                write!(f, " [derived-ctor]")?;
+            }
+            writeln!(f)?;
         }
 
         writeln!(f, "=== instructions ===")?;
@@ -1694,18 +1770,13 @@ mod tests {
         let module = Module::new(
             Some("test".to_string()),
             vec![],
-            HashMap::new(),
-            HashMap::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            HashMap::new(),
+            vec![],
             vec![],
             HashMap::new(),
         );
         assert_eq!(module.name, Some("test".to_string()));
         assert!(module.constants.is_empty());
-        assert!(module.symtab.is_empty());
+        assert!(module.code_blocks.is_empty());
         assert!(module.instructions.is_empty());
     }
 
@@ -1714,12 +1785,16 @@ mod tests {
         let module = Module::new(
             Some("main".to_string()),
             vec![Constant::from("hello")],
-            HashMap::new(),
-            HashMap::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            HashMap::new(),
+            vec![CodeBlock {
+                start: 0,
+                name: "f".to_string(),
+                arity: 1,
+                flags: FnFlags {
+                    generator: true,
+                    ..FnFlags::default()
+                },
+                exit_pc: Some(3),
+            }],
             vec![Instr::Halt {}],
             HashMap::new(),
         );
@@ -1791,9 +1866,9 @@ mod tests {
             assert!(body.end <= module.instructions.len(), "{id} 的范围越过了程序末尾");
             // 尾 `Ret` 必须在范围内 —— 而范围**还要覆盖它之后的 catch/finally**：
             // 早先用 `exit_pc + 1` 当 end，正好把处理器切在了函数外面（实测抓到过）。
-            if let Some(exit) = module.exit_pc.get(id) {
+            if let Some(exit) = module.func_exit_pc(*id) {
                 assert!(
-                    (body.start..body.end).contains(exit),
+                    (body.start..body.end).contains(&exit),
                     "{id} 的尾 Ret pc {exit} 不在范围 {body:?} 内"
                 );
             }
@@ -1804,7 +1879,7 @@ mod tests {
             .into_iter()
             .find(|(id, _)| module.eh_regions_of(*id).iter().any(|r| r.finally.is_some()));
         let (id, body) = with_try.expect("至少要有一个带 finally 的函数");
-        let exit = module.exit_pc[&id];
+        let exit = module.func_exit_pc(id).expect("带 finally 的函数必须有尾 Ret");
         assert!(
             body.end >= exit + 1,
             "{id} 的范围 {body:?} 连尾 Ret({exit}) 都没包住"
@@ -1916,15 +1991,11 @@ mod tests {
             );
         }
 
-        // 逐个函数核对表格的**语义**：
-        // 名字 → id 走 `func_info`。
+        // 逐个函数核对表格的**语义**：名字 → id 走 `CodeBlock.name`。
         let id_of = |name: &str| -> u32 {
-            *module
-                .func_info
-                .iter()
-                .find(|(_, (n, _))| n == name)
+            module
+                .func_id_by_name(name)
                 .unwrap_or_else(|| panic!("没有函数 {name}"))
-                .0
         };
         let one = |name: &str| -> EhRegion {
             let mut rs = module.eh_regions_of(id_of(name));
@@ -1995,12 +2066,7 @@ mod tests {
             .compile("function g() { try { return 1 } catch (e) { return 2 } } g();")
             .expect("compilation failed");
 
-        let id = *module
-            .func_info
-            .iter()
-            .find(|(_, (n, _))| n == "g")
-            .expect("没有函数 g")
-            .0;
+        let id = module.func_id_by_name("g").expect("没有函数 g");
         let regions = module.eh_regions_of(id);
         assert_eq!(regions.len(), 1, "g 只有一个 try，实际 {regions:?}");
         assert!(
@@ -2019,6 +2085,122 @@ mod tests {
         );
         // 而处理器地址仍然可信 —— 这正是运行时真正要用的那部分。
         assert!(regions[0].catch.is_some());
+    }
+
+    /// `CodeBlock` 是"按函数属性"的**唯一来源**（M1.3 把散在 `Module` 上的六张表
+    /// —— 入口 pc、名字/arity、三个 id 集合、尾 `Ret` 的 pc —— 并成了它）。
+    ///
+    /// 这条守卫钉住"每一项都描述的是**它自己那个**函数"。归并多张表最容易出的错
+    /// 不是漏搬，而是**搬错行**（把 A 的标志挂到 B 上），而那类错在别处全绿。
+    #[test]
+    fn code_blocks_describe_every_function() {
+        let mut compiler = crate::compiler::Compiler::new();
+        let module = compiler
+            .compile(
+                "function plain(a, b) { return a; }
+                 function* gen() { yield 1; }
+                 async function asy() { return 2; }
+                 class Base {}
+                 class Derived extends Base { constructor() { super(); } }
+                 var arr = [function () {}];
+                 var obj = { *m() { yield 2; } };
+                 plain; gen; asy; Base; Derived; arr; obj;",
+            )
+            .expect("compilation failed");
+
+        // 每个函数都有描述，且 `code_block(id)` 的 id 就是它在 Vec 里的下标。
+        assert!(!module.code_blocks.is_empty(), "至少要有几个函数");
+
+        let cb_of = |name: &str| -> &CodeBlock {
+            let id = module
+                .func_id_by_name(name)
+                .unwrap_or_else(|| panic!("没有函数 {name}"));
+            assert_eq!(
+                module.entry_pc(id),
+                module.code_block(id).map(|cb| cb.start),
+                "{name}: entry_pc 与 code_block.start 不一致"
+            );
+            module.code_block(id).expect("code_block")
+        };
+
+        // 普通函数：名字 / 形参个数 / 三类标志全空 / 有尾 `Ret`。
+        let plain = cb_of("plain");
+        assert_eq!((plain.name.as_str(), plain.arity), ("plain", 2), "{plain:?}");
+        assert!(
+            !plain.flags.generator && !plain.flags.r#async && !plain.flags.derived_ctor,
+            "plain 不该带任何函数类别标志: {plain:?}"
+        );
+        assert!(plain.exit_pc.is_some(), "普通函数有尾 Ret: {plain:?}");
+
+        // 三类标志各自只落在**它自己**那个函数上。
+        let plain_id = module.func_id_by_name("plain").expect("plain");
+        let gen_id = module.func_id_by_name("gen").expect("gen");
+        assert!(module.is_generator(gen_id) && !module.is_async(gen_id), "gen");
+        let asy = module.func_id_by_name("asy").expect("asy");
+        assert!(module.is_async(asy) && !module.is_generator(asy), "asy");
+        let derived = module.func_id_by_name("Derived").expect("Derived");
+        assert!(module.is_derived_ctor(derived), "Derived 是派生构造器");
+        let base = module.func_id_by_name("Base").expect("Base");
+        assert!(!module.is_derived_ctor(base), "Base 不是派生构造器");
+        assert!(!module.is_generator(derived), "构造器不是生成器");
+        assert!(!module.is_generator(plain_id), "plain 不是生成器");
+
+        // **方法形态的生成器也要被认出来** —— 历史上"方法调用路径漏判生成器"
+        // 是 B24 的根因（`{ *m(){} }` 走的是另一条注册路径）。
+        //
+        // 这里按"标志的**个数**"验，不按名字找它：对象字面量方法的名字由运行期的
+        // `SetFunctionName` 补上，所以 `CodeBlock.name` 是空串（实测 `obj.m.name`
+        // 在运行期仍是 `"m"`）。名字这条契约由 `features` 侧的 `obj.m.name` 断言覆盖。
+        let generator_ids: Vec<u32> = (0..module.code_blocks.len() as u32)
+            .filter(|id| module.is_generator(*id))
+            .collect();
+        assert!(generator_ids.contains(&gen_id), "函数声明的生成器: {generator_ids:?}");
+        assert!(
+            generator_ids.len() >= 2,
+            "对象字面量里的生成器方法也必须带 generator 标志: {generator_ids:?}"
+        );
+        assert!(
+            !generator_ids.contains(&asy),
+            "async 函数不该被当成生成器: {generator_ids:?}"
+        );
+
+        // 编译期名字为空串的有两处：匿名函数表达式（数组元素不会被 NamedEvaluation
+        // 取名 ⇒ 空串是**最终**答案）与对象字面量方法（空串是**中间态**）。
+        assert!(
+            module.code_blocks.iter().any(|cb| cb.name.is_empty()),
+            "至少要有一个名字为空串的函数: {:?}",
+            module
+                .code_blocks
+                .iter()
+                .map(|cb| cb.name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // 入口 pc 两两不同，且都落在指令流内（函数在流里顺序排列）。
+        let mut starts: Vec<usize> = module.code_blocks.iter().map(|cb| cb.start).collect();
+        let total = starts.len();
+        starts.sort_unstable();
+        starts.dedup();
+        assert_eq!(starts.len(), total, "两个函数用了同一个入口 pc");
+        assert!(
+            *starts.last().unwrap() < module.instructions.len(),
+            "有函数的入口 pc 越过了指令流末尾"
+        );
+
+        // `exit_pc` 有值 **⇔** 那个 pc 上真的是一条 `Ret`。
+        for (id, _) in module.bodies() {
+            if let Some(exit) = module.func_exit_pc(id) {
+                assert_eq!(
+                    module.instructions[exit].opcode(),
+                    Opcode::Ret,
+                    "{id} 的 exit_pc({exit}) 上不是 Ret"
+                );
+                assert!(
+                    module.code_block(id).is_some_and(|cb| cb.exit_pc == Some(exit)),
+                    "{id}: func_exit_pc 与 code_block.exit_pc 不一致"
+                );
+            }
+        }
     }
 
     /// 表的顺序与 `ALL` 一致（`ALL` 是拿来做工具/测试的，顺序即表顺序）。
