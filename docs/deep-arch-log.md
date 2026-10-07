@@ -170,3 +170,69 @@ M1.3 是全库扇出（44 处 `module.` 访问）。混在一起时回归噪声�
 3. **EH 表还在 `Module.eh_regions`，没挂进 `FunctionBody`**：`FunctionBody` 仍是
    `{start, end}` 派生视图。合并是 M1.3（`CodeBlock`）的事。
 4. `EhRegion.last_exit()` 目前只有测试用；M2 若确认无用应删掉（不留无人消费的 API）。
+
+### 3.6 补记：debug 模式验证（M1.1 的验证缺口）
+
+M1.1 的全量验证跑在 **release** 下，`debug_assert!` 被编译掉，
+所以"EH 表 == 指令操作数"这条等价性证据**当时并未执行**。补跑：
+
+```
+cargo test --lib        → 204 passed
+cargo test --test features → 524 passed / 3 ignored      （debug，跑真实 JS）
+```
+
+⇒ 两条断言都在真实 JS 上成立：`Try` 的指令操作数与表一致（两条独立回填路径不分叉），
+`eh_index` 的"退出点唯一"成立。**教训记入流程：涉及 `debug_assert` 的改动，
+验证必须包含一次 debug 运行**（release 跑绿不等于断言跑过）。
+
+---
+
+## 4. M1.2-a VM 的 EH 处理器地址改以表为准（2026-10-07）
+
+### 4.1 目标
+
+把 §10.3 留下的"等区域边界可信之后，再切到查表"这一刀切下去 ——
+让**运行期只有一个权威来源**（EH 表），指令操作数只作互校。
+
+### 4.2 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `vm/mod.rs` 的 `Instr::Try` arm | 处理器地址从 `eh_region_starting_at(pc)` 取（**权威来源**）；找不到声明时返回 `RuntimeError::InternalError`（不静默兜底，避免出现"第二条路径"）；`#[cfg(debug_assertions)]` 下仍读指令操作数做**互校** |
+| `vm/mod.rs` 的 `Instr::EndTry` arm | 加了 `debug_assert!(module.eh_region_ending_at(pc).is_some())` |
+
+**为什么现在才切**：文档里记着退回用指令偏移的两条理由 ——
+(a) 表的 `end` 不可靠；(b) 查表有开销。M1.1 把 (a) 修掉了（表由编译期声明、配对结构化）；
+(b) 在这一步同时是**负收益**：省掉了两次偏移加法，只多一次 O(1) 哈希。
+
+### 4.3 这一步的**证据**（不是"看起来对"）
+
+`Instr::EndTry` 上那条断言**曾经是 §10.3 的证物**：当时它在这里响过
+（`EndTry(pc=73)` 关掉的不是任何区域）。现在同一条断言在 **debug 模式、524 条真实 JS
+feature 断言**下全绿。这是"根因已修"最直接的证据 —— 断言没被删、没被放松，条件变了。
+
+### 4.4 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元（debug + release） | 204 | **204** | 不变 |
+| feature（debug + release） | 524 / 3 | **524 / 3** | 不变 |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | 逐字节一致 |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards 行 | timeout 7 / step-limit 0 / memory 22 | **同值** | 第二次独立测量取值相同 |
+| 定向 7 套件 | try / class / exprs.class / generators×2 / function / switch | **逐字节一致** | 含 `function`（347/74/30）与 `switch`（51/54/6）扩大异常路径覆盖 |
+| 告警 | lib 24 / lib test 26 | **同** | 无新增 |
+
+**自评**：本步是**行为变化**（运行期不再读指令偏移），但结果与基线逐字节相同 ——
+这正是"先证等价、再切换"要的结果：切换点本身不产生任何数字变化，
+变化的是"以后这类 bug 不可能再靠两条路径分叉产生"。
+
+### 4.5 已知未解 / 下一步
+
+- `SehRecord` 仍然把 `handler_pc` / `finally_pc` 存成**绝对 pc**。
+  M2 会把它换成 `region: RegionId`（或直接靠 `Frame.try_stack`），
+  那时 `EhRegion` 的 pc 只用于 dump。
+- **`ssabuilder` 的 `seh_scope` 仍盲目 pop**（M1.2 的第一项，尚未做）：
+  现在有了区域身份，可以按身份删；但那会改变**异常边集合** ⇒ 是语义变化，
+  要单独提交、单独验证。**这是下一步。**

@@ -3682,37 +3682,42 @@ impl VM {
             }
 
             // ===== Exception Handling =====
-            Instr::Try { catch_offset, finally_offset } => {
-                let catch_offset = catch_offset.as_immd();
-                let finally_offset = finally_offset.as_immd();
-                let from_operands = (
-                    if catch_offset != 0 {
-                        (self.state.pc as isize + catch_offset) as usize
-                    } else {
-                        0
-                    },
-                    if finally_offset != 0 {
-                        (self.state.pc as isize + finally_offset) as usize
-                    } else {
-                        0
-                    },
-                );
-                // 深改第 2 步：**地址仍以指令自己的相对偏移为准**（O(1)，无查表），
-                // EH 表只做等价性校验（debug）。
+            Instr::Try { .. } => {
+                // **以 EH 表为准**（M1.1 之后它才可信：区域由编译期声明、配对是结构化的）。
+                // 之前退回用指令偏移的两条理由都已消失：
+                // 1. "表不可靠" —— `EhRegion` 不再从指令流派生，§10.3 的根因已修；
+                // 2. 查表开销 —— `eh_index` 是一次 O(1) 哈希，而这一步同时省掉了两次偏移加法。
                 //
-                // 试过改成"以表为准"（`eh_region_starting_at`），两条理由又退回来了：
-                // 1. 每次执行 try 都要一次哈希查找，性能 A/B 落在噪声带上限（108.6s vs
-                //    历次 105.7–108.6），无法证明无代价；
-                // 2. 表的 `end` 本来就不可靠（§10.3：EndTry 与 Try 不是一一配对），
-                //    所以现在"以表为准"买不到任何收益。
-                // 等区域边界改由发射端给出（§10.3 的下一步）之后，再切到查表。
-                let (catch_pc, finally_pc) = from_operands;
+                // 处理器地址是**运行时真正要用的那部分**，所以它必须来自唯一的权威来源；
+                // 指令操作数保留下来只作互校（见下），不再参与决定控制流。
+                let region = module.eh_region_starting_at(self.state.pc).ok_or_else(|| {
+                    RuntimeError::InternalError(format!(
+                        "Try(pc={}) 没有对应的 EH 区域声明 —— 编译期漏声明",
+                        self.state.pc
+                    ))
+                })?;
+                let (catch_pc, finally_pc) = (region.catch.unwrap_or(0), region.finally.unwrap_or(0));
+                // 互校：指令操作数由 `codegen` 的 `PatchFn` 回填，表由 `resolve_eh_regions`
+                // 用 `block_map` 解析 —— **两条独立的计算路径**，分叉了就说明其中一条错了。
+                // 只在 debug 下读操作数，所以这里重新取一次指令（避免 release 下绑定未使用）。
                 #[cfg(debug_assertions)]
-                if let Some(region) = module.eh_region_starting_at(self.state.pc) {
+                if let Instr::Try {
+                    catch_offset,
+                    finally_offset,
+                } = module.instructions[self.state.pc]
+                {
+                    let abs = |off: isize| -> usize {
+                        if off == 0 {
+                            0
+                        } else {
+                            (self.state.pc as isize + off) as usize
+                        }
+                    };
                     debug_assert_eq!(
-                        (region.catch.unwrap_or(0), region.finally.unwrap_or(0)),
+                        (abs(catch_offset.as_immd()), abs(finally_offset.as_immd())),
                         (catch_pc, finally_pc),
-                        "EH 表与 Try 指令自己算出的处理器地址不一致: {region:?}"
+                        "Try(pc={})：指令操作数与 EH 表不一致 —— 两条回填路径分叉了",
+                        self.state.pc
                     );
                 }
                 let record = SehRecord {
@@ -3734,16 +3739,18 @@ impl VM {
                 self.state.seh_stack.push(record);
             }
             Instr::EndTry {  } => {
-                // 深改第 2 步·待查：**不能**假设这条 `EndTry` 就是派生表里某个区域的终点。
+                // 这条断言**现在成立**了，而且它曾经是 §10.3 的证物：
+                // 当时它在这里响过 —— `EndTry(pc=73)` 关掉的不是派生表里的任何区域，
+                // 因为那时"配对"靠扫指令流 + 深度计数，而 `EndTry` 与 `Try` 根本不一配对。
                 //
-                // 试过加 `debug_assert!(module.eh_region_ending_at(pc).is_some())`，结果在
-                // "嵌套 try + catch 里再 throw" 的程序上直接响：`EndTry(pc=73) 关掉的不是
-                // EH 表里的任何区域`。也就是：**运行时的进出配对与静态派生的区域在某处
-                // 不一致** —— 要么有 EndTry 没有配对的 Try，要么我的深度计数/边界算法在
-                // 处理器里再嵌 try 时算错了。
-                //
-                // 这一条必须先查清才能把 seh_stack 退掉（否则退掉就等于把异常路径改一遍）。
-                // 登记见 `docs/architecture-redesign.md` §10.3。
+                // M1.1 之后配对是结构化的（`PopSeh { region }` → 区域表的 `exits`），
+                // 所以每条 `EndTry` 的 pc 必然登记在某个区域上。留着它当守卫：
+                // 它一响就说明发射端与表之间又出现了新的分叉。
+                debug_assert!(
+                    module.eh_region_ending_at(self.state.pc).is_some(),
+                    "EndTry(pc={}) 不是任何区域的退出点 —— 发射端与 EH 表分叉了",
+                    self.state.pc
+                );
                 self.state.seh_stack.pop();
             }
             Instr::ThrowExc { value } => {
