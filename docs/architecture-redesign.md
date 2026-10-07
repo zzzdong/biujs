@@ -225,13 +225,29 @@ id 4 d:  Try 117, EndTry 119, Try 122 → regions: [117..119 catch 145], [122..1
 - 它 push 了一个 `SehFrameInfo { finally_blk, pending_exits, exit_edges }`，
   **受保护范围的出口集合就在 `exit_edges` 里**（还有"body 结束在哪个块"那个兜底分支）。
 
-所以正确的修法是：**让 `push_seh` 带上出口集合**（或至少"正常出口"那个 pc），
-由发射端回填进 `Try` 指令 / EH 表。之所以现在做不到，是因为 try body 可以从多个块离开
-（正常结束、break/continue 的 trampoline、异常边……），**出口不是一个 pc** ——
-这也顺带解释了为什么 `EndTry` 的发射是条件式的、不是一一配对。
+所以正确的修法是：**让 `push_seh` 带上受保护的 body 块**，由发射端解析它的正常出口并回填。
+已把改动点逐个确认过（比预想的小）：
 
-在这之前，`EhRegion` 只有 `catch` / `finally` 两个地址字段可信（已由 `Try` arm 的
-debug_assert 证明与指令操作数等价）。
+1. **`Instruction::PushSeh { handler, finally }`（`ir/instruction.rs:467`）缺 `body` 字段**
+   —— 而 `lower_try` 在调用 `push_seh` 的那一刻**手上就有 `try_body`**（它同时还调了
+   `add_exception_edge(try_body, …)`）。所以这是**加一个字段**的事，不需要新的 fixup 机制。
+2. **IR 层本来就没有 patch/fixup 机制** —— 所有回填都是 `codegen::generate_code` 内部的
+   `Vec<PatchFn>` 闭包（`codegen.rs:75`），在布局完成后统一执行。`PushSeh` 现有的
+   `catch_offset` / `finally_offset` 就是这么回填的，照抄即可。
+3. **从 `BlockId` 拿 pc 已有现成路**：`ControlFlowGraph::get_block_pos(block_id)`（块在布局里
+   的次序）+ codegen 已有的 `block_map`。正常出口就是 `body` 的终结指令（`Jump{target}` 或
+   条件分支的某一侧）指向的块。
+4. **`Try` 指令要加第三个操作数 `end_offset`**（`jr`，相对）：表里把它从 arity 2 组挪到
+   arity 3 组；`test_try_has_no_padding_slot` 那条测试要同步改（它现在断言 arity == 2）。
+
+**要注意的坑**：body 的**正常出口可能不止一个**（条件分支的两侧、break/continue 的
+trampoline），所以单个 `end_offset` 只是"主出口"的近似。真要 faithful 就得让 EH 表存
+**出口集合**（ChakraCore 的 EH 表正是按区域存范围的）。建议先上近似版 + 把
+"多出口"记成已知限制，等 `ResumeExc` 真要按区域跳时再升级。
+
+做完这四步，`EhRegion::end` 才可信，`ResumeExc` / `DelayedJump` 才有条件改，
+`seh_stack` 才能退。在那之前，`EhRegion` 只有 `catch` / `finally` 两个地址字段可信
+（已由 `Try` arm 的 debug_assert 证明与指令操作数等价）。
 
 ## 11. 分支与提交约定
 
