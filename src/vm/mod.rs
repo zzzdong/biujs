@@ -454,6 +454,13 @@ impl VM {
             .borrow_mut()
             .insert("globalThis".to_string(), self.state.global_object.clone());
 
+        // **顶层脚本也是一个帧**（`architecture-redesign.md` §4.3 陷阱 5）。
+        // 这条不是锦上添花：`pc` 现在住在 `Frame` 里，如果脚本没有帧，`pc` 就没有
+        // 唯一的家 —— 于是"读 pc / 写 pc"会分叉成两条路径，正是本次深改要消灭的东西。
+        // 顺带把"最外层"这个概念从 `ctrl_stack.is_empty()` 变成 `frames.len() == 1`，
+        // 与 `PushC`/`PopC` 在控制栈上的簿记彻底分开。
+        self.state.open_script_frame(module.instructions.len())?;
+
         while self.step(module)? {}
 
         // Promises settle through jobs, and there is no event loop: the end of
@@ -669,7 +676,10 @@ impl VM {
                     self.state.jump(finally_pc);
                 } else {
                     // No pending finally blocks, proceed with normal return
-                    if self.state.ctrl_stack_reached_bottom() {
+                    // "已经回到最外层"：只剩顶层脚本那一帧。
+                    // 以前是 `ctrl_stack.is_empty()` —— 那问的是"控制栈空不空"，
+                    // 而控制栈上还混着 `PushC`/`PopC` 的条目（两条知识混在一条栈上）。
+                    if self.state.frames.len() == 1 {
                         // The return value is already in Rv; stop the loop so the
                         // caller can read it.
                         return Ok(false);
@@ -1363,6 +1373,8 @@ impl VM {
         mode: FrameMode,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        // `pc` 仍是全局的一个，所以进入被调帧之前必须自己存好调用方的值 ——
+        // 它**不能**由 `frames` 恢复（`pc` 还没进 `Frame`，见 `State::pc` 的说明）。
         let saved_pc = self.state.pc;
         let saved_rsp = self.state.rsp;
         let saved_rbp = self.state.rbp;
@@ -9964,6 +9976,13 @@ struct State {
     frames: Vec<Frame>,
     rsp: usize,
     rbp: usize,
+    /// 指令指针。
+    ///
+    /// **它暂时还没进 `Frame`** —— 原因是实测出来的耦合（见 `deep-arch-log.md` §10）：
+    /// `Ret` 靠 `jump(return_pc)` 把控制权交回调用方，而嵌套循环靠"pc 越界"当出口。
+    /// 一旦 `pc` 变成每帧一个，`jump(return_pc)` 就会写进**调用方**那一帧，
+    /// 哨兵 pc 这个技巧同时失效。所以 `pc` 必须与"循环改成 `frames.len() > boundary`"
+    /// （删哨兵、删 `return_pc`）一起做，不能单独搬。
     pc: usize,
 }
 
@@ -10004,10 +10023,34 @@ impl State {
         }
     }
 
-    fn ctrl_stack_reached_bottom(&self) -> bool {
-        self.ctrl_stack.is_empty()
+    /// 压**顶层脚本帧**：与 5 个开帧点**完全同构**（`enter_frame` + 控制栈三项 +
+    /// `note_frame`），`pc` 从 0 起。
+    ///
+    /// 单独抽一个方法而不是让 `run` 内联：单元测试也需要"一个已经有帧的 `State`"，
+    /// 而它必须与运行期压的是**同一种**帧 —— 否则测试验的就是别的东西了。
+    /// 少了控制栈那三项，`note_frame` 的 `ctrl_base` 会下溢（实测踩到过）；
+    /// 而"每帧三项"正是本阶段镜面互校的依据。切片 1b 会把这三项连同 `ctrl_stack`
+    /// 一起退役，届时脚本帧就是普通的一员。
+    fn open_script_frame(&mut self, return_pc: usize) -> Result<(), RuntimeError> {
+        self.enter_frame(0)?;
+        let closure_depth = self.closure_var_stack.len();
+        let seh_depth = self.seh_stack.len();
+        self.pushc(closure_depth)?;
+        self.pushc(seh_depth)?;
+        self.pushc(return_pc)?;
+        self.note_frame(closure_depth, seh_depth, return_pc);
+        self.jump(0);
+        Ok(())
     }
 
+    /// `pc` 仍是**全局的一个**（还没进 `Frame`）。
+    ///
+    /// 试着搬过（见 `deep-arch-log.md` §10），结论是**它不能单独搬**：
+    /// `Ret` 用 `jump(return_pc)` 把控制权交回调用方，而嵌套循环用"pc 越界"当出口。
+    /// `pc` 一旦变成每帧一个，`jump(return_pc)` 就会写进**调用方**那一帧 ——
+    /// 实测表现是"Rust 驱动的回调一返回，脚本层的 pc 就被哨兵覆盖、主循环直接退出"
+    /// （`[1,,3].map(...)` 的完成值变成数组本身）。所以 `pc` 必须与
+    /// **"循环改成 `frames.len() > boundary`"**（删哨兵、删 `return_pc`）一起做。
     fn jump(&mut self, target: usize) {
         self.pc = target;
     }
@@ -10147,7 +10190,10 @@ impl State {
     /// Enter a JS call frame: save the caller's `this`, record the argument
     /// count (used by `Opcode::Arguments`) and guard recursion depth.
     fn enter_frame(&mut self, argc: usize) -> Result<(), RuntimeError> {
-        if self.ctrl_stack.len() / 3 >= MAX_CALL_DEPTH {
+        // 深度按**调用帧**数算：`frames[0]` 是顶层脚本帧，不算一次调用。
+        // 以前读 `ctrl_stack.len() / 3`（每帧三项）—— 那还混着 `PushC`/`PopC` 的条目，
+        // 只有"它们最多两项、整数除法恰好不出错"才成立，是个侥幸。
+        if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
             return Err(RuntimeError::RangeError(
                 "Maximum call stack size exceeded".to_string(),
             ));
@@ -10634,7 +10680,6 @@ mod tests {
     #[test]
     fn test_state_new() {
         let state = State::new();
-        assert_eq!(state.pc, 0);
         assert_eq!(state.rsp, 0);
         assert_eq!(state.rbp, 0);
         assert!(state.ctrl_stack.is_empty());
@@ -10688,12 +10733,15 @@ mod tests {
         assert!(matches!(result, Err(RuntimeError::RangeError(_))));
     }
 
-    #[test]
-    fn test_state_ctrl_stack_reached_bottom() {
+    /// 单元测试用：压一个"顶层脚本帧"。
+    ///
+    /// `pc` 现在住在 `Frame` 里，所以任何要动 `pc` 的测试都必须先有帧 ——
+    /// 这正是本步的意图：**没有帧就没有 pc**，不再有一条"帧外"的 pc 通道。
+    fn state_with_script_frame() -> State {
         let mut state = State::new();
-        assert!(state.ctrl_stack_reached_bottom());
-        state.pushc(0).unwrap();
-        assert!(!state.ctrl_stack_reached_bottom());
+        // 用**运行期同一个**压帧入口，测试才不会验到另一种帧。
+        state.open_script_frame(0).expect("open_script_frame");
+        state
     }
 
     #[test]
@@ -10711,6 +10759,24 @@ mod tests {
         assert_eq!(state.pc, 15);
         state.jump_offset(-3);
         assert_eq!(state.pc, 12);
+    }
+
+    /// 顶层脚本帧是 `frames[0]`：它由 `run` 在任何指令之前压好，
+    /// 于是"最外层"是 `frames.len() == 1`（不再是"控制栈空不空"）。
+    ///
+    /// 这一条钉住的就是 1a 的全部内容：**脚本也有帧**。
+    #[test]
+    fn the_script_runs_in_a_frame() {
+        let state = state_with_script_frame();
+        assert_eq!(state.frames.len(), 1, "脚本帧");
+        assert_eq!(
+            state.this_stack.len(),
+            1,
+            "它与其它帧同构：`this_stack` 也有一条（否则镜面不变量不成立）"
+        );
+        assert_eq!(state.frames[0].return_pc, 0, "测试里传的 return_pc");
+        // 脚本帧不是"一次调用"：深度按 `frames.len() - 1` 算。
+        assert_eq!(state.frames.len().saturating_sub(1), 0);
     }
 
     #[test]

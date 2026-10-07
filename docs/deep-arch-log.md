@@ -745,3 +745,93 @@ M2-1 诊断(func): pc=380 frames=1 function_stack=1
 | **1d** | `this` / `this_state` 直接搬（含 `super()` 那处中帧写） | 与 1c 同批也可，但 `this_state` 有"按帧回填"语义，单独更清楚 |
 | **1e** | `construct` / `new_target` / `argc` 的读点翻到 `frames`，删这三条栈 | 已镜面证明 |
 | **1f** | `closure_depth` / `seh_depth` 水位翻到 `frames`，删对应簿记 | 已镜面证明；这一片之后三路收帧可以合并成助手 |
+
+---
+
+## 10. M2-1a：顶层脚本变成帧（2026-10-07）—— 以及 `pc` 为什么**不能**单独搬
+
+### 10.1 做了什么
+
+**顶层脚本现在也是一个帧**（`architecture-redesign.md` §4.3 陷阱 5 那条，终于落地）：
+
+- `State::open_script_frame(return_pc)`：与 5 个开帧点**完全同构**
+  （`enter_frame(0)` + 控制栈三项 + `note_frame` + `jump(0)`），`run` 在任何指令之前调用它。
+- `Ret` 的"是不是最外层"从 `ctrl_stack.is_empty()` 改成 `frames.len() == 1`；
+  `State::ctrl_stack_reached_bottom()` **删除**（它问的是"控制栈空不空"，
+  而控制栈上还混着 `PushC`/`PopC` 的条目 —— 两条知识混在一条栈上）。
+- `enter_frame` 的递归深度从 `ctrl_stack.len() / 3` 改成 `frames.len() - 1`
+  （**调用帧**数；脚本帧不是一次调用）。
+  旧写法只有"`PushC`/`PopC` 最多贡献两项、整数除法恰好不出错"才成立 —— 是个侥幸，
+  现在一并去掉。
+
+**为什么抽成方法而不是让 `run` 内联**：单元测试也需要"一个已经有帧的 `State`"，
+而它必须与运行期压的是**同一种**帧，否则测试验的是别的东西。
+
+### 10.2 踩到的第一个坑：脚本帧必须与 5 个开帧点**逐字同构**
+
+第一版只写了 `enter_frame` + `note_frame`，没压控制栈那三项
+（那三项在 5 个开帧点里是内联的）。结果 `note_frame` 里的
+`ctrl_base: self.ctrl_stack.len() - 3` **整型下溢**，在 debug 下当场炸。
+
+⇒ 这不是"少写三行"，而是揭示了一条**拼图式的耦合**：镜面互校按"每帧三项"取
+`ctrl_base`，所以**任何**帧都必须有那三项 —— 包括脚本帧。
+切片 1b 会把这三项连同 `ctrl_stack` 一起退役，届时这条约束自然消失。
+
+### 10.3 踩到的第二个坑（**重要**）：`pc` 不能单独搬 —— 它与哨兵 pc 是绑死的
+
+按 §9.5 的计划，1a 应当"脚本帧 + `pc` 进 `Frame`"一起做。实际做了 `pc` 之后：
+
+- 单元测试全绿（205），
+- 但 feature **大面积失败**，症状是完成值变成对象：
+
+  ```
+  [1,2,3].map(function(v){return v*2;}).length   →  报 [object Object]（应为 3）
+  ```
+
+**根因**：`Ret` 用 `jump(return_pc)` 把控制权交回调用方，而 `return_pc` 在
+`invoke` 那条路上是**哨兵**（`module.instructions.len()`）；嵌套 `step` 循环的出口
+正是"pc 越界"。`pc` 一旦变成**每帧一个**：
+
+1. `Ret` 先 `frames.pop()`（被调帧没了），紧接着 `jump(return_pc)` 就写进了
+   **调用方那一帧** —— 把调用方的 pc 覆盖成哨兵；
+2. 于是 `step` 下一次取指令就"越界"，**主循环直接退出**；
+3. 程序在 `map(...)` 之后就停了，完成值留在 Rv 里正好是那个新数组。
+
+补一句：`drive_bytecode_frame` 里那个 `saved_pc` 之所以存在，就是为了兜住这个
+"调用方 pc 被被调帧破坏"的场景 —— 所以删它 + 搬 `pc` 是同一个决定的两半。
+
+⇒ **结论：`pc` 必须与"循环改成 `frames.len() > boundary`"一起做**
+（删哨兵 pc、删 `return_pc`、去掉 `drive_bytecode_frame`/`run_generator_frame` 的
+"靠 pc 越界出口"）。这本来就是 §5.2 的第 4 步（M2-2 的核心），
+现在有了硬理由说明它**不能推后**。已把这条写进 `State::pc` 的字段注释（就在代码里，
+不会随文档漂走）。
+
+**处置**：回退 `pc` 那一半，只提交**脚本帧**这一半（它自包含、可验证、全绿）。
+
+### 10.4 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元 | 205 | **205** | `test_state_jump`/`test_state_jump_offset` 回到直接操作字段；新增 `the_script_runs_in_a_frame` |
+| feature（debug，镜面互校激活） | 525 / 4 | **525 / 4** | 不变 |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | 逐字节一致 |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | 第六次同值 |
+| 探针（本次两处坑的现场） | —— | `3,false,2,6` ✓ | 与期望一致 |
+
+新增守卫：`the_script_runs_in_a_frame` —— 钉住"脚本帧是 `frames[0]`、
+与其它帧同构（`this_stack` 也有一条）、不是一次调用（深度按 `len()-1`）"。
+
+### 10.5 修正后的切片顺序（§9.5 再订正）
+
+| 新顺序 | 内容 |
+|---|---|
+| **1a′** | **脚本帧 + `pc` 进 `Frame` + 循环改 `frames.len() > boundary`（删哨兵、删 `return_pc`）** —— 三件事是一个整体，拆不开 |
+| 1b | `ctrl_stack` 三连退役（只留 `PushC`/`PopC`）；`invoke_boundaries` / `SehRecord.saved_ctrl_depth` 改帧深度 |
+| 1c | `func` 直接搬 + 删 `function_stack` + 删 `SavedExecutionState.function`（消掉 §9.3 的分叉） |
+| 1d | `this` / `this_state` 直接搬（含 `super()` 那处中帧写） |
+| 1e | `construct` / `new_target` / `argc` 读点翻帧，删三条栈 |
+| 1f | `closure_depth` / `seh_depth` 水位翻帧；三路收帧合并成助手 |
+
+**脚本帧已经就位**（本步），所以 1a′ 只剩"`pc` + 边界循环"。
