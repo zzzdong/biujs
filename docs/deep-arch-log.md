@@ -1144,3 +1144,64 @@ function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.nam
 
 **1c**：`func` 直接搬（值进 `Frame`）+ 删 `function_stack` +
 删 `SavedExecutionState.function` —— 顺带消掉 §9.3 定位的那处潜伏记账分叉。
+
+---
+
+## 15. M2-1c：`func` 搬进 `Frame`（2026-10-07）
+
+### 15.1 做了什么
+
+| 改动 | 说明 |
+|---|---|
+| `Frame` 加 `func`；`note_frame(pc, func, closure_depth, seh_depth)` | 6 个开帧点把**被调方**的函数对象直接交给帧 |
+| 读点统一走新的 `VM::current_func()` | `LoadCurrentFunction` / `MakeArrowFuncObj` / `current_function_id` / `extract_generator_frame` |
+| **删** `State.function_val` | 它以前是"当前函数是谁"的答案 |
+| **删** `State.function_stack` | 它以前存**调用方**的 func，与帧身份是两套记账 |
+| **删** `SavedExecutionState.function` | 同上；`restore_execution_state` 不再显式恢复 func |
+| 随之消失的三处"恢复调用方 func"赋值 | `Ret` / `unwind_frames_to` / `drive_bytecode_frame`（`saved_function` 局部量一并删） |
+| `enter_frame` 不再 push `function_stack` | —— |
+
+### 15.2 顺带消掉的两件事
+
+1. **§9.3 的潜伏记账分叉**：那条实测（`frames.last().func = objFn#5` 而
+   `function_val = objFn#1`）的根因是 `SavedExecutionState` 独立保存/恢复 `function_val`
+   却不保存帧身份。三个字段删掉之后，**"当前函数是谁"只有一个来源**，分叉按构造消失。
+2. **`restore_generator_frame` 的一处怪癖**：以前它在 `enter_frame` **之前**就覆盖了
+   `function_val`，于是 `function_stack` 里存的"调用方 func"其实是**生成器自己**的 ——
+   生成器帧 `Ret` 之后调用方会拿到错的函数对象。现在调用方由 `frames[len-2]` 回答，怪癖消失。
+
+### 15.3 为什么这一步是"直接搬"而不是镜面
+
+§9.3 已经证明 `function_val` 进不了镜面（九处写虽全在帧边界，但
+`SavedExecutionState` 的独立恢复会让镜面必失败）。所以它走**直接搬**，
+证明方式是**字节码逐字节不变** + 套件 —— 下面这条结果就是那个证明。
+
+### 15.4 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元 | 206 | **206** | 不变 |
+| feature（debug，镜面互校激活） | 526 / 4 ignored | **526 / 4 ignored** | 不变 |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | **逐字节一致** |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | —— |
+| 告警 | lib 24 / lib test 26 / features 8 | **同** | 无新增 |
+
+**这条结果本身是信息**：那两处"顺带消掉的"分叉（§15.2）在语料上**没有可观测影响** ——
+也就是说它们确实是**潜伏**的。这与 §9.3 当时的判断一致，但现在是**实测过**的：
+把它们修掉没有移动任何一个数字。
+
+### 15.5 迁移进度（`Frame` 的字段权威性）
+
+| 字段 | 状态 |
+|---|---|
+| `pc` / `func` / `closure_depth` / `seh_depth` | **权威**（唯一来源） |
+| `argc` / `construct` / `new_target` | 仍是 `frame_argc` / `construct_stack` / `new_target_stack` 栈顶的**镜像**（切片 1e 收口） |
+
+### 15.6 下一步
+
+**1d**：`this` / `this_state` 直接搬（含 `CallSuperSpread` 那处**中帧写** `this_val` 的
+`BindThisValue`）—— 它们同样进不了镜面，同样走直接搬。
+之后 1e（`construct`/`new_target`/`argc` 翻帧）、1f（水位与三路收帧合并），
+镜面互校机制届时整套退役。

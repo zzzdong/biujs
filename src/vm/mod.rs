@@ -277,7 +277,7 @@ enum FrameMode {
     Construct {
         /// 新建的实例，也就是构造器的 `this`。
         new_obj: Value,
-        /// 帧的 `function_val` 与 `new.target`（`Reflect.construct` 的第三个参数）。
+        /// 帧的函数对象与 `new.target`（`Reflect.construct` 的第三个参数）。
         new_target: Value,
     },
 }
@@ -718,9 +718,6 @@ impl VM {
                         self.state.this_val = saved_this;
                     }
                     self.state.this_state.pop();
-                    if let Some(saved_function) = self.state.function_stack.pop() {
-                        self.state.function_val = saved_function;
-                    }
                     self.state.frame_argc.pop();
                     // If this frame was invoked via `new`, apply [[Construct]] return
                     // semantics: a returned object becomes the result, otherwise the
@@ -1301,14 +1298,14 @@ impl VM {
 
     /// 开一帧：压好参数之后的全部准备工作。
     ///
-    /// `enter_frame` → `this` / `function_val` → 闭包捕获变量 → 控制栈三项 →
+    /// `enter_frame` → `this` / 函数对象 → 闭包捕获变量 →
     /// `construct_stack` / `new_target` → `jump` 到函数入口。**顺序有讲究**：
-    /// `enter_frame` 要先把**调用方**的 `this` / `function_val` 快照进 `this_stack` /
-    /// `function_stack`，所以它必须在覆盖这两个字段之前跑。
+    /// `enter_frame` 要先把**调用方**的 `this` 快照进 `this_stack`，所以它必须在
+    /// 覆盖 `this_val` 之前跑。（函数对象不必快照：它进了 `Frame`，调用方那一帧里就有。）
     ///
     /// 这段以前出现在 7 个地方（`drive_bytecode_frame` 与 `CallEx` / `CallMethod` /
     /// `New` 的内联开帧），差别只有调用方是谁（opcode 走自己的帧，被 `invoke`
-    /// 调用时用哨兵 `instructions.len()`）、`this` / `function_val` 的来源、
+    /// 调用时用哨兵 `instructions.len()`）、`this` 与函数对象的来源、
     /// `construct` 标志，以及各自要不要先清 `Rv`（那是记账，留在调用点）。
     #[allow(clippy::too_many_arguments)]
     fn open_frame(
@@ -1324,7 +1321,6 @@ impl VM {
     ) -> Result<(), RuntimeError> {
         self.state.enter_frame(argc)?;
         self.state.this_val = this;
-        self.state.function_val = function_val;
         for (name, value) in captured_vars {
             let mut map = std::collections::HashMap::new();
             map.insert(name.clone(), value.clone());
@@ -1342,7 +1338,7 @@ impl VM {
         let seh_depth = self.state.seh_stack.len();
         self.state.construct_stack.push(construct);
         self.state.new_target_stack.push(new_target);
-        self.state.note_frame(location, closure_depth, seh_depth);
+        self.state.note_frame(location, function_val.clone(), closure_depth, seh_depth);
         Ok(())
     }
 
@@ -1353,7 +1349,7 @@ impl VM {
     /// return address one past the last instruction.
     ///
     /// **两种模式共用这一份实现**（P1）：`[[Call]]` 与 `[[Construct]]` 的差别只有四处 ——
-    /// `this`（传入的 vs 新建的实例）、`function_val`/`new.target`、`construct_stack`
+    /// `this`（传入的 vs 新建的实例）、函数对象/`new.target`、`construct_stack`
     /// 的标志位、以及构造帧先把 `Rv` 清成 `undefined`。以前这四处差异是靠**两份 100 行
     /// 的拷贝**表达的（`drive_bytecode_frame` 与 `invoke_construct`），改一处忘一处就是
     /// B45/B46 那种"为了一个特性到处打补丁"。
@@ -1375,7 +1371,6 @@ impl VM {
         let saved_this_depth = self.state.this_stack.len();
         let saved_construct = self.state.construct_stack.len();
         let saved_new_target = self.state.new_target_stack.len();
-        let saved_function = self.state.function_val.clone();
         // **边界 = 调用方的帧深度**，一个值同时回答两个问题：
         // 1. 嵌套循环什么时候停（`frames.len() <= boundary`）；
         // 2. 哪些 SEH 记录属于外层帧、必须让异常穿出去（`handle_throw`）。
@@ -1482,7 +1477,6 @@ impl VM {
         // M2-1 镜面：异常逃出被调帧时它的镜面条目也要收掉。
         self.state.frames.truncate(saved_this_depth);
         self.state.this_val = saved_this;
-        self.state.function_val = saved_function;
         self.state.construct_stack.truncate(saved_construct);
         self.state.new_target_stack.truncate(saved_new_target);
 
@@ -2542,14 +2536,14 @@ impl VM {
                         self.state.enter_frame(arg_count)?;
                         // Strict mode: this = undefined for regular function calls
                         self.state.this_val = Value::Undefined;
-                        self.state.function_val = self.materialize_function(func_id as u32);
+                        let callee_func = self.materialize_function(func_id as u32);
                         let closure_depth = self.state.closure_var_stack.len();
                         let seh_depth = self.state.seh_stack.len();
                         // 调用点自己把**调用方**的 pc 推进一步（以前由 `Ret` 的 jump(return_pc) 做）。
                         self.state.jump_offset(1);
                         self.state.construct_stack.push(false);
                         self.state.new_target_stack.push(Value::Undefined);
-                        self.state.note_frame(location, closure_depth, seh_depth);
+                        self.state.note_frame(location, callee_func, closure_depth, seh_depth);
                         return Ok(());
                     }
                     None => {
@@ -3929,7 +3923,7 @@ impl VM {
                 // 4. Set this_val to the new object
                 self.state.this_val = new_obj_val;
                 // The running function inside the constructor is the constructor.
-                self.state.function_val = new_target_value.clone();
+                let callee_func = new_target_value.clone();
 
                 // 5. Save closure depth, SEH depth and return PC, then jump to constructor
                 match module.entry_pc(func_id) {
@@ -3950,7 +3944,7 @@ impl VM {
                         self.state.jump_offset(1);
                         self.state.construct_stack.push(true);
                         self.state.new_target_stack.push(new_target_value);
-                        self.state.note_frame(location, closure_depth, seh_depth);
+                        self.state.note_frame(location, callee_func, closure_depth, seh_depth);
                         return Ok(());
                     }
                     None => {
@@ -3980,7 +3974,7 @@ impl VM {
                 self.set_value(dst, value)?;
             }
             Instr::LoadCurrentFunction { dst } => {
-                let value = self.state.function_val.clone();
+                let value = self.current_func();
                 self.set_value(dst, value)?;
             }
             Instr::MakeFuncObj { dst, func } => {
@@ -4054,7 +4048,7 @@ impl VM {
                 // running function so `super()` / `super.x` work inside an arrow
                 // nested in a constructor or method (ES 14.2.16).
                 let inherited_super: Vec<(PropertyKey, crate::vm::PropertyDescriptor)> =
-                    match &self.state.function_val {
+                    match &self.current_func() {
                         Value::Object(func_ref) => {
                             let borrowed = func_ref.borrow();
                             ["__super__", "__superProto__"]
@@ -7745,17 +7739,12 @@ impl VM {
         // **切片 1b 之前这件事是顺手做的**（帧的簿记与 `PushC` 的簿记同挤在
         // 一条 `ctrl_stack` 上，一次 truncate 清两样）—— 分开之后就必须显式记两次。
         self.state.reg_saves.truncate(reg_saves_depth);
-        // `this_stack` / `function_stack` / `frame_argc` are parallel: one
+        // `this_stack` / `frame_argc` are parallel: one
         // entry per active frame, holding the *caller's* binding. Popping them
         // restores the handler's frame binding one level at a time.
         while self.state.this_stack.len() > this_depth {
             if let Some(saved_this) = self.state.this_stack.pop() {
                 self.state.this_val = saved_this;
-            }
-        }
-        while self.state.function_stack.len() > this_depth {
-            if let Some(saved_function) = self.state.function_stack.pop() {
-                self.state.function_val = saved_function;
             }
         }
         self.state.frame_argc.truncate(this_depth);
@@ -8418,7 +8407,7 @@ impl VM {
         self.state.rbp = self.state.rsp;
         self.state.enter_frame(args.len())?;
         self.state.this_val = this.clone();
-        self.state.function_val = self.materialize_function(func_id);
+        let callee_func = self.materialize_function(func_id);
         for (name, value) in captured_vars {
             let mut map = std::collections::HashMap::new();
             map.insert(name.clone(), value.clone());
@@ -8428,7 +8417,7 @@ impl VM {
         let seh_depth = self.state.seh_stack.len();
         self.state.construct_stack.push(false);
         self.state.new_target_stack.push(Value::Undefined);
-        self.state.note_frame(location, closure_depth, seh_depth);
+        self.state.note_frame(location, callee_func, closure_depth, seh_depth);
         Ok(())
     }
 
@@ -8837,10 +8826,27 @@ impl VM {
 
     /// The bytecode function this frame belongs to, when it is known.
     ///
-    /// `function_val` is the callee object (`FunctionObject`, or a bare
+    /// The current frame's function object (`FunctionObject`, or a bare
     /// `Value::Function` reference before materialization).
+    /// 当前帧的函数对象。
+    ///
+    /// **判定的唯一来源**。以前是 `State::function_val` 外加一条平行的
+    /// `function_stack`（存调用方的值）—— 那两套记账与"帧是谁"是分离的，
+    /// 一次嵌套运行之后可以对不上（§9.3 实测：`frames.last().func = objFn#5`
+    /// 而 `function_val = objFn#1`）。现在它由帧回答，那种分叉按构造消失。
+    ///
+    /// 没有帧时返回 `undefined`：`run` 在任何指令之前总会压顶层脚本帧，
+    /// 所以运行期不该出现空 `frames`（与 `State::pc()` 同一条约定）。
+    fn current_func(&self) -> Value {
+        self.state
+            .frames
+            .last()
+            .map(|frame| frame.func.clone())
+            .unwrap_or(Value::Undefined)
+    }
+
     fn current_function_id(&self) -> Option<u32> {
-        match &self.state.function_val {
+        match &self.current_func() {
             Value::Function(id) => Some(*id),
             Value::Object(obj_ref) => obj_ref
                 .borrow()
@@ -8923,11 +8929,10 @@ impl VM {
     }
 
     /// Unwind the bookkeeping of a frame that suspended: `Ret` never ran, so its
-    /// control entries and `function_stack` entry are still there. The value
+    /// control entries are gone with `frames` itself. The value
     /// stack and the other stacks are rewound by `restore_execution_state`.
     fn discard_generator_frame(&mut self) {
         // 帧的水位随 `frames` 一起收（见 `Ret`）—— 控制栈上已经没有它的三连。
-        self.state.function_stack.pop();
         // M2-1 镜面：`Ret` 没跑，这个帧的镜面条目同样要丢掉。
         self.state.frames.pop();
     }
@@ -9082,7 +9087,7 @@ impl VM {
         self.state.rbp = base + frame.argc;
         self.state.rsp = self.state.rbp + frame.bp_offset;
         self.state.this_val = frame.this.clone();
-        self.state.function_val = frame.function_val.clone();
+        let callee_func = frame.function_val.clone();
         self.state.enter_frame(frame.argc)?;
         for map in &frame.closure_maps {
             self.state.closure_var_stack.push(map.clone());
@@ -9094,7 +9099,7 @@ impl VM {
         let seh_depth = self.state.seh_stack.len();
         self.state.construct_stack.push(false);
         self.state.new_target_stack.push(Value::Undefined);
-        self.state.note_frame(module.instructions.len(), closure_depth, seh_depth);
+        self.state.note_frame(module.instructions.len(), callee_func, closure_depth, seh_depth);
         // The register file is global, not per frame, so the body's in-flight
         // values have to come back before anything else runs.
         for (slot, value) in self.state.registers.iter_mut().zip(frame.registers.iter()) {
@@ -9129,7 +9134,6 @@ impl VM {
             this_depth: self.state.this_stack.len(),
             construct: self.state.construct_stack.len(),
             new_target: self.state.new_target_stack.len(),
-            function: self.state.function_val.clone(),
             delegate: self.delegate_stack.len(),
             registers: std::array::from_fn(|i| self.state.registers[i].clone()),
         }
@@ -9146,7 +9150,6 @@ impl VM {
         // M2-1 镜面：与 `this_stack` 同一个水位。
         self.state.frames.truncate(saved.this_depth);
         self.state.this_val = saved.this.clone();
-        self.state.function_val = saved.function.clone();
         self.state.construct_stack.truncate(saved.construct);
         self.state.new_target_stack.truncate(saved.new_target);
         self.delegate_stack.truncate(saved.delegate);
@@ -9203,7 +9206,7 @@ impl VM {
             bp_offset: self.state.rsp.saturating_sub(self.state.rbp),
             pc: self.generator_yield_pc,
             this: self.state.this_val.clone(),
-            function_val: self.state.function_val.clone(),
+            function_val: self.current_func(),
             closure_maps: self
                 .state
                 .closure_var_stack
@@ -9903,6 +9906,11 @@ struct Frame {
     /// 绝不允许"顺着上一条指令落下来"—— 那样会在新帧里执行调用方的指令
     /// （实测踩过：`deep-arch-log.md` §12）。
     pc: usize,
+    /// 本帧的函数对象。
+    ///
+    /// **取代了 `State::function_val` + 平行的 `function_stack`**：那两套记账
+    /// 与帧身份是分离的，嵌套运行之后可以对不上（§9.3 实测）。现在由帧回答。
+    func: Value,
     /// 实参个数（`State::frame_argc` 栈顶的镜像）。
     argc: usize,
     /// 是否 `[[Construct]]` 帧（`State::construct_stack` 栈顶的镜像）。
@@ -9965,11 +9973,6 @@ struct State {
     /// through `new`, `undefined` otherwise. A frame entered for an arrow
     /// function inherits the value captured when the arrow was created.
     new_target_stack: Vec<Value>,
-    /// The function object whose body is currently executing. `super` reads the
-    /// home object recorded on it at class-definition time.
-    function_val: Value,
-    /// Saved `function_val` of the caller frames, parallel to `this_stack`.
-    function_stack: Vec<Value>,
     /// Saved `this` binding of the caller frame, restored on `Ret`.
     /// Keeping `this` per-frame prevents a nested call from clobbering it.
     this_stack: Vec<Value>,
@@ -10018,8 +10021,6 @@ impl State {
             closure_var_stack: Vec::new(),
             construct_stack: Vec::new(),
             new_target_stack: Vec::new(),
-            function_val: Value::Undefined,
-            function_stack: Vec::new(),
             this_stack: Vec::new(),
             this_state: Vec::new(),
             frame_argc: Vec::new(),
@@ -10041,7 +10042,7 @@ impl State {
         self.enter_frame(0)?;
         let closure_depth = self.closure_var_stack.len();
         let seh_depth = self.seh_stack.len();
-        self.note_frame(0, closure_depth, seh_depth);
+        self.note_frame(0, Value::Undefined, closure_depth, seh_depth);
         self.jump(0);
         Ok(())
     }
@@ -10218,23 +10219,23 @@ impl State {
         }
         self.this_stack.push(self.this_val.clone());
         self.this_state.push(THIS_NONE);
-        self.function_stack.push(self.function_val.clone());
         self.frame_argc.push(argc);
         Ok(())
     }
 
     /// **M2-1 镜面**：把一个新帧记进 `frames`。
     ///
-    /// 必须在 `enter_frame` + `this_val`/`function_val` 赋值 +
+    /// 必须在 `enter_frame` + `this_val` 赋值 +
     /// `construct_stack`/`new_target_stack` 的 push **之后**调用 —— 它读的就是那些栈顶。
     /// 两个水位参数由调用点传入；切片 1b 之后它们是这两个水位的**唯一**记录。
     /// （切片 1b 之前调用点还要把同样的值再 `pushc` 三份，两份必须一致 —— 那套簿记已退役。）
     /// `pc` 是**新帧的初始指令指针**，必须由调用点给：
     /// 入口 pc（4 个 opcode 调用点 / `open_frame` / `push_generator_frame`）
     /// 或哨兵（`restore_generator_frame`）。理由见 `Frame::pc`。
-    fn note_frame(&mut self, pc: usize, closure_depth: usize, seh_depth: usize) {
+    fn note_frame(&mut self, pc: usize, func: Value, closure_depth: usize, seh_depth: usize) {
         self.frames.push(Frame {
             pc,
+            func,
             argc: self.frame_argc.last().copied().unwrap_or(0),
             construct: self.construct_stack.last().copied().unwrap_or(false),
             new_target: self
@@ -10281,22 +10282,12 @@ impl State {
                     .unwrap_or(Value::Undefined),
             "镜面 new_target 与 new_target_stack 栈顶不一致"
         );
-        // 已实测：`this` 与 `func` **都**不满足"只在帧边界写"这个前提，所以都不在镜面里。
-        // 两者都不因此被放弃 —— 它们在 B 步**直接搬进 `Frame`**：
-        // 搬完之后"当前的 `this` / 当前函数是谁"由帧唯一决定，下面这两种分叉按构造消失。
-        // `func` **与 `this` 一样，故意不在这里校验**：实测它也属于"中帧也会写"的那一组。
-        // 实测数据（pc=380、frames=1、function_stack=1）：
-        //   frames.last().func = objFn#5（func_id 5）
-        //   state.function_val = objFn#1（func_id 1）
-        //   function_stack 栈顶 = undefined（说明这一帧是从脚本层开的）
-        // ⇒ 九处 `function_val =` 全在帧边界上，所以分叉不可能来自那些写点；
-        //   根因是 **`SavedExecutionState` 独立保存/恢复 `function_val` 却不保存帧身份**
-        //   （`save_execution_state` 的 `function` 字段 / `restore_execution_state` 的赋值）：
-        //   一次嵌套运行之后，`function_val` 可以与当前帧对不上。
-        //   这是既有代码里的一处**潜伏记账分叉**（无观测影响，但它是真的）。
-        //
-        // 这件事本身是"把 `func` 搬进 `Frame`"的**理由**：搬完之后调用方是谁由帧决定，
-        // 分叉按构造消失。所以 B 步直接搬（以字节码不变 + 套件为证），不靠镜面。
+        // 已实测：`this` 与 `func` **都**不满足"只在帧边界写"这个前提，所以都进不了镜面。
+        // `func` 已经**直接搬进** `Frame`（切片 1c）——那处潜伏分叉（`SavedExecutionState`
+        // 独立恢复 `function_val` 却不恢复帧身份，实测 `frames.last().func = objFn#5`
+        // 而 `function_val = objFn#1`）**按构造消失**：现在只有帧回答"当前函数是谁"。
+        // `State::function_val` / `State::function_stack` / `SavedExecutionState::function`
+        // 三个字段已随之删除。
         //
         // `this` **故意不在这里校验**：实测它属于"中帧也会写"的那一组 ——
         // `CallSuperSpread` 会在 `super()` 返回后把派生类的 `this` 绑成父构造器的结果
@@ -10467,7 +10458,7 @@ struct SehRecord {
     /// 还是抛出者那一帧（`pc` 就在抛出点上），会接着跑错的地方。
     /// 切片 1b 之前这里记的是控制栈深度 —— 那是同一个事实的另一种编码。
     saved_frame_depth: usize,
-    /// Depth of `this_stack` (and its parallel `function_stack` /
+    /// Depth of `this_stack` (and its parallel
     /// `frame_argc`) — one entry per active JS frame.
     saved_this_depth: usize,
     saved_construct_depth: usize,
@@ -10505,7 +10496,6 @@ struct SavedExecutionState {
     this_depth: usize,
     construct: usize,
     new_target: usize,
-    function: Value,
     delegate: usize,
     registers: [Value; 19],
 }
@@ -10772,7 +10762,7 @@ mod tests {
         state.jump(7);
         // 压一个"被调帧"：它有自己的 pc，**由开帧点显式给**。
         state.enter_frame(1).expect("enter_frame");
-        state.note_frame(42, 0, 0);
+        state.note_frame(42, Value::Undefined, 0, 0);
         assert_eq!(state.pc(), 42, "被调帧的出生 pc 就是入口");
         assert_eq!(state.frames[0].pc, 7, "调用方那帧的 pc 必须没被动过");
         state.frames.pop();
