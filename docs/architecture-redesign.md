@@ -216,10 +216,22 @@ id 4 d:  Try 117, EndTry 119, Try 122 → regions: [117..119 catch 145], [122..1
 所以我那个"深度计数找配对 `EndTry`"的派生规则，与运行时实际的进出**不是同一件事**，
 `EhRegion::end` 目前不能当作"受保护范围"来用。
 
-**下一步要做的**（退 `seh_stack` 之前必须解决）：区域边界不能靠扫 `EndTry`，得让**发射端**
-在 `Try` 指令里直接带上受保护块的结束地址（那是发射端才知道的块结构），或者给 `Try`/
-`EndTry` 补上真正的配对信息。在那之前，`EhRegion` 只有 catch/finally 地址这一个字段
-是可信的（已由 `Try` arm 的 debug_assert 证明与指令操作数等价）。
+**下一步要做的**（退 `seh_stack` 之前必须解决）：区域边界不能靠扫 `EndTry`。
+**答案在 lowering 层，而且它已经存在**（`lowering/mod.rs::lower_try`，约 1833 行起）：
+
+- 它建 4 个块：`try_body` / `catch` / `finally` / `after_finally`；
+- `seh_handler = if has_catch { catch_blk } else { finally_blk }` ——
+  **这正是"try/finally 的 catch 与 finally 同址"的来源**（没有 catch 时 finally 兼作 handler）；
+- 它 push 了一个 `SehFrameInfo { finally_blk, pending_exits, exit_edges }`，
+  **受保护范围的出口集合就在 `exit_edges` 里**（还有"body 结束在哪个块"那个兜底分支）。
+
+所以正确的修法是：**让 `push_seh` 带上出口集合**（或至少"正常出口"那个 pc），
+由发射端回填进 `Try` 指令 / EH 表。之所以现在做不到，是因为 try body 可以从多个块离开
+（正常结束、break/continue 的 trampoline、异常边……），**出口不是一个 pc** ——
+这也顺带解释了为什么 `EndTry` 的发射是条件式的、不是一一配对。
+
+在这之前，`EhRegion` 只有 `catch` / `finally` 两个地址字段可信（已由 `Try` arm 的
+debug_assert 证明与指令操作数等价）。
 
 ## 11. 分支与提交约定
 
