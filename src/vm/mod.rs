@@ -457,9 +457,9 @@ impl VM {
         // **顶层脚本也是一个帧**（`architecture-redesign.md` §4.3 陷阱 5）。
         // 这条不是锦上添花：`pc` 现在住在 `Frame` 里，如果脚本没有帧，`pc` 就没有
         // 唯一的家 —— 于是"读 pc / 写 pc"会分叉成两条路径，正是本次深改要消灭的东西。
-        // 顺带把"最外层"这个概念从 `ctrl_stack.is_empty()` 变成 `frames.len() == 1`，
+        // 顺带把"最外层"这个概念从"控制栈空不空"变成 `frames.len() == 1`，
         // 与 `PushC`/`PopC` 在控制栈上的簿记彻底分开。
-        self.state.open_script_frame(module.instructions.len())?;
+        self.state.open_script_frame()?;
 
         while self.step(module)? {}
 
@@ -677,7 +677,7 @@ impl VM {
                 } else {
                     // No pending finally blocks, proceed with normal return
                     // "已经回到最外层"：只剩顶层脚本那一帧。
-                    // 以前是 `ctrl_stack.is_empty()` —— 那问的是"控制栈空不空"，
+                    // 以前问的是"控制栈空不空"，
                     // 而控制栈上还混着 `PushC`/`PopC` 的条目（两条知识混在一条栈上）。
                     if self.state.frames.len() == 1 {
                         // The return value is already in Rv; stop the loop so the
@@ -699,9 +699,12 @@ impl VM {
                     // The frame's own constructor state, captured before the
                     // pops below take it off the stack.
                     let frame_ctor_state = self.state.this_state.last().copied();
-                    let return_pc = self.state.popc()?;
-                    let saved_seh_depth = self.state.popc()?;
-                    let saved_closure_depth = self.state.popc()?;
+                    // 三个水位现在住在帧里（`Frame{closure_depth, seh_depth}`），
+                    // （切片 1b 之前这里要从控制栈弹三项；那套簿记已退役。）
+                    let (saved_seh_depth, saved_closure_depth) = {
+                        let frame = self.state.frames.last().expect("Ret 时必有帧");
+                        (frame.seh_depth, frame.closure_depth)
+                    };
                     // The frame's own `this`, needed for [[Construct]] below.
                     // It has to be captured *before* the caller's binding is
                     // restored, otherwise a constructor would return the
@@ -1022,7 +1025,6 @@ impl VM {
         this: Value,
         args: CallArgs<'_>,
         dst: Register,
-        return_pc: usize,
         module: &Module,
     ) -> Result<Control, RuntimeError> {
         let target = Operand::Register(dst);
@@ -1072,7 +1074,6 @@ impl VM {
                     &[],
                     false,
                     Value::Undefined,
-                    return_pc,
                     module,
                 )?;
                 Ok(Control::Entered)
@@ -1127,7 +1128,6 @@ impl VM {
                     &captured_vars,
                     false,
                     captured_new_target.unwrap_or(Value::Undefined),
-                    return_pc,
                     module,
                 )?;
                 Ok(Control::Entered)
@@ -1307,7 +1307,7 @@ impl VM {
     /// `function_stack`，所以它必须在覆盖这两个字段之前跑。
     ///
     /// 这段以前出现在 7 个地方（`drive_bytecode_frame` 与 `CallEx` / `CallMethod` /
-    /// `New` 的内联开帧），差别只有 `return_pc`（opcode 用 `pc + 1`，被 `invoke`
+    /// `New` 的内联开帧），差别只有调用方是谁（opcode 走自己的帧，被 `invoke`
     /// 调用时用哨兵 `instructions.len()`）、`this` / `function_val` 的来源、
     /// `construct` 标志，以及各自要不要先清 `Rv`（那是记账，留在调用点）。
     #[allow(clippy::too_many_arguments)]
@@ -1320,7 +1320,6 @@ impl VM {
         captured_vars: &[(String, Value)],
         construct: bool,
         new_target: Value,
-        return_pc: usize,
         module: &Module,
     ) -> Result<(), RuntimeError> {
         self.state.enter_frame(argc)?;
@@ -1341,13 +1340,9 @@ impl VM {
         };
         let closure_depth = self.state.closure_var_stack.len();
         let seh_depth = self.state.seh_stack.len();
-        self.state.pushc(closure_depth)?;
-        self.state.pushc(seh_depth)?;
-        self.state.pushc(return_pc)?;
         self.state.construct_stack.push(construct);
         self.state.new_target_stack.push(new_target);
-        // M2-1 镜面：与上面那三条 `pushc` 用**同一批值**（不是重新算一遍）。
-        self.state.note_frame(location, closure_depth, seh_depth, return_pc);
+        self.state.note_frame(location, closure_depth, seh_depth);
         Ok(())
     }
 
@@ -1381,13 +1376,16 @@ impl VM {
         let saved_construct = self.state.construct_stack.len();
         let saved_new_target = self.state.new_target_stack.len();
         let saved_function = self.state.function_val.clone();
-        // Control-stack depth of the *caller*: SEH records at or below it belong
-        // to an outer frame and must see the exception propagated, not handled
-        // from inside this nested loop.
-        let saved_ctrl = self.state.ctrl_stack.len();
-        self.invoke_boundaries.push(saved_ctrl);
-        // 帧深度的边界：本帧被 `Ret` 收掉（或异常逃出后 truncate）即回到它。
+        // **边界 = 调用方的帧深度**，一个值同时回答两个问题：
+        // 1. 嵌套循环什么时候停（`frames.len() <= boundary`）；
+        // 2. 哪些 SEH 记录属于外层帧、必须让异常穿出去（`handle_throw`）。
+        // 切片 1b 之前这是**两个数**（控制栈深度 / 帧深度），
+        // 而它们必须保持一致 —— 那就是"两条知识"的来源。
         let boundary = self.state.frames.len();
+        self.invoke_boundaries.push(boundary);
+        // `PushC`/`PopC` 的保存项也需要一个水位：异常逃出被调帧时，它自己那几条
+        // 没来得及 `PopC` 的项必须丢掉 —— 否则外层之后会 `PopC` 到过期的 `rsp`/`rbp`。
+        let saved_reg_saves = self.state.reg_saves.len();
 
         // Push the arguments and open the callee's frame at the new stack top,
         // using the same convention as the `Call`/`CallEx` opcodes (arg0 ends up
@@ -1407,7 +1405,6 @@ impl VM {
         // `Ret` 之后循环接着跑下一段函数的代码，array / async / promise 一片红。
         // 要改成 per-function 哨兵，得先让循环在"pc == 本帧哨兵"时停止 —— 那是
         // 深改第 4 步（帧模型重写）的事，见 `docs/architecture-redesign.md`。）
-        let return_pc = module.instructions.len();
 
         // 模式差异在一处算清；开帧那 15 行在 `open_frame` 里，与各 opcode 内联开帧共用。
         let (this_val, function_val, new_target_val, is_construct) = match mode {
@@ -1446,7 +1443,6 @@ impl VM {
             captured_vars,
             is_construct,
             new_target_val,
-            return_pc,
             module,
         )?;
 
@@ -1471,12 +1467,10 @@ impl VM {
         // callee frame is gone either way, whether it returned or was unwound
         // by an exception escaping to an outer handler.
         //
-        // A normal return already popped this frame's three control-stack
-        // entries in `Ret`; an exception that escapes the frame did not, so
-        // rewind them here. Without this a native that *catches* the error and
-        // keeps going in the same frame (the `Promise` executor) would pop the
-        // stale `return_pc` as its own saved `rbp`.
-        self.state.ctrl_stack.truncate(saved_ctrl);
+        // 正常返回时被调帧自己已经 `PopC` 干净了；异常逃出去的那条路上没有 ——
+        // 所以在这里把它的保存项都丢掉。没有这一步，一个 *接住* 异常并继续
+        // 在同一帧里跑的原生（`Promise` 的执行器）会 `PopC` 到过期的 `rbp`。
+        self.state.reg_saves.truncate(saved_reg_saves);
         // 调用方的 `pc` 由 `frames.truncate(saved_this_depth)` 恢复（它在帧里）。
         self.state.rsp = saved_rsp;
         self.state.rbp = saved_rbp;
@@ -2553,13 +2547,9 @@ impl VM {
                         let seh_depth = self.state.seh_stack.len();
                         // 调用点自己把**调用方**的 pc 推进一步（以前由 `Ret` 的 jump(return_pc) 做）。
                         self.state.jump_offset(1);
-                        let return_pc = self.state.pc();
-                        self.state.pushc(closure_depth)?;
-                        self.state.pushc(seh_depth)?;
-                        self.state.pushc(return_pc)?;
                         self.state.construct_stack.push(false);
                         self.state.new_target_stack.push(Value::Undefined);
-                        self.state.note_frame(location, closure_depth, seh_depth, return_pc);
+                        self.state.note_frame(location, closure_depth, seh_depth);
                         return Ok(());
                     }
                     None => {
@@ -2581,13 +2571,11 @@ impl VM {
                 // 方法调用要给对象（`CallMethod` 走同一个入口，只是 `this` 不同）。
                 // 调用点自己把**调用方**的 pc 推进一步（以前由 `Ret` 的 jump(return_pc) 做）。
                 self.state.jump_offset(1);
-                let return_pc = self.state.pc();
                 match self.enter_call(
                     &callee,
                     Value::Undefined,
                     CallArgs::OnStack(arg_count),
                     Register::Rv,
-                    return_pc,
                     module,
                 )? {
                     // 帧已压好：接着跑被调方（不递归 —— 普通调用没有额外开销）。
@@ -2690,10 +2678,10 @@ impl VM {
             },
             Instr::PushC { src } => match src {
                 Operand::Register(Register::Rsp) => {
-                    self.state.pushc(self.state.rsp)?;
+                    self.state.save_reg(self.state.rsp)?;
                 }
                 Operand::Register(Register::Rbp) => {
-                    self.state.pushc(self.state.rbp)?;
+                    self.state.save_reg(self.state.rbp)?;
                 }
                 _ => {
                     return Err(RuntimeError::TypeError(format!(
@@ -2703,10 +2691,10 @@ impl VM {
             },
             Instr::PopC { dst } => match dst {
                 Operand::Register(Register::Rsp) => {
-                    self.state.rsp = self.state.popc()?;
+                    self.state.rsp = self.state.restore_reg()?;
                 }
                 Operand::Register(Register::Rbp) => {
-                    self.state.rbp = self.state.popc()?;
+                    self.state.rbp = self.state.restore_reg()?;
                 }
                 _ => {
                     return Err(RuntimeError::TypeError(format!(
@@ -3706,7 +3694,6 @@ impl VM {
                 // —— 错误类型不变，只是少了方法名。
                 // 调用点自己把**调用方**的 pc 推进一步（以前由 `Ret` 的 jump(return_pc) 做）。
                 self.state.jump_offset(1);
-                let return_pc = self.state.pc();
                 match self.enter_call(
                     &method_val,
                     obj_val.clone(),
@@ -3715,7 +3702,6 @@ impl VM {
                         args: &args,
                     },
                     Register::Rv,
-                    return_pc,
                     module,
                 )? {
                     // 帧已压好：接着跑被调方（不递归）。
@@ -3778,7 +3764,8 @@ impl VM {
                     delayed_jump_target: None,
                     delayed_return: false,
                     saved_closure_depth: self.state.closure_var_stack.len(),
-                    saved_ctrl_depth: self.state.ctrl_stack.len(),
+                    saved_reg_saves: self.state.reg_saves.len(),
+                    saved_frame_depth: self.state.frames.len(),
                     saved_this_depth: self.state.this_stack.len(),
                     saved_construct_depth: self.state.construct_stack.len(),
                     saved_new_target_depth: self.state.new_target_stack.len(),
@@ -3961,13 +3948,9 @@ impl VM {
                         let seh_depth = self.state.seh_stack.len();
                         // 调用点自己把**调用方**的 pc 推进一步（以前由 `Ret` 的 jump(return_pc) 做）。
                         self.state.jump_offset(1);
-                        let return_pc = self.state.pc();
-                        self.state.pushc(closure_depth)?;
-                        self.state.pushc(seh_depth)?;
-                        self.state.pushc(return_pc)?;
                         self.state.construct_stack.push(true);
                         self.state.new_target_stack.push(new_target_value);
-                        self.state.note_frame(location, closure_depth, seh_depth, return_pc);
+                        self.state.note_frame(location, closure_depth, seh_depth);
                         return Ok(());
                     }
                     None => {
@@ -7750,13 +7733,18 @@ impl VM {
     /// wrote the `try`, not in the frame that threw.
     fn unwind_frames_to(
         &mut self,
-        ctrl_depth: usize,
+        reg_saves_depth: usize,
         this_depth: usize,
         construct_depth: usize,
         new_target_depth: usize,
         closure_depth: usize,
     ) {
-        self.state.ctrl_stack.truncate(ctrl_depth);
+        // 被回退的那些帧可能留下没来得及 `PopC` 的保存项 —— 它们必须一起丢，
+        // 否则外层之后的 `PopC` 会弹到过期值（`rbp` 被破坏；实测症状：
+        // "数组字面量里夹一次会抛异常的调用" 直接报 `ArrayPush on non-object`）。
+        // **切片 1b 之前这件事是顺手做的**（帧的簿记与 `PushC` 的簿记同挤在
+        // 一条 `ctrl_stack` 上，一次 truncate 清两样）—— 分开之后就必须显式记两次。
+        self.state.reg_saves.truncate(reg_saves_depth);
         // `this_stack` / `function_stack` / `frame_argc` are parallel: one
         // entry per active frame, holding the *caller's* binding. Popping them
         // restores the handler's frame binding one level at a time.
@@ -7789,7 +7777,7 @@ impl VM {
         // a thrown value and let `invoke_*` propagate it to the outer step.
         if let Some(boundary) = self.invoke_boundary() {
             if let Some(top) = self.state.seh_stack.last() {
-                if top.saved_ctrl_depth <= boundary {
+                if top.saved_frame_depth <= boundary {
                     return Err(RuntimeError::Thrown(exc_val));
                 }
             }
@@ -7799,7 +7787,7 @@ impl VM {
                 self.state.rsp = record.saved_rsp;
                 self.state.rbp = record.saved_rbp;
                 self.unwind_frames_to(
-                    record.saved_ctrl_depth,
+                    record.saved_reg_saves,
                     record.saved_this_depth,
                     record.saved_construct_depth,
                     record.saved_new_target_depth,
@@ -8438,13 +8426,9 @@ impl VM {
         }
         let closure_depth = self.state.closure_var_stack.len();
         let seh_depth = self.state.seh_stack.len();
-        let return_pc = self.resume_sentinel(module);
-        self.state.pushc(closure_depth)?;
-        self.state.pushc(seh_depth)?;
-        self.state.pushc(return_pc)?;
         self.state.construct_stack.push(false);
         self.state.new_target_stack.push(Value::Undefined);
-        self.state.note_frame(location, closure_depth, seh_depth, return_pc);
+        self.state.note_frame(location, closure_depth, seh_depth);
         Ok(())
     }
 
@@ -8752,7 +8736,7 @@ impl VM {
                                 .unwrap_or(module.instructions.len()),
                         )
                     }
-                    Err(err) => match self.deliver_into_frame(err, saved.ctrl) {
+                    Err(err) => match self.deliver_into_frame(err, saved.this_depth) {
                         // 异常被交付**进帧里**：`handle_throw` 已经把 pc 设到处理器上，
                         // 所以这里**不能**覆盖它 —— 这是 `None` 唯一合法的用法。
                         Ok(()) => None,
@@ -8898,7 +8882,7 @@ impl VM {
         // bottom must come back as `Err(Thrown(_))` so the *resumer* dispatches
         // it. Letting it jump straight to a handler outside the frame would
         // unwind control-stack entries the nested loop still has to pop.
-        self.invoke_boundaries.push(saved.ctrl);
+        self.invoke_boundaries.push(saved.this_depth);
         self.generator_yielded = None;
         // 出口改成"回到 resumer 那一帧"：生成器**返回**时 `Ret` 把它收掉；
         // 而 `yield` / `PrologueEnd` 泊车时帧**还在**，靠 `step` 返回 `false`
@@ -8942,9 +8926,7 @@ impl VM {
     /// control entries and `function_stack` entry are still there. The value
     /// stack and the other stacks are rewound by `restore_execution_state`.
     fn discard_generator_frame(&mut self) {
-        let _ = self.state.popc();
-        let _ = self.state.popc();
-        let _ = self.state.popc();
+        // 帧的水位随 `frames` 一起收（见 `Ret`）—— 控制栈上已经没有它的三连。
         self.state.function_stack.pop();
         // M2-1 镜面：`Ret` 没跑，这个帧的镜面条目同样要丢掉。
         self.state.frames.pop();
@@ -9110,13 +9092,9 @@ impl VM {
         self.state.seh_stack.extend(frame.seh.iter().cloned());
         let closure_depth = self.state.closure_var_stack.len();
         let seh_depth = self.state.seh_stack.len();
-        let return_pc = self.resume_sentinel(module);
-        self.state.pushc(closure_depth)?;
-        self.state.pushc(seh_depth)?;
-        self.state.pushc(return_pc)?;
         self.state.construct_stack.push(false);
         self.state.new_target_stack.push(Value::Undefined);
-        self.state.note_frame(module.instructions.len(), closure_depth, seh_depth, return_pc);
+        self.state.note_frame(module.instructions.len(), closure_depth, seh_depth);
         // The register file is global, not per frame, so the body's in-flight
         // values have to come back before anything else runs.
         for (slot, value) in self.state.registers.iter_mut().zip(frame.registers.iter()) {
@@ -9152,7 +9130,6 @@ impl VM {
             construct: self.state.construct_stack.len(),
             new_target: self.state.new_target_stack.len(),
             function: self.state.function_val.clone(),
-            ctrl: self.state.ctrl_stack.len(),
             delegate: self.delegate_stack.len(),
             registers: std::array::from_fn(|i| self.state.registers[i].clone()),
         }
@@ -9901,22 +9878,22 @@ impl Default for VM {
     }
 }
 
-/// 一个活跃的调用帧（M2-1 的**镜面**阶段）。
+/// 一个活跃的调用帧。
 ///
-/// **只镜像"开帧时写一次、之后只读"的字段。** 这个前提是实测出来的，不是设计时假设的：
-/// - `pc` 每条指令都改（`jump` / `step` 自增）；
-/// - `this_state` 被 `CallSuperSpread` 按帧回填；
-/// - `this` 被 `super()` 绑定（ES `BindThisValue`，`CallSuperSpread` 里那处中帧写）——
-///   最初把 `this` / `func` 也放进镜面，互校在 `class C extends Error` 与
-///   `proxy::apply_and_construct_traps` 上立刻报"非帧边界的写入"。
+/// **迁移进度**（`deep-arch-log.md` §7.7 / §13 / §14）：`pc` 与
+/// `closure_depth` / `seh_depth` 已经是**权威记录**（不再是别处的镜像）；
+/// `argc` / `construct` / `new_target` 目前还是 `frame_argc` /
+/// `construct_stack` / `new_target_stack` 栈顶的**镜像**（切片 1e 收口）。
 ///
-/// 把它们也镜像就等于把读点一起翻掉 —— 那不是"证等价"，是"直接切换"。
-/// 所以 A 步只覆盖能**严格互校**的集合（水位 + 返回地址 + 每帧的 flag/argc）：
-/// 互校失败只可能来自开/收帧的记账分叉，正是要抓的东西。
-/// `pc` / `this` / `func` / `this_state` 在 B 步直接搬进 `Frame`。
+/// **为什么有些字段不能先进镜面**：镜面阶段要求"开帧时写一次、之后只读"，
+/// 而这个前提是**实测**出来的，不是设计时假设的：
+/// - `this` 被 `super()` 中帧绑定（ES `BindThisValue`，`CallSuperSpread` 里那处写）；
+/// - `func` 被 `SavedExecutionState` 独立恢复（§9.3 的潜伏分叉）；
+/// - `pc` 每条指令都改，`this_state` 被 `CallSuperSpread` 按帧回填。
+/// 最初把 `this` / `func` 放进镜面时，互校在 `class C extends Error` 与
+/// `proxy::apply_and_construct_traps` 上立刻报"非帧边界的写入"。
 ///
-/// 与 `Vec<Frame>` 并列存在的那 9 条平行栈**先不删**：本阶段的目标是
-/// "证明镜面被正确维护"，切换是下一阶段的事（`deep-arch-log.md` §7.7）。
+/// 所以这些字段走的是**直接搬**（以字节码逐字节不变为证），而不是靠镜面证明等价。
 #[derive(Debug, Clone, PartialEq)]
 struct Frame {
     /// 指令指针。**`pc` 住在帧里**（不再是 `State` 的字段）。
@@ -9932,24 +9909,17 @@ struct Frame {
     construct: bool,
     /// `new.target`（`State::new_target_stack` 栈顶的镜像）。
     new_target: Value,
-    /// 收帧时要回退到的水位（**绝对值**，ctl_stack 三连里的前两项）。
+    /// 收帧时要回退到的水位（**绝对值**）—— 与 `state.closure_var_stack` /
+    /// `state.seh_stack` 的长度对应。切片 1b 之后它们是这两个水位的**唯一**记录
+    /// （以前还要在控制栈上再存一份三连）。
     closure_depth: usize,
     seh_depth: usize,
-    /// 返回地址（ctl_stack 三连里的第三项）。
-    return_pc: usize,
-    /// 本帧那三连在 `ctrl_stack` 里的**起始下标**。
-    ///
-    /// 为什么需要它：`PushC`/`PopC` 会把 `rsp`/`rbp` 压在本帧三连**之上**
-    /// （它们是插在帧中间的），所以"末三项"根本不是本帧的三连 ——
-    /// 第一版互校就是照"末三项"写的，一跑就被打红（实测 `left 4 / right 2`）。
-    /// `PushC`/`PopC` 成对出现 ⇒ 只要本帧还活跃，这个下标就仍指向它的三连。
-    ctrl_base: usize,
 }
 
 /// VM execution state
 struct State {
     data_stack: Vec<Value>,
-    ctrl_stack: Vec<usize>,
+    reg_saves: Vec<usize>,
     registers: [Value; 19],
     seh_stack: Vec<SehRecord>,
     /// The script's globals — shared with the `globalThis` object (see
@@ -10031,7 +10001,7 @@ impl State {
         )));
         Self {
             data_stack: Vec::with_capacity(1024),
-            ctrl_stack: Vec::with_capacity(256),
+            reg_saves: Vec::with_capacity(256),
             registers: std::array::from_fn(|_| Value::Undefined),
             seh_stack: Vec::new(),
             globals,
@@ -10065,16 +10035,13 @@ impl State {
     /// 单独抽一个方法而不是让 `run` 内联：单元测试也需要"一个已经有帧的 `State`"，
     /// 而它必须与运行期压的是**同一种**帧 —— 否则测试验的就是别的东西了。
     /// 少了控制栈那三项，`note_frame` 的 `ctrl_base` 会下溢（实测踩到过）；
-    /// 而"每帧三项"正是本阶段镜面互校的依据。切片 1b 会把这三项连同 `ctrl_stack`
-    /// 一起退役，届时脚本帧就是普通的一员。
-    fn open_script_frame(&mut self, return_pc: usize) -> Result<(), RuntimeError> {
+    /// （切片 1b 之前这里还要在控制栈上凑齐"每帧三项"，那套簿记已退役。）
+    /// 现在脚本帧就是普通的一员。
+    fn open_script_frame(&mut self) -> Result<(), RuntimeError> {
         self.enter_frame(0)?;
         let closure_depth = self.closure_var_stack.len();
         let seh_depth = self.seh_stack.len();
-        self.pushc(closure_depth)?;
-        self.pushc(seh_depth)?;
-        self.pushc(return_pc)?;
-        self.note_frame(0, closure_depth, seh_depth, return_pc);
+        self.note_frame(0, closure_depth, seh_depth);
         self.jump(0);
         Ok(())
     }
@@ -10161,13 +10128,13 @@ impl State {
         Ok(self.data_stack[self.rsp].clone())
     }
 
-    fn pushc(&mut self, value: usize) -> Result<(), RuntimeError> {
-        self.ctrl_stack.push(value);
+    fn save_reg(&mut self, value: usize) -> Result<(), RuntimeError> {
+        self.reg_saves.push(value);
         Ok(())
     }
 
-    fn popc(&mut self) -> Result<usize, RuntimeError> {
-        self.ctrl_stack
+    fn restore_reg(&mut self) -> Result<usize, RuntimeError> {
+        self.reg_saves
             .pop()
             .ok_or_else(|| RuntimeError::RangeError("control stack underflow".to_string()))
     }
@@ -10242,7 +10209,7 @@ impl State {
     /// count (used by `Opcode::Arguments`) and guard recursion depth.
     fn enter_frame(&mut self, argc: usize) -> Result<(), RuntimeError> {
         // 深度按**调用帧**数算：`frames[0]` 是顶层脚本帧，不算一次调用。
-        // 以前读 `ctrl_stack.len() / 3`（每帧三项）—— 那还混着 `PushC`/`PopC` 的条目，
+        // 以前读控制栈长度 / 3（每帧三项）—— 那还混着 `PushC`/`PopC` 的条目，
         // 只有"它们最多两项、整数除法恰好不出错"才成立，是个侥幸。
         if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
             return Err(RuntimeError::RangeError(
@@ -10258,14 +10225,14 @@ impl State {
 
     /// **M2-1 镜面**：把一个新帧记进 `frames`。
     ///
-    /// 必须在 `enter_frame` + `this_val`/`function_val` 赋值 + 三条 `pushc` +
+    /// 必须在 `enter_frame` + `this_val`/`function_val` 赋值 +
     /// `construct_stack`/`new_target_stack` 的 push **之后**调用 —— 它读的就是那些栈顶。
-    /// 三个水位参数**故意由调用点传入**（就是刚 push 进 `ctrl_stack` 的那三个值），
-    /// 这样镜面与真值不可能来自两次不同的计算。
+    /// 两个水位参数由调用点传入；切片 1b 之后它们是这两个水位的**唯一**记录。
+    /// （切片 1b 之前调用点还要把同样的值再 `pushc` 三份，两份必须一致 —— 那套簿记已退役。）
     /// `pc` 是**新帧的初始指令指针**，必须由调用点给：
     /// 入口 pc（4 个 opcode 调用点 / `open_frame` / `push_generator_frame`）
     /// 或哨兵（`restore_generator_frame`）。理由见 `Frame::pc`。
-    fn note_frame(&mut self, pc: usize, closure_depth: usize, seh_depth: usize, return_pc: usize) {
+    fn note_frame(&mut self, pc: usize, closure_depth: usize, seh_depth: usize) {
         self.frames.push(Frame {
             pc,
             argc: self.frame_argc.last().copied().unwrap_or(0),
@@ -10277,9 +10244,6 @@ impl State {
                 .unwrap_or(Value::Undefined),
             closure_depth,
             seh_depth,
-            return_pc,
-            // 三条 `pushc` 刚做完，本帧三连就是最上面三项。
-            ctrl_base: self.ctrl_stack.len() - 3,
         });
     }
 
@@ -10339,31 +10303,6 @@ impl State {
         // （ES 12.3.5.1 `BindThisValue`），`this_state` 的 BOUND 回填是同一件事的另一半。
         // 所以它不满足"开帧时写一次、之后只读"这个前提，不属于 A 步能严格互校的集合；
         // B 步直接把它搬进 `Frame`（那时以字节码不变为证，而不是靠镜面）。
-        // `ctrl_stack` 的三连：`PushC`/`PopC` 会插在它**之上**，所以按本帧记录的
-        // `ctrl_base` 取，不能按"末三项"取。
-        debug_assert!(
-            frame.ctrl_base + 3 <= self.ctrl_stack.len(),
-            "本帧的三连已被弹掉（ctrl_base {} 越界，ctrl_stack 长 {}）",
-            frame.ctrl_base,
-            self.ctrl_stack.len()
-        );
-        if frame.ctrl_base + 3 <= self.ctrl_stack.len() {
-            debug_assert_eq!(
-                frame.closure_depth,
-                self.ctrl_stack[frame.ctrl_base],
-                "镜面 closure_depth 与本帧三连首项不一致"
-            );
-            debug_assert_eq!(
-                frame.seh_depth,
-                self.ctrl_stack[frame.ctrl_base + 1],
-                "镜面 seh_depth 与本帧三连第二项不一致"
-            );
-            debug_assert_eq!(
-                frame.return_pc,
-                self.ctrl_stack[frame.ctrl_base + 2],
-                "镜面 return_pc 与本帧三连第三项不一致"
-            );
-        }
     }
 
     /// Resolve `name` in the environment.
@@ -10511,13 +10450,23 @@ struct SehRecord {
     delayed_return: bool,
     /// saved closure var stack depth when return was deferred by finally
     saved_closure_depth: usize,
-    /// Call-frame depths captured when the `try` was entered.
+    /// `reg_saves` 的长度在进入这条 `try` 时的值。
     ///
-    /// An exception raised inside a nested call has to unwind those frames
-    /// before the handler runs: the control stack still holds their return
-    /// addresses, and leaving them there would make the handler resume the
-    /// throwing function instead of continuing in the handler's frame.
-    saved_ctrl_depth: usize,
+    /// **为什么必须单独记**：以前帧的簿记与 `PushC`/`PopC` 的簿记挤在同一条
+    /// `ctrl_stack` 上，所以 `unwind_frames_to` 里一次 `truncate(saved_ctrl_depth)`
+    /// 顺手把**被回退帧遗留的 `PushC` 项**也清掉了。切片 1b 把两者分开之后，
+    /// 这个清理动作就没有人做了 —— 实测后果：外层之后的 `PopC` 会弹到过期值，
+    /// `rbp` 被破坏（`[a, f(), b]` 这种"数组字面量里夹一次会抛异常的调用"
+    /// 直接报 `ArrayPush on non-object`）。
+    ///
+    /// ⇒ **一条记录要记两个水位，因为它们现在是两条独立的栈。**
+    saved_reg_saves: usize,
+    /// **帧深度**（`frames.len()`）在进入这条 `try` 时的值。
+    ///
+    /// 嵌套调用里抛出的异常必须先把那些帧收掉再跑处理器：否则处理器的帧身份
+    /// 还是抛出者那一帧（`pc` 就在抛出点上），会接着跑错的地方。
+    /// 切片 1b 之前这里记的是控制栈深度 —— 那是同一个事实的另一种编码。
+    saved_frame_depth: usize,
     /// Depth of `this_stack` (and its parallel `function_stack` /
     /// `frame_argc`) — one entry per active JS frame.
     saved_this_depth: usize,
@@ -10557,9 +10506,6 @@ struct SavedExecutionState {
     construct: usize,
     new_target: usize,
     function: Value,
-    /// Control-stack depth *before* the callee's own entries: the boundary a
-    /// generator body (or an `invoke`) may not dispatch an exception across.
-    ctrl: usize,
     delegate: usize,
     registers: [Value; 19],
 }
@@ -10736,7 +10682,7 @@ mod tests {
         let state = State::new();
         assert_eq!(state.rsp, 0);
         assert_eq!(state.rbp, 0);
-        assert!(state.ctrl_stack.is_empty());
+        assert!(state.reg_saves.is_empty());
         assert!(state.seh_stack.is_empty());
         assert!(state.globals.borrow().is_empty());
     }
@@ -10772,18 +10718,18 @@ mod tests {
     }
 
     #[test]
-    fn test_state_pushc_popc() {
+    fn test_state_save_restore_reg() {
         let mut state = State::new();
-        state.pushc(100).unwrap();
-        state.pushc(200).unwrap();
-        assert_eq!(state.popc().unwrap(), 200);
-        assert_eq!(state.popc().unwrap(), 100);
+        state.save_reg(100).unwrap();
+        state.save_reg(200).unwrap();
+        assert_eq!(state.restore_reg().unwrap(), 200);
+        assert_eq!(state.restore_reg().unwrap(), 100);
     }
 
     #[test]
-    fn test_state_popc_underflow() {
+    fn test_state_restore_reg_underflow() {
         let mut state = State::new();
-        let result = state.popc();
+        let result = state.restore_reg();
         assert!(matches!(result, Err(RuntimeError::RangeError(_))));
     }
 
@@ -10794,7 +10740,7 @@ mod tests {
     fn state_with_script_frame() -> State {
         let mut state = State::new();
         // 用**运行期同一个**压帧入口，测试才不会验到另一种帧。
-        state.open_script_frame(0).expect("open_script_frame");
+        state.open_script_frame().expect("open_script_frame");
         state
     }
 
@@ -10826,7 +10772,7 @@ mod tests {
         state.jump(7);
         // 压一个"被调帧"：它有自己的 pc，**由开帧点显式给**。
         state.enter_frame(1).expect("enter_frame");
-        state.note_frame(42, 0, 0, 0);
+        state.note_frame(42, 0, 0);
         assert_eq!(state.pc(), 42, "被调帧的出生 pc 就是入口");
         assert_eq!(state.frames[0].pc, 7, "调用方那帧的 pc 必须没被动过");
         state.frames.pop();
@@ -10846,7 +10792,6 @@ mod tests {
             1,
             "它与其它帧同构：`this_stack` 也有一条（否则镜面不变量不成立）"
         );
-        assert_eq!(state.frames[0].return_pc, 0, "测试里传的 return_pc");
         // 脚本帧不是"一次调用"：深度按 `frames.len() - 1` 算。
         assert_eq!(state.frames.len().saturating_sub(1), 0);
     }

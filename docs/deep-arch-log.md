@@ -1068,3 +1068,79 @@ vs "pc 已由别人设定"）。原代码把这两件事压成了同一个 `None
 它只剩"控制栈第三项"的簿记作用。切片 1b 应当连同 `PushC`/`PopC` 的记账、
 `ctrl_stack` 的两类条目混用一起删掉 —— 那时 `Frame` 也不再需要 `return_pc`
 与 `ctrl_base`（镜面互校的整套机制随旧栈一起退役）。
+
+---
+
+## 14. M2-1b：控制栈的两类条目分开（2026-10-07）
+
+### 14.1 目标
+
+修掉 §7.7 记下的那个隐患：`ctrl_stack` 上**挤着两类条目** —— 每帧一组 3 项
+（`closure_depth` / `seh_depth` / 返回地址）与 `PushC`/`PopC` 各 1 项（`rsp`/`rbp` 的保存）。
+于是"我是不是最外层帧"只能靠 `ctrl_stack.is_empty()`，而这个判断被两种记账同时影响。
+
+### 14.2 做了什么
+
+| 改动 | 说明 |
+|---|---|
+| `Frame.closure_depth` / `seh_depth` 从"镜像"变**权威** | 6 个开帧点不再压三连；`Ret` 不再弹三连（改从帧里读）；`discard_generator_frame` 不再弹 |
+| 删 `Frame.return_pc` / `Frame.ctrl_base` | `return_pc` 在 1a′ 之后已无读者；`ctrl_base` 是镜面机制的产物 |
+| `ctrl_stack` → **`reg_saves`**；`pushc`/`popc` → `save_reg`/`restore_reg` | 它现在只装 `PushC`/`PopC` 的保存项，名字与职责终于一致 |
+| 边界统一成**帧深度** | `drive_bytecode_frame` 的 `boundary` 一个值同时喂 `invoke_boundaries`（异常对外边界）与循环出口；`SehRecord.saved_ctrl_depth` → `saved_frame_depth`；`unwind_frames_to` 不再收 `ctrl_depth`；删 `SavedExecutionState.ctrl` |
+
+### 14.3 撞到并修掉的 bug：**分开两条栈时，丢掉了一个"顺手"的清理**
+
+**症状**（最小复现，`name_of` 内部用 try/catch 吞掉异常）：
+
+```js
+function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+[name_of(function () { Object.getPrototypeOf(null); })]
+// → Runtime error: TypeError: ArrayPush on non-array object
+```
+
+**症状的位置很能说明问题**：坏掉的不是抛异常的那个函数，而是**发出调用的那一侧** ——
+数组字面量的元素槽是 `[rbp+k]`，`rbp` 一错就读到非对象。
+
+**根因**：以前 `unwind_frames_to` 里一次 `ctrl_stack.truncate(record.saved_ctrl_depth)`
+**顺手**把"被回退的帧遗留的 `PushC` 项"也清掉了（两类条目同挤一条栈）。
+分开之后这件事没有人做 ⇒ 外层之后的 `PopC` 弹到过期值 ⇒ `rbp` 被破坏。
+
+**修法**：**一条 `SehRecord` 要记两个水位** —— `saved_frame_depth` 与 `saved_reg_saves`。
+两个都要，因为帧的簿记与 `PushC` 的簿记现在是两条独立的栈。
+`drive_bytecode_frame` 同理（异常逃出被调帧时要截断 `reg_saves`；这段是从原来的
+`ctrl_stack.truncate` 平移过来的，语义不变）。
+
+> 教训值得单列：**"顺手"—— 一次操作同时管两件事 —— 在拆分时会以"沉默丢失"的形式暴露。**
+> 拆的时候不能只问"这个字段搬到哪"，还要问"这次操作**顺带**保证了什么"。
+> 本次是 feature 套件（真实 JS）在 debug 下抓到的。
+
+### 14.4 回归测试
+
+`tests/features/control_flow.rs::a_call_that_catches_internally_keeps_the_callers_frame_pointer_intact`
+—— 3 组断言：数组字面量里夹"自己吞异常的调用"（原症状）、不经数组字面量的同形状、
+被调方**嵌套调用**里抛而由被调方自己接住。
+
+### 14.5 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元 | 206 | **206** | 不变 |
+| feature | 525 / 4 ignored | **526 / 4 ignored** | +1 回归测试 |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | 逐字节一致 |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | —— |
+| 告警 | lib 24 / lib test 26 / features 8 | **同** | 无新增 |
+
+### 14.6 结构性收益
+
+- §7.7 记的"两类条目混在一条控制栈上"**结构性消失** ——
+  `save_reg`/`restore_reg` 现在只管 `rsp`/`rbp`，与帧的深度再无关系。
+- 镜面互校的职责收窄到只剩 `argc` / `construct` / `new_target` + 长度不变量（切片 1e 收口）。
+- `SehRecord` 的字段语义变诚实：`saved_frame_depth` 是帧深度、`saved_reg_saves` 是保存项水位
+  —— 以前它们是同一条栈上的两个数。
+
+### 14.7 下一步
+
+**1c**：`func` 直接搬（值进 `Frame`）+ 删 `function_stack` +
+删 `SavedExecutionState.function` —— 顺带消掉 §9.3 定位的那处潜伏记账分叉。

@@ -823,3 +823,52 @@ fn a_throw_after_a_nested_try_reaches_the_outer_catch_with_the_current_value() {
         5.0
     );
 }
+
+/// **一次"在表达式内部被调用、自己吞掉了异常"的调用之后，调用方的帧指针必须完好。**
+///
+/// 回归来源（切片 1b 施工中实测）：帧的簿记（`closure_depth` / `seh_depth`）与
+/// `PushC`/`PopC` 的保存项**以前挤在同一条 `ctrl_stack` 上**，所以 `unwind_frames_to`
+/// 里一次 `truncate(saved_ctrl_depth)` 顺手把"被回退的帧遗留的 `PushC` 项"也清掉了。
+/// 切片 1b 把两者分开之后，这个清理**没有人做** —— 于是异常被同帧的 `catch` 接住之后，
+/// 外层那条 `PopC rbp` 会弹到过期值，`rbp` 被破坏。
+///
+/// 症状的位置很能说明问题：坏掉的不是抛异常的那个函数，而是**发出调用的那一侧** ——
+/// 数组字面量的元素槽是 `[rbp+k]`，`rbp` 一错就读到非对象，
+/// 于是报出 `ArrayPush on non-array object`（实测原文）。
+///
+/// ⇒ 契约：**一条 `SehRecord` 要记两个水位**（`saved_frame_depth` 与 `saved_reg_saves`），
+/// 因为帧的簿记与 `PushC` 的簿记现在是两条独立的栈。
+#[test]
+fn a_call_that_catches_internally_keeps_the_callers_frame_pointer_intact() {
+    // 数组字面量里夹调用：`rbp` 若被破坏，元素槽读到非对象。
+    assert_eq!(
+        eval_string(
+            "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+             [name_of(function () { Object.getPrototypeOf(null); }),
+              name_of(function () { throw new Error('x'); })].join(',')"
+        ),
+        "TypeError,Error"
+    );
+    // 同一个形状但不经数组字面量：调用方接着做别的（读自己的局部变量）也必须对。
+    assert_eq!(
+        eval_string(
+            "function f(fn) {
+               var tag = 'local';
+               try { fn(); } catch (e) { return tag + ':' + e.name; }
+               return 'no-throw';
+             }
+             f(function () { Object.getPrototypeOf(null); })"
+        ),
+        "local:TypeError"
+    );
+    // 被调方**嵌套调用**里抛、由被调方自己的 catch 接住，调用方同样不受影响。
+    assert_eq!(
+        eval_string(
+            "function inner() { Object.getPrototypeOf(null); }
+             function outer(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
+             var before = 'kept';
+             [outer(function () { inner(); }), before].join(',')"
+        ),
+        "TypeError,kept"
+    );
+}
