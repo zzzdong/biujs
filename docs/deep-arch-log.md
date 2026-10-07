@@ -456,3 +456,148 @@ obj.m.name        // "m" ← 运行期 SetFunctionName 补的（实测）
    - 尚未处理：known bug #4（`handle_throw` 在 catch 路径多弹一次）——
      M2 的 `Frame.try_stack` 按构造消除它，但**要在 M2 里显式验**（那条 `#[ignore]` 测试
      就是验收标准：去掉 `ignore` 应当变绿）。
+
+---
+
+## 7. M2 施工子计划（2026-10-07 勘察后写成）
+
+> 写成文档的理由：M2 是全深改里唯一要重写 `run_instruction` 的一步，
+> 而它的**实际改动面**（哪些字段、多少处引用、几条独立的收帧路径）只能靠实测枚举，
+> 不能靠印象。下面这份清单就是施工图；下个会话不必重做勘察。
+
+### 7.1 实测的改动面（`grep -c`，`src/vm/mod.rs`）
+
+| 字段 | 引用点 | 归属 |
+|---|---|---|
+| `self.state.seh_stack` | 29 | B（跨帧水位） |
+| `self.state.rbp` | 26 | A（帧内）/ 共享栈水位 |
+| `self.state.closure_var_stack` | 23 | B（以"空 map"为帧边界） |
+| `self.state.rsp` | 22 | A / 共享栈水位 |
+| `self.state.pc` | 18 | A（帧内） |
+| `self.state.construct_stack` | 12 | B（平行栈） |
+| `self.state.new_target_stack` | 12 | B（平行栈） |
+| `self.state.this_val` | 9 | A（帧内） |
+| `self.state.this_stack` | 8 | B（保存**调用方**的绑定） |
+| `self.invoke_boundaries` | 8 | B（= ctrl 深度水位） |
+| `self.state.this_state` | 7 | B（平行栈，且非纯栈操作，见 7.5） |
+| `self.state.frame_argc` | 7 | B（平行栈 + 参数越界规则） |
+| `self.state.ctrl_stack` | 6 | B（每帧 3 项） |
+| `self.state.function_stack` | 4 | B（保存调用方） |
+| `self.state.data_stack` | 4 | A / 共享值栈 |
+| `self.state.registers` | 4 | **C（全局！）** |
+
+⇒ **平行栈合计约 116 处 + `rsp`/`rbp`/`pc` 66 处**。规模是"机械但多"，不是"深"。
+
+### 7.2 三条**独立**的收帧路径（必须同时改，漏一条就出诡异 bug）
+
+| # | 路径 | 位置 | 触发 |
+|---|---|---|---|
+| 1 | `Ret` 的正常收帧 | `step` 的 `Ret` arm | 函数正常返回 |
+| 2 | `drive_bytecode_frame` 的收尾 | `drive_bytecode_frame` 尾部 | 嵌套循环退出 / 异常**逃出**该帧 |
+| 3 | 异常回退 + 生成器状态 | `unwind_frames_to` / `restore_execution_state` / `restore_generator_frame` | `handle_throw` 跨帧 / 挂起帧恢复 |
+
+三条路径现在各写一遍"回退哪些栈到哪个水位"，字段清单**必须保持一致**。
+`Frame` 化之后它们应当收成一个助手（`pop_frame_to(depth)` 之类），这是 M2 的
+主要正确性收益之一。
+
+### 7.3 目标的 `Frame`（M2 结束时的形状）
+
+```rust
+pub struct Frame {
+    pub code: u32,              // 函数 id（M2 时先存 id；M3 之后是 Gc<CodeBlock>）
+    pub func: Value,            // 当前帧的函数对象（`function_val` 的替代）
+    pub pc: u32,                // 指令指针（**唯一**来源，取代 state.pc）
+    pub base: u32,              // 寄存器窗口起点（取代 rbp）
+    pub locals_len: u32,        // 窗口长度 = 本帧局部+临时+实参区
+    pub argc: u32,              // 实参个数（`Arguments` / `MakeRest` / 越界规则）
+    pub this: Value,
+    pub this_state: u8,         // THIS_NONE / THIS_DERIVED_UNBOUND / THIS_DERIVED_BOUND
+    pub new_target: Value,
+    pub construct: bool,
+    /// 返回后把 `Rv` 送给**调用方**的哪个寄存器（取代 return_pc 的一部分语义）
+    pub dst: Register,
+    pub return_pc: u32,         // M2 阶段仍是绝对 pc（哨兵还在，见 7.4）
+    /// 水位的**绝对值**（不是长度）：收帧时 truncate 到它们
+    pub closure_depth: u32,
+    pub seh_depth: u32,
+    /// 本帧的 try 嵌套（M2 先沿用 `seh_stack` 的切片，M2-3 再收进帧）
+    pub try_top: u32,
+}
+```
+
+`State`：`frames: Vec<Frame>` 取代 `ctrl_stack` + `this_stack` + `this_state` +
+`function_stack` + `frame_argc` + `construct_stack` + `new_target_stack` +
+`function_val` + `this_val` + `pc`。
+
+### 7.4 分阶段（每阶段一次提交、一次全量验证）
+
+| 阶段 | 内容 | 是否改行为 | 改动面 |
+|---|---|---|---|
+| **M2-1** | `Frame` + `frames` 落位；把"帧身份"整组字段搬进去（`pc` / `function_val` / `this_val` / `this_state` / `frame_argc` / `construct` / `new_target` / `return_pc` / `closure_depth` / `seh_depth`）；三条收帧路径收成一个助手。**保留**嵌套 `step` 循环与哨兵 pc | 否（纯搬运） | ~110 处 |
+| **M2-2** | 单层主循环：`run_until(boundary)`；**删哨兵 pc**；`invoke` 改成"跑到 `frames.len()==boundary`"；删 `PushC`/`PopC`/`MovC` | **是** | 中 |
+| **M2-3** | `registers` 从全局 `[Value;19]` 变成帧窗口的一部分（`stack[base + reg]`）；`data_stack`/`rsp`/`rbp` 并入 `stack` + `Frame{base,len}` | 部分 | 中 |
+| **M2-4** | known bug #4 的验收：去掉 `known_bugs.rs` 那条 `#[ignore]`，应当变绿 | 是（修 bug） | 小 |
+
+**顺序理由**：M2-1 是纯搬运（噪声可归因）；M2-2 才是行为变化，必须等 M2-1 把"帧的
+字段"定死之后再做 —— 否则每改一次边界概念都要再动一遍 110 处。
+
+### 7.5 四个必须小心的地方（勘察实测出来的，不是推测）
+
+1. **`Ret` 要在 pop **之前**抓两样东西**：`frame_ctor_state`（`this_state.last()`）与
+   `frame_this`（`this_val`）。顺序错了，构造器的返回值语义就错
+   （`derived-class-return-override-catch.js` 一族）。
+2. **`this_state` 不是纯栈操作**：`enter_frame` 压 `THIS_NONE`、
+   `mark_this_uninitialized` 会**补齐到 `this_stack.len()`** 再写 UNBOUND、
+   `CallSuperSpread` 会**逆序回填**找到 UNBOUND 槽改成 BOUND。
+   ⇒ 搬进 `Frame` 时不能只做 `push/pop`，要保留"按帧回填"的语义。
+3. **`registers` 现在是全局的**（代码与注释都明说）：所以嵌套运行（生成器体 /
+   `invoke`）必须靠 `SavedExecutionState::registers` 与 `SuspendedFrame::registers`
+   来回搬。M2-3 把它变成帧窗口的一部分之后，**这两处搬运可以整块删掉**
+   （`extract/restore_generator_frame` 的清单少两项）。这是 M2 顺带拿到的收益。
+4. **`closure_var_stack` 以"空 map"当帧边界**（`take_pending_captured_vars` 靠它停止）。
+   搬进帧时要变成 `Frame.closure_depth` 的绝对值 + 一个显式的"本帧捕获表"，
+   不能继续依赖"遇到空 map 就停"这种隐式约定。
+
+### 7.6 M2-1 的切片顺序（按字段组，每片可独立验证）
+
+| 片 | 字段组 | 引用点 | 备注 |
+|---|---|---|---|
+| **1a** | `pc` + `ctrl_stack` 的三项 + `function_val` | 18+6+11 | `Ret`/`open_frame`/`drive_bytecode_frame` 一起改；`ctrl_stack_reached_bottom()` → `frames.is_empty()` |
+| 1b | `this_val` + `this_state` + `frame_argc` + `this_stack` + `function_stack` | 9+7+7+8+4 | 注意 7.5 第 2 条 |
+| 1c | `construct_stack` + `new_target_stack` | 12+12 | 与 `Frame.construct`/`new_target` 一一对应 |
+| 1d | `closure_depth` + `seh_depth` 水位 | 23+29 | 这一片之后三条收帧路径可以合并 |
+| 1e | 三路收帧合并成一个助手 | —— | 正确性收口，独立提交 |
+
+### 7.7 M2-1 的迁移机制（先证等价，再切换 —— 沿用 M1 的做法）
+
+110 处搬运如果"改一处删一处"，中途任何一次提交都处在半迁移状态，回归噪声无法归因。
+所以**每个切片走两步**：
+
+- **A 步（镜面 + 断言）**：新建的 `frames` 与旧的平行栈**同时维护**，并在三条收帧路径的
+  出口加 `debug_assert`：`frames.last()` 的每个字段都等于对应平行栈的栈顶。
+  读点仍然读旧字段 ⇒ **行为零变化**，而"新结构被正确维护"这件事被真实数据检验过。
+- **B 步（翻转读点）**：把该字段组的读点逐个改成读 `frames.last()/frame_mut()`，
+  断言仍在（此时它校验的是"写点还没换"）。全组翻完后，删掉旧字段与断言。
+
+这比"M1.1 先加数据再切换"更进一步：M1.1 里新数据是**新增**的，M2-1 里新数据是
+**同一份数据的第二种存放**，所以必须在切换完成前一直互校。
+
+> **勘察发现的额外隐患（顺带被 `Frame` 消除）**：`ctrl_stack` 里混着两种长度的条目 ——
+> 帧组是**每帧 3 项**（`return_pc` / seh 深度 / closure 深度，见 `open_frame`、
+> `Call`、`New`、`push_generator_frame`、`restore_generator_frame`），
+> 而 `PushC`/`PopC` 两条**指令**（各压/弹 **1 项**，成对使用时共 2 项：`rsp` / `rbp`；
+> codegen 发射 `PushC rsp` + `PushC rbp` 这样的一对）。
+> 于是 `Ret` 判断"我是不是最外层帧"只能靠 `ctrl_stack.is_empty()`
+> （`State::ctrl_stack_reached_bottom`），而它同时被两种记账影响 —— 这是"两条知识
+> 混在一条栈上"。`frames` 化之后这个判断变成 `frames.is_empty()`，与 `PushC`/`PopC`
+> 的簿记彻底分开（后者在 M2-2 随指令一起删）。
+
+### 7.8 验收（每个切片）
+
+- 全量 test262 **逐字节不变** + 零逐套件回退（M2-1 是纯搬运，这是硬要求）；
+- `guards:` 三个计数不变；
+- 定向：`language/statements/try`（SEH）、`generators` ×2、`class` ×2、
+  `language/expressions/arrow`（`this` 捕获）、`language/statements/for-of`（`delegate_stack`）；
+- **新增守卫**：`frames` 与已删除字段的"此刻一致"断言在 M2-1 期间可临时保留
+  （旧的平行栈先不删、只在末尾断言与 `frames` 同步），最后一片再删旧字段 ——
+  这是 M1 用过的"先证等价再切换"，本轮继续用。
