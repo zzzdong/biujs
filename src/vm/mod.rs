@@ -724,11 +724,12 @@ impl VM {
                             self.state.set_register(Register::Rv, frame_this)?;
                         }
                     }
-                    // 本帧收掉了；帧自己带着 `argc` / `construct` / `new.target`，
-                    // 所以没有平行栈要跟它一起退。
-                    self.state.frames.pop();
-                    self.state.closure_var_stack.truncate(saved_closure_depth);
-                    self.state.seh_stack.truncate(saved_seh_depth);
+                    // 本帧收掉了；它自己带着所有按帧的值，退帧只有上面这一处。
+                    self.unwind_frames_to(
+                        self.state.frames.len() - 1,
+                        saved_closure_depth,
+                        saved_seh_depth,
+                    );
                     // ES 9.2.2 step 13c: a derived constructor that returns a
                     // primitive other than `undefined` raises a TypeError. The
                     // frame is fully unwound by now — its own SEH records in
@@ -1469,9 +1470,7 @@ impl VM {
         // `frames.truncate(boundary)` 一起恢复 —— 它们全在帧里。
         self.state.rsp = saved_rsp;
         self.state.rbp = saved_rbp;
-        self.state.closure_var_stack.truncate(saved_closure);
-        self.state.seh_stack.truncate(saved_seh);
-        self.state.frames.truncate(boundary);
+        self.unwind_frames_to(boundary, saved_closure, saved_seh);
 
         outcome?;
         let rv = self.state.get_register(Register::Rv)?;
@@ -7705,22 +7704,34 @@ impl VM {
     /// Discard the JS frames entered after the `try` that owns the record: an
     /// exception raised in a nested call must be handled in the frame that
     /// wrote the `try`, not in the frame that threw.
+    /// **退帧的唯一出口**：退到 `frame_depth`（留下 `frames[..frame_depth]`，于是
+    /// `frames[frame_depth - 1]` 成为当前帧），并把两条"按帧存集合"的栈截到水位。
+    ///
+    /// 走这里的四条路径：`Ret`（正常返回）、异常回退（`handle_throw`）、
+    /// Rust 驱动调用的恢复（`drive_bytecode_frame`）、生成器恢复
+    /// （`restore_execution_state` / `discard_generator_frame`）。
+    ///
+    /// **为什么要合并**：以前"退一帧要做哪些 truncate"这个知识被复制了四份，
+    /// 而切片 1b 已经吃过一次这个亏 —— 同挤一条 `ctrl_stack` 时一次 truncate 顺手管两样，
+    /// 拆开之后那个"顺手"在别的路径上**沉默丢失**（`rbp` 被破坏，§14.3）。
+    /// 合并之后这类附带清理只有一处可写。
+    ///
+    /// **水位由调用点给，不在这里从帧里推**：三路的来源本就不同 ——
+    /// `Ret` 用本帧记录的水位，异常回退用 `SehRecord` 在 `try` 处记的水位，
+    /// Rust 驱动调用与生成器用 `SavedExecutionState` 记的。统一成"从帧里推"会改语义
+    /// （例如 `try` 之后又压了闭包映射，两条水位就不相等了）。
     fn unwind_frames_to(
         &mut self,
-        reg_saves_depth: usize,
         frame_depth: usize,
         closure_depth: usize,
+        seh_depth: usize,
     ) {
-        // 被回退的那些帧可能留下没来得及 `PopC` 的保存项 —— 它们必须一起丢，
-        // 否则外层之后的 `PopC` 会弹到过期值（`rbp` 被破坏；实测症状：
-        // "数组字面量里夹一次会抛异常的调用" 直接报 `ArrayPush on non-object`）。
-        // **切片 1b 之前这件事是顺手做的**（帧的簿记与 `PushC` 的簿记同挤在
-        // 一条 `ctrl_stack` 上，一次 truncate 清两样）—— 分开之后就必须显式记两次。
-        self.state.reg_saves.truncate(reg_saves_depth);
-        self.state.closure_var_stack.truncate(closure_depth);
-        // 帧自己带着 `this` / `this_state` / `argc`，所以"回退到第几帧"一步到位 ——
-        // 以前这里要分别 truncate `this_stack` / `this_state` / `frame_argc` 三条平行栈。
+        // 帧自己带着 `this` / `this_state` / `argc` / `func` / `pc` /
+        // `construct` / `new.target`，所以"回退到第几帧"一步到位 ——
+        // 切片 1b/1c/1d/1e 之前这里要分别 truncate 七条平行栈。
         self.state.frames.truncate(frame_depth);
+        self.state.closure_var_stack.truncate(closure_depth);
+        self.state.seh_stack.truncate(seh_depth);
     }
 
     fn handle_throw(&mut self, exc_val: Value) -> Result<(), RuntimeError> {
@@ -7740,10 +7751,18 @@ impl VM {
             Some(mut record) => {
                 self.state.rsp = record.saved_rsp;
                 self.state.rbp = record.saved_rbp;
+                // 被回退的那些帧可能留下没来得及 `PopC` 的保存项 —— 它们必须一起丢，
+                // 否则外层之后的 `PopC` 会弹到过期值（`rbp` 被破坏；实测症状：
+                // "数组字面量里夹一次会抛异常的调用" 直接报 `ArrayPush on non-object`）。
+                // **切片 1b 之前这件事是顺手做的**（帧的簿记与 `PushC` 的簿记同挤在
+                // 一条 `ctrl_stack` 上，一次 truncate 清两样）—— 分开之后必须显式记。
+                self.state.reg_saves.truncate(record.saved_reg_saves);
                 self.unwind_frames_to(
-                    record.saved_reg_saves,
                     record.saved_frame_depth,
                     record.saved_closure_depth,
+                    // 处理器这条记录刚刚被 `seh_stack.pop()` 掉了，所以"退到哪"就是
+                    // 现在的长度（不再额外截）。
+                    self.state.seh_stack.len(),
                 );
 
                 let finally_pc = record.finally_pc;
@@ -8929,9 +8948,19 @@ impl VM {
     /// control entries are gone with `frames` itself. The value
     /// stack and the other stacks are rewound by `restore_execution_state`.
     fn discard_generator_frame(&mut self) {
-        // 帧的水位随 `frames` 一起收（见 `Ret`）—— 控制栈上已经没有它的三连。
-        // M2-1 镜面：`Ret` 没跑，这个帧的镜面条目同样要丢掉。
-        self.state.frames.pop();
+        // `Ret` 没跑，所以帧的**附带状态**（它自己的闭包映射 / try 记录）也没被收 ——
+        // 按本帧记录的水位、走同一个"退帧"助手收掉。
+        let (closure_depth, seh_depth) = self
+            .state
+            .frames
+            .last()
+            .map(|frame| (frame.closure_depth, frame.seh_depth))
+            .unwrap_or((0, 0));
+        self.unwind_frames_to(
+            self.state.frames.len().saturating_sub(1),
+            closure_depth,
+            seh_depth,
+        );
     }
 
     /// Report what a finished run means for the generator object.
@@ -9143,9 +9172,7 @@ impl VM {
     fn restore_execution_state(&mut self, saved: &SavedExecutionState) {
         self.state.rsp = saved.rsp;
         self.state.rbp = saved.rbp;
-        self.state.closure_var_stack.truncate(saved.closure);
-        self.state.seh_stack.truncate(saved.seh);
-        self.state.frames.truncate(saved.frame_depth);
+        self.unwind_frames_to(saved.frame_depth, saved.closure, saved.seh);
         self.delegate_stack.truncate(saved.delegate);
         // The register file is *global*, not per frame: a nested run (a
         // generator body, an `invoke`) overwrites values the caller still has

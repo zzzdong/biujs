@@ -1371,3 +1371,107 @@ self.state.note_frame(FrameBirth {
 
 它们的动作已经**趋同**（把 `frames` / `closure_var_stack` / `seh_stack` 截到某个水位），
 差别只剩各自的附带动作。合并之后"收帧"只有一个实现，也只有一个水位概念。
+
+---
+
+## 18. M2-1f：退帧只有一个出口（2026-10-08）
+
+### 18.1 做了什么
+
+`VM::unwind_frames_to(frame_depth, closure_depth, seh_depth)` 成为**退帧的唯一实现**，
+五条路径全部改走它：
+
+| 路径 | 水位来源 |
+|---|---|
+| `Ret`（正常返回） | 本帧记录的 `closure_depth` / `seh_depth` |
+| `handle_throw`（异常回退） | `SehRecord` 在 `try` 处记的水位 |
+| `drive_bytecode_frame` 的恢复块（Rust 驱动的调用） | `SavedExecutionState`-式的三个局部水位 |
+| `restore_execution_state`（生成器恢复） | `SavedExecutionState` |
+| `discard_generator_frame`（生成器被丢弃） | 本帧记录的水位 |
+
+### 18.2 为什么值得做
+
+"退一帧要做哪些 truncate"这个知识以前被**复制了五份**。切片 1b 已经吃过一次这个亏：
+两类条目同挤一条 `ctrl_stack` 时，一次 `truncate` **顺手**管两样；拆开之后那个"顺手"
+在别的路径上**沉默丢失**（`rbp` 被破坏，§14.3 有最小复现）。
+
+合并之后，这类"退帧的附带清理"**只有一处可写** —— 下一处要加的东西不可能再漏在别的路径上。
+
+### 18.3 一个**刻意没有**统一的点
+
+水位**由调用点给**，不在这里从帧里推。三路的来源本就不同：
+
+- `Ret` / `discard_generator_frame` 用**开帧时**记录的水位；
+- 异常回退用 **`try` 处**（`SehRecord`）记录的水位；
+
+这两者**不相等**：`try` 之后体里还可以再压闭包映射，那时 `try` 处的水位 < 本帧的完整水位。
+统一成"从帧里推"会把异常路径的语义改掉。
+
+⇒ 合并的是**动作**（哪些栈要一起收），不是**水位**（收到哪儿）。
+
+### 18.4 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元 | 206 | **206** | 不变 |
+| feature（debug） | 526 / 4 ignored | **526 / 4 ignored** | 不变 |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | **逐字节一致** |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | —— |
+| 告警 | lib 24 / lib test 26 / features 8 | **同** | 无新增 |
+
+---
+
+## 19. M2-1 收口总账（2026-10-08）
+
+### 19.1 切片清单
+
+| 切片 | 交付 | 关键证据 |
+|---|---|---|
+| **1a** | 顶层脚本变成一个帧（`frames[0]`） | "最外层"从 `ctrl_stack.is_empty()` 变成 `frames.len() == 1` |
+| **1a′** | `pc` 进 `Frame` + 循环改边界驱动 | 先失败后成功：§10/§11 记录失败，§12 修掉潜伏 bug，§13 一次通过 |
+| **1b** | 控制栈的两类条目分开（`reg_saves`） | 撞到并修掉"分开时丢了顺手的清理"（§14.3） |
+| **1c** | `func` 搬进 `Frame` | 消掉 §9.3 的潜伏分叉 + 生成器那处怪癖 |
+| **1d** | `this` / `this_state` 搬进 `Frame` | 删掉 `mark_this_uninitialized`（"先建半成品再改"的信号） |
+| **1e** | `argc` / `construct` / `new_target` 翻到帧上 | **镜面机制整套退役**，出生值改成具名字段 |
+| **1f** | 退帧只有一个出口 | 五条路径归一，水位仍由调用点给 |
+
+### 19.2 消失了什么
+
+**七条按帧的平行栈全部退役**：`ctrl_stack`(→`reg_saves`，只管 `PushC`) /
+`function_stack` / `this_stack` / `this_state` / `frame_argc` /
+`construct_stack` / `new_target_stack`。
+
+另外消失的：`State.pc`、`Ret` 的返回地址寄存器、`drive_bytecode_frame` 的 `saved_pc`、
+`SavedExecutionState` 的 `pc` / `ctrl` / `this` / `construct` / `new_target`、
+`SehRecord` 的 `saved_ctrl_depth` / `saved_this_depth` / `saved_construct_depth` /
+`saved_new_target_depth`、`mark_this_uninitialized`、`assert_frame_mirror`。
+
+**`Frame` 现在是按帧状态的唯一来源**：
+`{ pc, func, this, this_state, argc, construct, new_target, closure_depth, seh_depth }`。
+
+### 19.3 剩下的（不是本阶段的事）
+
+- `closure_var_stack` / `seh_stack`：按帧**存集合**的两条栈（不是按帧取值）——
+  它们的深度已经是 `Frame.closure_depth` / `Frame.seh_depth`。
+- `current_code`（`Vec<CodeBlock>` 的运行期快照）：`materialize_function` 的 16 个调用点
+  经 `get_member`/`set_member` 级联，穿 `module` 进去是几十处扇出。
+  M2 让帧持有 `code` 之后删掉。
+- `registers[19]`、`rsp`/`rbp`、`PushC`/`PopC`/`MovC`、4 层嵌套 `step`：**M2 的内容**。
+
+### 19.4 进 M2 的门
+
+M2（执行模型：寄存器 arena + `Frame{base,len}` + 单层主循环 + 唯一调用入口）
+是深改里**收益最大、也唯一要重写 `run_instruction`** 的一步。
+M2-1 已经把它的前置全部就位：
+
+1. 帧是自包含的（七条平行栈已退役）→ 帧可以定义自己的寄存器窗口；
+2. 嵌套循环是**边界驱动**的 → 可以改成单层主循环；
+3. `pc` 在帧里、返回地址已废弃 → 帧切换不需要"返回地址"这个概念；
+4. 每退帧只有一处实现 → 帧模型的收尾动作不会漏。
+
+**已知的验收标准**：`tests/features/known_bugs.rs` 的 #4
+（`handle_throw` 在 catch 路径多弹一次 `seh_stack`，内层 catch 执行过之后外层 handler 丢失）
+由 M2 的 `Frame.try_stack` + completion 传递**按构造消除** ——
+M2 的验收里应当包含"去掉那条 `#[ignore]` 后变绿"。
