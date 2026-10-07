@@ -1205,3 +1205,81 @@ function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.nam
 `BindThisValue`）—— 它们同样进不了镜面，同样走直接搬。
 之后 1e（`construct`/`new_target`/`argc` 翻帧）、1f（水位与三路收帧合并），
 镜面互校机制届时整套退役。
+
+---
+
+## 16. M2-1d：`this` / `this_state` 搬进 `Frame`（2026-10-07）
+
+### 16.1 做了什么
+
+| 改动 | 说明 |
+|---|---|
+| `Frame` 加 `this` / `this_state` | `this_state` 与 `this` 是同一件事的两半（"这一帧的 this 绑定了没有"），所以一起住进帧 |
+| `note_frame(pc, func, this, this_state, …)` | 两个都成了**出生参数** |
+| **删 `mark_this_uninitialized`** | 见 16.2 |
+| `CallSuperSpread` 的两处改到帧上 | BOUND 标记的逆序扫描改成扫 `frames`；`this` 的替换写 `frames.last_mut().this` |
+| **删** `State.this_val` / `State.this_stack` / `State.this_state` | 三个字段从此不存在 |
+| `SavedExecutionState`：删 `this`，`this_depth` → `frame_depth` | 它本来就是帧深度 |
+| `SehRecord.saved_this_depth` **合并进** `saved_frame_depth` | 自 1b 起两者恒等（`this_stack.len() == frames.len()`），留着就是第二条记账 |
+| `unwind_frames_to` 的 `this_depth` → `frame_depth` | 名字要说实话 |
+| 镜面断言的不变量：`frames.len() == this_stack.len()` → `== frame_argc.len()` | 唯一还能当平行水位的那条栈 |
+
+### 16.2 `mark_this_uninitialized` 为什么可以整个删掉
+
+它存在的原因是**顺序**：派生构造器的"未绑定"状态必须在 `enter_frame` 之后、帧体开始之前
+设上去，而那时帧还没被 `note_frame` 建出来 —— 于是只能"先建一个半成品，再去改它"。
+还要 `while this_state.len() < this_stack.len() { push(THIS_NONE) }` 去补齐两条平行栈的长度。
+
+出生参数化之后，这件事变成 `note_frame` 的一个实参：
+
+```rust
+let initial_this_state = if module.is_derived_ctor(func_id) {
+    THIS_DERIVED_UNBOUND
+} else {
+    THIS_NONE
+};
+```
+
+⇒ **"先建半成品再改"是一个信号**：它通常说明"出生值"没有表达出来。
+这与 1a′ 的结论是同一条（帧要么生在入口 pc 上、要么生在哨兵上，不许"碰巧"）。
+
+### 16.3 一处**保留的既有不一致**（记录，本步不改）
+
+`CallSuperSpread` 里两件事打在不同的帧上：
+
+- **BOUND 标记**打在"**最内层未绑定**的那一帧"（逆序扫描，注释说"箭头函数可以代它外层的
+  构造器跑 `super()`"）；
+- **`this` 的替换**写的是"**当前帧**"。
+
+当 `super()` 由箭头函数代跑时，这两者可能不是同一帧 —— 也就是说那个构造器帧的 `this`
+可能没被换成父构造器产出的对象，而它的 BOUND 标记却已经打上了。
+**这是既有行为**（切片 1d 是数据位置迁移，不是语义修正），已在代码里留了注释。
+真要判定它是不是 bug，需要一条"箭头函数代跑 `super()` 且父构造器是内建"的探针 ——
+登记为待查，不在本步混做。
+
+### 16.4 验证
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元 | 206 | **206** | 不变 |
+| feature（debug，镜面互校激活） | 526 / 4 ignored | **526 / 4 ignored** | 不变 |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | **逐字节一致** |
+| 逐套件对比 | —— | —— | **无逐套件回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | —— |
+| 告警 | lib 24 / lib test 26 / features 8 | **同** | 无新增 |
+
+### 16.5 迁移进度
+
+| `Frame` 字段 | 状态 |
+|---|---|
+| `pc` / `func` / `this` / `this_state` / `closure_depth` / `seh_depth` | **权威** |
+| `argc` / `construct` / `new_target` | 仍是 `frame_argc` / `construct_stack` / `new_target_stack` 的**镜像**（1e 收口） |
+
+**已消失的平行栈**：`ctrl_stack`（1b 改名 `reg_saves` 且只管 `PushC`）、
+`function_stack`（1c）、`this_stack` / `this_state`（1d）。
+
+### 16.6 下一步
+
+**1e**：`argc` / `construct` / `new_target` 翻到帧上 —— 这三条栈消失之后，
+`assert_frame_mirror` 与"镜面"这套机制**整套退役**（它存在的意义就是安全地把这些字段搬过去）。
