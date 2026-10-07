@@ -3,11 +3,28 @@ use std::collections::{BTreeMap, HashMap};
 use log::{debug, trace};
 
 use super::ir::{BlockId, ControlFlowGraph, Instruction, Value, Variable};
-use crate::bytecode::{AbsPc, Instr, Operand, Register, RelPc};
+use crate::bytecode::{AbsPc, EhRegion, Instr, Operand, Register, RelPc};
 
 use super::regalloc::{Action, RegAlloc};
 
 type PatchFn = Box<dyn Fn(&mut Codegen)>;
+
+/// 一条受保护区域的**声明**：块 id 形式，来自 IR 的 `PushSeh` / `PopSeh`。
+///
+/// 布局完成后用 `block_map` 解析成 pc（见 `Codegen::resolve_eh_regions`）。
+/// 之所以先留声明再解析：`PushSeh` 发在**跳进 `try` 体之前的那条指令流位置**上，
+/// 而 `try` 体的入口块要等布局才知道落在哪个 pc；`EndTry` 更是在体降级完之后才发射。
+#[derive(Debug, Clone, Copy)]
+struct EhDecl {
+    /// 区域身份 = `try` 体入口块（`PushSeh.body`）。
+    body: isize,
+    /// `Try` 指令自己的 pc（运行期登记处理点的位置，也是 `start`）。
+    try_pc: isize,
+    /// 处理器块：有 `catch` 时是 catch 块，否则是 finally 块（与 ChakraCore 同构）。
+    handler: isize,
+    /// `finally` 块（没有则为 `None`）。
+    finally: Option<isize>,
+}
 
 pub struct Codegen {
     reg_alloc: RegAlloc,
@@ -28,6 +45,13 @@ pub struct Codegen {
     /// `spill_live_out`), which keeps values in registers inside a block and
     /// only routes them through memory at block boundaries.
     memory_resident_vars: bool,
+    /// EH 区域声明（顺序即 `Try` 的发射顺序）。
+    eh_decls: Vec<EhDecl>,
+    /// `(区域身份块 id, 该 `EndTry` 的 pc)`。**一条区域可以有 0/1/2 个**：
+    /// `try` 体的正常退出与 `catch` 的正常退出各发射一次 `PopSeh`。
+    eh_exits: Vec<(isize, isize)>,
+    /// 解析好的区域表（`generate_code` 末尾填好，供 `eh_regions()` 取）。
+    eh_regions: Vec<EhRegion>,
 }
 
 impl Codegen {
@@ -41,6 +65,9 @@ impl Codegen {
             throw_to_handlers,
             // Memory-resident by default; opt into the register path explicitly.
             memory_resident_vars: std::env::var("BIUJS_REG_VARS").is_err(),
+            eh_decls: Vec::new(),
+            eh_exits: Vec::new(),
+            eh_regions: Vec::new(),
         }
     }
 
@@ -582,9 +609,21 @@ impl Codegen {
                         }
                         self.codes.push(Instr::Halt {});
                     }
-                    Instruction::PushSeh { handler, finally } => {
+                    Instruction::PushSeh {
+                        handler,
+                        finally,
+                        body,
+                    } => {
                         let handler_id = handler.as_usize() as isize;
                         let pos = self.codes.len();
+                        // 记下这条区域的声明；`end` 与处理器地址都用 `block_map` 解析，
+                        // 所以这里不需要等回填（回填仍照旧写进 `Try` 的操作数）。
+                        self.eh_decls.push(EhDecl {
+                            body: body.as_usize() as isize,
+                            try_pc: pos as isize,
+                            handler: handler_id,
+                            finally: finally.map(|blk| blk.as_usize() as isize),
+                        });
                         patchs.push(Box::new(move |this: &mut Self| {
                             // 偏移先算出来，再一次性写回：`Try` 现在只有两个字段，
                             // 旧编码里那个第 3 槽是纯填充。
@@ -607,7 +646,11 @@ impl Codegen {
                             finally_offset: RelPc::immediate(0),
                         });
                     }
-                    Instruction::PopSeh => {
+                    Instruction::PopSeh { region } => {
+                        // 结构化配对：记下"这条 `EndTry` 关的是哪条区域"。
+                        // **不再**靠扫指令流 + 深度计数推断（那条规则被实测证伪）。
+                        self.eh_exits
+                            .push((region.as_usize() as isize, self.codes.len() as isize));
                         self.codes.push(Instr::EndTry {});
                     }
                     Instruction::Throw { value, args } => {
@@ -695,7 +738,42 @@ impl Codegen {
             patch(self);
         }
 
+        self.eh_regions = self.resolve_eh_regions();
+
         &self.codes
+    }
+
+    /// EH 区域表：把声明里的块 id 解析成 pc。**这是"哪条 `EndTry` 收哪条 `Try`"的唯一出口。**
+    fn resolve_eh_regions(&self) -> Vec<EhRegion> {
+        let pc_of = |blk: isize| -> usize {
+            *self
+                .block_map
+                .get(&blk)
+                .unwrap_or_else(|| panic!("EH 声明引用了没有布局的块 {blk}")) as usize
+        };
+        self.eh_decls
+            .iter()
+            .map(|decl| {
+                let mut exits: Vec<usize> = self
+                    .eh_exits
+                    .iter()
+                    .filter(|(body, _)| *body == decl.body)
+                    .map(|(_, pc)| *pc as usize)
+                    .collect();
+                exits.sort_unstable();
+                EhRegion {
+                    start: decl.try_pc as usize,
+                    exits,
+                    catch: Some(pc_of(decl.handler)),
+                    finally: decl.finally.map(pc_of),
+                }
+            })
+            .collect()
+    }
+
+    /// 本次代码生成产出的 EH 区域表（`generate_code` 之后才有内容）。
+    pub fn eh_regions(&self) -> &[EhRegion] {
+        &self.eh_regions
     }
 
     fn gen_call(&mut self, func: Value, args: &[Value], result: Value) {

@@ -9,7 +9,7 @@ pub mod symbol;
 
 use std::collections::HashMap;
 
-use crate::bytecode::{FunctionId, Module, Register};
+use crate::bytecode::{EhRegion, FunctionId, Module, Register};
 use crate::compiler::error::CompileError;
 use crate::compiler::ir::{FuncSignature, FunctionBuilder, IrFunction, IrUnit, SSABuilder};
 use crate::compiler::lowering::JSASTLower;
@@ -86,6 +86,8 @@ impl Compiler {
         let mut generators: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut asyncs: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut derived_ctors: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // EH 区域表：每个函数一份，**由 codegen 声明**（见 `bytecode::EhRegion` 的说明）。
+        let mut eh_regions: HashMap<u32, Vec<EhRegion>> = HashMap::new();
         for func in &unit.functions {
             func_info.insert(
                 func.id.as_usize() as u32,
@@ -131,10 +133,34 @@ impl Compiler {
             // Run codegen -> bytecode
             let mut codegen = Codegen::new(&registers, throw_to_handlers);
             let func_codes = codegen.generate_code(cfg).to_vec();
+            // 区域表是**块 id 解析成 pc** 之后的产物（pc 从 0 开始，属于本函数），
+            // 所以要在下面按 `offset` 平移到整个模块的坐标系里。
+            let func_eh: Vec<EhRegion> = codegen
+                .eh_regions()
+                .iter()
+                .map(|r| EhRegion {
+                    start: r.start,
+                    exits: r.exits.clone(),
+                    catch: r.catch,
+                    finally: r.finally,
+                })
+                .collect();
 
             // Record offset and append bytecodes
             let offset = all_codes.len();
             symtab.insert(func_id, offset);
+            eh_regions.insert(
+                func_id.as_usize() as u32,
+                func_eh
+                    .into_iter()
+                    .map(|r| EhRegion {
+                        start: r.start + offset,
+                        exits: r.exits.into_iter().map(|pc| pc + offset).collect(),
+                        catch: r.catch.map(|pc| pc + offset),
+                        finally: r.finally.map(|pc| pc + offset),
+                    })
+                    .collect(),
+            );
             // The function's exit is its trailing `Ret` — the one the lowering
             // appends after sealing the last block. A suspended generator
             // resumed with a return completion re-enters here (see
@@ -163,6 +189,7 @@ impl Compiler {
             derived_ctors,
             exit_pc,
             all_codes,
+            eh_regions,
         ))
     }
 }

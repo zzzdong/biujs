@@ -10718,6 +10718,7 @@ mod tests {
             std::collections::HashSet::new(),
             HashMap::new(),
             instructions,
+            HashMap::new(),
         )
     }
 

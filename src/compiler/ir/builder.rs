@@ -509,12 +509,18 @@ pub trait InstBuilder {
         self.emit(Instruction::ClosureVar { name, value });
     }
 
-    fn push_seh(&mut self, handler: BlockId, finally: Option<BlockId>) {
-        self.emit(Instruction::PushSeh { handler, finally });
+    /// 登记一条受保护区域：`body` 是区域的入口块，也是它的身份（见 `Instruction::PushSeh`）。
+    fn push_seh(&mut self, handler: BlockId, finally: Option<BlockId>, body: BlockId) {
+        self.emit(Instruction::PushSeh {
+            handler,
+            finally,
+            body,
+        });
     }
 
-    fn pop_seh(&mut self) {
-        self.emit(Instruction::PopSeh);
+    /// 正常退出 `region`（指回 `push_seh` 的 `body`）。
+    fn pop_seh(&mut self, region: BlockId) {
+        self.emit(Instruction::PopSeh { region });
     }
 
     fn add_exception_edge(&mut self, try_body: BlockId, catch: BlockId) {

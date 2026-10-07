@@ -467,8 +467,18 @@ pub enum Instruction {
     PushSeh {
         handler: BlockId,
         finally: Option<BlockId>,
+        /// 受保护区域的**入口块**（`try` 体的第一个块）。
+        ///
+        /// 它同时是这条区域在「区域表」里的**身份**：`PopSeh { region }` 用同一个块 id
+        /// 认领它，于是"哪条 `EndTry` 收的是哪条 `Try`"是**结构化**的，不再靠扫指令流 +
+        /// 深度计数。后者已被实测证伪（有的 `Try` 根本没有 `EndTry` —— 体以终结指令结束时
+        /// `lower_try` 不会发射 `PopSeh`），见 `docs/architecture-redesign.md` §10.3。
+        body: BlockId,
     },
-    PopSeh,
+    /// 正常退出受保护区域。`region` 指回 `PushSeh.body`：**配对靠身份，不靠嵌套深度**。
+    PopSeh {
+        region: BlockId,
+    },
     Throw {
         value: Value,
         args: Vec<Value>,
@@ -706,7 +716,7 @@ impl Instruction {
             Instruction::StoreEnv { name, value } => (vec![], vec![*name, *value]),
             Instruction::Halt { value } => (vec![], value.iter().cloned().collect()),
             Instruction::PushSeh { .. } => (vec![], vec![]),
-            Instruction::PopSeh => (vec![], vec![]),
+            Instruction::PopSeh { .. } => (vec![], vec![]),
             Instruction::PrologueEnd => (vec![], vec![]),
             Instruction::Throw { value, args } => {
                 let mut used = vec![*value];
@@ -992,14 +1002,18 @@ impl std::fmt::Display for Instruction {
                 Some(v) => write!(f, "halt {v}"),
                 None => write!(f, "halt"),
             },
-            Instruction::PushSeh { handler, finally } => {
-                write!(f, "push_seh {handler}")?;
+            Instruction::PushSeh {
+                handler,
+                finally,
+                body,
+            } => {
+                write!(f, "push_seh {handler} (body {body})")?;
                 if let Some(finally_blk) = finally {
                     write!(f, ", finally {finally_blk}")?;
                 }
                 Ok(())
             }
-            Instruction::PopSeh => write!(f, "pop_seh"),
+            Instruction::PopSeh { region } => write!(f, "pop_seh {region}"),
             Instruction::PrologueEnd => write!(f, "prologue_end"),
             Instruction::Throw { value, args } => {
                 write!(f, "throw {value}")?;

@@ -1860,7 +1860,9 @@ impl<'a> JSASTLower<'a> {
             exit_edges: Vec::new(),
         });
 
-        self.builder.push_seh(seh_handler, seh_finally);
+        // `try_body` 既是受保护区域的入口，也是这条区域的身份：它随 `PushSeh` 一起进 IR，
+        // 之后 `PopSeh { region: try_body }` 用它认领（结构化配对，取代"扫指令流 + 深度计数"）。
+        self.builder.push_seh(seh_handler, seh_finally, try_body);
         self.builder.add_exception_edge(try_body, seh_handler);
         if has_finally {
             self.builder.add_exception_edge(try_body, finally_blk);
@@ -1901,7 +1903,7 @@ impl<'a> JSASTLower<'a> {
             // `try_body` would append the normal-exit path after the body's
             // terminator (dead code) and leave the real tail block unterminated,
             // so it would silently fall through into the next block.
-            self.builder.pop_seh();
+            self.builder.pop_seh(try_body);
             if has_finally {
                 self.builder.jump(finally_blk);
             } else {
@@ -1933,8 +1935,9 @@ impl<'a> JSASTLower<'a> {
                 self.symbols.leave_scope();
             }
             if !self.current_block_is_terminated() {
-                // Pop SEH before leaving catch normally
-                self.builder.pop_seh();
+                // Pop SEH before leaving catch normally. 认领的还是同一条区域：
+                // catch 也在这条区域的运行时保护之内。
+                self.builder.pop_seh(try_body);
                 if has_finally {
                     self.builder.jump(finally_blk);
                 } else {

@@ -114,13 +114,15 @@ impl<'a> SSABuilder<'a> {
         for block in self.cfg.blocks() {
             for inst in block.instructions() {
                 match inst {
-                    Instruction::PushSeh { handler, finally } => {
+                    Instruction::PushSeh {
+                        handler, finally, ..
+                    } => {
                         if let Some(finally_blk) = finally {
                             finally_outer_scope.insert(*finally_blk, seh_scope.clone());
                         }
                         seh_scope.push((*handler, *finally));
                     }
-                    Instruction::PopSeh => {
+                    Instruction::PopSeh { .. } => {
                         seh_scope.pop();
                     }
                     Instruction::Throw { .. } => {
@@ -806,7 +808,7 @@ impl<'a> SSABuilder<'a> {
                 }
             }
             Instruction::PushSeh { .. } => {}
-            Instruction::PopSeh => {}
+            Instruction::PopSeh { .. } => {}
             // No definition, and the operands are a constant and a value that is
             // read, not written: nothing to rename.
             Instruction::MakeRegExp { dst, .. } => {
