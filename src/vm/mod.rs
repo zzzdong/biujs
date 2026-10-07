@@ -8726,10 +8726,25 @@ impl VM {
                         self.state.set_register(Register::Rv, value.clone())?;
                         // The function's trailing `Ret` is what makes
                         // `Opcode::Ret`'s `finally` dispatch run on the way out.
-                        // `None` only for a hand-built module without any `Ret`.
-                        module.func_exit_pc(func_id)
+                        //
+                        // **没有尾 `Ret` 时也要把重入点显式定下来**：置哨兵 = "这次恢复
+                        // 没有代码要跑"。以前这里是 `module.func_exit_pc(func_id)` 直接返回
+                        // `None` + 下面"不 jump"，于是 `run_generator_frame` 会从**当前 pc**
+                        // 开始跑 —— 而那是**调用方**停住的地方。实测（`for-of` + `try{break}`
+                        // 里 `IteratorClose` 触发的那条路）：pc = 21 = 调用方的 `iter_close`，
+                        // 也就是把调用方的那条指令当成生成器的代码又执行了一遍。
+                        // 今天它靠"再进一次 `generator_abrupt` 会因已无挂起帧而立刻返回"
+                        // 自终止 —— 纯属巧合。显式置哨兵把这个巧合变成契约，
+                        // 也是 `pc` 进帧（`deep-arch-log.md` §11.8）的前置。
+                        Some(
+                            module
+                                .func_exit_pc(func_id)
+                                .unwrap_or(module.instructions.len()),
+                        )
                     }
                     Err(err) => match self.deliver_into_frame(err, saved.ctrl) {
+                        // 异常被交付**进帧里**：`handle_throw` 已经把 pc 设到处理器上，
+                        // 所以这里**不能**覆盖它 —— 这是 `None` 唯一合法的用法。
                         Ok(()) => None,
                         Err(esc) => {
                             self.discard_generator_frame();
