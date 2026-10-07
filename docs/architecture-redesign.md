@@ -25,6 +25,7 @@
 | **M0** | 前置（**已完成**） | 3 个语义 bug 钉测试；`FunctionBody`/`EhRegion` 派生视图；`Instr` enum + `Kind`/`Role`/`RelPc`·`AbsPc`；`open_frame`/`enter_call` 收敛 | "三份知识互不校验"的一半；EH 表的"不可信" | 小（已落地） |
 | **M1** | 编译期自包含 | `CodeBlock` per function；**EH 区域表由 lowering 回填**（含出口集合）；`Module` 降为装配器；函数 flags 进 `CodeBlock` | `Module` 全局可变状态；`generators`/`asyncs`/`derived_ctors` 三个 HashSet；`EndTry`/`Try` 不配对 | 中（不碰生命周期） |
 | **M2** | **执行模型** | 寄存器 arena + `Frame{base,len}`；**单层主循环**；唯一调用入口；EH 走区域表 + completion 传递 | **9 条平行栈**、哨兵 pc、`PushC/PopC/MovC`、4 层嵌套 `step`、全局 `registers[19]` | **大**（VM 重写） |
+| 　↳ **M2-1** | **帧数据模型（已完成** 2026-10-08**）** | `Frame` 成为按帧状态的唯一来源；`pc` 进帧 + 嵌套循环改**边界驱动**；退帧只有一处实现 | **七条**按帧平行栈、`State.pc`、返回地址寄存器、`mark_this_uninitialized`、`assert_frame_mirror` | 小（切片式，每片单独验证） |
 | **M3** | 堆与句柄 | `Heap` + `Gc<T>` + `HandleScope`；`Value::Object` 从 `Rc<RefCell<dyn JSObject>>` 换成 `Gc<Object>`；**先只分配不回收** | `dyn` 分发、`RefCell` 借用崩溃、`borrow()×220` | **大**（全库类型改动） |
 | **M4** | 收集器 | size-class 堆块 + mark-sweep + 根集 + **GC stress 模式** | 循环泄漏；"堆预算护栏只是代理" | 中（收集器独立） |
 | **M5** | 值表示 | `Value` → NaN-boxed `u64`（8 B）；`Hole`/`Uninitialized` 成立即数 | `Value` 24 B、`Function(u32)` 双表示、`MarkHole` 指令、TDZ 特判 | 大（全库 match） |
