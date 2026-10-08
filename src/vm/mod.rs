@@ -3481,7 +3481,7 @@ impl VM {
                 // rule (which is about the callee's own parameters).
                 let mut raw_args = Vec::with_capacity(arg_count);
                 for i in 0..arg_count {
-                    let index = self.state.rbp - i - 1;
+                    let index = self.state.rsp - i - 1;
                     raw_args.push(self.state.raw_stack_value(index));
                 }
                 // Box bare function references: the builtin layer matches on
@@ -4085,7 +4085,7 @@ impl VM {
                     // Arguments are on the stack below the frame: arg0 at [rbp-1], arg1 at [rbp-2], etc.
                     let mut args = Vec::with_capacity(arg_count);
                     for i in 0..arg_count {
-                        let index = self.state.rbp - i - 1;
+                        let index = self.state.rsp - i - 1;
                         args.push(self.state.raw_stack_value(index));
                     }
 
@@ -7658,12 +7658,14 @@ impl VM {
 
     /// Read the arguments a caller pushed for a dynamic call.
     ///
-    /// Arguments live just below the current frame: arg0 at `[rbp-1]`, arg1 at
-    /// `[rbp-2]`, … (they were pushed in reverse order).
+    /// 实参仍在栈上、就在 `rsp` 之下：arg0 在 `[rsp-1]`、arg1 在 `[rsp-2]`……
+    /// （M2-2a 第 1 步·扩张：以前读 `rbp`，靠"调用点已把 `rbp` 切到实参窗口"。
+    ///  此刻 `rsp` 与那个 `rbp` 相等，所以改成 `rsp` 相对是**纯等价** ——
+    ///  切换还没搬走，程序行为不变。**同样的读法有三份副本**，三份都要改。） (they were pushed in reverse order).
     fn collect_call_args(&self, arg_count: usize) -> Result<Vec<Value>, RuntimeError> {
         let mut args = Vec::with_capacity(arg_count);
         for i in 0..arg_count {
-            let index = self.state.rbp - i - 1;
+            let index = self.state.rsp - i - 1;
             args.push(self.state.raw_stack_value(index));
         }
         Ok(args)
