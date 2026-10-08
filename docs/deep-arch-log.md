@@ -2052,3 +2052,66 @@ subc rsp, rsp, N     ← 抵消实参的 push
 ### 29.4 处置
 
 已撤除，工作树与 `e7c51e7` 一致：单元 206 / feature 526 全绿。
+
+---
+
+## 30. M2-2a 第 2 件的设计决定：收尾与切换是**一对配套约定**（2026-10-08）
+
+### 30.1 codegen 侧的现状
+
+每个调用点发射一条**固定**的收尾，5 个发射点
+（`Call` / `CallEx` / `CallNative` / `CallMethod` / +1）：
+
+```rust
+self.codes.push(Instr::PushC { src: Rbp });      // 1 保存调用方的 rbp
+self.codes.push(Instr::Call { … });               // 2 调用
+self.codes.push(Instr::MovC { dst: Rsp, src: Rbp });  // 3 复位 rsp
+self.codes.push(Instr::PopC { dst: Rbp });        // 4 恢复 rbp
+// 紧接 SubC rsp, N                                // 5 抵消实参的 push
+```
+
+⇒ 第 3 步 `movc rsp, rbp` **就是"把 rsp 复位到实参之后"这一步**，
+它成立的前提正是"第 2 步里 `rbp` 被切到了那个位置"。
+**切换与收尾是一对配套约定**，不是两个独立的动作。
+
+⇒ 这解释了 §29 为什么难：要让"切换"离开调用点，就必须同时给收尾另一条
+"复位 rsp"的办法。
+
+### 30.2 两个候选与**选定**
+
+| 候选 | 做法 | 评价 |
+|---|---|---|
+| (a) 删掉 `movc rsp, rbp` | 只留 `subc rsp, N`，靠"被调方 rsp 平衡" | **不可选**：无法便宜地证明所有被调方路径（原生回调进 JS、生成器帧、异常回退）都 rsp 平衡 |
+| (b) 换成显式保存/恢复 | `pushc rsp`（在实参 push 之后、调用之前）/ `popc rsp`（调用之后） | **选定**：局部（5 个发射点）、语义显式、不需要证明 rsp 平衡 |
+
+⇒ **选定 (b)**：把 `movc rsp, rbp` 换成 `pushc rsp` + `popc rsp`。
+
+注意 `pushc rbp` / `popc rbp` **要留着**：字节码被调方开帧时会覆盖 `rbp`
+（`open_frame` 里的 `rbp = rsp`），调用方必须能把它恢复回来。
+所以最终形态是：
+
+```
+pushc rbp            ← 恢复调用方 rbp（字节码被调方会覆盖它）
+push arg…            ← 实参（顺序见 codegen）
+pushc rsp            ← 记住"实参之后"的位置
+<call>
+popc rsp             ← 复位 rsp（替代 movc rsp, rbp）
+popc rbp
+subc rsp, N
+```
+
+⇒ 净增一条指令（`movc` 变 `pushc`+`popc`），**字节码会变** ——
+所以这一刀的证明口径是"生成代码语义等价 + 全量逐套件对比"，不是"逐字节不变"。
+
+### 30.3 M2-2a 的最终施工清单
+
+1. ✅ 三份实参读取 `rbp - i - 1` → `rsp - i - 1`（**已验证纯等价**，单元 206 绿）
+2. codegen 5 个发射点：`movc rsp, rbp` → `pushc rsp` / `popc rsp`
+3. VM 侧：3 处混合调用点删 `rbp = rsp`，搬进 `open_frame` 开头
+
+⇒ 三件做完，`rbp` 只剩"帧的窗口基址"一个角色（探针 0 命中已实测），
+M2-2b（把那 4 处 `rbp = <快照>` 改成由帧决定）才解锁。
+
+### 30.4 处置
+
+本轮只读 codegen + 记录，未改代码。工作树与 `a568d0e` 一致，单元 206 / feature 526 全绿。
