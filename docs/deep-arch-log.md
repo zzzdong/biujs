@@ -1896,3 +1896,50 @@ args.push(self.state.raw_stack_value(index));
 ### 26.5 处置
 
 本轮**只读代码 + 记录，未改代码**。工作树与 `3c30f6f` 一致，单元 206 / feature 526 全绿。
+
+---
+
+## 27. M2-2a 第一刀：**失败并撤除** —— 我在 §26.3 的判断是错的（2026-10-08）
+
+### 27.1 刀法
+
+按 §26.3：把 `rbp = rsp` 从 3 处"混合调用点"（`CallEx` / `CallSuperSpread` /
+native 分派）删掉，搬进 `open_frame` 的开头；同时加 `Frame.base` 与
+`save_execution_state` 的瞬态探针。
+
+### 27.2 结果：**12 条单元测试红**（`test_*_factory` 与 `test_class_debug*`）
+
+```
+thread 'tests::test_number_factory' panicked at src/vm/mod.rs:4092:
+attempt to subtract with overflow
+```
+
+4092 就是 `collect_call_args`：
+
+```rust
+let index = self.state.rbp - i - 1;      // rbp 相对
+```
+
+⇒ **原生路径确实靠那次切换**：`rbp` 不切到实参窗口，`rbp - i - 1` 直接下溢。
+
+### 27.3 被证伪的判断（§26.3 的"不必改 `collect_call_args`"）
+
+我在 §26.3 写"在 `enter_call` 时刻 `rsp` 仍指着实参之后，所以 `rsp - i - 1` 与
+`rbp - i - 1` 取到同一个槽 ⇒ 不必改 `collect_call_args`"。
+
+**前半句是对的，后半句推论错了**：正因为两者取同一个槽，正确的做法是
+**把 `collect_call_args` 改成 `rsp` 相对**，而不是"保留 rbp 切换"。
+我跳过了这一步，只做了"搬走切换"，于是实参窗口失去了唯一的基址。
+
+⇒ **M2-2a 的正确形状 = §26.3 的候选 A + 切换搬迁，两件必须一起做**：
+1. `collect_call_args` 改用 `rsp - i - 1`（此时实参仍在栈上，`rsp` 指着它们之后）；
+2. `rbp = rsp` 从 3 处混合调用点删掉，搬进 `open_frame`（只服务真正开帧的路径）；
+3. 顺带把 `Call` / `New` 两个内联开帧处的切换也挪到 `enter_frame` 紧前面。
+
+⇒ **教训**：把"切换搬进开帧"当成纯搬迁是不对的 —— 那次切换**同时**被原生路径
+当作实参基址用。**一个值被几处共用时，搬走其中一处的使用权之前，必须先确认
+另一处不再需要它**（§26.4 的风险 1 我只写了"回调进 JS"，没想到"取实参"本身）。
+
+### 27.4 处置
+
+已撤除，工作树与 `047641e` 一致：单元 206 / feature 526 全绿。
