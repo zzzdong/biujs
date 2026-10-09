@@ -1356,6 +1356,15 @@ impl VM {
         new_target: Value,
         module: &Module,
     ) -> Result<(), RuntimeError> {
+        // **帧的窗口基址只有一个写入时机**：开帧。
+        //
+        // 以前它分散在 8 处调用点（每次调用前 `rbp = rsp`），而那些调用点里有一半
+        // 最终**不开帧**（原生被调方）—— 于是 `rbp` 同时承担"当前帧的窗口基址"与
+        // "调用准备 / 原生实参参照系"两个角色，这也是本次 Migrating 连续回退的根源
+        // （见 `docs/deep-arch-log.md` §25/§42）。
+        // 收尾的 `rsp` 复位已经改成 `popc rsp`（不依赖 `rbp`），实参也改成 `rsp` 相对
+        // 读取 —— 两件事做完之后，"只在开帧时设定一次"才第一次成为可能。
+        self.state.rbp = self.state.rsp;
         self.state.enter_frame()?;
         for (name, value) in captured_vars {
             let mut map = std::collections::HashMap::new();
@@ -1428,7 +1437,7 @@ impl VM {
         for arg in args.iter().rev() {
             self.state.push(arg.clone())?;
         }
-        self.state.rbp = self.state.rsp;
+        // 不再在这里切 `rbp`：下面 `open_frame` 会在开帧时设定（唯一的写入时机）。
 
         // Sentinel return address one past the last instruction: when the callee
         // returns, `Ret` lands here and the nested loop stops.
@@ -2551,7 +2560,8 @@ impl VM {
                     .async_of(&Value::Function(func_id as u32), module)
                     .is_some()
                 {
-                    self.state.rbp = self.state.rsp;
+                    // 不再切 `rbp`：`collect_call_args` 已经改成 `rsp` 相对（第 1 步），
+                    // 而 `invoke` 内部开帧由 `open_frame` 负责 —— 这条路径根本不开帧。
                     let args = self.collect_call_args(arg_count)?;
                     let result = self.invoke(
                         &Value::Function(func_id as u32),
@@ -2597,7 +2607,7 @@ impl VM {
                 // place: a stack-slot operand would otherwise resolve inside the
                 // callee's frame. The frame switch happens once they are read.
                 let callee = self.get_value(callee)?;
-                self.state.rbp = self.state.rsp;
+                // 不再"调用前切换 rbp" —— 切换是 `open_frame` 的事（只有真正开帧的路径才需要）。
                 // 统一入口（P1-2c）：代理 / 原生 / 字节码（生成器 / async / 开帧）
                 // 的分支只有一份；`this` 由这里给 —— 普通调用是 `undefined`，
                 // 方法调用要给对象（`CallMethod` 走同一个入口，只是 `this` 不同）。
@@ -2612,14 +2622,7 @@ impl VM {
                 )? {
                     // 帧已压好：接着跑被调方（不递归 —— 普通调用没有额外开销）。
                     Control::Entered => return Ok(()),
-                    // 结果已写进 `Rv`，**收尾照跑**，不再"跳过下一条指令"。
-                    //
-                    // 以前这里要多推进一步，因为被跳过的那条是 `movc rsp, rbp`：
-                    // 在 `Done` 路径上 `invoke` 已经把 `rbp` 恢复成**调用方**的基址，
-                    // 拿它复位 `rsp` 会把调用方的栈打回基址 —— 所以只能跳过。
-                    // 收尾改成 `popc rsp`（复位到 `pushc rsp` 显式保存的"实参之后"）
-                    // 之后，`rsp` 的复位不再依赖 `rbp` ⇒ `Entered` 与 `Done` 两条
-                    // 路径的收尾**第一次完全一致**，这条隐式约定就此消失。
+                    // 结果已写进 `Rv`；收尾照跑（见 `CallMethod` 那条同名注释）。
                     Control::Done => return Ok(()),
                 }
             }
@@ -3512,13 +3515,10 @@ impl VM {
                     }
                 };
 
-                // Operands have been read with the caller's frame pointer; switch
-                // to the callee's frame before collecting the outgoing arguments.
-                // The switch must happen on EVERY path through here (including
-                // the symbol-keyed early return below): the epilogue emitted by
-                // codegen (`movc rsp, rbp; popc rbp`) expects rbp to be the new
-                // frame base.
-                self.state.rbp = self.state.rsp;
+                // 操作数已用**调用方**的帧指针读完。这里不再切换 `rbp`：
+                // 切换属于 `open_frame`（只有真正开帧的路径才需要），而收尾的
+                // `popc rsp` / `popc rbp` 也不再依赖 `rbp` —— 旧注释里那条
+                // "the switch must happen on EVERY path" 的前提已被移除。
 
                 // Read the outgoing arguments. These live below the *new* frame
                 // pointer, so they must not go through the "missing argument"
@@ -3739,7 +3739,14 @@ impl VM {
                 )? {
                     // 帧已压好：接着跑被调方（不递归）。
                     Control::Entered => return Ok(()),
-                    // 结果已写进 `Rv`，**收尾照跑**（理由同 `CallEx` 那条同名注释）。
+                    // 结果已写进 `Rv`，**收尾照跑**，不再"跳过下一条指令"。
+                    //
+                    // 以前这里要多推进一步，因为被跳过的那条是 `movc rsp, rbp`：
+                    // 在 `Done` 路径上 `invoke` 已经把 `rbp` 恢复成**调用方**的基址，
+                    // 拿它复位 `rsp` 会把调用方的栈打回基址 —— 所以只能跳过。
+                    // 收尾改成 `popc rsp`（复位到 `pushc rsp` 显式保存的"实参之后"）
+                    // 之后，`rsp` 的复位不再依赖 `rbp` ⇒ `Entered` 与 `Done` 两条
+                    // 路径的收尾**第一次完全一致**，这条隐式约定就此消失。
                     Control::Done => return Ok(()),
                 }
             }
@@ -3837,9 +3844,15 @@ impl VM {
             Instr::New { callee, argc } => {
                 let constructor_val = self.get_value(callee)?;
                 let arg_count = argc.as_immd() as usize;
-                // Operands are read with the caller's frame pointer; the frame
-                // switch happens afterwards, before the arguments are collected.
-                self.state.rbp = self.state.rsp;
+                // **这里不再切 `rbp`**（§22 记录的那处"中途换参照系"就此消失）：
+                //
+                // 以前切换放在最前面，于是下面 `set_value(callee, func_obj)` 那次写
+                // 落在**被调方**的参照系里 —— 它写的是调用方自己的操作数槽（`[rbp+3]`），
+                // 却写到了被调方窗口的同一个偏移上（一个尚未分配、被 `ensure` 硬撑出来的槽）。
+                // 那是"读在切换前、写在切换后"的时序巧合，从来不是契约。
+                //
+                // 现在切换只在真正开帧之前做（见下方 `enter_frame`），`New` 走原生 /
+                // 代理分支时**完全不切** —— 那些路径不开帧，切换出来的基址不属于任何帧。
 
                 // `new.target` inside the constructor is this constructor. A bare
                 // `Value::Function` is boxed first so the identity is the same
@@ -3959,6 +3972,9 @@ impl VM {
                 // 5. Save closure depth, SEH depth and return PC, then jump to constructor
                 match module.entry_pc(func_id) {
                     Some(location) => {
+                        // 帧的窗口基址：**开帧**是唯一的写入时机（与 `open_frame` 一致）。
+                        // 只有走到这里才真的要开帧 —— 原生构造器 / 代理分支在上面就返回了。
+                        self.state.rbp = self.state.rsp;
                         self.state.enter_frame()?;
                         // 派生构造器的 `this` 出生即"未绑定"（ES 9.2.2 / 12.3.5.1）。
                         // 以前这是 `enter_frame` 之后一次单独的 `mark_this_uninitialized`；
@@ -4118,9 +4134,8 @@ impl VM {
             Instr::CallNative { callee, argc } => {
                 let callable = self.get_value(callee)?;
                 let arg_count = argc.as_immd() as usize;
-                // Same ordering rule as `CallEx`: read operands first, then
-                // switch to the frame that holds the outgoing arguments.
-                self.state.rbp = self.state.rsp;
+                // 不再切 `rbp`：实参是 `rsp` 相对读的，而这条路径**永远不开帧**
+                // （`CallNative` 只分派内建）—— 切换只会造出一个不属于任何帧的基址。
 
                 if let Some(name) = crate::builtins::native_function_name(&callable) {
                     // Arguments are on the stack below the frame: arg0 at [rbp-1], arg1 at [rbp-2], etc.
@@ -7773,6 +7788,7 @@ impl VM {
         // `construct` / `new.target`，所以"回退到第几帧"一步到位 ——
         // 切片 1b/1c/1d/1e 之前这里要分别 truncate 七条平行栈。
         self.state.frames.truncate(frame_depth);
+        self.state.frame_bases.truncate(frame_depth);
         self.state.closure_var_stack.truncate(closure_depth);
         self.state.seh_stack.truncate(seh_depth);
     }
@@ -9201,6 +9217,23 @@ impl VM {
     /// Snapshot of everything a nested call must restore afterwards — the same
     /// inventory `invoke_with_new_target` saves.
     fn save_execution_state(&self) -> SavedExecutionState {
+        // 探针：M2-2b 的解锁判据。`rbp` 若恒等于当前帧的出生基址，
+        // 那 4 处 `rbp = <快照>` 就可以改成"由当前帧派生"。
+        vm_trace(|w| {
+            let base = self.state.frame_bases.last().copied();
+            if base != Some(self.state.rbp) {
+                let _ = std::io::Write::write_fmt(
+                    w,
+                    format_args!(
+                        "M2 探针(save): rbp={} 所在帧 base={:?} frames={} rsp={}\n",
+                        self.state.rbp,
+                        base,
+                        self.state.frames.len(),
+                        self.state.rsp,
+                    ),
+                );
+            }
+        });
         SavedExecutionState {
             rsp: self.state.rsp,
             rbp: self.state.rbp,
@@ -10024,6 +10057,14 @@ struct Frame {
 struct State {
     data_stack: Vec<Value>,
     reg_saves: Vec<usize>,
+    /// 探针：每一帧**出生时**的 `rbp`（与 `frames` 严格同进退）。
+    ///
+    /// 用途是回答 M2-2b 的解锁判据 —— "当前 `rbp` 是否恒等于当前帧的窗口基址"。
+    /// §25 实测过 526 条 feature 上有 168 次不等（因为原生调用会借用 `rbp` 当实参
+    /// 参照系）；`rbp` 的切换收进开帧之后，这个数应当归零。归零之后才能把
+    /// `drive_bytecode_frame` / `handle_throw` / `restore_execution_state` 里那 4 处
+    /// `rbp = <快照>` 改成"由当前帧派生"。
+    frame_bases: Vec<usize>,
     registers: [Value; 19],
     seh_stack: Vec<SehRecord>,
     /// The script's globals — shared with the `globalThis` object (see
@@ -10080,6 +10121,7 @@ impl State {
         Self {
             data_stack: Vec::with_capacity(1024),
             reg_saves: Vec::with_capacity(256),
+            frame_bases: Vec::new(),
             registers: std::array::from_fn(|_| Value::Undefined),
             seh_stack: Vec::new(),
             globals,
@@ -10303,6 +10345,8 @@ impl State {
     /// 切片 1e 之后那些平行栈（`frame_argc` / `construct_stack` / `new_target_stack`）
     /// 已经不存在了，`frames` 是唯一的按帧状态。
     fn note_frame(&mut self, birth: FrameBirth) {
+        // 探针：帧出生时的 `rbp` 就是它的窗口基址。
+        self.frame_bases.push(self.rbp);
         self.frames.push(Frame {
             pc: birth.pc,
             func: birth.func,
