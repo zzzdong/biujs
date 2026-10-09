@@ -787,7 +787,6 @@ impl Codegen {
         self.store_args(args, self.inst_index);
 
         // 3. Set up new stack frame
-        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         // 4. Call the function (the argument count travels along so the callee
@@ -797,9 +796,6 @@ impl Codegen {
         // 5. Restore stack pointer (reset to current base pointer)
         self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
-        // 6. Pop the saved base pointer
-        self.codes
-            .push(Instr::PopC { dst: Register::Rbp.into() });
 
         // 7. Clean up arguments from the stack
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });
@@ -827,7 +823,6 @@ impl Codegen {
         self.store_args(args, self.inst_index);
 
         // 3. Set up new stack frame
-        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         // 4. Call the function (CallEx). The argument count travels with the
@@ -838,9 +833,6 @@ impl Codegen {
         // 5. Restore stack pointer to current base pointer
         self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
-        // 6. Pop saved base pointer
-        self.codes
-            .push(Instr::PopC { dst: Register::Rbp.into() });
 
         // 7. Clean up arguments from the stack
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });
@@ -862,7 +854,6 @@ impl Codegen {
         self.store_args(args, self.inst_index);
 
         // 2. Set up new stack frame
-        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         // 3. Call the native function
@@ -871,9 +862,6 @@ impl Codegen {
         // 4. Restore stack pointer to current base pointer
         self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
-        // 5. Pop saved base pointer
-        self.codes
-            .push(Instr::PopC { dst: Register::Rbp.into() });
 
         // 6. Clean up arguments from the stack
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });
@@ -896,7 +884,6 @@ impl Codegen {
         self.store_args(args, self.inst_index);
 
         // 2. Set up new stack frame
-        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         let prop = self.gen_operand(property);
@@ -906,9 +893,6 @@ impl Codegen {
         // 4. Restore stack pointer to current base pointer
         self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
-        // 5. Pop saved base pointer
-        self.codes
-            .push(Instr::PopC { dst: Register::Rbp.into() });
 
         // 6. Clean up arguments from the stack
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });
@@ -936,7 +920,6 @@ impl Codegen {
         self.store_args(args, self.inst_index);
 
         // 3. Set up new stack frame
-        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         // 4. Call the constructor with New opcode (passing arg count)
@@ -945,9 +928,6 @@ impl Codegen {
         // 5. Restore stack pointer to current base pointer
         self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
-        // 6. Pop saved base pointer
-        self.codes
-            .push(Instr::PopC { dst: Register::Rbp.into() });
 
         // 7. Clean up arguments from the stack
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });

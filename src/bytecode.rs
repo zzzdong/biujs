@@ -368,8 +368,8 @@ pub enum Kind {
     Throw,
     /// 挂起当前帧、把控制权交回 resumer：`Yield` / `Await`。
     Suspend,
-    /// 栈指针簿记（`rsp` / `rbp` 的编译期维护），不参与 JS 值流：
-    /// `PushC` / `PopC` / `MovC` / `AddC` / `SubC`。
+    /// 栈指针簿记（`rsp` 的编译期维护），不参与 JS 值流：
+    /// `PushC` / `PopC` / `AddC` / `SubC`。
     Bookkeeping,
 }
 
@@ -817,7 +817,6 @@ define_instrs! {
         InitLexical { name: n, value: r },
         SetFunctionName { func: r, name: r },
         LoadEnv { dst: w, name: n },
-        MovC { dst: n, src: n } @Bookkeeping,
         Call { func: n, argc: n } @Call,
         CallEx { callee: r, argc: n } @Call,
         CallNative { callee: r, argc: n } @Call,
@@ -933,8 +932,6 @@ pub enum Opcode {
     AddC,
     /// subc offset
     SubC,
-    /// movc
-    MovC,
     /// call func_id
     Call,
     /// call_ex callable
@@ -1123,7 +1120,6 @@ impl fmt::Display for Opcode {
             Opcode::Pop => write!(f, "pop"),
             Opcode::PushC => write!(f, "pushc"),
             Opcode::PopC => write!(f, "popc"),
-            Opcode::MovC => write!(f, "movc"),
             Opcode::AddC => write!(f, "addc"),
             Opcode::SubC => write!(f, "subc"),
             Opcode::Call => write!(f, "call"),
@@ -1815,13 +1811,13 @@ mod tests {
     /// 它同时也是"标记没被手滑删掉"的守卫 —— 删掉一个 `@Call`，这里立刻红。
     #[test]
     fn kind_markers_cover_the_table() {
-        assert_eq!(Instr::ALL.len(), 93, "表里的指令条数");
+        assert_eq!(Instr::ALL.len(), 92, "表里的指令条数");
         assert_eq!(count_of(Kind::Call), 8, "Call* / New*");
         assert_eq!(count_of(Kind::Jump), 4, "Jump / BrIf / DelayedJump / ResumeExc");
         assert_eq!(count_of(Kind::Return), 2, "Ret / Halt");
         assert_eq!(count_of(Kind::Throw), 1, "ThrowExc");
         assert_eq!(count_of(Kind::Suspend), 3, "Yield / Await / PrologueEnd");
-        assert_eq!(count_of(Kind::Bookkeeping), 5, "PushC / PopC / MovC / AddC / SubC");
+        assert_eq!(count_of(Kind::Bookkeeping), 4, "PushC / PopC / AddC / SubC");
         // 其余全是 Normal；没有兜底分支的 kind() 保证"没标"就是 Normal。
         let marked = count_of(Kind::Call)
             + count_of(Kind::Jump)

@@ -2730,23 +2730,14 @@ impl VM {
                 let value = self.state.pop()?;
                 self.set_value(dst, value)?;
             }
-            Instr::MovC { dst, src } => match (dst, src) {
-                (Operand::Register(Register::Rsp), Operand::Register(Register::Rbp)) => {
-                    self.state.rsp = self.state.rbp;
-                }
-                (Operand::Register(Register::Rbp), Operand::Register(Register::Rsp)) => {
-                    self.state.rbp = self.state.rsp;
-                }
-                _ => {
-                    return Err(RuntimeError::TypeError(format!(
-                        "unsupported MovC operands: {inst}"
-                    )));
-                }
-            },
             Instr::PushC { src } => match src {
                 Operand::Register(Register::Rsp) => {
                     self.state.save_reg(self.state.rsp)?;
                 }
+                // `rbp` 这一支已经是死的（M2-2a 第 4 步：收尾不再搬 `rbp`，
+                // 5 个调用发射点只发了 `pushc rsp` / `popc rsp`）。留着是因为
+                // `PushC` 的操作数是通用 `Operand`，收窄要动指令形状（五层）；
+                // 等 M2-3 把 `rsp` 也收进帧，这两个 op 会一起退役。
                 Operand::Register(Register::Rbp) => {
                     self.state.save_reg(self.state.rbp)?;
                 }
