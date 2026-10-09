@@ -48,13 +48,37 @@ pub const DEFAULT_STEP_LIMIT: u64 = 20_000_000;
 ///
 /// 用 `BIUJS_TRACE=<path>` 打开；不开时只有一次 `OnceLock` 的原子读。
 fn vm_trace<F: FnOnce(&mut std::fs::File)>(f: F) {
+    vm_trace_with(false, f)
+}
+
+/// 同上，但只在 `BIUJS_TRACE_STEPS` 也打开时写。
+///
+/// 分成两个开关是实测需要：逐条指令那一行在 526 条 feature 上就是 63629 行、
+/// 在一个 test262 分片上是**千万行**量级 —— 与探针混在同一个开关里，
+/// 想在全量上量一把尺子就得先写几个 GB 的步骤日志。探针本身只在命中时才写，
+/// 所以"全量 + 探针"是廉价的，"全量 + 逐条"才是贵的。
+fn vm_trace_steps<F: FnOnce(&mut std::fs::File)>(f: F) {
+    vm_trace_with(true, f)
+}
+
+fn vm_trace_with<F: FnOnce(&mut std::fs::File)>(steps: bool, f: F) {
     static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
         std::sync::OnceLock::new();
+    // 逐条那个开关**必须**也只读一次：它在 `step` 里被问了几百万次，
+    // 而 `env::var_os` 每次都要走一遍环境表 + 加锁 —— 实测让 `language/statements`
+    // 整个慢 29%（70s → 90s），连带把两条"又分配又死循环"的用例从"撞内存上限"
+    // 推到"撞墙钟"（护栏 7/0/22 → 11/0/18，见 §44.3）。一次 `OnceLock` 读是纳秒级。
+    static STEPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let slot = TRACE.get_or_init(|| {
         std::env::var("BIUJS_TRACE")
             .ok()
             .map(|p| std::sync::Mutex::new(std::fs::File::create(p).expect("open trace file")))
     });
+    if steps
+        && !*STEPS.get_or_init(|| std::env::var_os("BIUJS_TRACE_STEPS").is_some())
+    {
+        return;
+    }
     if let Some(m) = slot {
         if let Ok(mut file) = m.lock() {
             f(&mut file);
@@ -637,7 +661,7 @@ impl VM {
             Some(i) => i,
             None => return Ok(false),
         };
-        vm_trace(|w| {
+        vm_trace_steps(|w| {
             let op = format!("{inst:?}");
             let op = op.split([' ', '{']).next().unwrap_or("?");
             let _ = writeln!(
@@ -1417,7 +1441,6 @@ impl VM {
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         let saved_rsp = self.state.rsp;
-        let saved_rbp = self.state.rbp;
         let saved_closure = self.state.closure_var_stack.len();
         let saved_seh = self.state.seh_stack.len();
         // **边界 = 调用方的帧深度**，一个值同时回答两个问题：
@@ -1515,11 +1538,16 @@ impl VM {
         // 所以在这里把它的保存项都丢掉。没有这一步，一个 *接住* 异常并继续
         // 在同一帧里跑的原生（`Promise` 的执行器）会 `PopC` 到过期的 `rbp`。
         self.state.reg_saves.truncate(saved_reg_saves);
-        // 调用方的 `pc` / `this` / `func` / `argc` / `new.target` 都由下面这条
-        // `frames.truncate(boundary)` 一起恢复 —— 它们全在帧里。
+        // 调用方的 `pc` / `this` / `func` / `argc` / `new.target` / **窗口基址** 都由
+        // 下面这条 `frames.truncate(boundary)` 一起恢复 —— 它们全在帧里。
+        //
+        // `rbp` 因此**不需要快照**：它是 `frames.last().base` 的派生值（M2-2b）。
+        // 实测（526 条 feature + 全量 test262 4 片）这处"快照值 == 退栈后当前帧的
+        // base"**零例外**，而 `handle_throw` / `restore_execution_state` 那两处
+        // 不成立 —— 它们跨生成器的挂起边界，快照属于**挂起前**那一次几何。
         self.state.rsp = saved_rsp;
-        self.state.rbp = saved_rbp;
         self.unwind_frames_to(boundary, saved_closure, saved_seh);
+        self.state.rbp = self.state.frame_base();
 
         outcome?;
         let rv = self.state.get_register(Register::Rv)?;
@@ -7788,7 +7816,6 @@ impl VM {
         // `construct` / `new.target`，所以"回退到第几帧"一步到位 ——
         // 切片 1b/1c/1d/1e 之前这里要分别 truncate 七条平行栈。
         self.state.frames.truncate(frame_depth);
-        self.state.frame_bases.truncate(frame_depth);
         self.state.closure_var_stack.truncate(closure_depth);
         self.state.seh_stack.truncate(seh_depth);
     }
@@ -7809,6 +7836,10 @@ impl VM {
         match self.state.seh_stack.pop() {
             Some(mut record) => {
                 self.state.rsp = record.saved_rsp;
+                // 这两行**不能**改成"由当前帧派生"（M2-2b 实测，§44.2）：`SehRecord`
+                // 会跟着生成器一起挂起（`restore_generator_frame` 把 `frame.seh` 整份带回来），
+                // 而恢复时帧的几何已经挪到新的栈底 —— 记录里的值属于**挂起前**那一次。
+                // 全量 test262 上 8 处不匹配（全部在 `language/expressions/yield/*`）。
                 self.state.rbp = record.saved_rbp;
                 // 被回退的那些帧可能留下没来得及 `PopC` 的保存项 —— 它们必须一起丢，
                 // 否则外层之后的 `PopC` 会弹到过期值（`rbp` 被破坏；实测症状：
@@ -7823,7 +7854,6 @@ impl VM {
                     // 现在的长度（不再额外截）。
                     self.state.seh_stack.len(),
                 );
-
                 let finally_pc = record.finally_pc;
                 let handler_pc = record.handler_pc;
 
@@ -9217,10 +9247,14 @@ impl VM {
     /// Snapshot of everything a nested call must restore afterwards — the same
     /// inventory `invoke_with_new_target` saves.
     fn save_execution_state(&self) -> SavedExecutionState {
-        // 探针：M2-2b 的解锁判据。`rbp` 若恒等于当前帧的出生基址，
-        // 那 4 处 `rbp = <快照>` 就可以改成"由当前帧派生"。
+        // 常驻的**不变量监视器**（不是一次性探针）：`rbp` 必须恒等于当前帧的基址。
+        // 违反它意味着又有地方把 `rbp` 当成了"调用准备 / 原生实参参照系"用 ——
+        // 那正是 §25/§42 那两轮连续回退的根源，所以监视器留在源码里而不是测完就撤。
+        //
+        // 取样点选在保存现场：这是**唯一**会把这整套状态交给"嵌套执行"的地方
+        // （生成器体 / 原生回调进来的解释器循环），也就是最容易丢掉"当前帧是谁"的地方。
         vm_trace(|w| {
-            let base = self.state.frame_bases.last().copied();
+            let base = self.state.frames.last().map(|frame| frame.base);
             if base != Some(self.state.rbp) {
                 let _ = std::io::Write::write_fmt(
                     w,
@@ -9236,6 +9270,9 @@ impl VM {
         });
         SavedExecutionState {
             rsp: self.state.rsp,
+            // **不能**省：生成器体的帧在挂起前记下这里，恢复时几何已经挪了
+            // （`restore_generator_frame` 按新的栈底重建），实测 5 处不匹配，
+            // 全部在 `language/expressions/yield/*` 与 class 计算属性名那几条（§44.2）。
             rbp: self.state.rbp,
             closure: self.state.closure_var_stack.len(),
             seh: self.state.seh_stack.len(),
@@ -9247,6 +9284,7 @@ impl VM {
 
     fn restore_execution_state(&mut self, saved: &SavedExecutionState) {
         self.state.rsp = saved.rsp;
+        // 与 `save_execution_state` 里那句注释成对：这份 `rbp` 属于挂起前的几何。
         self.state.rbp = saved.rbp;
         self.unwind_frames_to(saved.frame_depth, saved.closure, saved.seh);
         self.delegate_stack.truncate(saved.delegate);
@@ -10023,6 +10061,16 @@ struct Frame {
     /// 绝不允许"顺着上一条指令落下来"—— 那样会在新帧里执行调用方的指令
     /// （实测踩过：`deep-arch-log.md` §12）。
     pc: usize,
+    /// 本帧的**窗口基址**，也就是本帧出生那一刻的 `rbp`。
+    ///
+    /// 为什么它是**出生参数**而不是派生值：`rbp` 现在只有一个写入时机（开帧），
+    /// 所以帧一压上来它就定了（§43.2 实测 63629 步里"当前 `rbp` == 所在帧基址"
+    /// 零例外）。于是"`rbp` 是多少"这件事可以**由帧回答**，不必再靠快照往回搬
+    /// —— `drive_bytecode_frame` 那处就是这么省掉的。
+    ///
+    /// **生成器例外**：帧被挂起再恢复时（`restore_generator_frame`）几何会挪到
+    /// 新的栈底，所以**跨挂起边界的快照不能换成派生值**（实测 13 条用例，见 §44.2）。
+    base: usize,
     /// 本帧的 `this` 绑定。
     ///
     /// **会在中帧被写**：`CallSuperSpread` 按 ES 12.3.5.1 `BindThisValue` 把派生构造器的
@@ -10057,14 +10105,6 @@ struct Frame {
 struct State {
     data_stack: Vec<Value>,
     reg_saves: Vec<usize>,
-    /// 探针：每一帧**出生时**的 `rbp`（与 `frames` 严格同进退）。
-    ///
-    /// 用途是回答 M2-2b 的解锁判据 —— "当前 `rbp` 是否恒等于当前帧的窗口基址"。
-    /// §25 实测过 526 条 feature 上有 168 次不等（因为原生调用会借用 `rbp` 当实参
-    /// 参照系）；`rbp` 的切换收进开帧之后，这个数应当归零。归零之后才能把
-    /// `drive_bytecode_frame` / `handle_throw` / `restore_execution_state` 里那 4 处
-    /// `rbp = <快照>` 改成"由当前帧派生"。
-    frame_bases: Vec<usize>,
     registers: [Value; 19],
     seh_stack: Vec<SehRecord>,
     /// The script's globals — shared with the `globalThis` object (see
@@ -10121,7 +10161,6 @@ impl State {
         Self {
             data_stack: Vec::with_capacity(1024),
             reg_saves: Vec::with_capacity(256),
-            frame_bases: Vec::new(),
             registers: std::array::from_fn(|_| Value::Undefined),
             seh_stack: Vec::new(),
             globals,
@@ -10344,11 +10383,17 @@ impl State {
     /// （见 `FrameBirth`）—— 所以调用点不需要先摆好任何平行栈：
     /// 切片 1e 之后那些平行栈（`frame_argc` / `construct_stack` / `new_target_stack`）
     /// 已经不存在了，`frames` 是唯一的按帧状态。
+    ///
+    /// 唯一的例外是 `base`：它由 `note_frame` 自己从 `self.rbp` 取，而**不是**由
+    /// 调用点作为 `FrameBirth` 的字段传进来 —— 因为"帧的窗口基址 = 开帧那一刻的
+    /// `rbp`"这条等式正是要成立的东西，让调用点**另外**再写一遍就等于给它一个
+    /// 可以互相矛盾的机会（§25 的教训：两份知识必然分叉）。开帧是 `rbp` 唯一的写入
+    /// 时机，所以在这里读它就是权威来源。
     fn note_frame(&mut self, birth: FrameBirth) {
-        // 探针：帧出生时的 `rbp` 就是它的窗口基址。
-        self.frame_bases.push(self.rbp);
+        let base = self.rbp;
         self.frames.push(Frame {
             pc: birth.pc,
+            base,
             func: birth.func,
             this: birth.this,
             this_state: birth.this_state,
@@ -10358,6 +10403,14 @@ impl State {
             closure_depth: birth.closure_depth,
             seh_depth: birth.seh_depth,
         });
+    }
+
+    /// 当前帧的窗口基址 —— `rbp` 的**派生值**。
+    ///
+    /// 没有帧时返回 0：与 `pc()` 同一个兜底口径（运行期总有脚本帧，只有裸 `State`
+    /// 的单元测试才会撞上）。
+    fn frame_base(&self) -> usize {
+        self.frames.last().map_or(0, |frame| frame.base)
     }
 
     /// **M2-1 的互校**：镜面必须与各平行栈此刻的顶部一致。
