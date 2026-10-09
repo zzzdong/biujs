@@ -7806,6 +7806,12 @@ impl VM {
     /// `Ret` 用本帧记录的水位，异常回退用 `SehRecord` 在 `try` 处记的水位，
     /// Rust 驱动调用与生成器用 `SavedExecutionState` 记的。统一成"从帧里推"会改语义
     /// （例如 `try` 之后又压了闭包映射，两条水位就不相等了）。
+    ///
+    /// **`rbp` 反过来**：它是活跃帧的派生值，所以退栈之后由这里一步定到位 ——
+    /// 以前这件事靠每个调用点的一对 `PushC rbp` / `PopC rbp` 去搬（M2-2b 之前还
+    /// 要靠三位快照），而"退帧"和"搬 `rbp`"是两件事写在两处，谁漏一处就沉默损坏。
+    /// 两处**生成器路径**（`handle_throw` / `restore_execution_state`）在调用之后
+    /// 用它们的快照覆盖这个值 —— 那些快照属于挂起前那一次几何（§44.2 实测）。
     fn unwind_frames_to(
         &mut self,
         frame_depth: usize,
@@ -7818,6 +7824,7 @@ impl VM {
         self.state.frames.truncate(frame_depth);
         self.state.closure_var_stack.truncate(closure_depth);
         self.state.seh_stack.truncate(seh_depth);
+        self.state.rbp = self.state.frame_base();
     }
 
     fn handle_throw(&mut self, exc_val: Value) -> Result<(), RuntimeError> {
@@ -7836,11 +7843,6 @@ impl VM {
         match self.state.seh_stack.pop() {
             Some(mut record) => {
                 self.state.rsp = record.saved_rsp;
-                // 这两行**不能**改成"由当前帧派生"（M2-2b 实测，§44.2）：`SehRecord`
-                // 会跟着生成器一起挂起（`restore_generator_frame` 把 `frame.seh` 整份带回来），
-                // 而恢复时帧的几何已经挪到新的栈底 —— 记录里的值属于**挂起前**那一次。
-                // 全量 test262 上 8 处不匹配（全部在 `language/expressions/yield/*`）。
-                self.state.rbp = record.saved_rbp;
                 // 被回退的那些帧可能留下没来得及 `PopC` 的保存项 —— 它们必须一起丢，
                 // 否则外层之后的 `PopC` 会弹到过期值（`rbp` 被破坏；实测症状：
                 // "数组字面量里夹一次会抛异常的调用" 直接报 `ArrayPush on non-object`）。
@@ -7854,6 +7856,11 @@ impl VM {
                     // 现在的长度（不再额外截）。
                     self.state.seh_stack.len(),
                 );
+                // 快照**压过** `unwind_frames_to` 刚定好的派生值（§44.2）：`SehRecord`
+                // 跟着生成器一起挂起（`restore_generator_frame` 把 `frame.seh` 整份带回来），
+                // 而恢复时帧的几何已经挪到新的栈底 —— 这里的值属于**挂起前**那一次。
+                // 全量 test262 上 8 处与派生值不等（全部 `language/expressions/yield/*`）。
+                self.state.rbp = record.saved_rbp;
                 let finally_pc = record.finally_pc;
                 let handler_pc = record.handler_pc;
 
@@ -9284,9 +9291,10 @@ impl VM {
 
     fn restore_execution_state(&mut self, saved: &SavedExecutionState) {
         self.state.rsp = saved.rsp;
-        // 与 `save_execution_state` 里那句注释成对：这份 `rbp` 属于挂起前的几何。
-        self.state.rbp = saved.rbp;
         self.unwind_frames_to(saved.frame_depth, saved.closure, saved.seh);
+        // 快照**压过** `unwind_frames_to` 刚定好的派生值 —— 与 `save_execution_state`
+        // 里那条注释成对：这份 `rbp` 属于挂起前的几何（§44.2 实测 5 处不等）。
+        self.state.rbp = saved.rbp;
         self.delegate_stack.truncate(saved.delegate);
         // The register file is *global*, not per frame: a nested run (a
         // generator body, an `invoke`) overwrites values the caller still has
