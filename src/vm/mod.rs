@@ -13,6 +13,7 @@ pub use value::Value;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Write;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +37,30 @@ const MAX_CALL_DEPTH: usize = 512;
 /// Default instruction budget for a `run`. A runaway `while` loop therefore
 /// reports an error instead of spinning forever. `None` disables the budget.
 pub const DEFAULT_STEP_LIMIT: u64 = 20_000_000;
+
+/// 取数工具：把 trace 写进**文件**（`File` 的写是无缓冲的系统调用），
+/// 所以进程被 SIGABRT（栈溢出）杀掉时输出**不会丢行**。
+///
+/// 这不是可选的洁癖：`eprintln!` + abort 会**截断也会丢行**，本项目已经栽过三次
+/// （`docs/deep-arch-log.md` §24.1 / §38.1 / §41.3，其中 §38 那次据此得出了
+/// 错误结论并排查了两轮）。另外 `cargo test` 会捕获通过的测试的 stderr
+/// （§24.1），所以 `eprintln!` 还必须配 `--nocapture`。
+///
+/// 用 `BIUJS_TRACE=<path>` 打开；不开时只有一次 `OnceLock` 的原子读。
+fn vm_trace<F: FnOnce(&mut std::fs::File)>(f: F) {
+    static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let slot = TRACE.get_or_init(|| {
+        std::env::var("BIUJS_TRACE")
+            .ok()
+            .map(|p| std::sync::Mutex::new(std::fs::File::create(p).expect("open trace file")))
+    });
+    if let Some(m) = slot {
+        if let Ok(mut file) = m.lock() {
+            f(&mut file);
+        }
+    }
+}
 
 /// How many instructions may pass between two polls of the wall-clock and
 /// memory guards. `Instant::now()` costs orders of magnitude more than a
@@ -612,6 +637,21 @@ impl VM {
             Some(i) => i,
             None => return Ok(false),
         };
+        vm_trace(|w| {
+            let op = format!("{inst:?}");
+            let op = op.split([' ', '{']).next().unwrap_or("?");
+            let _ = writeln!(
+                w,
+                "step={} pc={} op={} rsp={} rbp={} frames={} reg_saves={}",
+                self.steps,
+                self.state.pc(),
+                op,
+                self.state.rsp,
+                self.state.rbp,
+                self.state.frames.len(),
+                self.state.reg_saves.len(),
+            );
+        });
         // A spent guard ends the run for good: JS may catch the `RangeError`,
         // but the next instruction fails with it again, so the test cannot
         // crawl back into the loop the guard just stopped.
@@ -2572,11 +2612,15 @@ impl VM {
                 )? {
                     // 帧已压好：接着跑被调方（不递归 —— 普通调用没有额外开销）。
                     Control::Entered => return Ok(()),
-                    // 结果已写进 `Rv`，跳过下一条指令。
-                    Control::Done => {
-                        self.state.jump_offset(1);
-                        return Ok(());
-                    }
+                    // 结果已写进 `Rv`，**收尾照跑**，不再"跳过下一条指令"。
+                    //
+                    // 以前这里要多推进一步，因为被跳过的那条是 `movc rsp, rbp`：
+                    // 在 `Done` 路径上 `invoke` 已经把 `rbp` 恢复成**调用方**的基址，
+                    // 拿它复位 `rsp` 会把调用方的栈打回基址 —— 所以只能跳过。
+                    // 收尾改成 `popc rsp`（复位到 `pushc rsp` 显式保存的"实参之后"）
+                    // 之后，`rsp` 的复位不再依赖 `rbp` ⇒ `Entered` 与 `Done` 两条
+                    // 路径的收尾**第一次完全一致**，这条隐式约定就此消失。
+                    Control::Done => return Ok(()),
                 }
             }
             Instr::Jump { offset } => {
@@ -3695,11 +3739,8 @@ impl VM {
                 )? {
                     // 帧已压好：接着跑被调方（不递归）。
                     Control::Entered => return Ok(()),
-                    // 结果已写进 `Rv`，跳过下一条指令。
-                    Control::Done => {
-                        self.state.jump_offset(1);
-                        return Ok(());
-                    }
+                    // 结果已写进 `Rv`，**收尾照跑**（理由同 `CallEx` 那条同名注释）。
+                    Control::Done => return Ok(()),
                 }
             }
 

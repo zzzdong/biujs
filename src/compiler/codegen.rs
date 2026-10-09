@@ -788,13 +788,14 @@ impl Codegen {
 
         // 3. Set up new stack frame
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         // 4. Call the function (the argument count travels along so the callee
         //    can materialise `arguments`).
         self.codes.push(Instr::Call { func: func.to_operand(), argc: Operand::new_immd(args.len() as isize) });
 
         // 5. Restore stack pointer (reset to current base pointer)
-        self.codes.push(Instr::MovC { dst: Operand::new_register(Register::Rsp), src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
         // 6. Pop the saved base pointer
         self.codes
@@ -827,6 +828,7 @@ impl Codegen {
 
         // 3. Set up new stack frame
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         // 4. Call the function (CallEx). The argument count travels with the
         //    instruction so the VM can read the pushed arguments when the
@@ -834,7 +836,7 @@ impl Codegen {
         self.codes.push(Instr::CallEx { callee: callable, argc: Operand::new_immd(args.len() as isize) });
 
         // 5. Restore stack pointer to current base pointer
-        self.codes.push(Instr::MovC { dst: Operand::new_register(Register::Rsp), src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
         // 6. Pop saved base pointer
         self.codes
@@ -861,12 +863,13 @@ impl Codegen {
 
         // 2. Set up new stack frame
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         // 3. Call the native function
         self.codes.push(Instr::CallNative { callee: callable, argc: Operand::new_immd(args.len() as isize) });
 
         // 4. Restore stack pointer to current base pointer
-        self.codes.push(Instr::MovC { dst: Operand::new_register(Register::Rsp), src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
         // 5. Pop saved base pointer
         self.codes
@@ -894,13 +897,14 @@ impl Codegen {
 
         // 2. Set up new stack frame
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         let prop = self.gen_operand(property);
         // 3. Call method on the object
         self.codes.push(Instr::CallMethod { callee: callable, property: prop, argc: Operand::new_immd(args.len() as isize) });
 
         // 4. Restore stack pointer to current base pointer
-        self.codes.push(Instr::MovC { dst: Operand::new_register(Register::Rsp), src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
         // 5. Pop saved base pointer
         self.codes
@@ -933,12 +937,13 @@ impl Codegen {
 
         // 3. Set up new stack frame
         self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PushC { src: Operand::new_register(Register::Rsp) });
 
         // 4. Call the constructor with New opcode (passing arg count)
         self.codes.push(Instr::New { callee: callable, argc: Operand::new_immd(args.len() as isize) });
 
         // 5. Restore stack pointer to current base pointer
-        self.codes.push(Instr::MovC { dst: Operand::new_register(Register::Rsp), src: Operand::new_register(Register::Rbp) });
+        self.codes.push(Instr::PopC { dst: Operand::new_register(Register::Rsp) });
 
         // 6. Pop saved base pointer
         self.codes
