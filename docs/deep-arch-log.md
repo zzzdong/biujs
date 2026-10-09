@@ -2675,3 +2675,190 @@ step=25 pc=25                ← **这一行是残缺的（没有 op=…）**
 
 22 处打印已撤除；工作树与 `738cd8f` 一致（第 1 步 `6ed5c03` 保留），
 单元 206 / feature 526 全绿。
+
+---
+
+## 42. **真因找到了**：`Control::Done` 会跳过一条收尾指令，而新收尾的那条**不能跳**（2026-10-09）
+
+### 42.1 现场（写文件的 trace，`BIUJS_TRACE=/tmp/trace.txt`，第 0–24 步）
+
+```
+step=18 pc=18 op=PushC rsp=44 rbp=0  reg_saves=0      ← pushc rbp
+step=19 pc=19 op=PushC rsp=44 rbp=0  reg_saves=1      ← pushc rsp（第 2 步新加的）
+step=20 pc=20 op=CallMethod rsp=44 rbp=0  reg_saves=2
+step=21 pc=22 op=PopC rsp=44 rbp=44 reg_saves=2      ← **pc 21 被跳过**
+step=22 pc=23 op=SubC rsp=44 rbp=44 reg_saves=1      ← popc rbp 弹到的是「保存的 rsp」= 44
+step=23 pc=24 op=Mov  rsp=41 rbp=44 reg_saves=1      ← rbp 从此是 44（应为 0）
+```
+
+⇒ 只跑了 **37 步**就栈溢出。故障在**第一条** `CallMethod` 上就已经发生，
+根本不需要"递归很深"才会现形 —— 这也解释了为什么前几轮的"深度/边界"类假说全都不相干。
+
+### 42.2 根因：`Control::Done` 的第二次 `jump_offset(1)`
+
+`CallMethod` arm（`CallEx` 同）：
+
+```rust
+self.state.jump_offset(1);          // 3685：调用方 pc 推进（1a′ 的返址推进）
+match self.enter_call(…)? {
+    Control::Entered => return Ok(()),
+    Control::Done => { self.state.jump_offset(1); return Ok(()); }   // ← 第二次
+}
+```
+
+`Control::Done` 一共推进 **2 步**，也就是**刻意跳过收尾的第一条指令**。
+`test_class_debug` 里那条 `CallMethod` 是类降级发射的
+`Object.defineProperty(...)` —— 它在 `vm_handled_static` 名单里，落到
+`enter_call` 的"原生内建"分支 ⇒ 返回 `Done`。
+
+**为什么旧代码不炸**：被跳过的那条是 `movc rsp, rbp`。它的作用是"把 `rsp` 复位"，
+而 `Done` 路径（`invoke` / `call_native_by_name`）**已经**把 `rsp` 与 `rbp` 恢复成
+调用方的值（`drive_bytecode_frame` 的 `rsp = saved_rsp; rbp = saved_rbp`），
+而且此时 `rbp` 是**调用方**的基址 —— 拿它复位 `rsp` 会把调用方的栈打回基址。
+所以那条指令**必须**被跳过。**跳过它是无害的。**
+
+**为什么新收尾一改就炸**：收尾变成 `popc rsp` 之后，被跳过的那条变成了
+**必须执行**的 `PopC`：
+
+- `pushc rsp`（pc19）已经压了一项；
+- `popc rsp`（pc21）被跳过 ⇒ `reg_saves` **每次调用泄漏一项**；
+- 紧接着的 `popc rbp`（pc22）弹到的是**保存的 `rsp`** ⇒ `rbp = 44`；
+- 之后所有 `[rbp+k]` 读到垃圾 ⇒ 无限递归 ⇒ 栈溢出。
+
+⇒ 与 §38 猜的**机制完全一样**，但 §41 判它"证伪"是**测错了对象**：
+§41 筛的是"同一步内出现两次推进"，而这两次推进分别在 `enter_call` **之前与之后**
+（3685 / 3700），中间夹着一整个 `enter_call` —— 按"步号相同"筛应当命中，
+那次筛选本身是坏的（§40 也承认 awk 写坏过一次）。
+
+### 42.3 修法：让收尾对两条路径**一致**，隐式约定消失
+
+`popc rsp` 复位到的是 `pushc rsp` 显式保存的"实参之后"，**不依赖 `rbp`** ——
+于是 `Entered`（被调方真跑过，`rbp` 是被调方基址）与 `Done`（`rbp` 已被恢复成调用方的）
+两条路径的收尾**第一次完全一致**。
+
+所以修法是**删掉 `Control::Done` 的那次多余推进**（`CallEx` 与 `CallMethod` 两处），
+而不是去迁就"跳过一条"：
+
+| | 旧 | 新 |
+|---|---|---|
+| `Entered` | `movc rsp, rbp` → `popc rbp` → `subc` | `popc rsp` → `popc rbp` → `subc` |
+| `Done` | **跳过** `movc` → `popc rbp` → `subc` | `popc rsp` → `popc rbp` → `subc` |
+
+两条路径上 `rsp` 的取值都相同（`popc rsp` 复位到实参之后、`invoke` 也恢复到这里），
+所以这是**纯等价**。
+
+### 42.4 顺带完成的第 3 步（收缩）：`rbp` 的切换收进 `open_frame`
+
+第 2 步一过，§32.4 的第 3 步立刻可以做了：
+`CallEx` / `CallMethod` 的 `rbp = self.state.rsp` 删除，改由 `open_frame` 在开帧时设定
+（只有真正开帧的路径才需要）。这两条 arm 上的**角色 2（调用准备的临时基址）就此消失**。
+
+| 项 | 基线 | 本步 | 结论 |
+|---|---|---|---|
+| 单元 | 206 | **206** | 不变（此前是栈溢出） |
+| feature（debug） | 526 / 4 ignored | **526 / 4 ignored** | 不变 |
+| 护栏 | 7 | **7** | 不变 |
+| 全量 test262 | 16561 / 7843 / 3147 | **16561 / 7843 / 3147** | **逐套件一致、零回退** |
+| guards | timeout 7 / step-limit 0 / memory 22 | **同值** | 第九次同值 |
+| 告警 | lib 24 / lib test 26 / features 8 | **同（38）** | 无新增 |
+
+**证明口径用的是 §34 的口径 B**：本步改了字节码（`movc` → `pushc`+`popc`，净增一条），
+所以"逐字节不变"不适用；证据是"全量逐套件对比 + 每片小而单一"。
+
+### 42.5 固化下来的取数工具（针对那条反复出现的教训）
+
+`src/vm/mod.rs` 新增 `vm_trace`（`BIUJS_TRACE=<path>` 打开，默认关闭）：
+把 trace 写进**文件**（`File` 的写是无缓冲的系统调用）。
+
+理由写进代码注释了：本项目已经因为"`eprintln!` + SIGABRT ⇒ 输出截断/丢行"得出过
+**三次**错误结论（§24.1 差点误判"写入点从不触发"；§38.1 的 trace 丢行造出"跳过一条"的
+假现场；§41.3 又用同一份丢行的 trace 把它判成证伪）。§42.1 的现场就是靠它拿到的 ——
+**37 步**，而不是被截断了的那 6 行。
+
+### 42.6 已证伪/已确认清单（更新 §41.4）
+
+| # | 假说 | 结果 |
+|---|---|---|
+| 1–4 | 见 §41.4 | 证伪 |
+| 5 | 调用 arm 双重推进 pc | **成立**（§42.2；§41 的"证伪"是筛选写坏） |
+| 6 | `New` / `CallSuperSpread` 的切换是差异点 | **与本故障无关**（失败在第 1 条 `CallMethod` 上） |
+
+### 42.7 下一步
+
+1. `rbp` 剩下的"调用准备"切换在 `New`（`set_value(callee,…)` 那处**依赖**切换后的参照系，
+   见 §22 —— 那是一处既有 wart，要单独一片、单独验）、`Call` 的 async 分支、
+   `CallSuperSpread`、`push_generator_frame` / `restore_generator_frame`（后两个本身就是装帧，
+   与 `open_frame` 合并即可）。
+2. 这些清完之后，**量一次 `save_execution_state` 的 `rbp` 是否恒等于当前帧的基址**
+   （§25 那 168 次命中应当归零）⇒ M2-2b（把 4 处 `rbp = <快照>` 改成由帧决定）解锁。
+3. 本轮两片（42.3 的修复 / 42.4 的收缩）应当**分两次提交**，各自可独立验证。
+
+---
+
+## 43. 收尾：两刀落地 + 量具归零 + 流水线上限（2026-10-09）
+
+### 43.1 拆分：两刀各自可独立验证（§42.7.3 已执行）
+
+| 提交 | 内容 | 全量 test262 | guards |
+|---|---|---|---|
+| 基线 `1dbee97` | — | 16561 / 7843 / 3147 | 7 / 0 / 22 |
+| `78ae479` | 第 2 刀（修复）：5 个发射点收尾改 `pushc rsp`+`popc rsp`；删掉 `CallEx` / `CallMethod` 的 `Done` 多余推进；`vm_trace` 取数工具 | 同值，逐套件零回退 | 7 / 0 / 22 |
+| `db347c9` | 第 3 刀（收缩）：`rbp` 的切换收进 `open_frame` / `New` 的开帧前，删掉 4 处调用点上的切换；留下 `frame_bases` 量具 | 同值，逐套件零回退 | 7 / 0 / 22 |
+
+单元 206 / feature 526（4 ignored）/ 护栏 7 三级在**每一刀之后**都单独跑过；
+`1dbee97` 本身也重跑了一遍，作为"同口径基线"（否则无法区分"这批导致的回退"与
+"环境导致的漂移"）。
+
+### 43.2 M2-2b 的解锁判据：**归零**
+
+量具：`frame_bases`（每帧**出生时**的 `rbp`，与 `frames` 严格同进退）+ `save_execution_state`
+里的一行比较，打印挂在 `vm_trace` 上。
+
+```
+BIUJS_TRACE=/tmp/t.txt cargo test --release --test features -- --test-threads=1
+# 63629 步，`rbp ≠ 所在帧的出生基址` 命中 **0 次**
+```
+
+§25 记的是 **168 次**（因为原生调用会借用 `rbp` 当实参参照系）。现在 0 次 ⇒
+"当前 `rbp` 恒等于当前帧的窗口基址"这条不变量成立，M2-2b（把
+`drive_bytecode_frame` / `handle_throw` / `restore_execution_state` 里那 4 处
+`rbp = <快照>` 改成由当前帧派生）**解锁**。这是本项目第一次把这类"派生值"改成
+"只有一个写入时机的量"。
+
+顺带清掉了 §22 记的那处 wart（`New` 里"读在切换前、写在切换后"的时序巧合）。
+
+### 43.3 流水线上的一个既有坑：2.5GB 上限会**丢掉整轮结果**
+
+跑 `./scripts/phase2-status.sh` 时第 3 片 SIGABRT：
+
+```
+memory allocation of 402653184 bytes failed      # 384MiB
+```
+
+定位到 `built-ins/Array/prototype/map/15.4.4.19-3-28.js`（对 `length: 4294967296` 的
+类数组做 `map`）。**不是这批改动带来的**：在 `1dbee97` 上同样复现，4 片与 8 片都复现，
+逐条定位到同一个用例；而 `built-ins/Array` 单跑（干净进程）给出的
+2113 / 113 / 855 与基线快照**逐项吻合** ⇒ 那两条用例本来就失败，只是整轮被带崩。
+
+已把 `MEM_LIMIT_KB` 默认值从 2500000 提到 **4000000**（实测该套件峰值 RSS 1.91GB，
+片是串行跑的 ⇒ 不会招致 OOM killer）。handover 里那条待办（"压下来"）的另一半答案：
+先抬上限，真正压下来是**语义**问题 —— `ArraySpeciesCreate` 在 length = 2^32 时应当
+按 ES 抛 `RangeError`，而不是先尝试物化。
+
+### 43.4 残留（下一批的输入）
+
+1. **`Instr::Call` 这条 arm 已经是死代码，但它的基址是错的。**
+   静态证据：`Instruction::Call` 的唯一生产者是 `IrBuilder::call_function`，
+   而 `call_function` **没有任何调用方**；运行期证据：526 条 feature 的 63629 步里
+   从未出现 `op=Call`。
+   它的 arm 直接 `enter_frame()` 而**不设 `rbp`** —— 在"只有开帧才写基址"的新约定下，
+   一旦有人复活这条路径，被调方就会拿调用方的基址。这是 §43.2 那把量具覆盖不到的地方
+   （没有帧 ⇒ 没有"所在帧"可比）。要么删掉，要么给它补上 `rbp = rsp`。
+2. `push_generator_frame` / `restore_generator_frame` 仍然是**自己装帧**（不走 `open_frame`）：
+   `restore_generator_frame` 要按 `base + frame.argc` 重建基址，语义上与 `open_frame`
+   不同，但"开帧 = 设基址"的约定在两处都是手写的。合并时要小心 §24 记过的
+   "帧布局必须与 `create_generator` 侧一致"。
+3. §42.7.1 里剩下的 `Call` async 分支与 `CallSuperSpread` 已在本批一并清掉
+   （`Call` 的 async 分支走 `invoke`，不开帧，本就不该切）——
+   所以 §42.7.1 现在**只剩生成器那两处**。
+
