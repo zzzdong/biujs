@@ -472,7 +472,7 @@ pub enum Instruction {
         /// 它同时是这条区域在「区域表」里的**身份**：`PopSeh { region }` 用同一个块 id
         /// 认领它，于是"哪条 `EndTry` 收的是哪条 `Try`"是**结构化**的，不再靠扫指令流 +
         /// 深度计数。后者已被实测证伪（有的 `Try` 根本没有 `EndTry` —— 体以终结指令结束时
-        /// `lower_try` 不会发射 `PopSeh`），见 `docs/architecture-redesign.md` §10.3。
+        /// `lower_try` 不会发射 `PopSeh`），见 `docs/archive/architecture-redesign.md` §10.3。
         body: BlockId,
     },
     /// 正常退出受保护区域。`region` 指回 `PushSeh.body`：**配对靠身份，不靠嵌套深度**。

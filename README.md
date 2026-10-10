@@ -13,12 +13,26 @@ A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6**
 - let variables, control flow, operators
 - Objects and Arrays with prototype methods
 - `JSON.parse` / `JSON.stringify` (includes `toJSON`, `replacer`, `space`, reviver)
+- Generators / async, `Promise`, `Proxy` / `Reflect`, `Map` / `Set`, `WeakMap` / `WeakSet`
+- `ArrayBuffer` / TypedArray views / `DataView`
+
+## 接手 / 继续开发
+
+**从这里开始，按顺序读三份：**
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/PROJECT.md`](docs/PROJECT.md) | 项目说明、当前数字、怎么跑、几条必须知道的纪律 |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 当前架构（照实现写）与已知结构性弱点 |
+| [`docs/PLAN.md`](docs/PLAN.md) | 下一阶段的任务计划与优先级 |
+
+test262 口径 / 批次表 / 快照纪律在
+[`docs/es6-conformance-phase2.md`](docs/es6-conformance-phase2.md)。
+历史决策与操作日志已归档到 `docs/archive/`（11 份，仅供溯源，不再照着施工）。
 
 ## Conformance
 
-**接手 / 继续开发请从 [`docs/handover.md`](docs/handover.md) 开始**（怎么跑、当前在哪、有哪些纪律），
-实现问题查 [`docs/architecture.md`](docs/architecture.md)，计划与批次表查
-[`docs/es6-conformance-phase2.md`](docs/es6-conformance-phase2.md)。
+**84.06%**（16567 / 执行 19708；2026-10-11 基线）。
 
 一条命令跑齐三级验证并与基线逐套件对比：
 
@@ -27,10 +41,18 @@ A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6**
 ./scripts/phase2-status.sh --update   # 完成一批后刷新基线快照
 ```
 
+快验三档：
+
+```sh
+cargo test --release --lib            # 单元 204
+cargo test --release --test features  # feature 断言 538
+cargo test --release --test guards    # 护栏 7
+```
+
 Conformance is tracked against a **pinned** revision of
 [tc39/test262](https://github.com/tc39/test262), recorded in `tests/test262.pin`
 (currently `7e115f4`, 2026-05-21) — every pass rate in
-`docs/es6-conformance-plan.md` is measured on that revision, and the runner prints
+`docs/es6-conformance-phase2.md` is measured on that revision, and the runner prints
 the revision it used:
 
 ```sh
@@ -40,4 +62,7 @@ cargo test --release --test test262_runner test262_at_pinned_revision   # pin dr
 ```
 
 Bumping the pin is a deliberate change; the procedure is documented in
-`docs/es6-conformance-plan.md` §6.7.
+`docs/es6-conformance-phase2.md` §6.7.
+
+> ⚠️ `[profile.release]` 是 `panic = "abort"`。release 下 panic 会直接中止进程，
+> 所以引擎里"能返回 `Err` 就不要 panic" —— 详见 `docs/PROJECT.md` §5。

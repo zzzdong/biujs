@@ -71,7 +71,7 @@ pub struct Module {
     ///
     /// 为什么必须声明而不是派生：`EndTry` 与 `Try` **不是一一配对**（`try` 体以终结指令
     /// 结束时 `lower_try` 根本不会发射 `PopSeh`），所以"扫一遍指令流 + 深度计数"得不到
-    /// 真实的区域边界。实测见 `docs/architecture-redesign.md` §10.3。
+    /// 真实的区域边界。实测见 `docs/archive/architecture-redesign.md` §10.3。
     ///
     /// 配对的权威来源是 IR 的 `PopSeh { region }`（`region` = 区域身份块 id），
     /// `codegen` 解析成 pc 后放在这里。

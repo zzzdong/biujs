@@ -1,0 +1,125 @@
+# biujs 架构
+
+照**当前实现**写（2026-10-11）。想看"当初为什么这么设计"翻 `docs/archive/`。
+本文只描述代码现在长什么样，以及哪些地方是已知的结构性弱点。
+
+## 1. 整体流水线
+
+```
+JS 源码
+  │  oxc_parser / oxc_semantic          src/compiler/parser.rs, semantic.rs
+  ▼
+AST ── 符号表 ──────────────────────────  src/compiler/symbol.rs
+  │  lowering（JSASTLower）               src/compiler/lowering/
+  ▼
+IR（SSA 形态 + CFG）───────────────────── src/compiler/ir/{builder,ssabuilder,cfg,instruction}.rs
+  │  寄存器分配                            src/compiler/regalloc.rs
+  │  指令选择 / 布局 / patch 回填           src/compiler/codegen.rs
+  ▼
+字节码：Module { Vec<CodeBlock>, … }      src/bytecode.rs
+  │
+  ▼
+虚拟机（寄存器式，单步循环）               src/vm/
+```
+
+- `Module` 里每个函数一个 `CodeBlock`；运行期一律读**函数自己的**属性（M1 的成果）。
+- 指令表 90 条，`Kind` 分类：`Call` / `Jump` / `Return` / `Throw` / `Suspend` /
+  `Bookkeeping`（现只剩 `AddC`/`SubC`）/ 其余 `Normal`。表本身是"漏登记即编译错误"
+  的（`Kind::kind()` 没有兜底分支）。
+
+## 2. 虚拟机
+
+`src/vm/mod.rs`（**11269 行，占全库 28%** —— 目前最该拆的文件）。
+
+### 2.1 状态
+
+```rust
+struct State {
+    data_stack: Vec<Value>,        // 值栈，rsp 索引
+    registers: [Value; 19],        // 寄存器堆 + 单独的 Rv（返回值）
+    frames: Vec<Frame>,
+    seh_stack: Vec<SehRecord>,
+    closure_var_stack: Vec<HashMap<String, Value>>,
+    globals / global_object / script_env / promise_jobs / …
+    rsp: usize,
+    rbp: usize,
+}
+```
+
+### 2.2 帧
+
+`Frame` 持有：`pc`、`base`、`rsp`、`this`、`this_state`、`func`、`argc`、
+`construct`、`new_target`、`closure_depth`、`seh_depth`。
+
+原先散在七条平行栈（`this_stack` / `function_stack` / `frame_argc` / …）里的东西
+已经收进帧；`closure_var_stack` 与 `seh_stack` 仍是两条独立的栈，由帧里的两个
+水位字段记录回退位置。
+
+**两条派生不变量**（这是近几批重构的核心成果）：
+
+- `rbp` = `frames.last().base` —— 只在**开帧**时写一次；
+- 退栈由 `unwind_frames_to(frame_depth, closure_depth, seh_depth)` 一处完成，
+  它截断三条栈并把 `rbp` 定到**留下来的那一帧**的 `base`、把 `rsp` 定到
+  **被弹出的那一帧**的出生 `rsp`（这个区别很关键：取错了就静默错）。
+
+三个地方**不能**用派生值、必须用快照（跨生成器挂起/恢复边界，几何会挪）：
+`handle_throw` 的 `SehRecord.saved_rbp/rsp`、`restore_execution_state`、
+`drive_bytecode_frame`。它们的赋值都放在 `unwind_frames_to` **之后**（派生是默认，
+快照是显式覆盖）。
+
+### 2.3 异常
+
+- 编译期给出 `EhRegion { start, exits: Vec<usize>, catch, finally }` —— 注意是
+  **出口集合**而不是 `[start, end)` 区间，因为 RPO 布局下嵌套 try 的 pc 顺序不表达
+  嵌套关系。
+- 运行期靠 `seh_stack` + `SehRecord`（含 `saved_rsp` / `saved_rbp` /
+  `saved_closure_depth` / `saved_frame_depth` / `finally_pc` …）。
+
+### 2.4 生成器 / async
+
+帧可以被挂起（`save_execution_state` → `SavedExecutionState`）再恢复；
+`invoke_boundaries` 用来判定"异常算帧内还是帧外"。**深度必须在装帧之前取**——
+这条教训在历史上出现过四次。
+
+## 3. 值与对象
+
+```rust
+pub enum Value {
+    Undefined, Null, Bool(bool), Number(f64),
+    String(Rc<String>), Symbol(Rc<SymbolData>),
+    Object(Rc<RefCell<dyn JSObject>>),
+    Function(u32),                     // 内部：按 id 引用字节码函数，不是 JS 可见类型
+}
+```
+
+- 对象：`JSObject` trait（约 20 个方法）+ `ObjectKind` 枚举（22 个变体：
+  Ordinary / Array / Function / … / Buffer / TypedArray / DataView / NativeFunction …）。
+  多数具体对象内部包一个 `OrdinaryObject` 做属性存储。
+- **没有 GC**。`Rc<RefCell<dyn JSObject>>` 收不了环，所以 `Builtins::teardown()`
+  手工"删掉 prototype 上的 `constructor`"来断环 —— 维护的是一条**写死的 23 项清单**，
+  每加一个构造函数都得记着往里补。漏过一次的实际后果：DataView 没进清单 ⇒ 每条
+  test262 用例（`VM::new()` 一次）漏一整个 realm ⇒ 撞穿 4 GB `ulimit`、进程 SIGABRT。
+
+## 4. 内建对象
+
+`src/builtins/` 20 个文件。`mod.rs` 负责注册全局与原型。
+
+**分派是按名字字符串做的**：`call_native_by_name` / `call_prototype_method` 里
+`match name`。由此派生出 arity 表、`__proto__xxx` 前缀约定、`vm_handled_static`
+旁路名单等一整套约定 —— 这是一处已知的设计债（对应"调用分派应该走 entry point"）。
+
+## 5. 已知的结构性弱点（下一阶段的输入）
+
+按"改了能拿到什么"排序：
+
+| # | 弱点 | 后果 |
+|---|---|---|
+| 1 | 无堆 / 无 GC，`Rc<RefCell<dyn JSObject>>` | 24 B 胖指针 + 动态分发 + 386 处 `borrow()`；**环必须手工断**（`teardown` 的 23 项清单） |
+| 2 | 闭包是 `HashMap<String, Value>` 的**创建时快照** | "闭包共享可变单元"不成立（`counter()` 仍返回 `0,0,0`）—— 这是**语义 bug**，不是性能问题 |
+| 3 | 内建分派按名字字符串 | arity 表 / 前缀约定 / 旁路名单；加一个原型方法要动多处 |
+| 4 | `Value::Function(u32)` 双表示 | `strict_eq` 特判、`materialize_function`、`callable_func_id` |
+| 5 | `src/vm/mod.rs` 11269 行 | 单文件过大，改动定位与 review 都困难 |
+| 6 | 属性存储是 `HashMap<String, Value>` | 属性访问是哈希查找；没有 shape / 内联缓存 |
+
+> 说明：`Value` 是否要做 NaN-boxing（8 B 定长）曾经被列为里程碑。**现已判定为可选**：
+> 它是纯性能项，不是正确性所需，且依赖"先有堆与句柄"。详见 `docs/PLAN.md`。

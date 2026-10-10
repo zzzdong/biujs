@@ -1268,7 +1268,7 @@ impl<'a> JSASTLower<'a> {
 
     /// `for (lhs of rhs) body` — iterate `rhs` via the iterator protocol.
     ///
-    /// CFG (see docs/m1-syntax-plan.md §3.2):
+    /// CFG (see docs/archive/m1-syntax-plan.md §3.2):
     /// ```text
     /// iter_blk: it = MakeIterator(rhs)          ← rhs evaluated once
     /// cond:     (item, has_next) = IterateNext(it)

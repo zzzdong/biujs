@@ -42,7 +42,7 @@ pub const DEFAULT_STEP_LIMIT: u64 = 20_000_000;
 /// 所以进程被 SIGABRT（栈溢出）杀掉时输出**不会丢行**。
 ///
 /// 这不是可选的洁癖：`eprintln!` + abort 会**截断也会丢行**，本项目已经栽过三次
-/// （`docs/deep-arch-log.md` §24.1 / §38.1 / §41.3，其中 §38 那次据此得出了
+/// （`docs/archive/deep-arch-log.md` §24.1 / §38.1 / §41.3，其中 §38 那次据此得出了
 /// 错误结论并排查了两轮）。另外 `cargo test` 会捕获通过的测试的 stderr
 /// （§24.1），所以 `eprintln!` 还必须配 `--nocapture`。
 ///
@@ -331,7 +331,7 @@ enum FrameMode {
     },
 }
 
-/// 一次 `[[Call]]` 的结果（P1-2c，见 `docs/interpreter-refactor.md` §3.3.4）。
+/// 一次 `[[Call]]` 的结果（P1-2c，见 `docs/archive/interpreter-refactor.md` §3.3.4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Control {
     /// 帧已压好（`open_frame` 做过）：**回到分派循环**去跑被调方。
@@ -1384,7 +1384,7 @@ impl VM {
         // 以前它分散在 8 处调用点（每次调用前 `rbp = rsp`），而那些调用点里有一半
         // 最终**不开帧**（原生被调方）—— 于是 `rbp` 同时承担"当前帧的窗口基址"与
         // "调用准备 / 原生实参参照系"两个角色，这也是本次 Migrating 连续回退的根源
-        // （见 `docs/deep-arch-log.md` §25/§42）。
+        // （见 `docs/archive/deep-arch-log.md` §25/§42）。
         // 收尾的 `rsp` 复位已经改成 `popc rsp`（不依赖 `rbp`），实参也改成 `rsp` 相对
         // 读取 —— 两件事做完之后，"只在开帧时设定一次"才第一次成为可能。
         self.state.rbp = self.state.rsp;
@@ -1469,7 +1469,7 @@ impl VM {
         // （试过用 `module.body_of(func_id).end` 当哨兵 —— 那是个合法的 pc，于是
         // `Ret` 之后循环接着跑下一段函数的代码，array / async / promise 一片红。
         // 要改成 per-function 哨兵，得先让循环在"pc == 本帧哨兵"时停止 —— 那是
-        // 深改第 4 步（帧模型重写）的事，见 `docs/architecture-redesign.md`。）
+        // 深改第 4 步（帧模型重写）的事，见 `docs/archive/architecture-redesign.md`。）
 
         // 模式差异在一处算清；开帧那 15 行在 `open_frame` 里，与各 opcode 内联开帧共用。
         let (this_val, function_val, new_target_val, is_construct) = match mode {
