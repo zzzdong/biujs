@@ -100,13 +100,35 @@ B44（`Reflect`：13 个静态方法 + `[Symbol.toStringTag]`，顺带修掉 `de
 帧结构归一（P3a）→ 堆帧 + 单层主循环（P3b，有 Go/No-Go 判据）。它**不产生 test262 分数**，
 目标是消掉"新增一条指令动五层""`invoke` 必须镜像 `Call`""10 条平行栈"这些结构性坑源。
 
-**下一步**：先清**同类的纪律债** —— `ArrayBuffer` / `DataView` / `TypedArray` 已由 B43 实现，
-但套件未入册、`TypedArray` 还在 `IN_SCOPE_PENDING`。B46 已经证明这类"入册解锁"很值钱：
-单是摘掉 `Reflect` 一个特性名就让跳过数 -323、通过数 +296（因为带
-`features: [Reflect]` 的用例远比 Reflect 套件本身多）。TypedArray 只会更夸张
-（`built-ins/TypedArray` 1446 条里 1339 条被门控）。**做法与 B46 完全同型**：先量
-（把套件加进 `SUITES`、删掉特性名，跑一次定向回归看通过率），达到 A5 的 ≥50%
-就留下并同批更新快照与 `EXPECTED_SKIPPED`。
+**下一步**：先清**同类的纪律债** —— `ArrayBuffer` / `DataView` / `TypedArray` 已由 B43 实现
+（**更正：只对了三分之二** —— `DataView` 从未实现，见下），但套件未入册、`TypedArray`
+还在 `IN_SCOPE_PENDING`。B46 已经证明这类"入册解锁"很值钱：单是摘掉 `Reflect`
+一个特性名就让跳过数 -323、通过数 +296（因为带 `features: [Reflect]` 的用例远比
+Reflect 套件本身多）。TypedArray 只会更夸张（`built-ins/TypedArray` 1446 条里
+1339 条被门控）。
+
+**这个"先量"已经做过了（2026-10-10），结论是"先别入册"**：
+
+| 套件 | passed / skipped / failed | 执行通过率 |
+|---|---|---|
+| `built-ins/TypedArray` | 63 / 509 / 874 | 6.7% |
+| `built-ins/TypedArrayConstructors` | 165 / 363 / 210 | 44% |
+| `built-ins/ArrayBuffer` | 41 / 17 / 163 | 20% |
+| `built-ins/DataView` | 0 / 101 / 460 | **0%** |
+
+离 A5 的 ≥50% 还差得很远，所以那次入册改动**没有留下**（按 §2.2：实现 + 解锁 + 入册
+三件事同批，只做后两件等于往池里倒垃圾）。缺口是两块实打实的活：
+`%TypedArray%.prototype` 那一族（874 条，几乎全缺，例如 `map/filter/reduce/every/
+indexOf/join/sort/copyWithin`）与 **`DataView`（0 条：它根本不是全局对象 ——
+实测 `typeof DataView === "undefined"`，`src/builtins/typedarray.rs` 里它只出现在
+一条注释中，B43 并没有交付它）**。
+
+那一轮顺手先修掉了"能不能安全地跑"这件事，因为三条用例会**把整个进程带崩**
+（`new Uint8Array(2**32)` / `new ArrayBuffer(7*1024**5)` / `new Uint8Array({length: 2**31})`
+都在真的去要内存）：现在超大尺寸按 ES 25.1.1.1 抛 `RangeError`。**这是入册的前置条件** ——
+崩溃优先于失败（§6 第 3 条），一条用例就带走整个分片的结果。同类还有一条没修：
+`ArraySpeciesCreate` 在 `length = 2^32` 时也是先尝试物化（`built-ins/Array/prototype/map/
+15.4.4.19-3-28.js`，384MiB），它决定了 `MEM_LIMIT_KB` 的下限（见 §4）。
 
 之后是 `Proxy` 的两条残留：**"原型链上的代理不触发陷阱"**量最大（约 10 条）——
 `find_descriptor` / `internal_has_property` / `internal_get` 在对象层走
