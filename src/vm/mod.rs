@@ -1545,8 +1545,11 @@ impl VM {
         // 实测（526 条 feature + 全量 test262 4 片）这处"快照值 == 退栈后当前帧的
         // base"**零例外**，而 `handle_throw` / `restore_execution_state` 那两处
         // 不成立 —— 它们跨生成器的挂起边界，快照属于**挂起前**那一次几何。
-        self.state.rsp = saved_rsp;
         self.unwind_frames_to(boundary, saved_closure, saved_seh);
+        // 快照**压过** `unwind_frames_to` 刚定好的派生值：这里是 Rust 驱动调用，
+        // `saved_rsp` 是驱动**之前**记录的（实参压栈之前），而派生值是"被弹出那一帧
+        // 的出生 `rsp"`（实参压栈之后）—— 两者不同，所以这份快照必须赢。
+        self.state.rsp = saved_rsp;
         self.state.rbp = self.state.frame_base();
 
         outcome?;
@@ -7849,10 +7852,22 @@ impl VM {
         // 帧自己带着 `this` / `this_state` / `argc` / `func` / `pc` /
         // `construct` / `new.target`，所以"回退到第几帧"一步到位 ——
         // 切片 1b/1c/1d/1e 之前这里要分别 truncate 七条平行栈。
+        // `rsp` 要取**被弹出的那一帧**的出生值（不是留下来的那一帧的）：
+        // `frames[d]` 是从 `frames[d-1]` 里被调起来的，它的出生 `rsp` 就是"退回
+        // 到 `d-1` 时该有的 `rsp"`。取留下来的那一帧的 `rsp` 是错的 —— 那是它
+        // 自己开帧时的值，而它此后早已继续压栈。
+        let restore_rsp = if frame_depth < self.state.frames.len() {
+            Some(self.state.frames[frame_depth].rsp)
+        } else {
+            None
+        };
         self.state.frames.truncate(frame_depth);
         self.state.closure_var_stack.truncate(closure_depth);
         self.state.seh_stack.truncate(seh_depth);
         self.state.rbp = self.state.frame_base();
+        if let Some(rsp) = restore_rsp {
+            self.state.rsp = rsp;
+        }
     }
 
     fn handle_throw(&mut self, exc_val: Value) -> Result<(), RuntimeError> {
@@ -7870,7 +7885,6 @@ impl VM {
         }
         match self.state.seh_stack.pop() {
             Some(mut record) => {
-                self.state.rsp = record.saved_rsp;
                 // 被回退的那些帧可能留下没来得及 `PopC` 的保存项 —— 它们必须一起丢，
                 // 否则外层之后的 `PopC` 会弹到过期值（`rbp` 被破坏；实测症状：
                 // "数组字面量里夹一次会抛异常的调用" 直接报 `ArrayPush on non-object`）。
@@ -7889,6 +7903,8 @@ impl VM {
                 // 而恢复时帧的几何已经挪到新的栈底 —— 这里的值属于**挂起前**那一次。
                 // 全量 test262 上 8 处与派生值不等（全部 `language/expressions/yield/*`）。
                 self.state.rbp = record.saved_rbp;
+                // `rsp` 同理：这份快照也是在 `try` 处记的，属于**挂起前**那一次几何。
+                self.state.rsp = record.saved_rsp;
                 let finally_pc = record.finally_pc;
                 let handler_pc = record.handler_pc;
 
@@ -9318,11 +9334,11 @@ impl VM {
     }
 
     fn restore_execution_state(&mut self, saved: &SavedExecutionState) {
-        self.state.rsp = saved.rsp;
         self.unwind_frames_to(saved.frame_depth, saved.closure, saved.seh);
         // 快照**压过** `unwind_frames_to` 刚定好的派生值 —— 与 `save_execution_state`
-        // 里那条注释成对：这份 `rbp` 属于挂起前的几何（§44.2 实测 5 处不等）。
+        // 里那条注释成对：这两份都属于挂起前的几何（§44.2 实测 5 处不等）。
         self.state.rbp = saved.rbp;
+        self.state.rsp = saved.rsp;
         self.delegate_stack.truncate(saved.delegate);
         // The register file is *global*, not per frame: a nested run (a
         // generator body, an `invoke`) overwrites values the caller still has
@@ -10111,6 +10127,17 @@ struct Frame {
     /// **生成器例外**：帧被挂起再恢复时（`restore_generator_frame`）几何会挪到
     /// 新的栈底，所以**跨挂起边界的快照不能换成派生值**（实测 13 条用例，见 §44.2）。
     base: usize,
+    /// 本帧**收帧时要回退到的 `rsp`** —— 也就是本帧出生那一刻的 `rsp`（调用方
+    /// 压完实参之后的值）。
+    ///
+    /// 与 `base` 同理，是**出生参数**：`rsp` 在帧内会随压栈/出栈一路走，所以
+    /// "该退回到多少"只有开帧这一刻知道。现在它由帧回答，不必再靠 `PushC`/`PopC`
+    /// 往控制栈（`reg_saves`）上搬一份 —— 那份正是本刀要拆掉的东西。
+    ///
+    /// **注意与 `base` 的一处不同**：`base` 是"本帧自己的窗口基址"，所以退栈后取
+    /// **留下来的那一帧**的 `base`；而这里是"退回到多少"，要取**被弹出的那一帧**
+    /// 的 `rsp`（见 `unwind_frames_to`）。
+    rsp: usize,
     /// 本帧的 `this` 绑定。
     ///
     /// **会在中帧被写**：`CallSuperSpread` 按 ES 12.3.5.1 `BindThisValue` 把派生构造器的
@@ -10431,9 +10458,11 @@ impl State {
     /// 时机，所以在这里读它就是权威来源。
     fn note_frame(&mut self, birth: FrameBirth) {
         let base = self.rbp;
+        let rsp = self.rsp;
         self.frames.push(Frame {
             pc: birth.pc,
             base,
+            rsp,
             func: birth.func,
             this: birth.this,
             this_state: birth.this_state,
