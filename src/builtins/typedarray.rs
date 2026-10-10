@@ -74,21 +74,53 @@ fn as_typedarray<'a>(this: &'a Value, method: &str) -> Result<std::cell::RefMut<
     }))
 }
 
-/// `new ArrayBuffer(byteLength)`.
-pub fn arraybuffer_construct(
-    args: &[Value],
-    proto: Option<Value>,
-) -> Result<Value, RuntimeError> {
-    let requested = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+/// 一块 Data Block 允许的最大字节数。**超过它不是错误，而是 range error** ——
+/// ES 25.1.1.1 `AllocateArrayBuffer` 明确允许实现在创建不出来的时候抛 `RangeError`；
+/// 真实引擎也是这么做的（`built-ins/ArrayBuffer/allocation-limit.js` 连
+/// "7 PiB 应当 RangeError" 都在断言里写明了）。
+///
+/// 这不是洁癖：实测 `new ArrayBuffer(7 * 1024**5)` 与 `new Uint8Array(2**32)`
+/// 之前会**真的去要 4GB / 7.8PB**，结果是进程 SIGABRT —— 而"崩溃优先于失败"
+/// 是本项目的硬纪律（handover §6 第 3 条），一条用例就把整个分片的结果带走。
+const MAX_BUFFER_BYTES: usize = 1 << 30;
+
+/// 一次尺寸请求是否合法 + 分配得出来。两件事分开是为了让错误信息能指出区别。
+fn checked_byte_length(requested: f64, bytes_per_element: usize) -> Result<usize, RuntimeError> {
+    // ES 7.1.22 `ToIndex`：NaN → 0；负数 / +∞ / 超过 2^53-1 → RangeError。
     if requested.is_nan() {
-        return Ok(make_buffer(0, proto));
+        return Ok(0);
     }
     if requested < 0.0 {
         return Err(RuntimeError::RangeError(
             "Invalid array buffer length".to_string(),
         ));
     }
-    Ok(make_buffer(requested as usize, proto))
+    let count = requested.trunc();
+    if count > 9_007_199_254_740_991.0 {
+        return Err(RuntimeError::RangeError(
+            "Array buffer length exceeds the safe integer range".to_string(),
+        ));
+    }
+    let count = count as usize;
+    let total = count
+        .checked_mul(bytes_per_element)
+        .unwrap_or(usize::MAX);
+    if total > MAX_BUFFER_BYTES {
+        return Err(RuntimeError::RangeError(
+            "Array buffer allocation failed".to_string(),
+        ));
+    }
+    Ok(total)
+}
+
+/// `new ArrayBuffer(byteLength)`.
+pub fn arraybuffer_construct(
+    args: &[Value],
+    proto: Option<Value>,
+) -> Result<Value, RuntimeError> {
+    let requested = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+    let byte_length = checked_byte_length(requested, 1)?;
+    Ok(make_buffer(byte_length, proto))
 }
 
 fn make_buffer(byte_length: usize, proto: Option<Value>) -> Value {
@@ -102,10 +134,15 @@ fn make_buffer(byte_length: usize, proto: Option<Value>) -> Value {
 /// The numbers a TypedArray constructor should copy: the elements of another
 /// TypedArray (read as elements, not as properties — `length` is a prototype
 /// getter and would read as 0) or of an array-like.
-fn source_numbers(value: &Value) -> Vec<f64> {
+///
+/// `bytes_per_element` 是进来就先的那道闸：类数组的 `length` 也是**请求尺寸**
+/// 的一种写法（`new Uint8Array({ length: 2 ** 31 })`），所以它也必须在
+/// `MAX_BUFFER_BYTES` 之前被拦住 —— 实测 `length-excessive-throws.js` 就是靠这个
+/// 形状把整个分片干掉的（2GiB）。
+fn source_numbers(value: &Value, bytes_per_element: usize) -> Result<Vec<f64>, RuntimeError> {
     let mut out = Vec::new();
     let Value::Object(obj_ref) = value else {
-        return out;
+        return Ok(out);
     };
     // A TypedArray source: read through the view.
     if obj_ref.borrow().as_any().is::<TypedArrayObject>() {
@@ -120,7 +157,7 @@ fn source_numbers(value: &Value) -> Vec<f64> {
                 other => other.to_number(),
             });
         }
-        return out;
+        return Ok(out);
     }
     let borrowed = obj_ref.borrow();
     let length = borrowed
@@ -128,16 +165,17 @@ fn source_numbers(value: &Value) -> Vec<f64> {
         .map(|d| d.value.to_number())
         .unwrap_or(0.0);
     if length.is_nan() || length <= 0.0 {
-        return out;
+        return Ok(out);
     }
-    for i in 0..(length as usize) {
+    let length = checked_byte_length(length, bytes_per_element)? / bytes_per_element;
+    for i in 0..length {
         let element = borrowed
             .property_get(&PropertyKey::from_str(&i.to_string()))
             .map(|d| d.value.to_number())
             .unwrap_or(f64::NAN);
         out.push(element);
     }
-    out
+    Ok(out)
 }
 
 /// `new Uint8Array(…)` and friends (ES 23.2.5.1): a length, another TypedArray,
@@ -205,18 +243,21 @@ pub fn typedarray_construct(
         // A number (or a numeric string) is a *length*; an object is a source to
         // copy, which is why the two cases cannot share a branch.
         other if !matches!(other, Value::Object(_)) => {
-            let length = other.to_number();
-            if length.is_nan() {
+            let requested = other.to_number();
+            if requested.is_nan() {
                 Vec::new()
-            } else if length < 0.0 || length.fract() != 0.0 {
+            } else if requested < 0.0 || requested.fract() != 0.0 {
                 return Err(RuntimeError::RangeError(
                     "Invalid typed array length".to_string(),
                 ));
             } else {
-                vec![0.0; length as usize]
+                // 同上：`new Uint8Array(2**32)` 以前会真的去要 4GB。
+                // `checked_byte_length` 同时负责 ToIndex 的上界与"分配不出来"。
+                let length = checked_byte_length(requested, size)? / size;
+                vec![0.0; length]
             }
         }
-        other => source_numbers(other),
+        other => source_numbers(other, size)?,
     };
 
     let buffer = make_buffer(numbers.len() * size, None);
@@ -313,8 +354,8 @@ pub fn ta_set(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let source = args.first().cloned().unwrap_or(Value::Undefined);
     let numbers = match source {
         // A TypedArray source copies *elements*, even of a different kind.
-        other if is_typedarray_receiver(&other) => source_numbers(&other),
-        Value::Object(_) | Value::String(_) => source_numbers(&source),
+        other if is_typedarray_receiver(&other) => source_numbers(&other, 1)?,
+        Value::Object(_) | Value::String(_) => source_numbers(&source, 1)?,
         other => return Err(RuntimeError::TypeError(format!(
             "TypedArray.prototype.set: {} is not an array-like",
             other.type_of()

@@ -1199,6 +1199,64 @@ fn typed_array_views_alias_the_buffer_they_were_built_on() {
 }
 
 #[test]
+fn huge_buffer_requests_are_range_errors_not_crashes() {
+    // 什么时候会遭在这上面：`new ArrayBuffer(7 * 1024**5)` 以前会真的去要内存，
+    // 结果是整个进程 SIGABRT —— 一条用例带走整个分片的结果。ES 25.1.1.1 明确允许
+    // 实现在分配不出来的时候抛 `RangeError`，真实引擎也这么做。
+    assert_eq!(
+        eval_string("try { new ArrayBuffer(9007199254740992); } catch (e) { e.name; }"),
+        "RangeError"
+    );
+    assert_eq!(
+        eval_string("try { new ArrayBuffer(Infinity); } catch (e) { e.name; }"),
+        "RangeError"
+    );
+    assert_eq!(
+        eval_string(
+            "try { new ArrayBuffer(7 * 1125899906842624); } catch (e) { e.name; }"
+        ),
+        "RangeError"
+    );
+    // `new Uint8Array(n)` 自己造 buffer，所以要乘 BYTES_PER_ELEMENT 再判。
+    assert_eq!(
+        eval_string("try { new Uint8Array(4294967296); } catch (e) { e.name; }"),
+        "RangeError"
+    );
+    assert_eq!(
+        eval_string("try { new Float64Array(4294967296); } catch (e) { e.name; }"),
+        "RangeError"
+    );
+    // 负长度仍然按 ES 25.1.1.1 step 4 走 RangeError（不是变成 0）。
+    assert_eq!(
+        eval_string("try { new ArrayBuffer(-1); } catch (e) { e.name; }"),
+        "RangeError"
+    );
+    // 上限以内照旧工作，而且 NaN 按 ToIndex 变成 0，`Infinity` 之外的都要刻意是。
+    assert_eq!(eval_number("new ArrayBuffer(16).byteLength"), 16.0);
+    assert_eq!(eval_number("new Float64Array(3).byteLength"), 24.0);
+    assert_eq!(eval_number("new ArrayBuffer(NaN).byteLength"), 0.0);
+    // 类数组的 `length` 是**同一个请求**的另一种写法，所以也必须在闸口内 ——
+    // 实测 `length-excessive-throws.js` 就是从这个形状把整个分片干掉的。
+    assert_eq!(
+        eval_string(
+            "try { new Uint8Array({ length: 2147483648 }); } catch (e) { e.name; }"
+        ),
+        "RangeError"
+    );
+    assert_eq!(
+        eval_string(
+            "try { new Float64Array({ length: 4294967296 }); } catch (e) { e.name; }"
+        ),
+        "RangeError"
+    );
+    // 而正常的类数组（ copying 语义）不受影响。
+    assert_eq!(
+        eval_string("JSON.stringify(Array.from(new Uint8Array({ length: 3, 0: 1, 1: 2, 2: 3 })))"),
+        "[1,2,3]"
+    );
+}
+
+#[test]
 fn reflect_exposes_the_internal_methods() {
     // `Reflect` is a namespace object, not a constructor.
     assert_eq!(eval_string("typeof Reflect"), "object");
