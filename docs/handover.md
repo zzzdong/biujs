@@ -126,9 +126,15 @@ indexOf/join/sort/copyWithin`）与 **`DataView`（0 条：它根本不是全局
 那一轮顺手先修掉了"能不能安全地跑"这件事，因为三条用例会**把整个进程带崩**
 （`new Uint8Array(2**32)` / `new ArrayBuffer(7*1024**5)` / `new Uint8Array({length: 2**31})`
 都在真的去要内存）：现在超大尺寸按 ES 25.1.1.1 抛 `RangeError`。**这是入册的前置条件** ——
-崩溃优先于失败（§6 第 3 条），一条用例就带走整个分片的结果。同类还有一条没修：
-`ArraySpeciesCreate` 在 `length = 2^32` 时也是先尝试物化（`built-ins/Array/prototype/map/
-15.4.4.19-3-28.js`，384MiB），它决定了 `MEM_LIMIT_KB` 的下限（见 §4）。
+崩溃优先于失败（§6 第 3 条），一条用例就带走整个分片的结果。
+
+同类另一条（`ArraySpeciesCreate` 在 `length = 2^32` 时先尝试物化，`built-ins/Array/prototype/map/
+15.4.4.19-3-28.js`，384MiB）**也已经修了**（2026-10-10，`0bc88cb`）：数组的"普通结果"
+路径统一走 `MAX_MATERIALIZED_LEN`（1 MiB）的闸口，和 `new Array(len)` / `slice` / `concat`
+共用同一个常量；`filter` / `flatMap` 之前漏传了 `len` 给 `ArraySpeciesCreate`，改回传
+`entries.len()`。现在 `map`/`filter` 对 2^32 长度都按 ES 9.4.2.2 抛 `RangeError`。
+这条修完之后，`MEM_LIMIT_KB` 设为 4GB 纯粹是给仍会分配大数组的合法用例留的余量，
+不再是"不抬高就崩"的硬门槛 —— 若日后想压低它，先确认没有别的物化路径漏闸。
 
 之后是 `Proxy` 的两条残留：**"原型链上的代理不触发陷阱"**量最大（约 10 条）——
 `find_descriptor` / `internal_has_property` / `internal_get` 在对象层走
