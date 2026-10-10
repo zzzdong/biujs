@@ -7851,11 +7851,13 @@ impl VM {
         }
         match self.state.seh_stack.pop() {
             Some(mut record) => {
-                // 被回退的那些帧可能留下没来得及 `PopC` 的保存项 —— 它们必须一起丢，
-                // 否则外层之后的 `PopC` 会弹到过期值（`rbp` 被破坏；实测症状：
-                // "数组字面量里夹一次会抛异常的调用" 直接报 `ArrayPush on non-object`）。
-                // **切片 1b 之前这件事是顺手做的**（帧的簿记与 `PushC` 的簿记同挤在
-                // 一条 `ctrl_stack` 上，一次 truncate 清两样）—— 分开之后必须显式记。
+                // 下面这一次 `unwind_frames_to` 就把帧、`closure_var_stack`、
+                // `seh_stack` 全截到位 —— 不需要再额外清什么。
+                //
+                // （控制栈还在的年代这里必须多做一步：被回退的帧会留下没来得及
+                // `PopC` 的保存项，外层之后的 `PopC` 会弹到过期值，实测症状是
+                // "数组字面量里夹一次会抛异常的调用" 直接报 `ArrayPush on non-object`。
+                // 控制栈与 `PushC`/`PopC` 删掉之后，这类残留不再可能存在。）
                 self.unwind_frames_to(
                     record.saved_frame_depth,
                     record.saved_closure_depth,
