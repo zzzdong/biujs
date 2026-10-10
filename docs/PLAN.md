@@ -73,20 +73,49 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 
 ## 3. 拆分 `src/vm/mod.rs`（P0-4）
 
-11269 行。建议按职责切，先在**同一个 crate 内**分模块（`mod` 文件），不要动
-`pub` 边界：
+**实测**（2026-10-11）：11269 行，**229 个函数**。最大的几个：
+
+| 行数 | 函数 | 说明 |
+|---|---|---|
+| **1740** | `run_instruction` | **指令分派 —— 一个函数顶全库 4.3%，是真正的抓手** |
+| 436 | `call_native_by_name` | 内建函数按名字分派 |
+| 376 | `try_array_callback_method` | `Array.prototype.{map,filter,…}` 的快速路径 |
+| 343 | `proxy_static_trap` | Proxy 静态陷阱 |
+| 224 | `get_global` / 210 `generator_abrupt` / 194 `set_like_method` | |
+| 192 | `step` | 单步循环外壳（本身不大） |
+
+**所以拆分的重点不是"按模块切文件"，而是先把 `run_instruction` 这一个 1740 行的
+巨型 `match` 拆开。** 建议顺序（先拆函数，再挪文件）：
+
+### 3.1 第一步：拆 `run_instruction`（1740 行）
+
+按 `Kind` / 语义分组，把每个分支体抽成 `fn run_<group>(&mut self, inst: &Instr, …)`
+放在同一文件里，让 `run_instruction` 只剩一个薄分派表。候选分组：
+
+`Call` / `Jump` / `Return` / `Throw` / `Suspend` / `Bookkeeping` / 属性访问 /
+算术 / 比较 / 对象字面量与数组 / 迭代器与 `for-of` / 生成器与 async。
+
+**纪律**：一次只抽一组，抽完立刻跑全量；**纯移动不改逻辑**。
+
+### 3.2 第二步：抽大函数
+
+`call_native_by_name`（436）、`try_array_callback_method`（376）、
+`proxy_static_trap`（343）各自成文件/模块。
+
+### 3.3 第三步：按职责切文件
 
 | 建议模块 | 内容 |
 |---|---|
 | `vm/frame.rs` | `Frame` / `FrameBirth` / `open_frame` / `note_frame` / `unwind_frames_to` / `frame_base` |
-| `vm/exec.rs` | `step()` 主循环与指令分派（最大的一块，可能还要再分） |
+| `vm/exec.rs` | `step` / `run_instruction` 与各 `run_<group>` |
 | `vm/call.rs` | `enter_call` / `invoke_*` / `Control` / `CallArgs` / 构造器路径 |
 | `vm/exception.rs` | `SehRecord` / `handle_throw` / `throw` 路径 |
 | `vm/generator.rs` | `SavedExecutionState` / 挂起恢复 / `discard_generator_frame` |
 | `vm/state.rs` | `State` 与 `data_stack` / 寄存器 / `push` / `pop` / `ensure` |
 | `vm/builtins_dispatch.rs` | `call_native_by_name` / `call_prototype_method` 与相关旁路名单 |
 
-**纪律**：纯移动，不改逻辑；每移动一个模块跑一次全量确认零回退。
+先在**同一个 crate 内**分 `mod` 文件，不要动 `pub` 边界。
+**每移动一个模块跑一次全量确认零回退。**
 
 ## 4. 两条待定的语义 bug（属于"修 bug"，不是重构）
 
