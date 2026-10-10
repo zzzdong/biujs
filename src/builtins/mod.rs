@@ -27,7 +27,9 @@ use crate::vm::value::Value;
 
 pub use crate::vm::ObjectKind;
 
-pub use array::{ARRAY_SPECIES_NATIVE, array_constructor, validate_array_length};
+pub use array::{
+    ARRAY_SPECIES_NATIVE, MAX_MATERIALIZED_LEN, array_constructor, validate_array_length,
+};
 pub use date::date_construct_value;
 pub use regexp::match_all_matches;
 pub mod typedarray;

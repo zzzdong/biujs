@@ -171,3 +171,83 @@ fn default_path_still_produces_holey_arrays() {
         "3,false,2,1,3"
     );
 }
+
+#[test]
+fn absurd_length_on_map_is_a_range_error() {
+    // ES `ArrayCreate(len)` throws for `len > 2**32 - 1`; this engine can't
+    // materialize arrays that big, so the same `RangeError` fires far earlier —
+    // but it must fire *before* the caller does `vec![Value::Undefined; len]`,
+    // otherwise `Array.prototype.map.call({length: 2**32}, ...)` materializes a
+    // ~16 GiB `Vec` and crashes the whole process ("crash beats failure" is the
+    // project's hard rule — one test would poison the whole batch).
+    assert_eq!(
+        eval_string(
+            "try { Array.prototype.map.call({ length: 4294967296 }, function() {}); }
+             catch (e) { e.name; }"
+        ),
+        "RangeError"
+    );
+}
+
+#[test]
+fn absurd_length_on_filter_is_a_range_error() {
+    // `filter` shares the same `ArraySpeciesCreate` gate.
+    assert_eq!(
+        eval_string(
+            "try { Array.prototype.filter.call({ length: 4294967296 }, function() {}); }
+             catch (e) { e.name; }"
+        ),
+        "RangeError"
+    );
+}
+
+#[test]
+fn moderate_array_like_map_keeps_holes() {
+    // A length the engine *can* hold still works on the ordinary path, and
+    // `map` keeps holes.
+    assert_eq!(
+        eval_string(
+            "Array.prototype.map.call({ length: 3, 0: 1, 1: 2, 2: 3 },
+             function(x) { return x * 2; }).join(',')"
+        ),
+        "2,4,6"
+    );
+}
+
+#[test]
+fn result_array_cap_matches_new_array_cap() {
+    // The ordinary-array cap is `MAX_MATERIALIZED_LEN` (1 MiB), the same bound
+    // `new Array(len)` already enforces — so a 2 MiB result throws here too.
+    // (We use an array-like receiver so the length is supplied directly to
+    // `ArraySpeciesCreate` without first building a 2 MiB `Array`.) This is a
+    // deliberate engine limitation, locked so the safe behaviour can't regress
+    // into a silent gigantic allocation.
+    assert_eq!(
+        eval_string(
+            "var n = 'none';
+             try { Array.prototype.map.call({ length: 2000000 }, function() {}); }
+             catch (e) { n = e.name; }
+             n"
+        ),
+        "RangeError"
+    );
+}
+
+#[test]
+fn custom_species_constructor_not_capped() {
+    // A custom `@@species` constructor decides its own length policy, so it is
+    // *not* subject to that cap — `array_species_create` must only apply the cap
+    // to the ordinary-array result, not to the `Construct` call.
+    assert_eq!(
+        eval_number(
+            "var seen = -1;
+             var Ctor = function(len) { seen = len; return []; };
+             var a = [];
+             a.constructor = {};
+             a.constructor[Symbol.species] = Ctor;
+             try { a.map(function() {}); } catch (e) {}
+             seen"
+        ),
+        0.0
+    );
+}

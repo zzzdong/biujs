@@ -192,7 +192,7 @@ pub fn array_to_string(obj: &Value) -> Result<Value, RuntimeError> {
 
 /// Largest length `Array(len)` will actually materialize. Anything above this
 /// raises `RangeError` instead of trying to allocate gigabytes up front.
-const MAX_MATERIALIZED_LEN: usize = 1 << 20;
+pub const MAX_MATERIALIZED_LEN: usize = 1 << 20;
 
 pub fn array_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
     if args.len() == 1 {

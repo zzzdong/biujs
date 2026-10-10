@@ -5443,7 +5443,7 @@ impl VM {
             _ => false,
         };
         if !is_array {
-            return Ok(None);
+            return self.array_species_ordinary(len);
         }
 
         // Step 5: `? Get(O, "constructor")` — abrupt completions propagate.
@@ -5454,22 +5454,42 @@ impl VM {
         if species.is_object() {
             species = self.get_member(&species, &crate::builtins::species_symbol_key(), module)?;
             if species.is_null() {
-                return Ok(None);
+                return self.array_species_ordinary(len);
             }
         }
         if species.is_undefined() {
-            return Ok(None);
+            return self.array_species_ordinary(len);
         }
         // `Array[Symbol.species]` returns its receiver, so the common case
         // resolves back to `Array`: build it directly instead of routing every
         // `slice` through Construct.
         if crate::builtins::native_function_name(&species).as_deref() == Some("Array") {
-            return Ok(None);
+            return self.array_species_ordinary(len);
         }
         // Step 10: `? Construct(C, «len»)` — a non-constructible species is the
-        // TypeError `create-ctor-non-object.js` expects.
+        // TypeError `create-ctor-non-object.js` expects. A custom `@@species`
+        // constructor decides the length policy for itself, so it is *not* subject
+        // to the ordinary-array cap `array_species_ordinary` enforces below.
         let target = self.construct(&species, &[Value::Number(len as f64)], module)?;
         Ok(Some(target))
+    }
+
+    /// `ArraySpeciesCreate`'s ordinary-array result: `ArrayCreate(len)`, which ES
+    /// 9.4.2.2 throws `RangeError` for `len > 2**32 - 1`. This engine's arrays are
+    /// `Vec`-backed and top out at `MAX_MATERIALIZED_LEN`, so the cap fires far
+    /// earlier — but it must fire *here*, before the caller materializes
+    /// `vec![Value::Undefined; len]`, otherwise `Array.prototype.map.call({length: 2**32}, ...)`
+    /// (and every other species-backed method) attempts a ~16 GiB allocation and
+    /// crashes the whole process. That is the same "crash beats failure" hazard
+    /// the TypedArray slice fixed; both stem from an unbounded `len` reaching a
+    /// `Vec` materialization.
+    fn array_species_ordinary(&self, len: usize) -> Result<Option<Value>, RuntimeError> {
+        if len > crate::builtins::MAX_MATERIALIZED_LEN {
+            return Err(RuntimeError::RangeError(
+                "Invalid array length".to_string(),
+            ));
+        }
+        Ok(None)
     }
 
     /// ES `Array.prototype.indexOf` / `lastIndexOf` over the hole-aware element
@@ -7585,7 +7605,11 @@ impl VM {
                 // Map, then flatten one level (ES 23.1.3.?): a mapped value that
                 // is an array contributes its elements, anything else is
                 // appended as-is. This is the same `call` plumbing `map` uses.
-                let species = self.array_species_create(receiver, 0, module)?;
+                // The result length is `len`, so `ArraySpeciesCreate` is asked for
+                // it — that is what makes the `MAX_MATERIALIZED_LEN` cap fire
+                // (e.g. `flatMap` over a 2**32-length array-like must be a
+                // `RangeError`, not a 16 GiB allocation).
+                let species = self.array_species_create(receiver, entries.len(), module)?;
                 let mut values: Vec<Value> = Vec::new();
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
@@ -7628,7 +7652,11 @@ impl VM {
                 }))
             }
             "filter" => {
-                let species = self.array_species_create(receiver, 0, module)?;
+                // Result length is `len`, so `ArraySpeciesCreate` is asked for it —
+                // that is what makes the `MAX_MATERIALIZED_LEN` cap fire (e.g.
+                // `filter` over a 2**32-length array-like must be a `RangeError`,
+                // not a 16 GiB allocation).
+                let species = self.array_species_create(receiver, entries.len(), module)?;
                 let mut out: Vec<Value> = Vec::new();
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
