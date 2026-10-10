@@ -3013,6 +3013,111 @@ impl JSObject for TypedArrayObject {
     }
 }
 
+/// A `DataView` instance: a byte-addressable view over an `ArrayBuffer` (ES 25.3).
+///
+/// Unlike `TypedArrayObject` it has no elements of its own — every `getUint8(n)`
+/// decodes *bytes* from the buffer at `byteOffset + n`, which is why it keeps only
+/// the buffer reference plus the window (`byteOffset` / `byte_length`) carved out of
+/// it at construction. The byte-level encoding lives in `builtins::typedarray`.
+#[derive(Debug)]
+pub struct DataViewObject {
+    /// `[[ViewedArrayBuffer]]`.
+    pub buffer: Rc<RefCell<dyn JSObject>>,
+    /// `[[ByteOffset]]` — where this view starts inside the buffer.
+    pub byte_offset: usize,
+    /// `[[ByteLength]]` — how many bytes this view spans.
+    pub byte_length: usize,
+    base: OrdinaryObject,
+}
+
+impl DataViewObject {
+    pub fn new(
+        buffer: Rc<RefCell<dyn JSObject>>,
+        byte_offset: usize,
+        byte_length: usize,
+        prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    ) -> Self {
+        let mut base = OrdinaryObject::with_class_name("DataView");
+        base.set_prototype(prototype);
+        Self {
+            buffer,
+            byte_offset,
+            byte_length,
+            base,
+        }
+    }
+
+    /// `true` once the underlying `ArrayBuffer` has been detached: every access then
+    /// throws a `TypeError` (ES 25.3.1.3-5, 25.3.3).
+    pub fn is_detached(&self) -> bool {
+        match self.buffer.borrow().as_any().downcast_ref::<ArrayBufferObject>() {
+            Some(buf) => buf.is_detached(),
+            None => true,
+        }
+    }
+}
+
+impl JSObject for DataViewObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::DataView
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        self.base.property_get(key)
+    }
+    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+        self.base.property_set(key, value)
+    }
+    fn define_property(
+        &mut self,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor,
+    ) -> Result<bool, String> {
+        self.base.define_property(key, descriptor)
+    }
+    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+        self.base.property_delete(key)
+    }
+    fn has_property(&self, key: &PropertyKey) -> bool {
+        self.base.has_property(key)
+    }
+    fn own_keys(&self) -> Vec<PropertyKey> {
+        self.base.own_keys()
+    }
+    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+        self.base.get_prototype()
+    }
+    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+        self.base.set_prototype(proto)
+    }
+    fn is_extensible(&self) -> bool {
+        self.base.is_extensible()
+    }
+    fn prevent_extensions(&mut self) {
+        self.base.prevent_extensions()
+    }
+    fn is_frozen(&self) -> bool {
+        self.base.is_frozen()
+    }
+    fn freeze(&mut self) {
+        self.base.freeze()
+    }
+    fn is_sealed(&self) -> bool {
+        self.base.is_sealed()
+    }
+    fn seal(&mut self) {
+        self.base.seal()
+    }
+    fn class_name(&self) -> &'static str {
+        "DataView"
+    }
+}
+
 /// A `Proxy` instance: `[[ProxyTarget]]` plus `[[ProxyHandler]]` (ES 10.5).
 ///
 /// Every operation on it *defaults to* the same operation on the target — that

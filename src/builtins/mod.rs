@@ -418,6 +418,12 @@ pub struct Builtins {
     pub date_prototype: Rc<RefCell<dyn JSObject>>,
     pub regexp_prototype: Rc<RefCell<dyn JSObject>>,
     pub promise_prototype: Rc<RefCell<dyn JSObject>>,
+    // Stored as fields (not locals) so `teardown` can break the
+    // `prototype ⇄ constructor` cycle on them — otherwise each `VM::new` (one per
+    // test262 test) leaks a whole realm. `DataView` was missing and leaked;
+    // `ArrayBuffer` had the same latent leak. See `teardown`.
+    pub arraybuffer_prototype: Rc<RefCell<dyn JSObject>>,
+    pub dataview_prototype: Rc<RefCell<dyn JSObject>>,
 }
 
 impl Builtins {
@@ -443,6 +449,11 @@ impl Builtins {
         let date_proto = new_proto(Some(Rc::clone(&object_proto)), "Date");
         let regexp_proto = new_proto(Some(Rc::clone(&object_proto)), "RegExp");
         let promise_proto = new_proto(Some(Rc::clone(&object_proto)), "Promise");
+        // Empty prototypes created up front and stored as fields so `teardown` can
+        // break their `prototype ⇄ constructor` cycle. (See the comment on the
+        // `arraybuffer_prototype` field.)
+        let arraybuffer_proto = new_proto(Some(Rc::clone(&object_proto)), "ArrayBuffer");
+        let dataview_proto = new_proto(Some(Rc::clone(&object_proto)), "DataView");
 
         // Needed before any built-in function object is created: every one of
         // them inherits from `Function.prototype`.
@@ -473,6 +484,8 @@ impl Builtins {
             date_prototype: date_proto,
             regexp_prototype: regexp_proto,
             promise_prototype: promise_proto,
+            arraybuffer_prototype: arraybuffer_proto,
+            dataview_prototype: dataview_proto,
         }
     }
 
@@ -507,7 +520,13 @@ impl Builtins {
     /// Removing the `constructor` property is enough: the constructor is only
     /// reachable through it once the realm's `globals` are gone.
     pub fn teardown(&self) {
-        let prototypes: [&Rc<RefCell<dyn JSObject>>; 21] = [
+        // Every prototype whose constructor is linked with
+        // `link_constructor_prototype` (which sets `proto.constructor = ctor`)
+        // must appear here, or the cycle keeps the whole builtins graph alive.
+        // `ArrayBuffer` and `DataView` were missing: `ArrayBuffer` leaked slowly,
+        // and adding `DataView` (16 prototype methods per realm) pushed the
+        // test262 runner past its 4 GB `ulimit -v` — a crash, not a failure.
+        let prototypes: [&Rc<RefCell<dyn JSObject>>; 23] = [
             &self.object_prototype,
             &self.array_prototype,
             &self.error_prototype,
@@ -529,6 +548,8 @@ impl Builtins {
             &self.date_prototype,
             &self.regexp_prototype,
             &self.promise_prototype,
+            &self.arraybuffer_prototype,
+            &self.dataview_prototype,
         ];
         for proto in prototypes {
             let _ = proto
@@ -684,7 +705,7 @@ impl Builtins {
         // *view* over an existing buffer, and `new Uint8Array(4)` one over a fresh
         // one — the prototype comes from `newTarget`, so the builtin layer gets it
         // handed in.
-        let ab_proto = new_proto(Some(Rc::clone(&self.object_prototype)), "ArrayBuffer");
+        let ab_proto = Rc::clone(&self.arraybuffer_prototype);
         let ab_fn_val = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
             "ArrayBuffer",
         ))));
@@ -694,6 +715,15 @@ impl Builtins {
             typedarray::arraybuffer_is_view(args)
         });
         globals.insert("ArrayBuffer".to_string(), ab_fn_val);
+
+        // `DataView` (ES 25.3): a byte-addressable view over an `ArrayBuffer`.
+        let dv_proto = Rc::clone(&self.dataview_prototype);
+        let dv_fn_val = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+            "DataView",
+        ))));
+        typedarray::register_dataview_prototype(&dv_proto);
+        Self::link_constructor_prototype(&dv_fn_val, &dv_proto);
+        globals.insert("DataView".to_string(), dv_fn_val);
 
         for kind in typedarray::TYPED_ARRAY_KINDS {
             let name = kind.name();
@@ -1244,6 +1274,34 @@ pub fn call_prototype_method(
     }
     if typedarray::is_arraybuffer_receiver(obj) && method_name == "slice" {
         return typedarray::ab_slice(obj, args);
+    }
+    if typedarray::is_dataview_receiver(obj) {
+        use typedarray::DataViewType::*;
+        // Only the 8 `get*` / 8 `set*` are DataView-specific; every other method
+        // (`hasOwnProperty`, `toString`, `valueOf`, …) is inherited from
+        // `Object.prototype` and must fall through to the generic dispatch below.
+        let handled = match method_name {
+            "getInt8" => Some(typedarray::dv_get(obj, args, Int8)),
+            "getUint8" => Some(typedarray::dv_get(obj, args, Uint8)),
+            "getInt16" => Some(typedarray::dv_get(obj, args, Int16)),
+            "getUint16" => Some(typedarray::dv_get(obj, args, Uint16)),
+            "getInt32" => Some(typedarray::dv_get(obj, args, Int32)),
+            "getUint32" => Some(typedarray::dv_get(obj, args, Uint32)),
+            "getFloat32" => Some(typedarray::dv_get(obj, args, Float32)),
+            "getFloat64" => Some(typedarray::dv_get(obj, args, Float64)),
+            "setInt8" => Some(typedarray::dv_set(obj, args, Int8)),
+            "setUint8" => Some(typedarray::dv_set(obj, args, Uint8)),
+            "setInt16" => Some(typedarray::dv_set(obj, args, Int16)),
+            "setUint16" => Some(typedarray::dv_set(obj, args, Uint16)),
+            "setInt32" => Some(typedarray::dv_set(obj, args, Int32)),
+            "setUint32" => Some(typedarray::dv_set(obj, args, Uint32)),
+            "setFloat32" => Some(typedarray::dv_set(obj, args, Float32)),
+            "setFloat64" => Some(typedarray::dv_set(obj, args, Float64)),
+            _ => None,
+        };
+        if let Some(result) = handled {
+            return result;
+        }
     }
     match method_name {
         // `Number.prototype.toString([radix])` takes the radix argument.

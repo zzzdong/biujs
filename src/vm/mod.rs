@@ -2205,6 +2205,15 @@ impl VM {
         if name == crate::builtins::typedarray::AB_BYTE_LENGTH_NATIVE {
             return crate::builtins::typedarray::ab_byte_length(&this);
         }
+        if name == crate::builtins::typedarray::DV_BUFFER_NATIVE {
+            return crate::builtins::typedarray::dv_buffer(&this);
+        }
+        if name == crate::builtins::typedarray::DV_BYTE_LENGTH_NATIVE {
+            return crate::builtins::typedarray::dv_byte_length(&this);
+        }
+        if name == crate::builtins::typedarray::DV_BYTE_OFFSET_NATIVE {
+            return crate::builtins::typedarray::dv_byte_offset(&this);
+        }
         // `get Map[Symbol.species]` / `get Set[Symbol.species]` (23.1.2.2,
         // 23.2.2.2) and `get Promise[Symbol.species]` (27.2.2.3) all answer
         // their receiver.
@@ -9881,6 +9890,10 @@ impl VM {
         if name == "ArrayBuffer" {
             let proto = self.prototype_from_constructor(constructor_val, new_target);
             return crate::builtins::typedarray::arraybuffer_construct(args, proto);
+        }
+        if name == "DataView" {
+            let proto = self.prototype_from_constructor(constructor_val, new_target);
+            return crate::builtins::typedarray::dataview_construct(args, proto);
         }
         if let Some(kind) = crate::builtins::typedarray::kind_from_name(name) {
             let proto = self.prototype_from_constructor(constructor_val, new_target);

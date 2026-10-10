@@ -143,6 +143,8 @@ pub enum ObjectKind {
     Buffer,
     /// A TypedArray: an integer-indexed view over an `ArrayBuffer`.
     TypedArray,
+    /// A `DataView`: a byte-addressable view over an `ArrayBuffer` (ES 25.3).
+    DataView,
     /// Native (built-in) function
     NativeFunction,
 }

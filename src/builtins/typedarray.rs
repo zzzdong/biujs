@@ -10,7 +10,8 @@ use std::rc::Rc;
 
 use crate::RuntimeError;
 use crate::vm::object::{
-    ArrayBufferObject, JSObject, NativeFunctionObject, TypedArrayKind, TypedArrayObject,
+    ArrayBufferObject, DataViewObject, JSObject, NativeFunctionObject, TypedArrayKind,
+    TypedArrayObject,
 };
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
@@ -23,6 +24,125 @@ pub const TA_BYTE_LENGTH_NATIVE: &str = "__ta_byte_length__";
 pub const TA_BYTE_OFFSET_NATIVE: &str = "__ta_byte_offset__";
 pub const TA_BUFFER_NATIVE: &str = "__ta_buffer__";
 pub const AB_BYTE_LENGTH_NATIVE: &str = "__ab_byte_length__";
+
+/// `DataView` prototype getter names (reached as accessors, receiver arrives as
+/// `this` — same shape as the TypedArray getters).
+pub const DV_BUFFER_NATIVE: &str = "__dv_buffer__";
+pub const DV_BYTE_LENGTH_NATIVE: &str = "__dv_byte_length__";
+pub const DV_BYTE_OFFSET_NATIVE: &str = "__dv_byte_offset__";
+
+/// Element type of a `DataView` access. Unlike `TypedArrayKind` these read *bytes*
+/// at an absolute offset rather than elements, so the enum only needs the byte
+/// width and the signedness of the integer forms.
+#[derive(Clone, Copy)]
+pub enum DataViewType {
+    Int8,
+    Uint8,
+    Int16,
+    Uint16,
+    Int32,
+    Uint32,
+    Float32,
+    Float64,
+}
+
+impl DataViewType {
+    fn bytes(self) -> usize {
+        match self {
+            Self::Int8 | Self::Uint8 => 1,
+            Self::Int16 | Self::Uint16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Float64 => 8,
+        }
+    }
+
+    /// Decode `data[..size]` (little- or big-endian) as this type.
+    fn read(self, data: &[u8], little_endian: bool) -> f64 {
+        let le = |b: [u8; 8], n: usize| -> [u8; 8] {
+            if little_endian {
+                b
+            } else {
+                let mut out = [0u8; 8];
+                for i in 0..n {
+                    out[i] = b[n - 1 - i];
+                }
+                out
+            }
+        };
+        match self {
+            Self::Int8 => data[0] as i8 as f64,
+            Self::Uint8 => data[0] as f64,
+            Self::Int16 => {
+                i16::from_le_bytes(le([data[0], data[1], 0, 0, 0, 0, 0, 0], 2)[..2].try_into().unwrap())
+                    as f64
+            }
+            Self::Uint16 => {
+                u16::from_le_bytes(le([data[0], data[1], 0, 0, 0, 0, 0, 0], 2)[..2].try_into().unwrap())
+                    as f64
+            }
+            Self::Int32 => {
+                i32::from_le_bytes(le([data[0], data[1], data[2], data[3], 0, 0, 0, 0], 4)[..4].try_into().unwrap())
+                    as f64
+            }
+            Self::Uint32 => {
+                u32::from_le_bytes(le([data[0], data[1], data[2], data[3], 0, 0, 0, 0], 4)[..4].try_into().unwrap())
+                    as f64
+            }
+            Self::Float32 => {
+                f32::from_le_bytes(le([data[0], data[1], data[2], data[3], 0, 0, 0, 0], 4)[..4].try_into().unwrap())
+                    as f64
+            }
+            Self::Float64 => f64::from_le_bytes(le(
+                [
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ],
+                8,
+            )),
+        }
+    }
+
+    /// Encode `value` (after ToNumber) into `data[..size]`, honoring endianness.
+    fn write(self, data: &mut [u8], value: f64, little_endian: bool) {
+        let bits: u64 = match self {
+            Self::Int8 => (value as i8) as u64,
+            Self::Uint8 => (value as u8) as u64,
+            Self::Int16 => (value as i16) as u64,
+            Self::Uint16 => (value as u16) as u64,
+            Self::Int32 => (value as i32) as u64,
+            Self::Uint32 => (value as u32) as u64,
+            Self::Float32 => (value as f32).to_bits() as u64,
+            Self::Float64 => value.to_bits(),
+        };
+        let bytes = bits.to_le_bytes();
+        let n = self.bytes();
+        for i in 0..n {
+            data[i] = if little_endian { bytes[i] } else { bytes[n - 1 - i] };
+        }
+    }
+}
+
+/// `ToIndex` (ES 7.1.22) for a `DataView` offset / length argument: `undefined` /
+/// `NaN` → 0, negatives and values above 2^53-1 are out of range.
+fn to_index(value: Option<&Value>) -> Result<usize, RuntimeError> {
+    let n = match value {
+        None | Some(Value::Undefined) | Some(Value::Null) => 0.0,
+        Some(v) => v.to_number(),
+    };
+    if n.is_nan() {
+        return Ok(0);
+    }
+    if n < 0.0 {
+        return Err(RuntimeError::RangeError(
+            "DataView offset must not be negative".to_string(),
+        ));
+    }
+    if n > 9_007_199_254_740_991.0 {
+        return Err(RuntimeError::RangeError(
+            "DataView offset is too large".to_string(),
+        ));
+    }
+    Ok(n as usize)
+}
 
 /// Every TypedArray constructor the engine provides. `%TypedArray%` itself is
 /// not exposed (`BigInt64Array` / `BigUint64Array` are: BigInt is still absent).
@@ -52,6 +172,32 @@ pub fn is_typedarray_receiver(value: &Value) -> bool {
 pub fn is_arraybuffer_receiver(value: &Value) -> bool {
     matches!(value, Value::Object(obj_ref)
         if obj_ref.borrow().as_any().is::<ArrayBufferObject>())
+}
+
+pub fn is_dataview_receiver(value: &Value) -> bool {
+    matches!(value, Value::Object(obj_ref)
+        if obj_ref.borrow().as_any().is::<DataViewObject>())
+}
+
+fn as_dataview<'a>(
+    this: &'a Value,
+    method: &str,
+) -> Result<std::cell::RefMut<'a, DataViewObject>, RuntimeError> {
+    let Value::Object(obj_ref) = this else {
+        return Err(RuntimeError::TypeError(format!(
+            "{method} called on a non-object"
+        )));
+    };
+    if !obj_ref.borrow().as_any().is::<DataViewObject>() {
+        return Err(RuntimeError::TypeError(format!(
+            "{method} called on an object that is not a DataView"
+        )));
+    }
+    Ok(std::cell::RefMut::map(obj_ref.borrow_mut(), |obj| {
+        obj.as_any_mut()
+            .downcast_mut::<DataViewObject>()
+            .expect("checked above")
+    }))
 }
 
 fn as_typedarray<'a>(this: &'a Value, method: &str) -> Result<std::cell::RefMut<'a, TypedArrayObject>, RuntimeError> {
@@ -129,6 +275,135 @@ fn make_buffer(byte_length: usize, proto: Option<Value>) -> Value {
         buffer.set_prototype(Some(Rc::clone(&p)));
     }
     Value::Object(Rc::new(RefCell::new(buffer)))
+}
+
+/// `new DataView(buffer [, byteOffset [, byteLength]])` (ES 25.3.2.1).
+pub fn dataview_construct(
+    args: &[Value],
+    proto: Option<Value>,
+) -> Result<Value, RuntimeError> {
+    let first = args.first().cloned().unwrap_or(Value::Undefined);
+    if !is_arraybuffer_receiver(&first) {
+        return Err(RuntimeError::TypeError(
+            "DataView requires an ArrayBuffer argument".to_string(),
+        ));
+    }
+    let (buffer_len, buffer_obj) = {
+        let Value::Object(obj_ref) = &first else {
+            unreachable!()
+        };
+        let borrowed = obj_ref.borrow();
+        let Some(buffer) = borrowed.as_any().downcast_ref::<ArrayBufferObject>() else {
+            return Err(RuntimeError::TypeError(
+                "DataView requires an ArrayBuffer argument".to_string(),
+            ));
+        };
+        if buffer.is_detached() {
+            return Err(RuntimeError::TypeError(
+                "DataView cannot view a detached ArrayBuffer".to_string(),
+            ));
+        }
+        (buffer.byte_length(), Rc::clone(obj_ref))
+    };
+    let offset = to_index(args.get(1))?;
+    if offset > buffer_len {
+        return Err(RuntimeError::RangeError(
+            "DataView byteOffset is outside the bounds of the buffer".to_string(),
+        ));
+    }
+    let length = match args.get(2) {
+        None | Some(Value::Undefined) => buffer_len - offset,
+        Some(v) => {
+            let len = to_index(Some(v))?;
+            if offset + len > buffer_len {
+                return Err(RuntimeError::RangeError(
+                    "DataView byteLength is outside the bounds of the buffer".to_string(),
+                ));
+            }
+            len
+        }
+    };
+    let mut dv = DataViewObject::new(Rc::clone(&buffer_obj), offset, length, None);
+    if let Some(Value::Object(p)) = proto {
+        dv.set_prototype(Some(Rc::clone(&p)));
+    }
+    Ok(Value::Object(Rc::new(RefCell::new(dv))))
+}
+
+// ── getters ──────────────────────────────────────────────────────────────────
+
+/// Validate `this` is a live (non-detached) DataView, returning the borrowed view.
+/// The getters all throw on a detached buffer (ES 25.3.1.3-5).
+fn as_live_dataview<'a>(
+    this: &'a Value,
+) -> Result<std::cell::RefMut<'a, DataViewObject>, RuntimeError> {
+    let dv = as_dataview(this, "DataView getter")?;
+    if dv.is_detached() {
+        return Err(RuntimeError::TypeError(
+            "DataView access after detachment".to_string(),
+        ));
+    }
+    Ok(dv)
+}
+
+pub fn dv_buffer(this: &Value) -> Result<Value, RuntimeError> {
+    Ok(Value::Object(Rc::clone(&as_live_dataview(this)?.buffer)))
+}
+
+pub fn dv_byte_length(this: &Value) -> Result<Value, RuntimeError> {
+    Ok(Value::Number(as_live_dataview(this)?.byte_length as f64))
+}
+
+pub fn dv_byte_offset(this: &Value) -> Result<Value, RuntimeError> {
+    Ok(Value::Number(as_live_dataview(this)?.byte_offset as f64))
+}
+
+/// `getInt8(byteOffset, littleEndian?)` … `getFloat64(byteOffset, littleEndian?)`:
+/// decode `size` bytes from `buffer[byteOffset + byteOffset ..]` honoring endianness.
+pub fn dv_get(this: &Value, args: &[Value], ty: DataViewType) -> Result<Value, RuntimeError> {
+    let dv = as_live_dataview(this)?;
+    let offset = to_index(args.first())?;
+    let size = ty.bytes();
+    if offset + size > dv.byte_length {
+        return Err(RuntimeError::RangeError(
+            "DataView read is outside the bounds of the buffer".to_string(),
+        ));
+    }
+    let little = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+    let buffer = dv.buffer.borrow();
+    let Some(abuf) = buffer.as_any().downcast_ref::<ArrayBufferObject>() else {
+        return Err(RuntimeError::TypeError(
+            "DataView buffer is not an ArrayBuffer".to_string(),
+        ));
+    };
+    let at = dv.byte_offset + offset;
+    let data = abuf.data();
+    Ok(Value::Number(ty.read(&data[at..at + size], little)))
+}
+
+/// `setInt8(byteOffset, value, littleEndian?)` … `setFloat64(…)`: the inverse of
+/// `dv_get`.
+pub fn dv_set(this: &Value, args: &[Value], ty: DataViewType) -> Result<Value, RuntimeError> {
+    let dv = as_live_dataview(this)?;
+    let offset = to_index(args.first())?;
+    let size = ty.bytes();
+    if offset + size > dv.byte_length {
+        return Err(RuntimeError::RangeError(
+            "DataView write is outside the bounds of the buffer".to_string(),
+        ));
+    }
+    let value = args.get(1).cloned().unwrap_or(Value::Undefined).to_number();
+    let little = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+    let mut buffer = dv.buffer.borrow_mut();
+    let Some(abuf) = buffer.as_any_mut().downcast_mut::<ArrayBufferObject>() else {
+        return Err(RuntimeError::TypeError(
+            "DataView buffer is not an ArrayBuffer".to_string(),
+        ));
+    };
+    let at = dv.byte_offset + offset;
+    let data = abuf.data_mut();
+    ty.write(&mut data[at..at + size], value, little);
+    Ok(Value::Undefined)
 }
 
 /// The numbers a TypedArray constructor should copy: the elements of another
@@ -499,12 +774,11 @@ pub fn ab_slice(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(new_buffer)
 }
 
-/// `ArrayBuffer.isView(value)` — TypedArray and DataView both count; DataView is
-/// not implemented yet, so only the former can answer `true`.
+/// `ArrayBuffer.isView(value)` — TypedArray and DataView both count.
 pub fn arraybuffer_is_view(args: &[Value]) -> Result<Value, RuntimeError> {
-    Ok(Value::Bool(
-        args.first().is_some_and(is_typedarray_receiver),
-    ))
+    Ok(Value::Bool(args.first().is_some_and(|v| {
+        is_typedarray_receiver(v) || is_dataview_receiver(v)
+    })))
 }
 
 /// `start` as an index into `[0, length]`, clamping the way `Array.prototype`
@@ -529,6 +803,52 @@ pub fn register_arraybuffer_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("byteLength"),
         accessor(AB_BYTE_LENGTH_NATIVE),
+    );
+}
+
+/// `DataView.prototype`: the 8 `get*` / 8 `set*` methods and the three accessors
+/// (`buffer` / `byteLength` / `byteOffset`).
+pub fn register_dataview_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+    use super::set_prototype_method;
+    let get_types: [(DataViewType, &str); 8] = [
+        (DataViewType::Int8, "getInt8"),
+        (DataViewType::Uint8, "getUint8"),
+        (DataViewType::Int16, "getInt16"),
+        (DataViewType::Uint16, "getUint16"),
+        (DataViewType::Int32, "getInt32"),
+        (DataViewType::Uint32, "getUint32"),
+        (DataViewType::Float32, "getFloat32"),
+        (DataViewType::Float64, "getFloat64"),
+    ];
+    for (ty, name) in get_types {
+        let ty = ty;
+        set_prototype_method(proto, name, move |this, args| dv_get(this, args, ty));
+    }
+    let set_types: [(DataViewType, &str); 8] = [
+        (DataViewType::Int8, "setInt8"),
+        (DataViewType::Uint8, "setUint8"),
+        (DataViewType::Int16, "setInt16"),
+        (DataViewType::Uint16, "setUint16"),
+        (DataViewType::Int32, "setInt32"),
+        (DataViewType::Uint32, "setUint32"),
+        (DataViewType::Float32, "setFloat32"),
+        (DataViewType::Float64, "setFloat64"),
+    ];
+    for (ty, name) in set_types {
+        let ty = ty;
+        set_prototype_method(proto, name, move |this, args| dv_set(this, args, ty));
+    }
+    let _ = proto.borrow_mut().define_property(
+        PropertyKey::from_str("buffer"),
+        accessor(DV_BUFFER_NATIVE),
+    );
+    let _ = proto.borrow_mut().define_property(
+        PropertyKey::from_str("byteLength"),
+        accessor(DV_BYTE_LENGTH_NATIVE),
+    );
+    let _ = proto.borrow_mut().define_property(
+        PropertyKey::from_str("byteOffset"),
+        accessor(DV_BYTE_OFFSET_NATIVE),
     );
 }
 

@@ -27,6 +27,8 @@ mod const_var_test;
 mod control_flow;
 #[path = "features/coercion_errors.rs"]
 mod coercion_errors;
+#[path = "features/dataview.rs"]
+mod dataview;
 #[path = "features/destructuring.rs"]
 mod destructuring;
 #[path = "features/debug_instanceof.rs"]
