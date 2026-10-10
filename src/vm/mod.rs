@@ -666,14 +666,13 @@ impl VM {
             let op = op.split([' ', '{']).next().unwrap_or("?");
             let _ = writeln!(
                 w,
-                "step={} pc={} op={} rsp={} rbp={} frames={} reg_saves={}",
+                "step={} pc={} op={} rsp={} rbp={} frames={}",
                 self.steps,
                 self.state.pc(),
                 op,
                 self.state.rsp,
                 self.state.rbp,
                 self.state.frames.len(),
-                self.state.reg_saves.len(),
             );
         });
         // A spent guard ends the run for good: JS may catch the `RangeError`,
@@ -1452,7 +1451,6 @@ impl VM {
         self.invoke_boundaries.push(boundary);
         // `PushC`/`PopC` 的保存项也需要一个水位：异常逃出被调帧时，它自己那几条
         // 没来得及 `PopC` 的项必须丢掉 —— 否则外层之后会 `PopC` 到过期的 `rsp`/`rbp`。
-        let saved_reg_saves = self.state.reg_saves.len();
 
         // Push the arguments and open the callee's frame at the new stack top,
         // using the same convention as the `Call`/`CallEx` opcodes (arg0 ends up
@@ -1537,7 +1535,6 @@ impl VM {
         // 正常返回时被调帧自己已经 `PopC` 干净了；异常逃出去的那条路上没有 ——
         // 所以在这里把它的保存项都丢掉。没有这一步，一个 *接住* 异常并继续
         // 在同一帧里跑的原生（`Promise` 的执行器）会 `PopC` 到过期的 `rbp`。
-        self.state.reg_saves.truncate(saved_reg_saves);
         // 调用方的 `pc` / `this` / `func` / `argc` / `new.target` / **窗口基址** 都由
         // 下面这条 `frames.truncate(boundary)` 一起恢复 —— 它们全在帧里。
         //
@@ -2742,36 +2739,6 @@ impl VM {
                 let value = self.state.pop()?;
                 self.set_value(dst, value)?;
             }
-            Instr::PushC { src } => match src {
-                Operand::Register(Register::Rsp) => {
-                    self.state.save_reg(self.state.rsp)?;
-                }
-                // `rbp` 这一支已经是死的（M2-2a 第 4 步：收尾不再搬 `rbp`，
-                // 5 个调用发射点只发了 `pushc rsp` / `popc rsp`）。留着是因为
-                // `PushC` 的操作数是通用 `Operand`，收窄要动指令形状（五层）；
-                // 等 M2-3 把 `rsp` 也收进帧，这两个 op 会一起退役。
-                Operand::Register(Register::Rbp) => {
-                    self.state.save_reg(self.state.rbp)?;
-                }
-                _ => {
-                    return Err(RuntimeError::TypeError(format!(
-                        "unsupported PushC operand: {inst}"
-                    )));
-                }
-            },
-            Instr::PopC { dst } => match dst {
-                Operand::Register(Register::Rsp) => {
-                    self.state.rsp = self.state.restore_reg()?;
-                }
-                Operand::Register(Register::Rbp) => {
-                    self.state.rbp = self.state.restore_reg()?;
-                }
-                _ => {
-                    return Err(RuntimeError::TypeError(format!(
-                        "unsupported PopC operand: {inst}"
-                    )));
-                }
-            },
             Instr::AddC { dst, src, value } => match (dst, src) {
                 (Operand::Register(Register::Rsp), Operand::Register(Register::Rsp)) => {
                     self.state.rsp += value.as_immd() as usize;
@@ -3832,7 +3799,6 @@ impl VM {
                     delayed_jump_target: None,
                     delayed_return: false,
                     saved_closure_depth: self.state.closure_var_stack.len(),
-                    saved_reg_saves: self.state.reg_saves.len(),
                     saved_frame_depth: self.state.frames.len(),
                 };
                 self.state.seh_stack.push(record);
@@ -7890,7 +7856,6 @@ impl VM {
                 // "数组字面量里夹一次会抛异常的调用" 直接报 `ArrayPush on non-object`）。
                 // **切片 1b 之前这件事是顺手做的**（帧的簿记与 `PushC` 的簿记同挤在
                 // 一条 `ctrl_stack` 上，一次 truncate 清两样）—— 分开之后必须显式记。
-                self.state.reg_saves.truncate(record.saved_reg_saves);
                 self.unwind_frames_to(
                     record.saved_frame_depth,
                     record.saved_closure_depth,
@@ -10132,7 +10097,6 @@ struct Frame {
     ///
     /// 与 `base` 同理，是**出生参数**：`rsp` 在帧内会随压栈/出栈一路走，所以
     /// "该退回到多少"只有开帧这一刻知道。现在它由帧回答，不必再靠 `PushC`/`PopC`
-    /// 往控制栈（`reg_saves`）上搬一份 —— 那份正是本刀要拆掉的东西。
     ///
     /// **注意与 `base` 的一处不同**：`base` 是"本帧自己的窗口基址"，所以退栈后取
     /// **留下来的那一帧**的 `base`；而这里是"退回到多少"，要取**被弹出的那一帧**
@@ -10171,7 +10135,6 @@ struct Frame {
 /// VM execution state
 struct State {
     data_stack: Vec<Value>,
-    reg_saves: Vec<usize>,
     registers: [Value; 19],
     seh_stack: Vec<SehRecord>,
     /// The script's globals — shared with the `globalThis` object (see
@@ -10227,7 +10190,6 @@ impl State {
         )));
         Self {
             data_stack: Vec::with_capacity(1024),
-            reg_saves: Vec::with_capacity(256),
             registers: std::array::from_fn(|_| Value::Undefined),
             seh_stack: Vec::new(),
             globals,
@@ -10354,17 +10316,6 @@ impl State {
         }
         self.rsp -= 1;
         Ok(self.data_stack[self.rsp].clone())
-    }
-
-    fn save_reg(&mut self, value: usize) -> Result<(), RuntimeError> {
-        self.reg_saves.push(value);
-        Ok(())
-    }
-
-    fn restore_reg(&mut self) -> Result<usize, RuntimeError> {
-        self.reg_saves
-            .pop()
-            .ok_or_else(|| RuntimeError::RangeError("control stack underflow".to_string()))
     }
 
     /// Make sure slot `index` is addressable, growing the (lazy) value stack.
@@ -10638,7 +10589,6 @@ struct SehRecord {
     delayed_return: bool,
     /// saved closure var stack depth when return was deferred by finally
     saved_closure_depth: usize,
-    /// `reg_saves` 的长度在进入这条 `try` 时的值。
     ///
     /// **为什么必须单独记**：以前帧的簿记与 `PushC`/`PopC` 的簿记挤在同一条
     /// `ctrl_stack` 上，所以 `unwind_frames_to` 里一次 `truncate(saved_ctrl_depth)`
@@ -10648,7 +10598,6 @@ struct SehRecord {
     /// 直接报 `ArrayPush on non-object`）。
     ///
     /// ⇒ **一条记录要记两个水位，因为它们现在是两条独立的栈。**
-    saved_reg_saves: usize,
     /// **帧深度**（`frames.len()`）在进入这条 `try` 时的值。
     ///
     /// 嵌套调用里抛出的异常必须先把那些帧收掉再跑处理器：否则处理器的帧身份
@@ -10861,7 +10810,6 @@ mod tests {
         let state = State::new();
         assert_eq!(state.rsp, 0);
         assert_eq!(state.rbp, 0);
-        assert!(state.reg_saves.is_empty());
         assert!(state.seh_stack.is_empty());
         assert!(state.globals.borrow().is_empty());
     }
@@ -10893,22 +10841,6 @@ mod tests {
     fn test_state_pop_underflow() {
         let mut state = State::new();
         let result = state.pop();
-        assert!(matches!(result, Err(RuntimeError::RangeError(_))));
-    }
-
-    #[test]
-    fn test_state_save_restore_reg() {
-        let mut state = State::new();
-        state.save_reg(100).unwrap();
-        state.save_reg(200).unwrap();
-        assert_eq!(state.restore_reg().unwrap(), 200);
-        assert_eq!(state.restore_reg().unwrap(), 100);
-    }
-
-    #[test]
-    fn test_state_restore_reg_underflow() {
-        let mut state = State::new();
-        let result = state.restore_reg();
         assert!(matches!(result, Err(RuntimeError::RangeError(_))));
     }
 

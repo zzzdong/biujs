@@ -369,7 +369,7 @@ pub enum Kind {
     /// 挂起当前帧、把控制权交回 resumer：`Yield` / `Await`。
     Suspend,
     /// 栈指针簿记（`rsp` 的编译期维护），不参与 JS 值流：
-    /// `PushC` / `PopC` / `AddC` / `SubC`。
+    /// `AddC` / `SubC`。
     Bookkeeping,
 }
 
@@ -795,8 +795,6 @@ define_instrs! {
         DeclareLexical { name: n },
         Push { src: r },
         Pop { dst: w },
-        PushC { src: n } @Bookkeeping,
-        PopC { dst: n } @Bookkeeping,
         Jump { offset: jr } @Jump,
         DelegateOpen { iter: r },
         DelegateClose { iter: n },
@@ -924,10 +922,6 @@ pub enum Opcode {
     Push,
     /// pop dst
     Pop,
-    /// pushc offset
-    PushC,
-    /// popc dst
-    PopC,
     /// addc offset
     AddC,
     /// subc offset
@@ -1118,8 +1112,6 @@ impl fmt::Display for Opcode {
             Opcode::Halt => write!(f, "halt"),
             Opcode::Push => write!(f, "push"),
             Opcode::Pop => write!(f, "pop"),
-            Opcode::PushC => write!(f, "pushc"),
-            Opcode::PopC => write!(f, "popc"),
             Opcode::AddC => write!(f, "addc"),
             Opcode::SubC => write!(f, "subc"),
             Opcode::Call => write!(f, "call"),
@@ -1811,13 +1803,13 @@ mod tests {
     /// 它同时也是"标记没被手滑删掉"的守卫 —— 删掉一个 `@Call`，这里立刻红。
     #[test]
     fn kind_markers_cover_the_table() {
-        assert_eq!(Instr::ALL.len(), 92, "表里的指令条数");
+        assert_eq!(Instr::ALL.len(), 90, "表里的指令条数");
         assert_eq!(count_of(Kind::Call), 8, "Call* / New*");
         assert_eq!(count_of(Kind::Jump), 4, "Jump / BrIf / DelayedJump / ResumeExc");
         assert_eq!(count_of(Kind::Return), 2, "Ret / Halt");
         assert_eq!(count_of(Kind::Throw), 1, "ThrowExc");
         assert_eq!(count_of(Kind::Suspend), 3, "Yield / Await / PrologueEnd");
-        assert_eq!(count_of(Kind::Bookkeeping), 4, "PushC / PopC / AddC / SubC");
+        assert_eq!(count_of(Kind::Bookkeeping), 2, "AddC / SubC");
         // 其余全是 Normal；没有兜底分支的 kind() 保证"没标"就是 Normal。
         let marked = count_of(Kind::Call)
             + count_of(Kind::Jump)
