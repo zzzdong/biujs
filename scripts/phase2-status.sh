@@ -111,14 +111,51 @@ echo "   护栏：单例 ${TEST262_TIMEOUT_MS}ms / ${TEST262_STEP_LIMIT:-默认}
 CHUNK_FILES=""
 RUN_STATUS=0
 INDEX=0
+# 并行跑各片（并发度 `TEST262_JOBS`，默认核数）。
+#
+# 每片仍然是**独立进程** —— 这一点是刻意保留的，不是偷懒：内存护栏是一个**进程级
+# 全局分配器**（`BUDGET_BYTES` 按用例装填，`ALLOCATOR.live` 全进程计数，预算是"当前
+# 活跃字节 + 每用例额度"的增量）。改成多线程 worker 会让所有 worker 共用同一个预算和
+# 同一个活跃计数，于是 A 用例的分配被算到 B 用例头上 —— 护栏要么误报要么漏报。
+# 进程隔离本来就是这套护栏成立的前提，所以并行只能加在进程这一层。
+# 默认 **串行**（`TEST262_JOBS=1`）：实测 4 片并发（4 核）**更慢** —— 512s vs 串行
+# 452s，而且护栏计数漂了（timeout 7→11、memory 22→18；头条数字 16567/7843/3141
+# 两次一致）。两个原因：
+#   1. 分片是按"套件在 `SUITES` 里的位置"切的，而套件大小极不均衡（`built-ins/Array`
+#      一家三千多条），所以并发的墙钟≈最大的那一片，大部分核在等这一片；
+#   2. 4 个进程抢 CPU，靠墙钟判定的 timeout 护栏开始误伤 —— 于是"内存护栏"里的
+#      用例改在"超时护栏"里失败。头条不变，但护栏分类不再可比。
+# 想真加速，得先把工作量切匀（按用例数而不是按套件位置切），再谈并发。
+JOBS="${TEST262_JOBS:-1}"
+# 直接跑编译好的二进制，而不是 `cargo test`：并发调用 cargo 会抢 target 目录的
+# 构建锁，实测会退化成串行 —— 并行白做。
+cargo test --release --test test262_runner --no-run >/dev/null 2>&1
+RUNNER_BIN="$(ls -t target/release/deps/test262_runner-* 2>/dev/null | grep -v '\.d$' | head -1)"
+if [ -z "$RUNNER_BIN" ]; then
+  echo "找不到 test262_runner 二进制（先 cargo test --release --test test262_runner --no-run）。" >&2
+  exit 1
+fi
 while [ "$INDEX" -lt "$TEST262_CHUNKS" ]; do
   OUT="$TMP/full-chunk-$INDEX.txt"
   CHUNK_FILES="$CHUNK_FILES $OUT"
   ( ulimit -v "$MEM_LIMIT_KB"
     timeout --signal=TERM "$TEST262_HARD_TIMEOUT" \
       env TEST262_FAILURES=0 TEST262_CHUNKS="$TEST262_CHUNKS" TEST262_CHUNK_INDEX="$INDEX" \
-        cargo test --release --test test262_runner -- --nocapture ) > "$OUT" 2>&1
-  STATUS=$?
+        "$RUNNER_BIN" --nocapture
+    # 后台作业的退出码只能这样回收：`wait` 拿到的是汇总值。
+    echo $? > "$OUT.status" ) > "$OUT" 2>&1 &
+  INDEX=$((INDEX + 1))
+  while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do
+    wait -n 2>/dev/null || true
+  done
+done
+wait
+
+# 收尾检查：并发时退出码统一在这里判读（与串行时逐片判断的行为一致）。
+INDEX=0
+while [ "$INDEX" -lt "$TEST262_CHUNKS" ]; do
+  OUT="$TMP/full-chunk-$INDEX.txt"
+  STATUS="$(cat "$OUT.status" 2>/dev/null || echo 1)"
   if [ "$STATUS" = "124" ] || [ "$STATUS" = "143" ]; then
     echo "第 $INDEX 片超过硬超时 ${TEST262_HARD_TIMEOUT}s 被中止。" >&2
     echo "先看卡在哪个用例：TEST262_TIMINGS=1 复跑看最慢的十条，或 BIUJS_TEST262_TRACE=1 看最后一行。" >&2

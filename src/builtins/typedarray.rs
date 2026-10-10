@@ -104,12 +104,12 @@ impl DataViewType {
     /// Encode `value` (after ToNumber) into `data[..size]`, honoring endianness.
     fn write(self, data: &mut [u8], value: f64, little_endian: bool) {
         let bits: u64 = match self {
-            Self::Int8 => (value as i8) as u64,
-            Self::Uint8 => (value as u8) as u64,
-            Self::Int16 => (value as i16) as u64,
-            Self::Uint16 => (value as u16) as u64,
-            Self::Int32 => (value as i32) as u64,
-            Self::Uint32 => (value as u32) as u64,
+            Self::Int8 => to_int_n(value, 8, true),
+            Self::Uint8 => to_int_n(value, 8, false),
+            Self::Int16 => to_int_n(value, 16, true),
+            Self::Uint16 => to_int_n(value, 16, false),
+            Self::Int32 => to_int_n(value, 32, true),
+            Self::Uint32 => to_int_n(value, 32, false),
             Self::Float32 => (value as f32).to_bits() as u64,
             Self::Float64 => value.to_bits(),
         };
@@ -123,6 +123,26 @@ impl DataViewType {
 
 /// `ToIndex` (ES 7.1.22) for a `DataView` offset / length argument: `undefined` /
 /// `NaN` → 0, negatives and values above 2^53-1 are out of range.
+/// ES 7.1.6–7.1.9 `ToInt8` / `ToUint8` / `ToInt16` / `ToUint16` / `ToInt32` / `ToUint32`.
+///
+/// All six share one shape: `NaN`, `±0` and `±∞` become `0`; otherwise the value is
+/// truncated toward zero and taken modulo `2**bits`, and the signed variants
+/// re-interpret results ≥ `2**(bits-1)` as negative. Rust's `as` cast does
+/// *neither* — it saturates — which is why `setInt8(0, 300)` used to write `127`
+/// instead of `44`, and `setUint8(0, -1)` wrote `0` instead of `255`.
+fn to_int_n(value: f64, bits: u32, signed: bool) -> u64 {
+    if value.is_nan() || value.is_infinite() || value == 0.0 {
+        return 0;
+    }
+    let modulus = (1u64 << bits) as f64;
+    let wrapped = value.trunc().rem_euclid(modulus);
+    if signed && wrapped >= modulus / 2.0 {
+        (wrapped - modulus) as i64 as u64
+    } else {
+        wrapped as u64
+    }
+}
+
 fn to_index(value: Option<&Value>) -> Result<usize, RuntimeError> {
     let n = match value {
         None | Some(Value::Undefined) | Some(Value::Null) => 0.0,

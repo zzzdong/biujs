@@ -86,6 +86,27 @@ fn out_of_bounds_and_bad_args() {
 }
 
 #[test]
+fn set_coerces_values_per_es_not_per_rust() {
+    // `set*` 走的是 ES 的 `ToInt8` / `ToUint8` / …：先向零取整，再对 `2**bits` 取模
+    // （有符号的把 ≥ 2**(bits-1) 的结果解释为负数），而 `NaN` / `±0` / `±∞` 都是 0。
+    // Rust 的 `as` 是**饱和**转换，两者完全不同 —— `setInt8(0, 300)` 用 `as` 会写出
+    // `127`，规范是 `300 mod 256 = 44`。
+    assert_eq!(
+        eval_string(
+            "var dv = new DataView(new ArrayBuffer(8));
+             var r = [];
+             dv.setInt8(0, 300);    r.push(dv.getUint8(0));  // 44
+             dv.setUint8(1, -1);    r.push(dv.getUint8(1));  // 255
+             dv.setInt8(2, NaN);    r.push(dv.getUint8(2));  // 0
+             dv.setInt16(4, 32768); r.push(dv.getInt16(4));  // -32768
+             dv.setUint8(6, 255.9); r.push(dv.getUint8(6));  // 255（向零取整）
+             r.join(',')"
+        ),
+        "44,255,0,-32768,255"
+    );
+}
+
+#[test]
 fn writes_land_in_the_underlying_buffer() {
     // A DataView is a window, not a copy: a byte written through it shows up in
     // the buffer (and in a sibling TypedArray view).
