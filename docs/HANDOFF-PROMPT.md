@@ -22,9 +22,9 @@
 
 **当前最该做的（按优先级）：**
 
-- P0-4：拆分 `src/vm/mod.rs`（11269 行，占全库 28%）。切分方案已在 `docs/PLAN.md` §3 列好
-  （`frame.rs` / `exec.rs` / `call.rs` / `exception.rs` / `generator.rs` / `state.rs` /
-  `builtins_dispatch.rs`）。纪律：**纯移动不改逻辑，每移动一个模块跑一次全量确认零回退**。
+- P0-4：拆分 `src/vm/mod.rs`（原 11269 行，已拆到 `mod.rs` 6288 + `exec.rs` 3404 + `proxy.rs` 748
+  + `builtins_dispatch.rs` 1083）。切分方案与拆分现状见 `docs/PLAN.md` §3。纪律：**纯移动不改逻辑，
+  每移动一个模块跑一次全量确认零回退**（更细的 `frame.rs` / `call.rs` 等切分属收尾，可顺手做）。
 - P1：把 `Rc<RefCell<dyn JSObject>>` 换成 `Heap` + `Gc<T>` 句柄。动机很实在：现在没有 GC，
   环要靠 `Builtins::teardown()` 里一条**写死的 23 项清单**手工断，漏一项就会每条 test262
   用例漏一整个 realm，最终撞穿 4GB `ulimit` 让进程 SIGABRT（真实发生过）。

@@ -29,7 +29,13 @@ IR（SSA 形态 + CFG）──────────────────�
 
 ## 2. 虚拟机
 
-`src/vm/mod.rs`（**11269 行，占全库 28%** —— 目前最该拆的文件）。
+`src/vm/mod.rs`（**6288 行**，已从 11269 行拆出 —— 见下方"拆分现状"），外加同目录的子模块：
+
+- `src/vm/exec.rs`（**3404 行**）：`step`（`Halt` / `Ret` 之外全部指令用它分派）、`to_primitive`、`enter_call` / `invoke*` / `open_frame` / `drive_bytecode_frame`、`json_*`、`run_instruction` 与 17 个 `run_<group>`。
+- `src/vm/proxy.rs`（748 行）：`Proxy` 对象与 `proxy_static_trap` 等 9 个静态 trap 钩子。
+- `src/vm/builtins_dispatch.rs`（1083 行）：按名字字符串的内建分派（arity 表 / 前缀约定 / 旁路名单）。
+
+> 拆分现状（2026-10-11）：P0-4 已拆完三步 —— `run_instruction` 的 1740 行巨型 match 先按语义切成 17 个 `run_<group>`，再把 Proxy（`proxy_static_trap` 等）与内建分派搬出，最后把整个执行循环（`step` + `run_*`）搬进 `exec.rs` 子模块。mod.rs 由 11269 行降到 6288 行。逻辑未改，全量零回退（16567 / 7843 / 3141，护栏 7/0/22）。
 
 ### 2.1 状态
 
@@ -118,7 +124,7 @@ pub enum Value {
 | 2 | 闭包是 `HashMap<String, Value>` 的**创建时快照** | "闭包共享可变单元"不成立（`counter()` 仍返回 `0,0,0`）—— 这是**语义 bug**，不是性能问题 |
 | 3 | 内建分派按名字字符串 | arity 表 / 前缀约定 / 旁路名单；加一个原型方法要动多处 |
 | 4 | `Value::Function(u32)` 双表示 | `strict_eq` 特判、`materialize_function`、`callable_func_id` |
-| 5 | `src/vm/mod.rs` 11269 行 | 单文件过大，改动定位与 review 都困难 |
+| 5 | `src/vm/mod.rs` 曾 11269 行（现已拆到 6288 行 + `exec.rs` 3404 行） | 单文件过大，改动定位与 review 都困难 |
 | 6 | 属性存储是 `HashMap<String, Value>` | 属性访问是哈希查找；没有 shape / 内联缓存 |
 
 > 说明：`Value` 是否要做 NaN-boxing（8 B 定长）曾经被列为里程碑。**现已判定为可选**：

@@ -26,7 +26,7 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 | P0-1 | 删 `Instr::Call` 死 arm（唯一生产者 `IrBuilder::call_function` 已无调用方） | 编译通过、全量零回退 |
 | P0-2 | `AddC`/`SubC` 退役：让帧真正拥有一段栈窗口（开帧时按 `stack_size` 划好，收帧自动回收） | 全量零回退；`Bookkeeping` 归零 |
 | P0-3 | 删 `invoke_boundaries`；`tests/test262_runner.rs` 的 256 MB 栈恢复默认 | 全量零回退、护栏计数不增 |
-| P0-4 | **拆分 `src/vm/mod.rs`（11269 行，占全库 28%）** | 见 §3 |
+| P0-4 | **拆分 `src/vm/mod.rs`** —— 已从 11269 行拆到 `mod.rs` 6288 + `exec.rs` 3404 + `proxy.rs` 748 + `builtins_dispatch.rs` 1083，逻辑未改、全量零回退（§3.4 收尾可选） | 见 §3 |
 | P0-5 | 生成器两处自装帧与 `open_frame` 合并 | 全量零回退 |
 
 ### P1 — 消环：堆 + 句柄（M3）
@@ -73,7 +73,7 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 
 ## 3. 拆分 `src/vm/mod.rs`（P0-4）
 
-**实测**（2026-10-11）：11269 行，**229 个函数**。最大的几个：
+**实测**（2026-10-11，拆分前）：11269 行，**229 个函数**。最大的几个：
 
 | 行数 | 函数 | 说明 |
 |---|---|---|
@@ -102,6 +102,11 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 `call_native_by_name`（436）、`try_array_callback_method`（376）、
 `proxy_static_trap`（343）各自成文件/模块。
 
+> **已完成**（2026-10-11）：`proxy_static_trap` 等 9 个 trap 钩子与 `Proxy` 对象
+> 整体搬到 `src/vm/proxy.rs`；按名字字符串的内建分派（arity 表 / 前缀约定 /
+> 旁路名单）搬到 `src/vm/builtins_dispatch.rs`。逻辑未改，全量零回退。
+> 下一步 `vm/call.rs` 等更细的职责切分**暂未做**（见 §3.4）。
+
 ### 3.3 第三步：按职责切文件
 
 | 建议模块 | 内容 |
@@ -116,6 +121,28 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 
 先在**同一个 crate 内**分 `mod` 文件，不要动 `pub` 边界。
 **每移动一个模块跑一次全量确认零回退。**
+
+### 3.4 拆分现状与收尾
+
+**已完成**（2026-10-11，纯移动、逻辑未改、全量零回退）：
+
+1. `run_instruction` 的 1740 行巨型 match 按 `Kind` / 语义切成 **17 个 `run_<group>`**
+   （实际分组：`suspend` / `call` / `jump` / `stack` / `load` / `arith` / `compare` /
+   `type` / `iteration` / `call_spread` / `convert` / `array` / `object` / `exception` /
+   `construct` / `function` / `halt`），`run_instruction` 只剩一张"指令 → 组"的分派表。
+2. Proxy（`proxy_static_trap` 等）与内建分派搬出 → `proxy.rs` / `builtins_dispatch.rs`。
+3. 整个执行循环（`step` + `run_instruction` + 17 个组）搬出 → `exec.rs`（3404 行）。
+
+**结果**：`src/vm/mod.rs` 由 **11269 行降到 6288 行**（−44%）。
+
+**收尾可选**（不再阻塞 P0-4 验收）：§3.3 表里更细的 `frame.rs` / `call.rs` /
+`exception.rs` / `generator.rs` / `state.rs` 切分 —— 它们只是把剩余的方法按职责归并，
+纯移动、每步跑全量即可。鉴于 mod.rs 已减半、且更细的切分边际收益递减，可留待顺手做。
+
+> 验证提醒：搬文件会改变方法可见性（私有方法对父模块不可见），所以搬出去的方法要加
+> `pub(crate)`、出现在它们签名里的枚举（`FrameMode` / `Control` / `CallArgs` /
+> `CalleeKind`）也要提为 `pub(crate)`。bytecode.rs 的元测试直接读 VM 源码取证，范围
+> 从单文件变成 `vm/dispatch_sources()` 列表，漏掉一个文件覆盖断言立刻报出来。
 
 ## 4. 两条待定的语义 bug（属于"修 bug"，不是重构）
 
