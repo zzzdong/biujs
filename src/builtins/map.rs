@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{JSObject, MapObject, NativeFunctionObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
@@ -114,7 +115,7 @@ pub fn map_clear(this: &Value, _args: &[Value]) -> Result<Value, RuntimeError> {
 /// prototype methods, but the VM intercepts all four (see
 /// `VM::try_map_method`): they either call a user callback or mint an iterator
 /// object, and neither is possible from this layer.
-pub fn register_map_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_map_prototype(proto: &Gc<Object>, heap: &mut Heap) {
 
     // Every method carries the Map-specific dispatch prefix: they either call
     // a user callback / mint an iterator (`forEach`, `entries`, `keys`,
@@ -135,11 +136,11 @@ pub fn register_map_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
         "getOrInsert",
         "getOrInsertComputed",
     ] {
-        super::set_map_method(proto, name);
+        super::set_map_method(proto, heap, name);
     }
 
     // `size` is an accessor (ES 23.1.3.9): a getter with no setter.
-    let getter = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+    let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
         MAP_SIZE_NATIVE,
     ))));
     let _ = proto.borrow_mut().define_property(

@@ -12,10 +12,8 @@
 //! traps that must (`get` / `set` / `has` / `deleteProperty` / `apply` /
 //! `construct`) are dispatched by the VM before control ever reaches them.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::RuntimeError;
+use crate::vm::gc::{Heap, Object};
 use crate::vm::object::{NativeFunctionObject, ProxyObject};
 use crate::vm::value::Value;
 
@@ -43,7 +41,11 @@ pub const TRAPS: [&str; 13] = [
 /// Both arguments must be objects and neither is coerced — that is the whole of
 /// the constructor's own logic; the object it answers is inert until something
 /// operates on it, and every such operation is a trap lookup.
-pub fn proxy_construct(target: Value, handler: Value) -> Result<Value, RuntimeError> {
+pub fn proxy_construct(
+    heap: &mut Heap,
+    target: Value,
+    handler: Value,
+) -> Result<Value, RuntimeError> {
     if !target.is_object() {
         return Err(RuntimeError::TypeError(
             "Cannot create proxy with a non-object as target".to_string(),
@@ -58,7 +60,7 @@ pub fn proxy_construct(target: Value, handler: Value) -> Result<Value, RuntimeEr
     // answers the *target's* (ES 10.5.20). The base therefore only matters once
     // the proxy is revoked — and then every operation throws anyway.
     let proto = crate::builtins::wrapper_prototype("Object");
-    Ok(Value::Object(Rc::new(RefCell::new(ProxyObject::new(
+    Ok(Value::Object(heap.alloc(Object::Proxy(ProxyObject::new(
         target, handler, proto,
     )))))
 }
@@ -70,9 +72,9 @@ pub fn proxy_construct(target: Value, handler: Value) -> Result<Value, RuntimeEr
 /// `revocable` is registered as a name only: the revoke function has to
 /// remember *which* proxy it belongs to, so the VM mints it (the same trick
 /// `Function.prototype.bind` uses for its wrapper).
-pub fn create_proxy_constructor() -> Value {
-    let ctor = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new("Proxy"))));
-    crate::builtins::set_static_method(&ctor, "revocable", |_args: &[Value]| {
+pub fn create_proxy_constructor(heap: &mut Heap) -> Value {
+    let ctor = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new("Proxy"))));
+    crate::builtins::set_static_method(&ctor, "revocable", heap, |_args: &[Value]| {
         Err(RuntimeError::InternalError(
             "Proxy.revocable is dispatched by the VM".to_string(),
         ))

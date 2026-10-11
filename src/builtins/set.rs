@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{JSObject, NativeFunctionObject, SetObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
@@ -82,7 +83,7 @@ pub fn set_clear(this: &Value, _args: &[Value]) -> Result<Value, RuntimeError> {
 /// `keys`/`values`/`entries`/`forEach` are registered as Map-style VM methods:
 /// they either call a user callback or mint an iterator object, and they need
 /// the same "receiver must carry `[[SetData]]`" check.
-pub fn register_set_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_set_prototype(proto: &Gc<Object>, heap: &mut Heap) {
 
     // All of these carry the Set-specific dispatch prefix (see
     // `MAP_METHOD_PREFIX`): `has`/`delete`/`clear` also exist on
@@ -107,11 +108,11 @@ pub fn register_set_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
         "isSupersetOf",
         "isDisjointFrom",
     ] {
-        super::set_set_method(proto, name);
+        super::set_set_method(proto, heap, name);
     }
 
     // `Set.prototype.size` is an accessor (ES 23.2.3.9).
-    let getter = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+    let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
         SET_SIZE_NATIVE,
     ))));
     let _ = proto.borrow_mut().define_property(

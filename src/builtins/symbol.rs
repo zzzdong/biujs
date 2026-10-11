@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{JSObject, NativeFunctionObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::{SymbolData, Value};
@@ -99,7 +100,7 @@ where
 }
 
 /// Symbol constructor: Symbol(description?)
-pub fn symbol_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn symbol_constructor(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     // Get optional description argument
     let description = if args.is_empty() {
         None
@@ -214,15 +215,15 @@ pub const SYMBOL_DESCRIPTION_NATIVE: &str = "__symbol_description__";
 /// `toString` / `valueOf` are registered as *callable* natives (not as
 /// descriptive strings) so that `Symbol.prototype.toString.call(sym)` works;
 /// the VM's `call_prototype_method` performs the actual conversion.
-pub fn register_symbol_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_symbol_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use crate::builtins::mark_prototype_method;
 
-    mark_prototype_method(proto, "toString");
-    mark_prototype_method(proto, "valueOf");
+    mark_prototype_method(proto, heap, "toString");
+    mark_prototype_method(proto, heap, "valueOf");
 
     // `Symbol.prototype.description` is an accessor: the getter unwraps the
     // symbol and returns its description (or undefined).
-    let getter = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+    let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
         SYMBOL_DESCRIPTION_NATIVE,
     ))));
     let description_desc = PropertyDescriptor {
@@ -252,10 +253,10 @@ pub fn register_symbol_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
 }
 
 /// Register Symbol static methods
-pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Gc<Object>, heap: &mut Heap) {
     if let Value::Object(obj) = symbol_fn {
         // Symbol.for
-        let for_fn = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+        let for_fn = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
             "Symbol.for",
         ))));
         obj.borrow_mut()
@@ -265,7 +266,7 @@ pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Rc<RefCell<dyn 
             );
 
         // Symbol.keyFor
-        let key_for_fn = Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
+        let key_for_fn = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
             "Symbol.keyFor",
         ))));
         obj.borrow_mut()
@@ -277,7 +278,7 @@ pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Rc<RefCell<dyn 
         // Set Symbol.prototype
         obj.borrow_mut().define_property(
             PropertyKey::from_str("prototype"),
-            super::constructor_prototype_descriptor(Value::Object(Rc::clone(symbol_proto))),
+            super::constructor_prototype_descriptor(Value::Object(*symbol_proto)),
         );
     }
 }

@@ -15,6 +15,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{JSObject, NativeFunctionObject};
 use crate::vm::property::{ObjectKind, PropertyDescriptor, PropertyKey};
 use crate::vm::value::{SymbolData, Value};
@@ -74,11 +75,11 @@ pub enum MapIterKind {
 
 impl MapIterKind {
     /// Render one live entry as the value this iterator kind yields.
-    fn project(&self, key: Value, value: Value) -> Value {
+    fn project(&self, heap: &mut crate::vm::gc::Heap, key: Value, value: Value) -> Value {
         match self {
             MapIterKind::Key => key,
             MapIterKind::Value => value,
-            MapIterKind::Entry => Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+            MapIterKind::Entry => Value::Object(heap.alloc(Object::Array(
                 crate::vm::object::ArrayObject::from_vec(vec![key, value]),
             ))),
         }
@@ -95,10 +96,10 @@ pub enum SetIterKind {
 }
 
 impl SetIterKind {
-    fn project(&self, value: Value) -> Value {
+    fn project(&self, heap: &mut crate::vm::gc::Heap, value: Value) -> Value {
         match self {
             SetIterKind::Value => value,
-            SetIterKind::Entry => Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+            SetIterKind::Entry => Value::Object(heap.alloc(Object::Array(
                 crate::vm::object::ArrayObject::from_vec(vec![value.clone(), value]),
             ))),
         }
@@ -120,7 +121,7 @@ pub enum NativeIteratorState {
     /// The map is held as `dyn JSObject` because an `Rc<RefCell<dyn …>>` cannot
     /// be downcast to a concrete `Rc`; each step downcasts through `as_any`.
     Map {
-        map: Rc<RefCell<dyn JSObject>>,
+        map: Gc<Object>,
         kind: MapIterKind,
         idx: usize,
         /// Once the walk has run off the end, the iterator stays done even if
@@ -130,7 +131,7 @@ pub enum NativeIteratorState {
     },
     /// A *live* iterator over a `Set` — same discipline as the `Map` one.
     Set {
-        set: Rc<RefCell<dyn JSObject>>,
+        set: Gc<Object>,
         kind: SetIterKind,
         idx: usize,
         /// See the `Map` arm: exhaustion is permanent (`values-iteration-mutable`).
@@ -145,15 +146,35 @@ pub struct NativeIteratorObject {
     /// the VM's registry (user-facing methods, e.g. `it.next()`).
     pub id: u64,
     state: RefCell<NativeIteratorState>,
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    prototype: Option<Gc<Object>>,
+    /// 预先构造的 `[Symbol.iterator]` / `next` / `return` 原生方法 Value。
+    ///
+    /// `property_get` 是 `&self`、拿不到堆，无法现分配 `NativeFunctionObject`；
+    /// 因此这三个句柄在构造点（有堆）一次性生成并存起来。
+    iterator_fn: Value,
+    next_fn: Value,
+    return_fn: Value,
 }
 
 impl NativeIteratorObject {
-    pub fn new(id: u64, state: NativeIteratorState) -> Self {
+    pub fn new(
+        heap: &mut crate::vm::gc::Heap,
+        id: u64,
+        state: NativeIteratorState,
+    ) -> Self {
+        let mk = |heap: &mut crate::vm::gc::Heap, name: String| {
+            Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(&name))))
+        };
+        let iterator_fn = mk(heap, ITERATOR_NATIVE_NAME.to_string());
+        let next_fn = mk(heap, format!("{ITERATOR_NEXT_PREFIX}{id}"));
+        let return_fn = mk(heap, format!("{ITERATOR_RETURN_PREFIX}{id}"));
         Self {
             id,
             state: RefCell::new(state),
             prototype: None,
+            iterator_fn,
+            next_fn,
+            return_fn,
         }
     }
 
@@ -179,18 +200,13 @@ impl JSObject for NativeIteratorObject {
         // A native iterator is itself iterable: `it[Symbol.iterator]` is the
         // standard iterator factory (which hands the same iterator back).
         if *key == crate::vm::iterator::iterator_symbol_key() {
-            return Some(PropertyDescriptor::data_descriptor(Value::Object(
-                Rc::new(RefCell::new(NativeFunctionObject::new(ITERATOR_NATIVE_NAME))),
-            )));
+            return Some(PropertyDescriptor::data_descriptor(self.iterator_fn.clone()));
         }
-        let native_name = match key.as_str() {
-            Some("next") => format!("{ITERATOR_NEXT_PREFIX}{}", self.id),
-            Some("return") => format!("{ITERATOR_RETURN_PREFIX}{}", self.id),
-            _ => return None,
-        };
-        Some(PropertyDescriptor::data_descriptor(Value::Object(
-            Rc::new(RefCell::new(NativeFunctionObject::new(&native_name))),
-        )))
+        match key.as_str() {
+            Some("next") => Some(PropertyDescriptor::data_descriptor(self.next_fn.clone())),
+            Some("return") => Some(PropertyDescriptor::data_descriptor(self.return_fn.clone())),
+            _ => None,
+        }
     }
 
     fn property_set(&mut self, _key: PropertyKey, _value: Value) -> Result<bool, String> {
@@ -221,11 +237,11 @@ impl JSObject for NativeIteratorObject {
         ]
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.prototype = proto;
     }
 
@@ -262,7 +278,7 @@ impl JSObject for NativeIteratorObject {
 /// (`str.matchAll(re)`, `arr.keys()`) and when it merely has to be turned into
 /// one (a Set or a Map). `None` when `iter_val` is not a native iterator — a
 /// generator, whose steps can run user code and so need the VM's `iterator_next`.
-pub fn drain_native_iterator(iter_val: &Value) -> Option<Vec<Value>> {
+pub fn drain_native_iterator(heap: &mut crate::vm::gc::Heap, iter_val: &Value) -> Option<Vec<Value>> {
     let Value::Object(obj_ref) = iter_val else {
         return None;
     };
@@ -284,7 +300,7 @@ pub fn drain_native_iterator(iter_val: &Value) -> Option<Vec<Value>> {
                 .as_any()
                 .downcast_ref::<NativeIteratorObject>()
                 .expect("checked above");
-            native_next(&mut iterator.state().borrow_mut())
+            native_next(heap, &mut iterator.state().borrow_mut())
         };
         match next {
             Some(value) => out.push(value),
@@ -295,7 +311,10 @@ pub fn drain_native_iterator(iter_val: &Value) -> Option<Vec<Value>> {
 }
 
 /// Fast-path step for array/string iterators. `None` means exhausted.
-pub fn native_next(state: &mut NativeIteratorState) -> Option<Value> {
+pub fn native_next(
+    heap: &mut crate::vm::gc::Heap,
+    state: &mut NativeIteratorState,
+) -> Option<Value> {
     match state {
         NativeIteratorState::Array { items, idx } | NativeIteratorState::String { chars: items, idx } => {
             if *idx < items.len() {
@@ -319,7 +338,7 @@ pub fn native_next(state: &mut NativeIteratorState) -> Option<Value> {
             match step {
                 Some((i, value)) => {
                     *idx = i + 1;
-                    Some(kind.project(value))
+                    Some(kind.project(heap, value))
                 }
                 None => {
                     *done = true;
@@ -342,7 +361,7 @@ pub fn native_next(state: &mut NativeIteratorState) -> Option<Value> {
             match step {
                 Some((i, key, value)) => {
                     *idx = i + 1;
-                    Some(kind.project(key, value))
+                    Some(kind.project(heap, key, value))
                 }
                 None => {
                     *done = true;

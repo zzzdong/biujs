@@ -1,7 +1,5 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{JSObject, OrdinaryObject};
 use crate::vm::property::PropertyKey;
 use crate::vm::value::Value;
@@ -72,15 +70,16 @@ fn error_message_descriptor(value: Value) -> crate::vm::property::PropertyDescri
 /// the error prototype (ES 20.5.3.1 only defines it on the prototype), and an
 /// error constructed without a message has no own `message` at all.
 pub fn create_error_object(
+    heap: &mut Heap,
     message: Option<String>,
-    prototype: Rc<RefCell<dyn JSObject>>,
+    prototype: Gc<Object>,
     _name: &str,
 ) -> Value {
     // Every error instance reports `[[Class]]` "Error", whatever the concrete
     // constructor: `Object.prototype.toString.call(new TypeError())` is
     // "[object Error]" (ES 19.1.3.6).
     let mut obj = OrdinaryObject::with_class_name("Error");
-    obj.set_prototype(Some(Rc::clone(&prototype)));
+    obj.set_prototype(Some(prototype));
     if let Some(msg) = message {
         obj.define_property(
             PropertyKey::from_str("message"),
@@ -88,14 +87,14 @@ pub fn create_error_object(
         )
         .ok();
     }
-    Value::Object(Rc::new(RefCell::new(obj)))
+    Value::Object(heap.alloc(Object::Ordinary(obj)))
 }
 
 /// Generic error constructor dispatcher
 /// Note: The actual prototype is determined by the constructor function's [[Prototype]]
 /// which is set up in Builtins::register. This function creates the error object
 /// and the VM will set the correct prototype based on the constructor.
-pub fn error_constructor(error_type: ErrorType, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn error_constructor(heap: &mut Heap, error_type: ErrorType, args: &[Value]) -> Result<Value, RuntimeError> {
     // `new Error()` has no own `message`; `new Error(undefined)` neither. The
     // VM installs the constructor's `prototype` afterwards.
     let message = match args.first() {
@@ -122,7 +121,7 @@ pub fn error_constructor(error_type: ErrorType, args: &[Value]) -> Result<Value,
         obj.define_property(PropertyKey::from_str("cause"), cause).ok();
     }
 
-    Ok(Value::Object(Rc::new(RefCell::new(obj))))
+    Ok(Value::Object(heap.alloc(Object::Ordinary(obj))))
 }
 
 // ─────────────────────────────────────────────────────────
@@ -131,40 +130,47 @@ pub fn error_constructor(error_type: ErrorType, args: &[Value]) -> Result<Value,
 
 /// Convert a RuntimeError to a JS Error object Value
 pub fn runtime_error_to_js_error(
+    heap: &mut Heap,
     err: &RuntimeError,
     builtins: &crate::builtins::Builtins,
 ) -> Value {
     match err {
         RuntimeError::TypeError(msg) => create_error_object(
+            heap,
             Some(msg.clone()),
-            Rc::clone(&builtins.type_error_prototype),
+            builtins.type_error_prototype,
             "TypeError",
         ),
         RuntimeError::ReferenceError(msg) => create_error_object(
+            heap,
             Some(msg.clone()),
-            Rc::clone(&builtins.reference_error_prototype),
+            builtins.reference_error_prototype,
             "ReferenceError",
         ),
         RuntimeError::RangeError(msg) => create_error_object(
+            heap,
             Some(msg.clone()),
-            Rc::clone(&builtins.range_error_prototype),
+            builtins.range_error_prototype,
             "RangeError",
         ),
         // `SyntaxError` must be a *SyntaxError*: JSON.parse and the compiler's
         // diagnostics are matched by `e instanceof SyntaxError` / `e.name`.
         RuntimeError::SyntaxError(msg) => create_error_object(
+            heap,
             Some(msg.clone()),
-            Rc::clone(&builtins.syntax_error_prototype),
+            builtins.syntax_error_prototype,
             "SyntaxError",
         ),
         RuntimeError::InternalError(msg) => create_error_object(
+            heap,
             Some(msg.clone()),
-            Rc::clone(&builtins.error_prototype),
+            builtins.error_prototype,
             "Error",
         ),
         RuntimeError::NotImplemented(msg) => create_error_object(
+            heap,
             Some(format!("Not implemented: {}", msg)),
-            Rc::clone(&builtins.error_prototype),
+            builtins.error_prototype,
             "Error",
         ),
         RuntimeError::Thrown(val) => val.clone(),
@@ -188,7 +194,7 @@ pub fn error_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> {
     };
 
     let get = |prop: &str| -> Option<Value> {
-        crate::vm::prototype::find_descriptor(Rc::clone(obj_ref), &PropertyKey::from_str(prop))
+        crate::vm::prototype::find_descriptor(*obj_ref, &PropertyKey::from_str(prop))
             .ok()
             .flatten()
             .map(|(_, desc)| desc.value)
@@ -220,8 +226,9 @@ pub fn error_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> {
 /// Setup `Error.prototype`: `name`, `message` and `toString`
 /// (ES 20.5.3.1–20.5.3.4; `constructor` is wired up by the caller).
 pub fn setup_error_prototype(
-    proto: &Rc<RefCell<dyn JSObject>>,
+    proto: &Gc<Object>,
     _builtins: &crate::builtins::Builtins,
+    heap: &mut Heap,
 ) {
     use crate::builtins::set_prototype_method;
     use crate::vm::property::PropertyDescriptor;
@@ -244,7 +251,7 @@ pub fn setup_error_prototype(
         .define_property(PropertyKey::from_str("message"), writable_string(Value::string("")));
 
     // Error.prototype.toString
-    set_prototype_method(proto, "toString", |this, _args| {
+    set_prototype_method(proto, heap, "toString", |this, _args| {
         error_prototype_to_string(this)
     });
 }
@@ -254,7 +261,7 @@ pub fn setup_error_prototype(
 /// `TypeError.prototype.name` is `"TypeError"` and its `message` starts as the
 /// empty string (ES 19.5.6.3.2); every other property is inherited from
 /// `Error.prototype`.
-pub fn setup_native_error_prototype(proto: &Rc<RefCell<dyn JSObject>>, name: &str) {
+pub fn setup_native_error_prototype(proto: &Gc<Object>, name: &str) {
     use crate::vm::property::PropertyDescriptor;
 
     let writable = |value: Value| PropertyDescriptor {

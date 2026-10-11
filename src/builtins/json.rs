@@ -12,10 +12,8 @@
 //!
 //! Both share [`quote_json_string`] / [`number_to_string`] for leaves.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::RuntimeError;
+use crate::vm::gc::{Heap, Object};
 use crate::vm::object::{ArrayObject, JSObject, OrdinaryObject};
 use crate::vm::ObjectKind;
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
@@ -26,16 +24,16 @@ use crate::vm::value::Value;
 /// `JSON` is a plain object with two own methods and
 /// `JSON[Symbol.toStringTag] === "JSON"`; it is neither callable nor a
 /// constructor.
-pub fn register_json() -> Value {
+pub fn register_json(heap: &mut Heap) -> Value {
     let mut json = OrdinaryObject::new();
     if let Some(proto) = crate::builtins::wrapper_prototype("Object") {
         json.set_prototype(Some(proto));
     }
 
-    let parse = Value::Object(Rc::new(RefCell::new(
+    let parse = Value::Object(heap.alloc(Object::NativeFunction(
         crate::vm::object::NativeFunctionObject::new("JSON.parse"),
     )));
-    let stringify = Value::Object(Rc::new(RefCell::new(
+    let stringify = Value::Object(heap.alloc(Object::NativeFunction(
         crate::vm::object::NativeFunctionObject::new("JSON.stringify"),
     )));
     let _ = json.define_property(PropertyKey::from_str("parse"), super::method_descriptor(parse));
@@ -55,7 +53,7 @@ pub fn register_json() -> Value {
         },
     );
 
-    Value::Object(Rc::new(RefCell::new(json)))
+    Value::Object(heap.alloc(Object::Ordinary(json)))
 }
 
 // ─────────────────────────────────────────────────────────
@@ -100,8 +98,8 @@ pub fn json_number(value: f64) -> String {
 /// no leading `+`/leading zeros, and only the four JSON whitespace characters.
 /// Lone surrogates cannot be represented in a Rust `String`, so `\uD800` (and a
 /// trail surrogate on its own) decode to U+FFFD.
-pub fn json_parse(text: &str) -> Result<Value, RuntimeError> {
-    let mut parser = JsonParser { text, pos: 0 };
+pub fn json_parse(heap: &mut Heap, text: &str) -> Result<Value, RuntimeError> {
+    let mut parser = JsonParser { text, pos: 0, heap };
     let value = parser.parse_value()?;
     parser.skip_whitespace();
     if parser.pos != text.len() {
@@ -113,6 +111,7 @@ pub fn json_parse(text: &str) -> Result<Value, RuntimeError> {
 struct JsonParser<'a> {
     text: &'a str,
     pos: usize,
+    heap: &'a mut Heap,
 }
 
 impl<'a> JsonParser<'a> {
@@ -190,7 +189,7 @@ impl<'a> JsonParser<'a> {
         self.skip_whitespace();
         if self.peek() == Some('}') {
             self.bump();
-            return Ok(Value::Object(Rc::new(RefCell::new(obj))));
+            return Ok(Value::Object(self.heap.alloc(Object::Ordinary(obj))));
         }
         loop {
             self.skip_whitespace();
@@ -214,7 +213,7 @@ impl<'a> JsonParser<'a> {
                 _ => return self.error("Expected ',' or '}'"),
             }
         }
-        Ok(Value::Object(Rc::new(RefCell::new(obj))))
+        Ok(Value::Object(self.heap.alloc(Object::Ordinary(obj))))
     }
 
     fn parse_array(&mut self) -> Result<Value, RuntimeError> {
@@ -223,7 +222,7 @@ impl<'a> JsonParser<'a> {
         self.skip_whitespace();
         if self.peek() == Some(']') {
             self.bump();
-            return Ok(Value::Object(Rc::new(RefCell::new(arr))));
+            return Ok(Value::Object(self.heap.alloc(Object::Array(arr))));
         }
         loop {
             let value = self.parse_value()?;
@@ -235,7 +234,7 @@ impl<'a> JsonParser<'a> {
                 _ => return self.error("Expected ',' or ']'"),
             }
         }
-        Ok(Value::Object(Rc::new(RefCell::new(arr))))
+        Ok(Value::Object(self.heap.alloc(Object::Array(arr))))
     }
 
     fn parse_number(&mut self) -> Result<Value, RuntimeError> {
@@ -358,7 +357,7 @@ impl<'a> JsonParser<'a> {
 /// accessors. `None` means "the value is not serializable" (`undefined`, a
 /// function or a symbol), which callers turn into `undefined` or `null`
 /// depending on where the value sits.
-pub fn json_stringify(value: &Value) -> Result<Option<String>, RuntimeError> {
+pub fn json_stringify(heap: &mut Heap, value: &Value) -> Result<Option<String>, RuntimeError> {
     let mut stack = Vec::new();
     serialize(value, &mut stack)
 }

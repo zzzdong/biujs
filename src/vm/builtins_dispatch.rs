@@ -216,7 +216,7 @@ impl VM {
             // the value the outer `next(v)` supplied into the delegate.
             let send = args.first().cloned();
             let (item, done) = self.iterator_next(iter_val, send, module)?;
-            return Ok(Self::iterator_result(item, done));
+            return Ok(Self::iterator_result(&mut self.heap, item, done));
         }
         if let Some(id) = name.strip_prefix(crate::vm::iterator::ITERATOR_RETURN_PREFIX) {
             let id: u64 = id
@@ -228,7 +228,7 @@ impl VM {
             // `return()` is an iterator method, so it answers with an iterator
             // result — `yield*` checks that the value is an object
             // (ES 14.4.14 step 5.c.vi).
-            return Ok(Self::iterator_result(Value::Undefined, true));
+            return Ok(Self::iterator_result(&mut self.heap, Value::Undefined, true));
         }
         // `Function.prototype` registers `call` / `apply` / `bind` under their
         // plain names, so handle them before the static-method lookup.
@@ -306,7 +306,7 @@ impl VM {
                             .iter()
                             .enumerate()
                             .map(|(i, value)| {
-                                Value::Object(Rc::new(RefCell::new(
+                                Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
                                     crate::vm::object::ArrayObject::from_vec(vec![
                                         Value::Number(i as f64),
                                         value.clone(),
@@ -319,13 +319,15 @@ impl VM {
                             .collect(),
                         _ => items,
                     };
-                    let snapshot_val = Value::Object(Rc::new(RefCell::new(
-                        crate::vm::object::ArrayObject::from_vec(snapshot),
-                    )));
+                    let snapshot_val = Value::Object(self.heap.alloc(
+                        crate::vm::gc::Object::Array(
+                            crate::vm::object::ArrayObject::from_vec(snapshot),
+                        ),
+                    ));
                     return self.make_iterator(snapshot_val, module);
                 }
             }
-            return crate::builtins::call_prototype_method(&this, method, args);
+            return crate::builtins::call_prototype_method(&mut self.heap, &this, method, args);
         }
         // Static methods are stored under their qualified name ("Array.from").
         if name.contains('.') {
@@ -377,6 +379,7 @@ impl VM {
                 return crate::builtins::call_static_method(
                     name,
                     &[args[0].clone(), args[1].clone(), descriptor],
+                    &mut self.heap,
                 );
             }
             if name == "Object.defineProperties" && args.len() >= 2 {
@@ -384,6 +387,7 @@ impl VM {
                 return crate::builtins::call_static_method(
                     name,
                     &[args[0].clone(), props],
+                    &mut self.heap,
                 );
             }
             // `JSON.stringify` runs `toJSON`/`replacer` and reads through
@@ -399,6 +403,7 @@ impl VM {
                 return crate::builtins::call_static_method(
                     name,
                     &[args[0].clone(), props],
+                    &mut self.heap,
                 );
             }
             // `Reflect.get` / `set` / `apply` / `construct` / `defineProperty`:
@@ -415,19 +420,21 @@ impl VM {
                     self.as_object_value(&args.first().cloned().unwrap_or(Value::Undefined));
                 let handler =
                     self.as_object_value(&args.get(1).cloned().unwrap_or(Value::Undefined));
-                let proxy = crate::builtins::proxy::proxy_construct(target, handler)?;
+                let proxy = crate::builtins::proxy::proxy_construct(&mut self.heap, target, handler)?;
                 let revoke = self.make_revoke(proxy.clone());
                 let mut result = crate::vm::object::OrdinaryObject::new();
-                result.set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
+                result.set_prototype(Some(self.builtins.object_prototype));
                 for (field, value) in [("proxy", proxy), ("revoke", revoke)] {
                     let _ = result.define_property(
                         PropertyKey::from_str(field),
                         PropertyDescriptor::data_descriptor(value),
                     );
                 }
-                return Ok(Value::Object(Rc::new(RefCell::new(result))));
+                return Ok(Value::Object(
+                    self.heap.alloc(crate::vm::gc::Object::Ordinary(result)),
+                ));
             }
-            return crate::builtins::call_static_method(name, args);
+            return crate::builtins::call_static_method(name, args, &mut self.heap);
         }
         // The `revoke` function of `Proxy.revocable`: its work is one flag on
         // the proxy it names. Everything after revocation throws.
@@ -453,7 +460,7 @@ impl VM {
                 "Constructor Proxy requires 'new'".to_string(),
             ));
         }
-        crate::builtins::call_native(name, args)
+        crate::builtins::call_native(name, args, &mut self.heap)
     }
 
     /// `String.prototype.matchAll(re)` / `RegExp.prototype[Symbol.matchAll](s)`.
@@ -473,13 +480,14 @@ impl VM {
         }
         crate::builtins::require_object_coercible(receiver)?;
         let matches = crate::builtins::match_all_matches(
+            &mut self.heap,
             receiver,
             args,
-            Some(Value::Object(Rc::clone(&self.builtins.regexp_prototype))),
+            Some(Value::Object(self.builtins.regexp_prototype)),
         )?;
-        let snapshot_val = Value::Object(Rc::new(RefCell::new(
-            crate::vm::object::ArrayObject::from_vec(matches),
-        )));
+        let snapshot_val = Value::Object(self.heap.alloc(
+            crate::vm::gc::Object::Array(crate::vm::object::ArrayObject::from_vec(matches)),
+        ));
         Ok(Some(self.make_iterator(snapshot_val, module)?))
     }
 
@@ -506,7 +514,7 @@ impl VM {
         let Some(target) = self.array_species_create(receiver, 0, module)? else {
             return Ok(None);
         };
-        let plain = crate::builtins::call_prototype_method(receiver, method, args)?;
+        let plain = crate::builtins::call_prototype_method(&mut self.heap, receiver, method, args)?;
         // Snapshot the present indices first: writing into `target` can run
         // user code (accessors, proxies once they land), and `plain` is a
         // RefCell that must not stay borrowed across that call.
@@ -697,8 +705,8 @@ impl VM {
                         let id = self.state.next_finally_id;
                         self.state.next_finally_id += 1;
                         self.state.finally_handlers.insert(id, cb);
-                        let fulfilled = Self::native_fn(&format!("__promise_finally__{id}_f"));
-                        let rejected = Self::native_fn(&format!("__promise_finally__{id}_r"));
+                        let fulfilled = Self::native_fn(&mut self.heap, &format!("__promise_finally__{id}_f"));
+                        let rejected = Self::native_fn(&mut self.heap, &format!("__promise_finally__{id}_r"));
                         Ok(Some(self.promise_then(
                             &promise,
                             Some(fulfilled),
@@ -791,7 +799,8 @@ impl VM {
         // wrapper.
         let callback_receiver = match receiver {
             Value::Object(_) | Value::Function(_) => receiver.clone(),
-            other => crate::builtins::to_object(other).unwrap_or_else(|_| other.clone()),
+            other => crate::builtins::to_object(&mut self.heap, other)
+                .unwrap_or_else(|_| other.clone()),
         };
         let call = |vm: &mut Self,
                     cb: &Value,
@@ -895,7 +904,7 @@ impl VM {
                         for h in next..entries.len() {
                             holes.push(h);
                         }
-                        let result = crate::vm::object::new_array_object_from_vec(out);
+                        let result = crate::vm::object::new_array_object_from_vec(&mut self.heap, out);
                         if let Value::Object(result_ref) = &result {
                             if let Some(arr) = result_ref
                                 .borrow_mut()
@@ -958,7 +967,7 @@ impl VM {
                     }
                 }
                 Ok(Some(match species {
-                    None => crate::vm::object::new_array_object_from_vec(values),
+                    None => crate::vm::object::new_array_object_from_vec(&mut self.heap, values),
                     Some(target) => {
                         for (i, v) in values.into_iter().enumerate() {
                             self.set_member(
@@ -987,7 +996,7 @@ impl VM {
                     }
                 }
                 Ok(Some(match species {
-                    None => crate::vm::object::new_array_object_from_vec(out),
+                    None => crate::vm::object::new_array_object_from_vec(&mut self.heap, out),
                     Some(target) => {
                         for (i, v) in out.iter().enumerate() {
                             self.set_member(

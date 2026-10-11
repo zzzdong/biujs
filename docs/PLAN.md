@@ -29,19 +29,33 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 | P0-4 | **拆分 `src/vm/mod.rs`** —— 已从 11269 行拆到 `mod.rs` 6288 + `exec.rs` 3404 + `proxy.rs` 748 + `builtins_dispatch.rs` 1083，逻辑未改、全量零回退（§3.4 收尾可选） | 见 §3 |
 | P0-5 | 生成器两处自装帧与 `open_frame` 合并 | 全量零回退 |
 
-### P1 — 消环：堆 + 句柄（M3）
+### P1 — 消环：堆 + 句柄（M3）— **已完成（2026-10-12）**
 
 **为什么先做它**：手工断环清单是事故源，且每加一个构造函数都要记着补一项。
-换成真 GC 之后整套机制消失。
 
-1. `Heap`（只分配不回收）+ `Gc<T>`（`Copy`，句柄）。
-2. `HandleScope` + `Rooted`；定 builtins 签名 —— **先在一个 builtins 文件上验证，
-   再铺开**（建议 `src/builtins/array.rs`，它最大，能把签名形状试出来）。
-3. `Value::Object(Rc<RefCell<dyn JSObject>>)` → `Value::Object(Gc<Object>)`；
-   `dyn` 消失 ⇒ trait 的方法变成具体类型的函数。
-4. `borrow()` / `borrow_mut()` 全部消失（现值约 386 处）。
+实际形态与最初设想有几处出入，**以 `docs/GC-DESIGN.md` 为准**：
 
-**验收**：功能等价；**不给性能承诺**（此时还没 GC，内存会涨）；全量零回退。
+1. ✅ `Heap`（分块、不移动、只分配不回收）+ `Gc<T>`（`Copy` 句柄，无引用计数）。
+   堆归 `VM` 持有，VM 析构时整片释放；分配一律显式传 `&mut Heap`
+   （现有 117 处形参），**不用 `thread_local`、不设 fallback 堆**。
+2. ✅ `Value::Object(Rc<RefCell<dyn JSObject>>)` → `Value::Object(Gc<Object>)`；
+   `Object` 是**具体枚举**（20 变体），`dyn` 消失。`Value` 由 24 B 降到 **16 B**。
+3. ✅ `RefCell` 从各对象类型内部**上移到堆槽**（原计划"386 处 `borrow()` 全部消失"
+   改为"收拢到堆槽"）—— 于是 235 处 `borrow()` 调用**文本不变**，churn 小一个量级。
+4. ✅ `Builtins::teardown` 的 **23 项断环清单整条删除**，连同 `VM::run` 与
+   `Drop for VM` 里两处同类补丁。
+5. ✅ `Object` 尺寸守门：`GeneratorObject::suspended` 装箱（624 B → ≤256 B）。
+
+**没有做** `HandleScope` + `Rooted`：推迟到 P2 之前，见 `GC-DESIGN.md` §6.2
+与 `REFACTOR-HEAP-GC.md` 阶段 B3。
+
+**验收结果**：三级全绿（211 / 538 / 7）；全量 **16567 / 7843 / 3141（84.06%）**，
+**无逐套件回退**。唯一漂移是内存护栏：堆在单次 `run` 内不回收，单用例峰值上升，
+故 `TEST262_MEMORY_MB` 默认由 256 提到 384（成因已量化并定位，**正解是下面的 P2
+收集器**，届时预算可降回 256）。顺带收益：超时护栏 7 → 4（P1 更快）、
+`built-ins/Array` +3、`language/statements/class` +2、`built-ins/Object` +1。
+
+后续步骤见 `docs/REFACTOR-HEAP-GC.md`（阶段 B 铺路 / 阶段 C 收集器）。
 
 ### P2 — 收集器（M4）
 
@@ -49,7 +63,9 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 2. **GC stress 模式**（每次分配都收集 + 释放时填 `0xDD`）跑 feature 全套，
    把所有 rooting bug 炸出来。
 3. 弱引用 → `WeakMap`/`WeakSet` 从"条目永不回收"改成真回收。
-4. 护栏的堆预算改读 `Heap::bytes_allocated`（现在是全局分配器的代理）。
+4. ~~护栏的堆预算改读 `Heap::bytes_allocated`~~ —— **已撤销**：该口径只算
+   `size_of::<Object>()`，**不含**对象内 `Vec` / `HashMap` 持有的堆外内存
+   （数组元素、属性表才是大头），比现有的全局分配器代理更差。见 `GC-DESIGN.md` §11。
 
 **验收**：`BIUJS_GC_STRESS=1` 下 feature 全绿（这是真正的验收）；
 循环引用（`obj.self = obj`、长原型链、闭包环）在显式收集后被回收。

@@ -93,18 +93,36 @@ struct State {
 pub enum Value {
     Undefined, Null, Bool(bool), Number(f64),
     String(Rc<String>), Symbol(Rc<SymbolData>),
-    Object(Rc<RefCell<dyn JSObject>>),
-    Function(u32),                     // 内部：按 id 引用字节码函数，不是 JS 可见类型
+    Object(Gc<Object>),            // P1：8 B 瘦句柄，见 §3.1
+    Function(u32),                 // 内部：按 id 引用字节码函数，不是 JS 可见类型
 }
 ```
 
-- 对象：`JSObject` trait（约 20 个方法）+ `ObjectKind` 枚举（22 个变体：
-  Ordinary / Array / Function / … / Buffer / TypedArray / DataView / NativeFunction …）。
+- **对象：`Object` 是具体枚举**（20 个变体，对应原 `JSObject` 的 20 个实现体；
+  `dyn` 已消失、`Sized`）。`ObjectKind` 保留供 `kind()` 使用。
   多数具体对象内部包一个 `OrdinaryObject` 做属性存储。
-- **没有 GC**。`Rc<RefCell<dyn JSObject>>` 收不了环，所以 `Builtins::teardown()`
-  手工"删掉 prototype 上的 `constructor`"来断环 —— 维护的是一条**写死的 23 项清单**，
-  每加一个构造函数都得记着往里补。漏过一次的实际后果：DataView 没进清单 ⇒ 每条
-  test262 用例（`VM::new()` 一次）漏一整个 realm ⇒ 撞穿 4 GB `ulimit`、进程 SIGABRT。
+- `Value` = **16 B**（原 24 B），`Gc<Object>` = 8 B。
+
+### 3.1 堆与句柄（`src/vm/gc.rs`，P1）
+
+```rust
+pub struct Heap { chunks: Vec<Vec<RefCell<Object>>>, bytes: Cell<usize> }
+pub struct Gc<T> { ptr: NonNull<RefCell<T>> }   // Copy，无 Drop、无引用计数
+```
+
+- **堆归 `VM` 持有**（本引擎里 VM 即 runtime），VM 析构时**整片释放**。
+  不引入 `thread_local` 全局堆、不设 fallback 堆：只有**分配**需要接触堆，
+  一律显式传 `&mut Heap`（现有 117 处形参）；`Gc::borrow()` 直接解引用、不碰堆。
+- `RefCell` 从各对象类型内部**上移到堆槽**，所以 235 处 `borrow()` 调用文本不变。
+- **`Object` 尺寸 = 最大变体**，故大变体必须装箱（实测：`GeneratorObject` 曾内联
+  `SuspendedFrame` 撑到 624 B，装箱后 ≤256 B）。`gc.rs` 有断言守着这个上限。
+- **P1 不回收**。环（`prototype` ⇄ `constructor` 等）不再需要手工断——它们都在同一个
+  堆里，随堆整片释放。`Builtins::teardown` 那条**写死的 23 项断环清单已删除**
+  （漏过一次的实际后果：DataView 没进清单 ⇒ 每条用例漏一整个 realm ⇒ 撞穿 4 GB
+  `ulimit`、进程 SIGABRT）。
+- **契约**：`Gc` 无引用计数，**任何 `Gc`（及其所在的 `Value`）不得活过它所属的
+  `Heap`/`VM`**。`src/lib.rs::eval` 是已知触发点，用 `mem::forget(vm)` 兜住。
+- 设计（含 P2 的 mark-sweep、根集、安全点、不变量清单）见 `docs/GC-DESIGN.md`。
 
 ## 4. 内建对象
 
@@ -120,7 +138,7 @@ pub enum Value {
 
 | # | 弱点 | 后果 |
 |---|---|---|
-| 1 | 无堆 / 无 GC，`Rc<RefCell<dyn JSObject>>` | 24 B 胖指针 + 动态分发 + 386 处 `borrow()`；**环必须手工断**（`teardown` 的 23 项清单） |
+| 1 | **P1 已有堆与句柄，但还没有回收器**：`Heap` 只在 VM 析构时整片释放，单次 `run` 内不回收 | 临时垃圾一直留到 run 结束 ⇒ 单用例内存峰值上升（实测 `TEST262_MEMORY_MB` 须 256→384 才维持原头条）。正解是 P2 的 mark-sweep，见 `docs/GC-DESIGN.md` |
 | 2 | 闭包是 `HashMap<String, Value>` 的**创建时快照** | "闭包共享可变单元"不成立（`counter()` 仍返回 `0,0,0`）—— 这是**语义 bug**，不是性能问题 |
 | 3 | 内建分派按名字字符串 | arity 表 / 前缀约定 / 旁路名单；加一个原型方法要动多处 |
 | 4 | `Value::Function(u32)` 双表示 | `strict_eq` 特判、`materialize_function`、`callable_func_id` |

@@ -14,6 +14,7 @@ use std::cell::{RefCell, RefMut};
 use std::rc::Rc;
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{ArrayObject, JSObject, NativeFunctionObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
@@ -67,7 +68,7 @@ fn normalise_flags(flags: &str) -> Result<String, RuntimeError> {
 ///
 /// A `RegExp` argument is copied (with the flags defaulting to the argument's),
 /// which is the ES behaviour and what makes `new RegExp(re, 'g')` work.
-pub fn regexp_construct_value(args: &[Value], proto: Option<Value>) -> Result<Value, RuntimeError> {
+pub fn regexp_construct_value(heap: &mut Heap, args: &[Value], proto: Option<Value>) -> Result<Value, RuntimeError> {
     let (source, flags) = match args.first() {
         None => (String::new(), String::new()),
         Some(Value::Object(obj))
@@ -100,7 +101,7 @@ pub fn regexp_construct_value(args: &[Value], proto: Option<Value>) -> Result<Va
         Some(Value::Object(p)) => Some(p),
         _ => None,
     };
-    Ok(Value::Object(Rc::new(RefCell::new(
+    Ok(Value::Object(heap.alloc(Object::RegExp(
         crate::vm::object::RegExpObject::new(source, flags, proto),
     ))))
 }
@@ -156,7 +157,11 @@ pub fn regexp_test(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
 }
 
 /// `exec` answers the match array (`0`, `1`… plus `index` and `input`) or null.
-pub fn regexp_exec(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn regexp_exec(
+    heap: &mut Heap,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let text = args.first().map(|v| v.to_js_string()).unwrap_or_default();
     let mut re = compiled(this, "exec")?;
     let matcher = re.compiled.clone().expect("checked above");
@@ -211,7 +216,7 @@ pub fn regexp_exec(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     if re.is_global() || re.is_sticky() {
         re.last_index = whole.end() as f64;
     }
-    Ok(Value::Object(Rc::new(RefCell::new(array))))
+    Ok(Value::Object(heap.alloc(Object::Array(array))))
 }
 
 /// Every match of a global pattern over `text`, as match arrays (ES 22.2.5.8).
@@ -225,6 +230,7 @@ pub fn regexp_exec(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
 /// is observationally equivalent for every use except mutating the pattern
 /// mid-iteration.
 pub fn match_all_matches(
+    heap: &mut Heap,
     this: &Value,
     args: &[Value],
     regexp_proto: Option<Value>,
@@ -243,7 +249,7 @@ pub fn match_all_matches(
         let re = if is_regexp_receiver(&pattern) {
             pattern
         } else {
-            regexp_construct_value(&[pattern, Value::string("g")], regexp_proto)?
+            regexp_construct_value(heap, &[pattern, Value::string("g")], regexp_proto)?
         };
         (re, text)
     };
@@ -271,7 +277,7 @@ pub fn match_all_matches(
             break;
         };
         let whole = captures.get(0).expect("a match implies group 0");
-        out.push(match_array(&captures, &text));
+        out.push(match_array(heap, &captures, &text));
         // An empty match would never advance, so the spec steps `lastIndex` by
         // one code unit in that case (step 6.a.ii).
         from = if whole.end() == whole.start() {
@@ -284,7 +290,7 @@ pub fn match_all_matches(
 }
 
 /// The match array for one set of captures: the groups, plus `index` / `input`.
-fn match_array(captures: &regex::Captures, text: &str) -> Value {
+fn match_array(heap: &mut Heap, captures: &regex::Captures, text: &str) -> Value {
     let mut elements: Vec<Value> = Vec::new();
     for i in 0..captures.len() {
         elements.push(match captures.get(i) {
@@ -313,7 +319,7 @@ fn match_array(captures: &regex::Captures, text: &str) -> Value {
             },
         );
     }
-    Value::Object(Rc::new(RefCell::new(array)))
+    Value::Object(heap.alloc(Object::Array(array)))
 }
 
 /// `Symbol.matchAll` — the id the well-known symbol table in `builtins::mod`
@@ -326,11 +332,11 @@ pub fn regexp_to_string(this: &Value) -> Result<Value, RuntimeError> {
     Ok(Value::string(&format!("/{}/{}", re.source, re.flags)))
 }
 
-pub fn register_regexp_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_regexp_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
-    set_prototype_method(proto, "test", |this, args| regexp_test(this, args));
-    set_prototype_method(proto, "exec", |this, args| regexp_exec(this, args));
-    set_prototype_method(proto, "toString", |this, _| regexp_to_string(this));
+    set_prototype_method(proto, heap, "test", |this, args| regexp_test(this, args));
+    set_prototype_method(proto, heap, "exec", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "toString", |this, _| regexp_to_string(this));
     // `RegExp.prototype[Symbol.matchAll]` is the other entry point of the same
     // algorithm (`String.prototype.matchAll` delegates to it). Handled by the
     // VM for the same reason: the result is an iterator.
@@ -340,7 +346,7 @@ pub fn register_regexp_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     // then found nothing.
     let _ = proto.borrow_mut().define_property(
         PropertyKey::Symbol(MATCH_ALL_SYMBOL_ID),
-        super::method_descriptor(Value::Object(Rc::new(RefCell::new(
+        super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new(&format!(
                 "{}{}",
                 super::PROTO_METHOD_PREFIX,
@@ -350,7 +356,7 @@ pub fn register_regexp_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     );
 }
 
-pub fn register_regexp_statics(ctor: &Value) {
+pub fn register_regexp_statics(ctor: &Value, heap: &mut Heap) {
     // `RegExp` has no own static methods in ES6; nothing to do. The hook exists
     // so the registration site reads like the other constructors'.
     let _ = ctor;
@@ -364,7 +370,7 @@ pub fn register_regexp_statics(ctor: &Value) {
 
 /// The matcher and flags of `value`, coercing a non-RegExp the way the spec does
 /// (`"abc".match("b")` builds `new RegExp("b")`).
-fn matcher_for(value: &Value) -> Result<(regex::Regex, String), RuntimeError> {
+fn matcher_for(heap: &mut Heap, value: &Value) -> Result<(regex::Regex, String), RuntimeError> {
     if is_regexp_receiver(value) {
         let Value::Object(obj_ref) = value else {
             return Err(RuntimeError::TypeError("not a RegExp".to_string()));
@@ -383,23 +389,27 @@ fn matcher_for(value: &Value) -> Result<(regex::Regex, String), RuntimeError> {
         Ok((compiled, obj.flags.clone()))
     } else {
         let source = value.to_js_string();
-        let built = regexp_construct_value(&[Value::string(&source)], None)?;
-        matcher_for(&built)
+        let built = regexp_construct_value(heap, &[Value::string(&source)], None)?;
+        matcher_for(heap, &built)
     }
 }
 
 /// `String.prototype.match(regexp)`: every match for `g`, otherwise the capture
 /// array (`0` plus the groups, with `index` and `input`).
-pub fn regexp_match(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn regexp_match(
+    heap: &mut Heap,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let text = super::string_receiver(this)?;
     let arg = args.first().unwrap_or(&Value::Undefined);
-    let (matcher, flags) = matcher_for(arg)?;
+    let (matcher, flags) = matcher_for(heap, arg)?;
     let mut array = ArrayObject::new();
     if flags.contains('g') {
         for m in matcher.find_iter(text.as_str()) {
             array.push(Value::string(m.as_str()));
         }
-        return Ok(Value::Object(Rc::new(RefCell::new(array))));
+        return Ok(Value::Object(heap.alloc(Object::Array(array))));
     }
     let Some(captures) = matcher.captures(text.as_str()) else {
         return Ok(Value::Null);
@@ -433,15 +443,19 @@ pub fn regexp_match(this: &Value, args: &[Value]) -> Result<Value, RuntimeError>
             setter: None,
         },
     );
-    Ok(Value::Object(Rc::new(RefCell::new(array))))
+    Ok(Value::Object(heap.alloc(Object::Array(array))))
 }
 
 /// `String.prototype.search(regexp)`: the index of the first match, or -1.
 /// It ignores `lastIndex` and does not advance it (ES 22.2.5.9).
-pub fn regexp_search(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn regexp_search(
+    heap: &mut Heap,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let text = super::string_receiver(this)?;
     let arg = args.first().unwrap_or(&Value::Undefined);
-    let (matcher, _) = matcher_for(arg)?;
+    let (matcher, _) = matcher_for(heap, arg)?;
     Ok(Value::Number(
         matcher
             .find(text.as_str())
@@ -451,9 +465,13 @@ pub fn regexp_search(this: &Value, args: &[Value]) -> Result<Value, RuntimeError
 }
 
 /// `String.prototype.split(separator[, limit])` with a RegExp separator.
-pub fn regexp_split(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn regexp_split(
+    heap: &mut Heap,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let text = super::string_receiver(this)?;
-    let (matcher, _) = matcher_for(args.first().unwrap_or(&Value::Undefined))?;
+    let (matcher, _) = matcher_for(heap, args.first().unwrap_or(&Value::Undefined))?;
     let limit = match args.get(1) {
         Some(v) if !v.is_undefined() => v.to_number() as usize,
         _ => usize::MAX,
@@ -463,16 +481,20 @@ pub fn regexp_split(this: &Value, args: &[Value]) -> Result<Value, RuntimeError>
         .take(limit)
         .map(Value::string)
         .collect();
-    Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
-        parts,
-    )))))
+    Ok(Value::Object(
+        heap.alloc(Object::Array(ArrayObject::from_vec(parts))),
+    ))
 }
 
 /// `String.prototype.replace(searchValue, replaceValue)` with a RegExp,
 /// including the `$$` / `$&` / `` $` `` / `$'` / `$n` substitutions.
-pub fn regexp_replace(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn regexp_replace(
+    heap: &mut Heap,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let text = super::string_receiver(this)?;
-    let (matcher, flags) = matcher_for(args.first().unwrap_or(&Value::Undefined))?;
+    let (matcher, flags) = matcher_for(heap, args.first().unwrap_or(&Value::Undefined))?;
     if args.len() > 1 && matches!(args[1], Value::Object(_)) {
         return Err(RuntimeError::TypeError(
             "String.prototype.replace: a function replacer is not supported yet".to_string(),

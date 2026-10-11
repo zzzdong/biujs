@@ -20,7 +20,12 @@ mod tests {
         let mut compiler = Compiler::new();
         let module = compiler.compile(js).expect("compilation failed");
         let mut vm = VM::new();
-        vm.run(&module).expect("runtime error")
+        let result = vm.run(&module).expect("runtime error");
+        // 返回的 `Value` 可能含 `Gc` 句柄，其堆由 VM 持有；VM 一析构堆即整片释放，
+        // 句柄随即悬垂。测试里结果要活过 VM，故有意泄漏这个 VM
+        // （P1 契约：`Value` 不得活过其 VM）。
+        std::mem::forget(vm);
+        result
     }
 
     #[test]

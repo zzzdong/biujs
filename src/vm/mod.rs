@@ -1,10 +1,12 @@
 pub mod iterator;
 pub(crate) mod builtins_dispatch;
 pub(crate) mod exec;
+pub(crate) mod gc;
 pub mod object;
 pub mod property;
 pub mod prototype;
 pub(crate) mod proxy;
+pub(crate) mod trace;
 pub mod value;
 
 pub use object::{
@@ -13,6 +15,8 @@ pub use object::{
 };
 pub use property::{ObjectKind, PropertyDescriptor, PropertyKey};
 pub use value::Value;
+
+use crate::vm::gc::{Gc, Heap, Object};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -261,6 +265,10 @@ pub struct VM {
     /// so it can abandon its own work. Records at or below the boundary are
     /// therefore turned back into `RuntimeError::Thrown` and propagated.
     invoke_boundaries: Vec<usize>,
+    /// 对象堆。**声明在最后**，因此按字段声明顺序析构时 heap 晚于 `state` /
+    /// `builtins` 释放 —— 这是 `Gc` 句柄不悬垂的前提（`Drop for VM` 体先于
+    /// 所有字段析构运行，故 `clear_wrapper_prototypes()` 也早于堆释放）。
+    heap: Heap,
 }
 
 impl VM {
@@ -272,7 +280,7 @@ impl VM {
     /// Whether `val` carries the `length` + integer-key shape the
     /// `Array.prototype` methods operate on (real arrays, array-likes, string
     /// wrappers). Strings are excluded: they use substring search.
-    fn receiver_is_array_like(&self, val: &Value) -> bool {
+    fn receiver_is_array_like(&mut self, val: &Value) -> bool {
         if receiver_is_string(val) {
             return false;
         }
@@ -286,7 +294,7 @@ impl VM {
             Value::Object(_) | Value::Function(_) => val,
             Value::Undefined | Value::Null => return false,
             other => {
-                boxed = crate::builtins::to_object(other).ok();
+                boxed = crate::builtins::to_object(&mut self.heap, other).ok();
                 match &boxed {
                     Some(value) => value,
                     None => return false,
@@ -295,7 +303,7 @@ impl VM {
         };
         match target {
             Value::Object(obj_ref) => crate::vm::prototype::internal_has_property(
-                Rc::clone(obj_ref),
+                *obj_ref,
                 &PropertyKey::from_str("length"),
             )
             .unwrap_or(false),
@@ -387,9 +395,11 @@ pub(crate) enum CalleeKind {
 
 impl VM {
     pub fn new() -> Self {
-        let mut state = State::new();
-        let builtins = Builtins::new();
-        builtins.register(&mut state.globals.borrow_mut());
+        // 堆先建：`state` / `builtins` 的构造都要往里分配对象。
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
+        let builtins = Builtins::new(&mut heap);
+        builtins.register(&mut state.globals.borrow_mut(), &mut heap);
         // `globalThis.globalThis === globalThis`, as in every host.
         state
             .globals
@@ -420,6 +430,7 @@ impl VM {
             revocable_proxies: HashMap::new(),
             next_revoke_id: 0,
             invoke_boundaries: Vec::new(),
+            heap,
         }
     }
 
@@ -446,22 +457,8 @@ impl VM {
 
     /// Execute a bytecode module and return the result
     pub fn run(&mut self, module: &Module) -> Result<Value, RuntimeError> {
-        // Break the `globals` ⇄ `globalThis` cycle *before* dropping this run's
-        // State: the map holds the global object and the object holds the map, so
-        // with no GC the pair (and the whole State with it) would survive.
-        self.state.globals.borrow_mut().remove("globalThis");
-        self.state = State::new();
-        // Break each boxed function's `prototype` ⇄ `constructor` cycle before
-        // dropping the map: a function object and its `prototype` object point at
-        // each other, so the pair survives the map being cleared (no GC) and
-        // takes the whole program's graph with it.
-        for value in self.func_objs.values() {
-            if let Value::Object(obj_ref) = value {
-                let _ = obj_ref
-                    .borrow_mut()
-                    .property_delete(&crate::vm::property::PropertyKey::from_str("prototype"));
-            }
-        }
+        // 换 realm：整个 `State` 换成新的（堆不换，它归 VM）。
+        self.state = State::new(&mut self.heap);
         self.func_objs.clear();
         self.current_code = Some(module.code_blocks.clone());
         self.bound_functions.clear();
@@ -499,7 +496,8 @@ impl VM {
         // test's teardown) must not be blamed on the program about to run.
         clear_memory_pressure();
         // Re-register builtins into the fresh state
-        self.builtins.register(&mut self.state.globals.borrow_mut());
+        self.builtins
+            .register(&mut self.state.globals.borrow_mut(), &mut self.heap);
         self.state
             .globals
             .borrow_mut()
@@ -581,10 +579,10 @@ impl VM {
             .code(func_id)
             .map(|block| (block.name.clone(), block.arity))
             .unwrap_or_default();
-        let obj = crate::vm::object::new_function_object(func_id, &name, arity);
+        let obj = crate::vm::object::new_function_object(&mut self.heap, func_id, &name, arity);
         if let Value::Object(ref obj_ref) = obj {
             let mut borrowed = obj_ref.borrow_mut();
-            borrowed.set_prototype(Some(Rc::clone(&self.builtins.function_prototype)));
+            borrowed.set_prototype(Some(self.builtins.function_prototype));
             if let Some(func_obj) = borrowed.as_any_mut().downcast_mut::<FunctionObject>() {
                 func_obj.captured_vars = captured_vars;
             }
@@ -602,12 +600,12 @@ impl VM {
             .unwrap_or_default();
         // `fn.length` / `fn.name` / `fn.prototype` are installed by the
         // constructor (non-writable, non-enumerable, configurable).
-        let obj = crate::vm::object::new_function_object(id, &name, arity);
+        let obj = crate::vm::object::new_function_object(&mut self.heap, id, &name, arity);
         // Attach Function.prototype so `f.call`, `f.bind`, … resolve.
         if let Value::Object(ref obj_ref) = obj {
             obj_ref
                 .borrow_mut()
-                .set_prototype(Some(Rc::clone(&self.builtins.function_prototype)));
+                .set_prototype(Some(self.builtins.function_prototype));
         }
         self.func_objs.insert(id, obj.clone());
         obj
@@ -720,14 +718,14 @@ impl VM {
         // supplies `length` and the index properties.
         let boxed = match receiver {
             Value::Object(_) | Value::Function(_) => None,
-            _ => Some(crate::builtins::to_object(receiver)?),
+            _ => Some(crate::builtins::to_object(&mut self.heap, receiver)?),
         };
         let target = boxed.as_ref().unwrap_or(receiver);
 
         let Value::Object(obj_ref) = target else {
             return Ok(Vec::new());
         };
-        let obj = Rc::clone(obj_ref);
+        let obj = *obj_ref;
         // The full `[[Get]]`: `length` may live on the prototype chain *and* be
         // an accessor (`Array.prototype.indexOf.call(instance)` where the
         // constructor's prototype defines `get length()`). Reading it with
@@ -745,7 +743,7 @@ impl VM {
         let mut entries: Vec<Option<Value>> = Vec::with_capacity(len);
         for i in 0..len {
             let key = PropertyKey::from_str(&i.to_string());
-            let present = crate::vm::prototype::internal_has_property(Rc::clone(&obj), &key)
+            let present = crate::vm::prototype::internal_has_property(obj, &key)
                 .map_err(RuntimeError::TypeError)?;
             if present {
                 // Through `[[Get]]`, so an accessor element is *invoked*.
@@ -861,6 +859,7 @@ impl VM {
                 let defined = crate::builtins::call_static_method(
                     "Object.defineProperty",
                     &[args[0].clone(), args[1].clone(), descriptor],
+                    &mut self.heap,
                 );
                 Ok(Some(Value::Bool(defined.is_ok())))
             }
@@ -1222,15 +1221,17 @@ impl VM {
         };
         let id = self.next_iterator_id;
         self.next_iterator_id += 1;
-        let iter_val = Value::Object(Rc::new(RefCell::new(NativeIteratorObject::new(
+        let iter_obj = NativeIteratorObject::new(
+            &mut self.heap,
             id,
             NativeIteratorState::Set {
-                set: Rc::clone(obj_ref),
+                set: *obj_ref,
                 kind,
                 idx: 0,
                 done: false,
             },
-        ))));
+        );
+        let iter_val = Value::Object(self.heap.alloc(Object::NativeIterator(iter_obj)));
         self.iterator_registry.insert(id, iter_val.clone());
         Ok(iter_val)
     }
@@ -1245,12 +1246,11 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         let proto = self.prototype_from_constructor(constructor_val, new_target);
         let prototype = match &proto {
-            Some(Value::Object(p)) => Some(Rc::clone(p)),
-            _ => Some(Rc::clone(&self.builtins.set_prototype)),
+            Some(Value::Object(p)) => Some(*p),
+            _ => Some(self.builtins.set_prototype),
         };
-        let set_val = Value::Object(Rc::new(RefCell::new(crate::vm::object::SetObject::new(
-            prototype,
-        ))));
+        let set_obj = crate::vm::object::SetObject::new(prototype);
+        let set_val = Value::Object(self.heap.alloc(Object::Set(set_obj)));
 
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
@@ -1354,7 +1354,7 @@ impl VM {
             "intersection" => {
                 let this_size = set_data_size(this);
                 if record.size >= this_size {
-                    let result = set_data_new(Some(self.builtins.set_prototype.clone()));
+                    let result = set_data_new(&mut self.heap, Some(self.builtins.set_prototype));
                     for value in set_data_values(this) {
                         let keep = self.invoke(
                             &record.has,
@@ -1368,7 +1368,7 @@ impl VM {
                     }
                     Ok(result)
                 } else {
-                    let result = set_data_new(Some(self.builtins.set_prototype.clone()));
+                    let result = set_data_new(&mut self.heap, Some(self.builtins.set_prototype));
                     let iter = self.iter_from_method(&record.object, &record.keys, module)?;
                     loop {
                         let (value, done) = self.iterator_next(iter.clone(), None, module)?;
@@ -1388,7 +1388,7 @@ impl VM {
             // (`difference/allows-set-like-*.js` asserts exactly that).
             "difference" => {
                 if set_data_size(this) <= record.size {
-                    let result = set_data_new(Some(self.builtins.set_prototype.clone()));
+                    let result = set_data_new(&mut self.heap, Some(self.builtins.set_prototype));
                     for value in set_data_values(this) {
                         let found = self.invoke(
                             &record.has,
@@ -1639,12 +1639,11 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         let proto = self.prototype_from_constructor(constructor_val, new_target);
         let prototype = match &proto {
-            Some(Value::Object(p)) => Some(Rc::clone(p)),
-            _ => Some(Rc::clone(&self.builtins.weakmap_prototype)),
+            Some(Value::Object(p)) => Some(*p),
+            _ => Some(self.builtins.weakmap_prototype),
         };
-        let map_val = Value::Object(Rc::new(RefCell::new(
-            crate::vm::object::WeakMapObject::new(prototype),
-        )));
+        let map_obj = crate::vm::object::WeakMapObject::new(prototype);
+        let map_val = Value::Object(self.heap.alloc(Object::WeakMap(map_obj)));
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
             let iter = self.make_iterator(iterable, module)?;
@@ -1712,12 +1711,11 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         let proto = self.prototype_from_constructor(constructor_val, new_target);
         let prototype = match &proto {
-            Some(Value::Object(p)) => Some(Rc::clone(p)),
-            _ => Some(Rc::clone(&self.builtins.weakset_prototype)),
+            Some(Value::Object(p)) => Some(*p),
+            _ => Some(self.builtins.weakset_prototype),
         };
-        let set_val = Value::Object(Rc::new(RefCell::new(
-            crate::vm::object::WeakSetObject::new(prototype),
-        )));
+        let set_obj = crate::vm::object::WeakSetObject::new(prototype);
+        let set_val = Value::Object(self.heap.alloc(Object::WeakSet(set_obj)));
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
             let iter = self.make_iterator(iterable, module)?;
@@ -1829,10 +1827,12 @@ impl VM {
         }
         let id = self.next_iterator_id;
         self.next_iterator_id += 1;
-        let iter_val = Value::Object(Rc::new(RefCell::new(NativeIteratorObject::new(
+        let iter_obj = NativeIteratorObject::new(
+            &mut self.heap,
             id,
             NativeIteratorState::Js { iterator },
-        ))));
+        );
+        let iter_val = Value::Object(self.heap.alloc(Object::NativeIterator(iter_obj)));
         self.iterator_registry.insert(id, iter_val.clone());
         Ok(iter_val)
     }
@@ -1843,8 +1843,8 @@ impl VM {
     /// The result always has `%Set.prototype%`: the set methods are specified
     /// to return a plain `Set` even on a subclass receiver, and `@@species` is
     /// never consulted (`union/subclass-symbol-species.js` checks the counter).
-    fn set_copy_of(&self, this: &Value) -> Value {
-        let result = set_data_new(Some(self.builtins.set_prototype.clone()));
+    fn set_copy_of(&mut self, this: &Value) -> Value {
+        let result = set_data_new(&mut self.heap, Some(self.builtins.set_prototype));
         for value in set_data_values(this) {
             set_data_add(&result, value);
         }
@@ -1918,9 +1918,8 @@ impl VM {
                 "Map.groupBy callback is not a function".to_string(),
             ));
         }
-        let map_val = Value::Object(Rc::new(RefCell::new(crate::vm::object::MapObject::new(
-            Some(Rc::clone(&self.builtins.map_prototype)),
-        ))));
+        let map_obj = crate::vm::object::MapObject::new(Some(self.builtins.map_prototype));
+        let map_val = Value::Object(self.heap.alloc(Object::Map(map_obj)));
         let iter = self.make_iterator(items.clone(), module)?;
         let mut index = 0usize;
         loop {
@@ -1953,10 +1952,8 @@ impl VM {
                     }
                 }
                 _ => {
-                    map.set(
-                        key,
-                        Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(vec![value])))),
-                    );
+                    let arr = ArrayObject::from_vec(vec![value]);
+                    map.set(key, Value::Object(self.heap.alloc(Object::Array(arr))));
                 }
             }
         }
@@ -2033,15 +2030,17 @@ impl VM {
         };
         let id = self.next_iterator_id;
         self.next_iterator_id += 1;
-        let iter_val = Value::Object(Rc::new(RefCell::new(NativeIteratorObject::new(
+        let iter_obj = NativeIteratorObject::new(
+            &mut self.heap,
             id,
             NativeIteratorState::Map {
-                map: Rc::clone(obj_ref),
+                map: *obj_ref,
                 kind,
                 idx: 0,
                 done: false,
             },
-        ))));
+        );
+        let iter_val = Value::Object(self.heap.alloc(Object::NativeIterator(iter_obj)));
         self.iterator_registry.insert(id, iter_val.clone());
         Ok(iter_val)
     }
@@ -2060,12 +2059,11 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         let proto = self.prototype_from_constructor(constructor_val, new_target);
         let prototype = match &proto {
-            Some(Value::Object(p)) => Some(Rc::clone(p)),
-            _ => Some(Rc::clone(&self.builtins.map_prototype)),
+            Some(Value::Object(p)) => Some(*p),
+            _ => Some(self.builtins.map_prototype),
         };
-        let map_val = Value::Object(Rc::new(RefCell::new(
-            crate::vm::object::MapObject::new(prototype),
-        )));
+        let map_obj = crate::vm::object::MapObject::new(prototype);
+        let map_val = Value::Object(self.heap.alloc(Object::Map(map_obj)));
 
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
@@ -2134,18 +2132,19 @@ impl VM {
 
     /// A promise as a `Value` (the coercion to `dyn JSObject` has to happen
     /// where the target type is known).
-    fn promise_value(promise: &Rc<RefCell<PromiseObject>>) -> Value {
-        let obj: Rc<RefCell<dyn crate::vm::object::JSObject>> = promise.clone();
-        Value::Object(obj)
+    fn promise_value(promise: &Gc<Object>) -> Value {
+        Value::Object(*promise)
     }
 
     /// A fresh promise with the engine's `Promise.prototype`.
-    fn new_promise(&mut self) -> Rc<RefCell<PromiseObject>> {
-        let proto = Rc::clone(&self.builtins.promise_prototype);
+    fn new_promise(&mut self) -> Gc<Object> {
+        let proto = self.builtins.promise_prototype;
         let id = self.state.next_promise_id;
         self.state.next_promise_id += 1;
-        let promise = Rc::new(RefCell::new(PromiseObject::new(Some(proto), id)));
-        self.state.promises.insert(id, Rc::clone(&promise));
+        let promise = self
+            .heap
+            .alloc(Object::Promise(PromiseObject::new(Some(proto), id)));
+        self.state.promises.insert(id, promise);
         promise
     }
 
@@ -2182,8 +2181,9 @@ impl VM {
 
     /// A host function boxed for use as a handler (the reaction runner checks
     /// `is_callable`, which is only answered by the boxed form).
-    fn native_fn(name: &str) -> Value {
-        Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(name))))
+    fn native_fn(heap: &mut Heap, name: &str) -> Value {
+        let obj = NativeFunctionObject::new(name);
+        Value::Object(heap.alloc(Object::NativeFunction(obj)))
     }
 
     /// `await src` (ES 27.7.5.3): convert `src` to a promise, wait for it, then
@@ -2205,7 +2205,8 @@ impl VM {
         loop {
             let (state, value) = {
                 let borrowed = promise.borrow();
-                (borrowed.state, borrowed.value.clone())
+                let p = borrowed.as_promise().expect("promise");
+                (p.state, p.value.clone())
             };
             match state {
                 PromiseState::Fulfilled => return Ok(value),
@@ -2225,15 +2226,16 @@ impl VM {
     /// foreign thenable, otherwise fulfil.
     fn promise_resolve(
         &mut self,
-        promise: &Rc<RefCell<PromiseObject>>,
+        promise: &Gc<Object>,
         value: Value,
         module: &Module,
     ) {
         if let Some(existing) = self.as_promise(&value) {
-            if Rc::ptr_eq(&existing, promise) {
+            if Gc::ptr_eq(&existing, promise) {
                 // `resolve(p)` with p itself: a chaining cycle (ES 27.2.1.3.2
                 // step 6.1) is a TypeError.
                 let reason = crate::builtins::runtime_error_to_js_error(
+                    &mut self.heap,
                     &RuntimeError::TypeError("Chaining cycle detected".to_string()),
                     &self.builtins,
                 );
@@ -2245,18 +2247,24 @@ impl VM {
             let forwarding = PromiseReaction {
                 on_fulfilled: None,
                 on_rejected: None,
-                target: Rc::clone(promise),
+                target: *promise,
             };
             let settled = {
                 let borrowed = existing.borrow();
-                if borrowed.is_pending() {
+                let p = borrowed.as_promise().expect("promise");
+                if p.is_pending() {
                     None
                 } else {
-                    Some((borrowed.state, borrowed.value.clone()))
+                    Some((p.state, p.value.clone()))
                 }
             };
             match settled {
-                None => existing.borrow_mut().reactions.push(forwarding),
+                None => existing
+                    .borrow_mut()
+                    .as_promise_mut()
+                    .expect("promise")
+                    .reactions
+                    .push(forwarding),
                 Some((state, value)) => self.state.promise_jobs.push_back(PromiseJob::Reaction {
                     reaction: forwarding,
                     argument: value,
@@ -2273,7 +2281,7 @@ impl VM {
                     let then = self.as_object_value(&then);
                     let _ = then;
                     self.state.promise_jobs.push_back(PromiseJob::Thenable {
-                        promise: Rc::clone(promise),
+                        promise: *promise,
                         thenable: value,
                     });
                     return;
@@ -2327,7 +2335,7 @@ impl VM {
             id,
             PromiseAggregation {
                 kind,
-                result: Rc::clone(&result),
+                result,
                 remaining: total,
                 values: vec![Value::Undefined; total],
                 done: false,
@@ -2351,11 +2359,9 @@ impl VM {
             };
             // `promise_then` mints the child that the handler's return value
             // settles; the aggregation itself settles the result promise.
-            self.promise_then(
-                &element_promise,
-                Some(Self::native_fn(&format!("__promise_agg_ok__{id}_{index}"))),
-                Some(Self::native_fn(&format!("__promise_agg_err__{id}_{index}"))),
-            );
+            let ok = Self::native_fn(&mut self.heap, &format!("__promise_agg_ok__{id}_{index}"));
+            let err = Self::native_fn(&mut self.heap, &format!("__promise_agg_err__{id}_{index}"));
+            self.promise_then(&element_promise, Some(ok), Some(err));
         }
         Self::promise_value(&result)
     }
@@ -2366,12 +2372,12 @@ impl VM {
             let Some(agg) = self.state.aggregations.get(&id) else {
                 return Value::Undefined;
             };
-            Rc::clone(&agg.result)
+            agg.result
         };
         self.state.aggregations.remove(&id);
         match kind {
             AggregateKind::All | AggregateKind::AllSettled => {
-                let array = Value::Object(Rc::new(RefCell::new(
+                let array = Value::Object(self.heap.alloc(Object::Array(
                     crate::vm::object::ArrayObject::from_vec(vec![]),
                 )));
                 self.promise_settle(&result, PromiseState::Fulfilled, array);
@@ -2393,14 +2399,15 @@ impl VM {
     /// The full constructor is ES2021 and out of this engine's ES6 target, so
     /// no `AggregateError` global exists; the rejection reason still has the
     /// right shape (`name` `"AggregateError"`, own `errors`) for `Promise.any`.
-    fn aggregate_error(&self, errors: Vec<Value>) -> Value {
-        let prototype = Rc::clone(&self.builtins.error_prototype);
+    fn aggregate_error(&mut self, errors: Vec<Value>) -> Value {
+        let prototype = self.builtins.error_prototype;
         let mut value = crate::builtins::create_error_object(
+            &mut self.heap,
             Some("All promises were rejected".to_string()),
             prototype,
             "AggregateError",
         );
-        let array = Value::Object(Rc::new(RefCell::new(
+        let array = Value::Object(self.heap.alloc(Object::Array(
             crate::vm::object::ArrayObject::from_vec(errors),
         )));
         if let Value::Object(obj) = &mut value {
@@ -2443,7 +2450,7 @@ impl VM {
                         if agg.done {
                             return Some(Ok(Value::Undefined));
                         }
-                        Rc::clone(&agg.result)
+                        agg.result
                     };
                     self.state.aggregations.remove(&id);
                     self.promise_settle(&result, PromiseState::Rejected, argument);
@@ -2455,7 +2462,7 @@ impl VM {
                     };
                     agg.values[index] = argument;
                     agg.remaining -= 1;
-                    (agg.remaining == 0, Rc::clone(&agg.result))
+                    (agg.remaining == 0, agg.result)
                 };
                 if complete {
                     let values = self
@@ -2464,7 +2471,7 @@ impl VM {
                         .remove(&id)
                         .map(|a| a.values)
                         .unwrap_or_default();
-                    let array = Value::Object(Rc::new(RefCell::new(
+                    let array = Value::Object(self.heap.alloc(Object::Array(
                         crate::vm::object::ArrayObject::from_vec(values),
                     )));
                     self.promise_settle(&result, PromiseState::Fulfilled, array);
@@ -2479,7 +2486,7 @@ impl VM {
                     if agg.done {
                         return Some(Ok(Value::Undefined));
                     }
-                    Rc::clone(&agg.result)
+                    agg.result
                 };
                 self.state.aggregations.remove(&id);
                 let state = if fulfilled {
@@ -2508,9 +2515,9 @@ impl VM {
                         crate::vm::property::PropertyDescriptor::data_descriptor(argument),
                     )
                     .ok();
-                    agg.values[index] = Value::Object(Rc::new(RefCell::new(obj)));
+                    agg.values[index] = Value::Object(self.heap.alloc(Object::Ordinary(obj)));
                     agg.remaining -= 1;
-                    (agg.remaining == 0, Rc::clone(&agg.result))
+                    (agg.remaining == 0, agg.result)
                 };
                 if complete {
                     let values = self
@@ -2519,7 +2526,7 @@ impl VM {
                         .remove(&id)
                         .map(|a| a.values)
                         .unwrap_or_default();
-                    let array = Value::Object(Rc::new(RefCell::new(
+                    let array = Value::Object(self.heap.alloc(Object::Array(
                         crate::vm::object::ArrayObject::from_vec(values),
                     )));
                     self.promise_settle(&result, PromiseState::Fulfilled, array);
@@ -2534,7 +2541,7 @@ impl VM {
                         if agg.done {
                             return Some(Ok(Value::Undefined));
                         }
-                        Rc::clone(&agg.result)
+                        agg.result
                     };
                     self.state.aggregations.remove(&id);
                     self.promise_settle(&result, PromiseState::Fulfilled, argument);
@@ -2549,7 +2556,7 @@ impl VM {
                     (
                         agg.rejections == agg.total,
                         agg.values.clone(),
-                        Rc::clone(&agg.result),
+                        agg.result,
                     )
                 };
                 if exhausted {
@@ -2564,18 +2571,19 @@ impl VM {
 
     fn promise_settle(
         &mut self,
-        promise: &Rc<RefCell<PromiseObject>>,
+        promise: &Gc<Object>,
         state: PromiseState,
         value: Value,
     ) {
         let reactions = {
             let mut borrowed = promise.borrow_mut();
-            if !borrowed.is_pending() {
+            let p = borrowed.as_promise_mut().expect("promise");
+            if !p.is_pending() {
                 return;
             }
-            borrowed.state = state;
-            borrowed.value = value.clone();
-            std::mem::take(&mut borrowed.reactions)
+            p.state = state;
+            p.value = value.clone();
+            std::mem::take(&mut p.reactions)
         };
         let fulfilled = state == PromiseState::Fulfilled;
         for reaction in reactions {
@@ -2588,25 +2596,21 @@ impl VM {
     }
 
     /// The receiver as a promise, or None when it is not one.
-    fn as_promise(&self, value: &Value) -> Option<Rc<RefCell<PromiseObject>>> {
+    fn as_promise(&self, value: &Value) -> Option<Gc<Object>> {
         let Value::Object(obj_ref) = value else {
             return None;
         };
-        let id = {
-            let borrowed = obj_ref.borrow();
-            if borrowed.kind() != ObjectKind::Promise {
-                return None;
-            }
-            borrowed.as_any().downcast_ref::<PromiseObject>()?.id
-        };
-        self.state.promises.get(&id).cloned()
+        if obj_ref.borrow().as_promise().is_none() {
+            return None;
+        }
+        Some(*obj_ref)
     }
 
     /// `promise.then(onFulfilled, onRejected)` — always asynchronous, so a
     /// settled promise still queues its reaction.
     fn promise_then(
         &mut self,
-        promise: &Rc<RefCell<PromiseObject>>,
+        promise: &Gc<Object>,
         on_fulfilled: Option<Value>,
         on_rejected: Option<Value>,
     ) -> Value {
@@ -2614,18 +2618,24 @@ impl VM {
         let reaction = PromiseReaction {
             on_fulfilled,
             on_rejected,
-            target: Rc::clone(&child),
+            target: child,
         };
         let settled = {
             let borrowed = promise.borrow();
-            if borrowed.is_pending() {
+            let p = borrowed.as_promise().expect("promise");
+            if p.is_pending() {
                 None
             } else {
-                Some((borrowed.state, borrowed.value.clone()))
+                Some((p.state, p.value.clone()))
             }
         };
         match settled {
-            None => promise.borrow_mut().reactions.push(reaction),
+            None => promise
+                .borrow_mut()
+                .as_promise_mut()
+                .expect("promise")
+                .reactions
+                .push(reaction),
             Some((state, value)) => {
                 self.state.promise_jobs.push_back(PromiseJob::Reaction {
                     reaction,
@@ -2651,9 +2661,11 @@ impl VM {
                 PromiseJob::Thenable { promise, thenable } => {
                     // ES 27.2.1.9: call `thenable.then(resolveFn, rejectFn)` with
                     // functions that resolve/reject the adopting promise.
-                    let id = promise.borrow().id;
-                    let resolve = Self::native_fn(&format!("__promise_resolve__{id}"));
-                    let reject = Self::native_fn(&format!("__promise_reject__{id}"));
+                    let id = promise.borrow().as_promise().expect("promise").id;
+                    let resolve =
+                        Self::native_fn(&mut self.heap, &format!("__promise_resolve__{id}"));
+                    let reject =
+                        Self::native_fn(&mut self.heap, &format!("__promise_reject__{id}"));
                     let then = match self.get_member(
                         &thenable,
                         &PropertyKey::from_str("then"),
@@ -2713,10 +2725,14 @@ impl VM {
     }
 
     /// A `RuntimeError` as a JS error value (what a rejection reason should be).
-    fn error_value(&self, err: RuntimeError) -> Value {
+    fn error_value(&mut self, err: RuntimeError) -> Value {
         match err {
             RuntimeError::Thrown(value) => value,
-            other => crate::builtins::runtime_error_to_js_error(&other, &self.builtins),
+            other => crate::builtins::runtime_error_to_js_error(
+                &mut self.heap,
+                &other,
+                &self.builtins,
+            ),
         }
     }
 
@@ -2733,18 +2749,17 @@ impl VM {
             Some(Value::Object(p)) => {
                 let id = self.state.next_promise_id;
                 self.state.next_promise_id += 1;
-                let promise = Rc::new(RefCell::new(PromiseObject::new(Some(p), id)));
-                self.state.promises.insert(id, Rc::clone(&promise));
+                let promise = self
+                    .heap
+                    .alloc(Object::Promise(PromiseObject::new(Some(p), id)));
+                self.state.promises.insert(id, promise);
                 promise
             }
             _ => self.new_promise(),
         };
-        let id = promise.borrow().id;
-        let native = |name: &str| {
-            Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(name))))
-        };
-        let resolve = native(&format!("__promise_resolve__{id}"));
-        let reject = native(&format!("__promise_reject__{id}"));
+        let id = promise.borrow().as_promise().expect("promise").id;
+        let resolve = Self::native_fn(&mut self.heap, &format!("__promise_resolve__{id}"));
+        let reject = Self::native_fn(&mut self.heap, &format!("__promise_reject__{id}"));
         match self.invoke(executor, Value::Undefined, &[resolve, reject], module) {
             Ok(_) => {}
             Err(err) => {
@@ -3020,12 +3035,12 @@ impl VM {
     }
 
     /// Resolve the prototype object that backs a primitive's wrapper type.
-    fn primitive_prototype(&self, val: &Value) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn primitive_prototype(&self, val: &Value) -> Option<Gc<Object>> {
         match val {
-            Value::String(_) => Some(Rc::clone(&self.builtins.string_prototype)),
-            Value::Number(_) => Some(Rc::clone(&self.builtins.number_prototype)),
-            Value::Bool(_) => Some(Rc::clone(&self.builtins.boolean_prototype)),
-            Value::Symbol(_) => Some(Rc::clone(&self.builtins.symbol_prototype)),
+            Value::String(_) => Some(self.builtins.string_prototype),
+            Value::Number(_) => Some(self.builtins.number_prototype),
+            Value::Bool(_) => Some(self.builtins.boolean_prototype),
+            Value::Symbol(_) => Some(self.builtins.symbol_prototype),
             _ => None,
         }
     }
@@ -3049,7 +3064,7 @@ impl VM {
                 // below then answers the target's property: `ProxyObject`
                 // forwards `property_get` to the target.
                 if obj_ref.borrow().kind() == ObjectKind::Proxy {
-                    let proxy_val = Value::Object(Rc::clone(obj_ref));
+                    let proxy_val = Value::Object(*obj_ref);
                     if let Some(value) = self.proxy_get(&proxy_val, key, &proxy_val, module)? {
                         return Ok(value);
                     }
@@ -3057,14 +3072,14 @@ impl VM {
                 // Accessor properties have to invoke their getter, which needs a
                 // re-entrant call — hence the descriptor search here.
                 if let Some((owner, desc)) =
-                    crate::vm::prototype::find_descriptor(Rc::clone(obj_ref), key)
+                    crate::vm::prototype::find_descriptor(*obj_ref, key)
                         .map_err(RuntimeError::TypeError)?
                 {
                     if desc.is_accessor_descriptor() {
                         // `this` is the *receiver* (the object the property was
                         // read from), not the object that happens to hold the
                         // descriptor — class accessors live on the prototype.
-                        let receiver = Value::Object(Rc::clone(obj_ref));
+                        let receiver = Value::Object(*obj_ref);
                         let _ = owner;
                         return match desc.invoked_getter() {
                             Some(getter) => self.invoke(getter, receiver, &[], module),
@@ -3115,7 +3130,7 @@ impl VM {
     fn get_from_prototype(
         &mut self,
         receiver: &Value,
-        proto: &Option<Rc<RefCell<dyn JSObject>>>,
+        proto: &Option<Gc<Object>>,
         key: &PropertyKey,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
@@ -3123,7 +3138,7 @@ impl VM {
             return Ok(Value::Undefined);
         };
         if let Some((_owner, desc)) =
-            crate::vm::prototype::find_descriptor(Rc::clone(proto_ref), key)
+            crate::vm::prototype::find_descriptor(*proto_ref, key)
                 .map_err(RuntimeError::TypeError)?
         {
             if desc.is_accessor_descriptor() {
@@ -3154,12 +3169,12 @@ impl VM {
             return self.get_member(obj, key, module);
         };
         if obj_ref.borrow().kind() == ObjectKind::Proxy {
-            let proxy_val = Value::Object(Rc::clone(obj_ref));
+            let proxy_val = Value::Object(*obj_ref);
             if let Some(value) = self.proxy_get(&proxy_val, key, receiver, module)? {
                 return Ok(value);
             }
         }
-        if let Some((_owner, desc)) = crate::vm::prototype::find_descriptor(Rc::clone(obj_ref), key)
+        if let Some((_owner, desc)) = crate::vm::prototype::find_descriptor(*obj_ref, key)
             .map_err(RuntimeError::TypeError)?
         {
             if desc.is_accessor_descriptor() {
@@ -3198,7 +3213,7 @@ impl VM {
         };
         // A `set` trap answers for the whole operation, receiver included.
         if obj_ref.borrow().kind() == ObjectKind::Proxy {
-            let proxy_val = Value::Object(Rc::clone(obj_ref));
+            let proxy_val = Value::Object(*obj_ref);
             return self.proxy_set(&proxy_val, key, value, receiver, module);
         }
         let own = obj_ref.borrow().property_get(key);
@@ -3260,11 +3275,11 @@ impl VM {
 
     fn lookup_on_prototype(
         &self,
-        proto: &Option<Rc<RefCell<dyn JSObject>>>,
+        proto: &Option<Gc<Object>>,
         key: &PropertyKey,
     ) -> Result<Value, RuntimeError> {
         match proto {
-            Some(p) => crate::vm::prototype::internal_get(Rc::clone(p), key, None)
+            Some(p) => crate::vm::prototype::internal_get(*p, key, None)
                 .map_err(RuntimeError::TypeError),
             None => Ok(Value::Undefined),
         }
@@ -3283,7 +3298,7 @@ impl VM {
                 // A `set` trap replaces the whole assignment: it decides both
                 // the value and whether the write succeeded (ES 10.5.9).
                 if obj_ref.borrow().kind() == ObjectKind::Proxy {
-                    let proxy_val = Value::Object(Rc::clone(obj_ref));
+                    let proxy_val = Value::Object(*obj_ref);
                     if self.proxy_set(&proxy_val, &key, &value, &proxy_val, module)? {
                         return Ok(());
                     }
@@ -3297,12 +3312,12 @@ impl VM {
                 // An accessor anywhere on the chain intercepts the assignment
                 // and routes it to the setter (which needs a re-entrant call).
                 if let Some((owner, desc)) =
-                    crate::vm::prototype::find_descriptor(Rc::clone(obj_ref), &key)
+                    crate::vm::prototype::find_descriptor(*obj_ref, &key)
                         .map_err(RuntimeError::TypeError)?
                 {
                     if desc.is_accessor_descriptor() {
                         // Same receiver rule as `get_member` above.
-                        let receiver = Value::Object(Rc::clone(obj_ref));
+                        let receiver = Value::Object(*obj_ref);
                         let _ = owner;
                         return match desc.invoked_setter() {
                             Some(setter) => {
@@ -3367,15 +3382,15 @@ impl VM {
             Value::Object(obj_ref) if obj_ref.borrow().kind() == ObjectKind::Proxy => {
                 // A `deleteProperty` trap answers for the whole operation
                 // (ES 10.5.10); with no trap the delete is the target's.
-                let proxy_val = Value::Object(Rc::clone(obj_ref));
+                let proxy_val = Value::Object(*obj_ref);
                 match self.proxy_delete(&proxy_val, key, module)? {
                     Some(removed) => Ok(removed),
-                    None => crate::vm::prototype::internal_delete(Rc::clone(obj_ref), key)
+                    None => crate::vm::prototype::internal_delete(*obj_ref, key)
                         .map_err(RuntimeError::TypeError),
                 }
             }
             Value::Object(obj_ref) => {
-                crate::vm::prototype::internal_delete(Rc::clone(obj_ref), key)
+                crate::vm::prototype::internal_delete(*obj_ref, key)
                     .map_err(RuntimeError::TypeError)
             }
             Value::Function(id) => {
@@ -3401,7 +3416,7 @@ impl VM {
             Value::Object(obj_ref) => {
                 let key = PropertyKey::from_str(prop_name);
                 if obj_ref.borrow().kind() == ObjectKind::Proxy {
-                    let proxy_val = Value::Object(Rc::clone(obj_ref));
+                    let proxy_val = Value::Object(*obj_ref);
                     if let Some(value) = self.proxy_get(&proxy_val, &key, &proxy_val, module)? {
                         return Ok(value);
                     }
@@ -3455,7 +3470,8 @@ impl VM {
         let prologue_this = this.clone();
         let prologue_args = args.clone();
         let prologue_captured = captured_vars.clone();
-        let mut gobj = crate::vm::object::GeneratorObject::new(id, func_id, args, this);
+        let mut gobj =
+            crate::vm::object::GeneratorObject::new(&mut self.heap, id, func_id, args, this);
         gobj.captured_vars = captured_vars;
         // ES 14.4.11 / 9.1.13: the instance's prototype comes from
         // `GetPrototypeFromConstructor(functionObject, "%GeneratorPrototype%")`,
@@ -3468,7 +3484,7 @@ impl VM {
                 }
             }
         }
-        let value = Value::Object(Rc::new(RefCell::new(gobj)));
+        let value = Value::Object(self.heap.alloc(Object::Generator(gobj)));
         self.generator_registry.insert(id, value.clone());
 
         // ES 9.2.12 `FunctionDeclarationInstantiation` runs when the generator is
@@ -3626,7 +3642,7 @@ impl VM {
             gobj.state
         };
         if state == crate::vm::object::GeneratorState::Completed {
-            return Ok(Self::iterator_result(Value::Undefined, true));
+            return Ok(Self::iterator_result(&mut self.heap, Value::Undefined, true));
         }
 
         if state == crate::vm::object::GeneratorState::SuspendedStart {
@@ -3646,7 +3662,7 @@ impl VM {
                 {
                     Some(gobj) if gobj.suspended.is_some() => {
                         gobj.state = crate::vm::object::GeneratorState::Executing;
-                        gobj.suspended.take()
+                        gobj.suspended.take().map(|f| *f)
                     }
                     _ => None,
                 }
@@ -3702,7 +3718,7 @@ impl VM {
                     .unwrap();
                 gobj.state = crate::vm::object::GeneratorState::Executing;
                 match gobj.suspended.take() {
-                    Some(frame) => frame,
+                    Some(frame) => *frame,
                     None => {
                         // Unreachable through the spec's own state machine, but a
                         // panic here aborts the entire run — keep it local to the
@@ -3789,7 +3805,7 @@ impl VM {
             let func_id = gobj.func_id;
             let frame = if state == crate::vm::object::GeneratorState::SuspendedYield {
                 gobj.state = crate::vm::object::GeneratorState::Executing;
-                gobj.suspended.take()
+                gobj.suspended.take().map(|f| *f)
             } else {
                 None
             };
@@ -3801,7 +3817,7 @@ impl VM {
         let Some(mut frame) = frame else {
             self.mark_generator_completed(&gen_value);
             return match completion {
-                Ok(value) => Ok(Self::iterator_result(value, true)),
+                Ok(value) => Ok(Self::iterator_result(&mut self.heap, value, true)),
                 Err(err) => Err(err),
             };
         };
@@ -3872,7 +3888,7 @@ impl VM {
                     // merely runs would report `undefined` (see §2.1x).
                     None => {
                         self.mark_generator_completed(&gen_value);
-                        Ok(Self::iterator_result(value, true))
+                        Ok(Self::iterator_result(&mut self.heap, value, true))
                     }
                 }
             }
@@ -3904,10 +3920,10 @@ impl VM {
                                 frame,
                                 crate::vm::object::GeneratorState::SuspendedYield,
                             );
-                            return Ok(Self::iterator_result(value, false));
+                            return Ok(Self::iterator_result(&mut self.heap, value, false));
                         }
                         self.mark_generator_completed(&gen_value);
-                        return Ok(Self::iterator_result(value, true));
+                        return Ok(Self::iterator_result(&mut self.heap, value, true));
                     }
                 }
                 // No delegate `throw`: the completion lands on the `yield`
@@ -4127,11 +4143,11 @@ impl VM {
                     frame,
                     crate::vm::object::GeneratorState::SuspendedYield,
                 );
-                Self::iterator_result(value, false)
+                Self::iterator_result(&mut self.heap, value, false)
             }
             _ => {
                 self.mark_generator_completed(gen_value);
-                Self::iterator_result(run.rv, true)
+                Self::iterator_result(&mut self.heap, run.rv, true)
             }
         }
     }
@@ -4155,7 +4171,7 @@ impl VM {
                 .downcast_mut::<crate::vm::object::GeneratorObject>()
             {
                 gobj.state = state;
-                gobj.suspended = Some(frame);
+                gobj.suspended = Some(Box::new(frame));
             }
         }
     }
@@ -4274,11 +4290,11 @@ impl VM {
     }
 
     /// `{ value, done }` — the shape every iterator result has.
-    fn iterator_result(value: Value, done: bool) -> Value {
+    fn iterator_result(heap: &mut Heap, value: Value, done: bool) -> Value {
         let mut result = crate::vm::object::OrdinaryObject::new();
         let _ = result.property_set(PropertyKey::from_str("value"), value);
         let _ = result.property_set(PropertyKey::from_str("done"), Value::Bool(done));
-        Value::Object(Rc::new(RefCell::new(result)))
+        Value::Object(heap.alloc(Object::Ordinary(result)))
     }
 
     /// Snapshot of everything a nested call must restore afterwards — the same
@@ -4422,14 +4438,14 @@ impl VM {
             {
                 let id = self.next_iterator_id;
                 self.next_iterator_id += 1;
-                let iter_val = Value::Object(Rc::new(RefCell::new(
-                    crate::vm::iterator::NativeIteratorObject::new(
-                        id,
-                        crate::vm::iterator::NativeIteratorState::Js {
-                            iterator: src.clone(),
-                        },
-                    ),
-                )));
+                let iter_obj = crate::vm::iterator::NativeIteratorObject::new(
+                    &mut self.heap,
+                    id,
+                    crate::vm::iterator::NativeIteratorState::Js {
+                        iterator: src.clone(),
+                    },
+                );
+                let iter_val = Value::Object(self.heap.alloc(Object::NativeIterator(iter_obj)));
                 self.iterator_registry.insert(id, iter_val.clone());
                 return Ok(iter_val);
             }
@@ -4514,9 +4530,8 @@ impl VM {
 
         let id = self.next_iterator_id;
         self.next_iterator_id += 1;
-        let iter_val = Value::Object(Rc::new(RefCell::new(
-            crate::vm::iterator::NativeIteratorObject::new(id, state),
-        )));
+        let iter_obj = crate::vm::iterator::NativeIteratorObject::new(&mut self.heap, id, state);
+        let iter_val = Value::Object(self.heap.alloc(Object::NativeIterator(iter_obj)));
         self.iterator_registry.insert(id, iter_val.clone());
         Ok(iter_val)
     }
@@ -4531,7 +4546,7 @@ impl VM {
         use crate::vm::iterator::{native_next, NativeIteratorState};
 
         let iter_obj = match &iter_val {
-            Value::Object(obj_ref) => Rc::clone(obj_ref),
+            Value::Object(obj_ref) => *obj_ref,
             _ => {
                 return Err(RuntimeError::TypeError(
                     "IteratorNext on non-iterator".to_string(),
@@ -4583,7 +4598,7 @@ impl VM {
                 .as_any_mut()
                 .downcast_mut::<crate::vm::iterator::NativeIteratorObject>()
                 .unwrap();
-            match native_next(&mut *it.state().borrow_mut()) {
+            match native_next(&mut self.heap, &mut *it.state().borrow_mut()) {
                 Some(item) => Ok((item, false)),
                 None => Ok((Value::Undefined, true)),
             }
@@ -4821,11 +4836,11 @@ impl VM {
 
         let mut new_obj = crate::vm::object::OrdinaryObject::new();
         if let Some(Value::Object(proto_obj)) = &prototype {
-            new_obj.set_prototype(Some(Rc::clone(proto_obj)));
+            new_obj.set_prototype(Some(*proto_obj));
         } else {
-            new_obj.set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
+            new_obj.set_prototype(Some(self.builtins.object_prototype));
         }
-        let new_obj_val = Value::Object(Rc::new(RefCell::new(new_obj)));
+        let new_obj_val = Value::Object(self.heap.alloc(Object::Ordinary(new_obj)));
 
         self.invoke_construct(&boxed_ctor, new_obj_val, args, new_target, module)
     }
@@ -4891,22 +4906,22 @@ impl VM {
         // one, and the prototype comes from `newTarget` — so both need the VM.
         if name == "ArrayBuffer" {
             let proto = self.prototype_from_constructor(constructor_val, new_target);
-            return crate::builtins::typedarray::arraybuffer_construct(args, proto);
+            return crate::builtins::typedarray::arraybuffer_construct(&mut self.heap, args, proto);
         }
         if name == "DataView" {
             let proto = self.prototype_from_constructor(constructor_val, new_target);
-            return crate::builtins::typedarray::dataview_construct(args, proto);
+            return crate::builtins::typedarray::dataview_construct(&mut self.heap, args, proto);
         }
         if let Some(kind) = crate::builtins::typedarray::kind_from_name(name) {
             let proto = self.prototype_from_constructor(constructor_val, new_target);
-            return crate::builtins::typedarray::typedarray_construct(kind, args, proto);
+            return crate::builtins::typedarray::typedarray_construct(&mut self.heap, kind, args, proto);
         }
         // `new Date(...)` builds the object itself: `Date()` without `new`
         // answers a *string*, so `call_native` cannot serve both
         // (ES 21.4.2.1 vs 21.4.3.1).
         if name == "Date" {
             let proto = self.prototype_from_constructor(constructor_val, new_target);
-            return crate::builtins::date_construct_value(args, proto);
+            return crate::builtins::date_construct_value(&mut self.heap, args, proto);
         }
         // `new Promise(executor)`: the executor has to be *called* with the two
         // settling functions, which only the VM can do.
@@ -4929,7 +4944,7 @@ impl VM {
             // object — but `is_object` cannot see that, so it is boxed first.
             let target = self.as_object_value(&args.first().cloned().unwrap_or(Value::Undefined));
             let handler = self.as_object_value(&args.get(1).cloned().unwrap_or(Value::Undefined));
-            return crate::builtins::proxy::proxy_construct(target, handler);
+            return crate::builtins::proxy::proxy_construct(&mut self.heap, target, handler);
         }
 
         // ES 9.1.14 `GetPrototypeFromConstructor`: `newTarget.prototype` when
@@ -4942,16 +4957,16 @@ impl VM {
         let reparent = new_target.is_some_and(|nt| !nt.strict_eq_obj(constructor_val));
         let mut this_obj = crate::vm::object::OrdinaryObject::new();
         match &proto {
-            Some(Value::Object(p)) => this_obj.set_prototype(Some(Rc::clone(p))),
-            _ => this_obj.set_prototype(Some(Rc::clone(&self.builtins.object_prototype))),
+            Some(Value::Object(p)) => this_obj.set_prototype(Some(*p)),
+            _ => this_obj.set_prototype(Some(self.builtins.object_prototype)),
         }
-        let this_val = Value::Object(Rc::new(RefCell::new(this_obj)));
+        let this_val = Value::Object(self.heap.alloc(Object::Ordinary(this_obj)));
 
-        let result = crate::builtins::call_native(name, args)?;
+        let result = crate::builtins::call_native(name, args, &mut self.heap)?;
         let result = self.finish_native_construct(result, &proto, this_val);
         if reparent {
             if let (Value::Object(obj_ref), Some(Value::Object(p))) = (&result, &proto) {
-                obj_ref.borrow_mut().set_prototype(Some(Rc::clone(p)));
+                obj_ref.borrow_mut().set_prototype(Some(*p));
             }
         }
         Ok(result)
@@ -4964,13 +4979,13 @@ impl VM {
     /// object), or nothing at all — in which case the `this` object created for
     /// the call is the result.
     fn finish_native_construct(
-        &self,
+        &mut self,
         result: Value,
         proto: &Option<Value>,
         this_obj: Value,
     ) -> Value {
         let proto_ref = match proto {
-            Some(Value::Object(p)) => Some(Rc::clone(p)),
+            Some(Value::Object(p)) => Some(*p),
             _ => None,
         };
         match &result {
@@ -4986,17 +5001,17 @@ impl VM {
                 result
             }
             // `new String("x")` / `new Number(1)` / `new Boolean(true)`.
-            Value::String(_) | Value::Number(_) | Value::Bool(_) => Value::Object(Rc::new(
-                RefCell::new(crate::vm::object::PrimitiveWrapperObject::new(
-                    result, proto_ref,
-                )),
-            )),
+            Value::String(_) | Value::Number(_) | Value::Bool(_) => {
+                Value::Object(self.heap.alloc(Object::PrimitiveWrapper(
+                    crate::vm::object::PrimitiveWrapperObject::new(result, proto_ref),
+                )))
+            }
             _ => this_obj,
         }
     }
 
     fn call_builtin_method(
-        &self,
+        &mut self,
         obj: &Value,
         method_name: &str,
         args: &[Value],
@@ -5004,13 +5019,15 @@ impl VM {
         // First check: is this a static method on a native function (constructor)?
         if let Some(name) = crate::builtins::native_function_name(obj) {
             let static_method = format!("{}.{}", name, method_name);
-            if let Ok(result) = crate::builtins::call_static_method(&static_method, args) {
+            if let Ok(result) =
+                crate::builtins::call_static_method(&static_method, args, &mut self.heap)
+            {
                 return Ok(result);
             }
         }
 
         // Delegate to the builtins module for prototype method dispatching
-        match crate::builtins::call_prototype_method(obj, method_name, args) {
+        match crate::builtins::call_prototype_method(&mut self.heap, obj, method_name, args) {
             Ok(result) => Ok(result),
             Err(_) => {
                 // Fallback: unknown method, try property lookup via prototype chain
@@ -5179,7 +5196,7 @@ struct State {
     /// Promises reachable from the native `resolve` / `reject` functions, keyed
     /// by the id embedded in their names — the engine dispatches natives by
     /// name, so that is how those two closures carry their target.
-    promises: HashMap<u64, Rc<RefCell<PromiseObject>>>,
+    promises: HashMap<u64, Gc<Object>>,
     next_promise_id: u64,
     /// In-flight `Promise.all` / `race` / `allSettled` / `any` aggregations,
     /// keyed by the id embedded in the per-element native handler names — the
@@ -5204,9 +5221,9 @@ struct State {
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(heap: &mut Heap) -> Self {
         let globals = Rc::new(RefCell::new(HashMap::new()));
-        let global_object = Value::Object(Rc::new(RefCell::new(
+        let global_object = Value::Object(heap.alloc(Object::Global(
             crate::vm::object::GlobalObject::new(Rc::clone(&globals)),
         )));
         Self {
@@ -5537,10 +5554,9 @@ struct SetRecord {
 }
 
 /// A fresh `Set` with the given prototype and no entries.
-fn set_data_new(prototype: Option<Rc<RefCell<dyn crate::vm::object::JSObject>>>) -> Value {
-    Value::Object(Rc::new(RefCell::new(crate::vm::object::SetObject::new(
-        prototype,
-    ))))
+fn set_data_new(heap: &mut Heap, prototype: Option<Gc<Object>>) -> Value {
+    let set_obj = crate::vm::object::SetObject::new(prototype);
+    Value::Object(heap.alloc(Object::Set(set_obj)))
 }
 
 /// Run `f` with the `SetObject` behind `value` (no-op when it is not a Set).
@@ -5672,7 +5688,7 @@ pub enum PromiseJob {
     /// to a resolving function, so its `then` has to be called with functions
     /// that settle the promise this job is adopting (`promise`).
     Thenable {
-        promise: Rc<RefCell<crate::vm::object::PromiseObject>>,
+        promise: Gc<Object>,
         thenable: Value,
     },
 }
@@ -5705,7 +5721,7 @@ fn parse_aggregation_handler(name: &str) -> Option<(u64, usize)> {
 #[derive(Debug)]
 pub struct PromiseAggregation {
     kind: AggregateKind,
-    result: Rc<RefCell<crate::vm::object::PromiseObject>>,
+    result: Gc<Object>,
     /// Elements still to settle (for `all` / `allSettled` / `any`).
     remaining: usize,
     /// Element results, by index (`all` / `allSettled` values, `any` reasons).
@@ -5719,15 +5735,19 @@ pub struct PromiseAggregation {
 }
 
 impl Drop for VM {
-    /// Break this realm's cycles so dropping the VM actually frees it.
+    /// 清空 wrapper 原型的线程局部缓存。
     ///
-    /// A host that builds a VM per program (the test262 runner does, because a
-    /// test may mutate built-ins and expects a clean realm) otherwise leaks the
-    /// whole builtins graph of every program: measured as a shard that could not
-    /// finish under a 1 GiB `ulimit`.
+    /// 该缓存按名字存放 `Gc<Object>` 句柄，而句柄**没有引用计数、也没有 Drop** ——
+    /// 不清的话，下一个 VM 会查到本 VM 已经释放的槽并读它（悬垂，release 下是静默 UB）。
+    /// `Rc` 时代"忘了清 = 泄漏"，现在升级为"忘了清 = 悬垂"，所以这一步是**必须**的。
+    ///
+    /// 注意 drop 体**先于**字段析构运行，故它必然早于 `heap` 的释放。
+    ///
+    /// 至于对象之间的环（`prototype` ⇄ `constructor` 等）：不再需要手工断 ——
+    /// 它们都活在同一个 `Heap` 里，随 `heap` 字段析构整片释放。原先那条写死的
+    /// 23 项清单（`Builtins::teardown`）已删除。
     fn drop(&mut self) {
-        self.state.globals.borrow_mut().remove("globalThis");
-        self.builtins.teardown();
+        crate::builtins::clear_wrapper_prototypes();
     }
 }
 
@@ -5795,7 +5815,7 @@ impl std::fmt::Display for RuntimeError {
                 if let Some(obj_ref) = val.as_object() {
                     let get = |prop: &str| -> Option<String> {
                         crate::vm::prototype::find_descriptor(
-                            Rc::clone(&obj_ref),
+                            obj_ref,
                             &PropertyKey::from_str(prop),
                         )
                         .ok()
@@ -5828,7 +5848,8 @@ mod tests {
 
     #[test]
     fn test_state_new() {
-        let state = State::new();
+        let mut heap = Heap::new();
+        let state = State::new(&mut heap);
         assert_eq!(state.rsp, 0);
         assert_eq!(state.rbp, 0);
         assert!(state.seh_stack.is_empty());
@@ -5837,7 +5858,8 @@ mod tests {
 
     #[test]
     fn test_state_push_pop() {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         state.push(Value::Number(42.0)).unwrap();
         assert_eq!(state.rsp, 1);
         let val = state.pop().unwrap();
@@ -5847,7 +5869,8 @@ mod tests {
 
     #[test]
     fn test_state_push_pop_multiple() {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         state.push(Value::Number(1.0)).unwrap();
         state.push(Value::Number(2.0)).unwrap();
         state.push(Value::Number(3.0)).unwrap();
@@ -5860,7 +5883,8 @@ mod tests {
 
     #[test]
     fn test_state_pop_underflow() {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         let result = state.pop();
         assert!(matches!(result, Err(RuntimeError::RangeError(_))));
     }
@@ -5870,7 +5894,8 @@ mod tests {
     /// `pc` 现在住在 `Frame` 里，所以任何要动 `pc` 的测试都必须先有帧 ——
     /// 这正是本步的意图：**没有帧就没有 pc**，不再有一条"帧外"的 pc 通道。
     fn state_with_script_frame() -> State {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         // 用**运行期同一个**压帧入口，测试才不会验到另一种帧。
         state.open_script_frame().expect("open_script_frame");
         state
@@ -5940,7 +5965,8 @@ mod tests {
 
     #[test]
     fn test_state_register() {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         state
             .set_register(Register::R0, Value::Number(42.0))
             .unwrap();
@@ -5950,28 +5976,32 @@ mod tests {
 
     #[test]
     fn test_state_register_default_undefined() {
-        let state = State::new();
+        let mut heap = Heap::new();
+        let state = State::new(&mut heap);
         let val = state.get_register(Register::R0).unwrap();
         assert_eq!(val, Value::Undefined);
     }
 
     #[test]
     fn test_state_register_rsp_rbp_not_readable() {
-        let state = State::new();
+        let mut heap = Heap::new();
+        let state = State::new(&mut heap);
         let result = state.get_register(Register::Rsp);
         assert!(matches!(result, Err(RuntimeError::TypeError(_))));
     }
 
     #[test]
     fn test_state_register_rsp_rbp_not_writable() {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         let result = state.set_register(Register::Rsp, Value::Number(0.0));
         assert!(matches!(result, Err(RuntimeError::TypeError(_))));
     }
 
     #[test]
     fn test_state_get_value_from_stack() {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         state.rbp = 0;
         // The value stack grows lazily, so an untouched slot reads as undefined.
         assert_eq!(state.get_value_from_stack(0).unwrap(), Value::Undefined);
@@ -5982,7 +6012,8 @@ mod tests {
 
     #[test]
     fn test_state_set_value_to_stack() {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         state.rbp = 0;
         state.set_value_to_stack(0, Value::Number(42.0)).unwrap();
         assert_eq!(state.data_stack[0], Value::Number(42.0));
@@ -5990,14 +6021,16 @@ mod tests {
 
     #[test]
     fn test_state_stack_out_of_bounds() {
-        let state = State::new();
+        let mut heap = Heap::new();
+        let state = State::new(&mut heap);
         let result = state.get_value_from_stack(-1);
         assert!(matches!(result, Err(RuntimeError::RangeError(_))));
     }
 
     #[test]
     fn test_state_global() {
-        let mut state = State::new();
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
         assert!(state.get_global("x").is_none());
         state
             .globals
@@ -6083,8 +6116,9 @@ mod tests {
     #[test]
     fn test_js_prop_get_array_length() {
         use crate::vm::object::new_array_object;
+        let mut heap = Heap::new();
         let arr_val = {
-            let arr = new_array_object();
+            let arr = new_array_object(&mut heap);
             if let Value::Object(ref arr_ref) = arr {
                 let mut obj = arr_ref.borrow_mut();
                 if let Some(a) = obj.as_any_mut().downcast_mut::<ArrayObject>() {
@@ -6104,8 +6138,9 @@ mod tests {
     fn test_js_prop_get_object() {
         use crate::vm::object::new_ordinary_object;
         use crate::vm::property::PropertyKey;
+        let mut heap = Heap::new();
         let obj_val = {
-            let obj = new_ordinary_object();
+            let obj = new_ordinary_object(&mut heap);
             if let Value::Object(ref obj_ref) = obj {
                 let mut ob = obj_ref.borrow_mut();
                 ob.property_set(PropertyKey::from_str("x"), Value::Number(42.0))

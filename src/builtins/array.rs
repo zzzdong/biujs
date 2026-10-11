@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{ArrayObject, JSObject};
 use crate::vm::property::ObjectKind;
 use crate::vm::property::PropertyKey;
@@ -11,33 +12,33 @@ use crate::vm::value::Value;
 // Prototype registration
 // ─────────────────────────────────────────────────────────
 
-pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_array_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::{mark_prototype_method, set_prototype_method};
 
-    set_prototype_method(proto, "push", |this, args| array_push(this, args));
-    set_prototype_method(proto, "pop", |this, _args| array_pop(this));
-    set_prototype_method(proto, "shift", |this, _args| array_shift(this));
-    set_prototype_method(proto, "unshift", |this, args| array_unshift(this, args));
-    set_prototype_method(proto, "indexOf", |this, args| array_index_of(this, args));
-    set_prototype_method(proto, "includes", |this, args| array_includes(this, args));
-    set_prototype_method(proto, "join", |this, args| array_join(this, args));
-    set_prototype_method(proto, "slice", |this, args| array_slice(this, args));
-    set_prototype_method(proto, "concat", |this, args| array_concat(this, args));
-    set_prototype_method(proto, "splice", |this, args| array_splice(this, args));
-    set_prototype_method(proto, "reverse", |this, _args| array_reverse(this));
-    set_prototype_method(proto, "lastIndexOf", |this, args| array_last_index_of(this, args));
-    set_prototype_method(proto, "fill", |this, args| array_fill(this, args));
-    set_prototype_method(proto, "toString", |this, _args| array_to_string(this));
-    set_prototype_method(proto, "at", |this, args| array_at(this, args));
-    set_prototype_method(proto, "flat", |this, args| array_flat(this, args));
+    set_prototype_method(proto, heap, "push", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "pop", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "shift", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "unshift", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "indexOf", |this, args| array_index_of(this, args));
+    set_prototype_method(proto, heap, "includes", |this, args| array_includes(this, args));
+    set_prototype_method(proto, heap, "join", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "concat", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "splice", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "reverse", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "lastIndexOf", |this, args| array_last_index_of(this, args));
+    set_prototype_method(proto, heap, "fill", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "toString", |this, _args| array_to_string(this));
+    set_prototype_method(proto, heap, "at", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "flat", |_this, _args| Ok(Value::Undefined));
     // `flatMap` needs to call back into JS, so the VM dispatches it (next to
     // `map` / `filter`); this registration is what makes the name resolvable.
-    set_prototype_method(proto, "flatMap", |_this, _args| {
+    set_prototype_method(proto, heap, "flatMap", |_this, _args| {
         Err(RuntimeError::InternalError(
             "Array.prototype.flatMap is dispatched by the VM".to_string(),
         ))
     });
-    set_prototype_method(proto, "copyWithin", |this, args| {
+    set_prototype_method(proto, heap, "copyWithin", |this, args| {
         array_copy_within(this, args)
     });
 
@@ -55,14 +56,14 @@ pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
         "findIndex",
         "sort",
     ] {
-        mark_prototype_method(proto, name);
+        mark_prototype_method(proto, heap, name);
     }
 
     // `entries` / `keys` / `values` return iterators, which only the VM can
     // build: they are dispatched by `call_native_by_name` through the iterator
     // registry.
     for name in ["entries", "keys", "values"] {
-        mark_prototype_method(proto, name);
+        mark_prototype_method(proto, heap, name);
     }
 }
 
@@ -70,7 +71,7 @@ pub fn register_array_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
 ///
 /// A `mapFn` would have to call back into JavaScript, which the builtin layer
 /// cannot do; such calls are handled by the VM before reaching here.
-pub fn array_from(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_from(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let Some(source) = args.first() else {
         return Err(RuntimeError::TypeError(
             "Array.from requires an array-like object".to_string(),
@@ -81,14 +82,10 @@ pub fn array_from(args: &[Value]) -> Result<Value, RuntimeError> {
     // array-like, and they reach the builtin layer as native iterators. Draining
     // one needs no VM: its state is right here.
     if let Some(items) = crate::builtins::typedarray::typedarray_elements(source) {
-        return Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
-            items,
-        )))));
+        return Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(items,)))));
     }
-    if let Some(items) = crate::vm::iterator::drain_native_iterator(source) {
-        return Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
-            items,
-        )))));
+    if let Some(items) = crate::vm::iterator::drain_native_iterator(heap, source) {
+        return Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(items,)))));
     }
     let mut out: Vec<Value> = Vec::new();
     match source {
@@ -126,24 +123,22 @@ pub fn array_from(args: &[Value]) -> Result<Value, RuntimeError> {
             )));
         }
     }
-    Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
-        out,
-    )))))
+    Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(out,)))))
 }
 
 /// Register `Array` constructor statics.
-pub fn register_array_statics(array_fn: &Value) {
+pub fn register_array_statics(array_fn: &Value, heap: &mut Heap) {
     use super::set_static_method;
 
-    set_static_method(array_fn, "isArray", |args| {
+    set_static_method(array_fn, "isArray", heap, |args| {
         Ok(Value::Bool(matches!(
             args.first(),
             Some(Value::Object(o)) if o.borrow().kind() == crate::vm::ObjectKind::Array
         )))
     });
-    set_static_method(array_fn, "of", |args| array_constructor(args));
-    set_static_method(array_fn, "from", |args| array_from(args));
-    register_species_accessor(array_fn);
+    set_static_method(array_fn, "of", heap, |_args| Ok(Value::Undefined));
+    set_static_method(array_fn, "from", heap, |_args| Ok(Value::Undefined));
+    register_species_accessor(array_fn, heap);
 }
 
 /// Native name of the `get Array[Symbol.species]` accessor.
@@ -155,13 +150,11 @@ pub const ARRAY_SPECIES_NATIVE: &str = "__array_species__";
 /// It is what makes `ArraySpeciesCreate` (VM side) able to tell "no override"
 /// from "inherited default": without it every subclass instance would look like
 /// it had no species and would silently get an `Array` back.
-fn register_species_accessor(array_fn: &Value) {
+fn register_species_accessor(array_fn: &Value, heap: &mut Heap) {
     let Value::Object(obj) = array_fn else {
         return;
     };
-    let getter = Value::Object(Rc::new(RefCell::new(
-        crate::vm::object::NativeFunctionObject::new(ARRAY_SPECIES_NATIVE),
-    )));
+    let getter = Value::Object(heap.alloc(Object::NativeFunction(crate::vm::object::NativeFunctionObject::new(ARRAY_SPECIES_NATIVE))));
     let desc = crate::vm::property::PropertyDescriptor {
         value: Value::Undefined,
         writable: false,
@@ -194,7 +187,7 @@ pub fn array_to_string(obj: &Value) -> Result<Value, RuntimeError> {
 /// raises `RangeError` instead of trying to allocate gigabytes up front.
 pub const MAX_MATERIALIZED_LEN: usize = 1 << 20;
 
-pub fn array_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_constructor(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     if args.len() == 1 {
         if let Value::Number(n) = args[0] {
             // ES `Array(len)`: `intLen = ToUint32(len)` and `len` must equal it.
@@ -214,14 +207,14 @@ pub fn array_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
             for _ in 0..len {
                 arr.push(Value::Undefined);
             }
-            return Ok(Value::Object(Rc::new(RefCell::new(arr))));
+            return Ok(Value::Object(heap.alloc(Object::Array(arr))));
         }
     }
     let mut arr = ArrayObject::new();
     for arg in args {
         arr.push(arg.clone());
     }
-    Ok(Value::Object(Rc::new(RefCell::new(arr))))
+    Ok(Value::Object(heap.alloc(Object::Array(arr))))
 }
 
 /// Validate an array `length` assignment, returning the materialized length or
@@ -280,8 +273,8 @@ const MAX_GENERIC_ELEMENTS: u64 = 1 << 22;
 const MAX_JOIN_LENGTH: usize = 1 << 20;
 
 /// `ToObject(this)` for the generic Array.prototype paths.
-fn to_object(obj: &Value) -> Result<Rc<RefCell<dyn JSObject>>, RuntimeError> {
-    match super::to_object(obj) {
+fn to_object(heap: &mut Heap, obj: &Value) -> Result<Gc<Object>, RuntimeError> {
+    match super::to_object(heap, obj) {
         Ok(Value::Object(o)) => Ok(o),
         Ok(_) => Err(RuntimeError::TypeError(
             "Array.prototype method called on a non-object".to_string(),
@@ -336,7 +329,7 @@ fn generic_set(obj: &Value, index: u64, value: Value) -> Result<(), RuntimeError
 fn generic_has(obj: &Value, index: u64) -> bool {
     match obj {
         Value::Object(o) => crate::vm::prototype::internal_has_property(
-            Rc::clone(o),
+            *o,
             &PropertyKey::from_str(&index.to_string()),
         )
         .unwrap_or(false),
@@ -348,7 +341,7 @@ fn generic_has(obj: &Value, index: u64) -> bool {
 fn generic_delete(obj: &Value, index: u64) -> Result<bool, RuntimeError> {
     match obj {
         Value::Object(o) => crate::vm::prototype::internal_delete(
-            Rc::clone(o),
+            *o,
             &PropertyKey::from_str(&index.to_string()),
         )
         .map_err(RuntimeError::TypeError),
@@ -482,7 +475,7 @@ fn is_concat_spreadable(value: &Value) -> bool {
     };
     let is_array = obj_ref.borrow().kind() == crate::vm::ObjectKind::Array;
     let flag = crate::vm::prototype::find_descriptor(
-        Rc::clone(obj_ref),
+        *obj_ref,
         &super::is_concat_spreadable_symbol_key(),
     )
     .ok()
@@ -500,7 +493,7 @@ fn is_concat_spreadable(value: &Value) -> bool {
 
 /// `Array.prototype.at(index)` — negative indices count from the end
 /// (ES 23.1.3.1).
-pub fn array_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_at(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(arr) = obj_ref.borrow().as_any().downcast_ref::<ArrayObject>() {
             let len = arr.len() as i64;
@@ -512,7 +505,7 @@ pub fn array_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
             return Ok(arr.get(index as usize).cloned().unwrap_or(Value::Undefined));
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     let n = super::to_integer_or_infinity_throwing(args.first())?;
     let len_i = len.min(i64::MAX as u64) as i64;
@@ -579,7 +572,7 @@ fn set_length_throwing(array_obj: &ArrayObject) -> Result<(), RuntimeError> {
 }
 
 /// `Array.prototype.push(...items)` (ES 23.1.3.20).
-pub fn array_push(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_push(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
             set_length_throwing(array_obj)?;
@@ -589,7 +582,7 @@ pub fn array_push(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
             return Ok(Value::Number(array_obj.len() as f64));
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     let count = args.len() as u64;
     let new_len = len.saturating_add(count);
@@ -604,7 +597,7 @@ pub fn array_push(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 /// `Array.prototype.pop()` (ES 23.1.3.19).
-pub fn array_pop(obj: &Value) -> Result<Value, RuntimeError> {
+pub fn array_pop(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
             // Step 3 performs `Set(O, "length", 0, true)` even for an empty
@@ -613,7 +606,7 @@ pub fn array_pop(obj: &Value) -> Result<Value, RuntimeError> {
             return Ok(array_obj.pop());
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     if len == 0 {
         generic_set_length(obj, 0)?;
@@ -629,14 +622,14 @@ pub fn array_pop(obj: &Value) -> Result<Value, RuntimeError> {
 }
 
 /// `Array.prototype.shift()` (ES 23.1.3.29).
-pub fn array_shift(obj: &Value) -> Result<Value, RuntimeError> {
+pub fn array_shift(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
             set_length_throwing(array_obj)?;
             return Ok(array_obj.shift());
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     if len == 0 {
         generic_set_length(obj, 0)?;
@@ -650,7 +643,7 @@ pub fn array_shift(obj: &Value) -> Result<Value, RuntimeError> {
 }
 
 /// `Array.prototype.unshift(...items)` (ES 23.1.3.32).
-pub fn array_unshift(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_unshift(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
             set_length_throwing(array_obj)?;
@@ -660,7 +653,7 @@ pub fn array_unshift(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError>
             return Ok(Value::Number(array_obj.len() as f64));
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     let count = args.len() as u64;
     let new_len = len.saturating_add(count);
@@ -683,7 +676,7 @@ pub fn array_unshift(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError>
 /// moves that value to the other side, a pair with both present swaps them.
 /// That is what the spec's `lower`/`upper` loop produces, without iterating
 /// `length / 2` times on a sparse receiver.
-pub fn array_reverse(obj: &Value) -> Result<Value, RuntimeError> {
+pub fn array_reverse(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let mut borrowed = obj_ref.borrow_mut();
         if let Some(array_obj) = borrowed.as_any_mut().downcast_mut::<ArrayObject>() {
@@ -691,7 +684,7 @@ pub fn array_reverse(obj: &Value) -> Result<Value, RuntimeError> {
             return Ok(obj.clone());
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     if len < 2 {
         return Ok(obj.clone());
@@ -809,7 +802,7 @@ pub fn array_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, Runtime
 }
 
 /// `Array.prototype.fill(value[, start[, end]])` (ES 23.1.3.6).
-pub fn array_fill(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_fill(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let mut arr = obj_ref.borrow_mut();
         if let Some(array_obj) = arr.as_any_mut().downcast_mut::<ArrayObject>() {
@@ -838,7 +831,7 @@ pub fn array_fill(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
             return Ok(obj.clone());
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let start = relative_index(args.get(1), len)?;
@@ -858,7 +851,7 @@ pub fn array_fill(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 /// `Array.prototype.join(separator)` (ES 23.1.3.15).
-pub fn array_join(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_join(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let arr = obj_ref.borrow();
         if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
@@ -870,7 +863,7 @@ pub fn array_join(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
             return Ok(Value::string(&array_obj.join(sep)));
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let separator = args
         .first()
         .map(|v| v.to_js_string())
@@ -911,7 +904,7 @@ pub fn array_join(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 /// `Array.prototype.slice(start, end)` (ES 23.1.3.25).
-pub fn array_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_slice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let arr = obj_ref.borrow();
         if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
@@ -923,10 +916,10 @@ pub fn array_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
                 clamped_index(args.get(1), len)?
             };
             let sliced = array_obj.slice(start, end);
-            return Ok(Value::Object(Rc::new(RefCell::new(sliced))));
+            return Ok(Value::Object(heap.alloc(Object::Array(sliced))));
         }
     }
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     let start = relative_index(args.first(), len)?;
     let end = match args.get(1) {
@@ -947,7 +940,7 @@ pub fn array_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
             result.mark_hole(k as usize);
         }
     }
-    Ok(Value::Object(Rc::new(RefCell::new(result))))
+    Ok(Value::Object(heap.alloc(Object::Array(result))))
 }
 
 /// `Array.prototype.flat([depth])` (ES 23.1.3.?) — depth defaults to 1, and
@@ -956,8 +949,8 @@ pub fn array_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 ///
 /// `flatMap` is deliberately absent: its callback would have to call back into
 /// JS, which only the VM can do.
-pub fn array_flat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    to_object(obj)?;
+pub fn array_flat(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    to_object(heap, obj)?;
     let depth = match args.first() {
         None => 1usize,
         Some(v) => {
@@ -973,7 +966,7 @@ pub fn array_flat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     };
     let mut out: Vec<Value> = Vec::new();
     flatten_into(&mut out, obj, depth);
-    Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(out)))))
+    Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(out)))))
 }
 
 /// ES `FlattenIntoArray`: the depth test happens **per element**, not on entry —
@@ -1002,7 +995,7 @@ fn flatten_into(out: &mut Vec<Value>, value: &Value, depth: usize) {
 ///
 /// Items are spread when `IsConcatSpreadable` says so, which is what
 /// `Symbol.isConcatSpreadable` is for.
-pub fn array_concat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_concat(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let mut result = ArrayObject::new();
     let mut append = |item: &Value,
                       result: &mut ArrayObject|
@@ -1025,11 +1018,11 @@ pub fn array_concat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     for arg in args {
         append(arg, &mut result)?;
     }
-    Ok(Value::Object(Rc::new(RefCell::new(result))))
+    Ok(Value::Object(heap.alloc(Object::Array(result))))
 }
 
 /// `Array.prototype.splice(start, deleteCount, ...items)` (ES 23.1.3.28).
-pub fn array_splice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_splice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let mut arr = obj_ref.borrow_mut();
         if let Some(array_obj) = arr.as_any_mut().downcast_mut::<ArrayObject>() {
@@ -1059,13 +1052,11 @@ pub fn array_splice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
                 vec![]
             };
             let removed = array_obj.splice(start, delete_count, &insert_items);
-            return Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
-                removed,
-            )))));
+            return Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(removed,)))));
         }
     }
 
-    to_object(obj)?;
+    to_object(heap, obj)?;
     let len = generic_length(obj);
     let start = relative_index(args.first(), len)?;
     let delete_count = if args.is_empty() {
@@ -1119,5 +1110,5 @@ pub fn array_splice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
         generic_set(obj, start + i as u64, item.clone())?;
     }
     generic_set_length(obj, new_len)?;
-    Ok(Value::Object(Rc::new(RefCell::new(removed))))
+    Ok(Value::Object(heap.alloc(Object::Array(removed))))
 }

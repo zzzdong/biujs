@@ -1,4 +1,5 @@
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::property::PropertyDescriptor;
 use crate::vm::object::{JSObject, OrdinaryObject, new_array_object_from_vec};
 use crate::vm::property::PropertyKey;
@@ -8,7 +9,7 @@ use std::rc::Rc;
 
 use super::set_static_method;
 
-pub fn object_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_constructor(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     match args.first() {
         // `Object()` / `Object(null)` / `Object(undefined)`: an empty ordinary
         // object. The prototype comes from the wrapper registry (a plain
@@ -18,16 +19,16 @@ pub fn object_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
             let proto = super::wrapper_prototype("Object");
             let mut obj = crate::vm::object::OrdinaryObject::new();
             obj.set_prototype(proto);
-            Ok(Value::Object(Rc::new(RefCell::new(obj))))
+            Ok(Value::Object(heap.alloc(Object::Ordinary(obj))))
         }
         Some(v) if matches!(v, Value::Undefined | Value::Null) => {
             let proto = super::wrapper_prototype("Object");
             let mut obj = crate::vm::object::OrdinaryObject::new();
             obj.set_prototype(proto);
-            Ok(Value::Object(Rc::new(RefCell::new(obj))))
+            Ok(Value::Object(heap.alloc(Object::Ordinary(obj))))
         }
         // `Object(value)`: ToObject — primitives are boxed in wrapper objects.
-        Some(v) => super::to_object(v),
+        Some(v) => super::to_object(heap, v),
     }
 }
 
@@ -79,7 +80,7 @@ fn to_object_get(value: &Value, key: &PropertyKey) -> Value {
     }
 }
 
-pub fn object_keys(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_keys(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
             "Object.keys requires at least 1 argument".to_string(),
@@ -90,10 +91,10 @@ pub fn object_keys(args: &[Value]) -> Result<Value, RuntimeError> {
         .iter()
         .filter_map(|k| k.as_str().map(Value::string))
         .collect();
-    Ok(new_array_object_from_vec(str_keys))
+    Ok(new_array_object_from_vec(heap, str_keys))
 }
 
-pub fn object_values(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_values(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
             "Object.values requires at least 1 argument".to_string(),
@@ -101,10 +102,10 @@ pub fn object_values(args: &[Value]) -> Result<Value, RuntimeError> {
     }
     let keys = to_object_string_keys(&args[0])?;
     let values: Vec<Value> = keys.iter().map(|k| to_object_get(&args[0], k)).collect();
-    Ok(new_array_object_from_vec(values))
+    Ok(new_array_object_from_vec(heap, values))
 }
 
-pub fn object_entries(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_entries(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
             "Object.entries requires at least 1 argument".to_string(),
@@ -114,13 +115,13 @@ pub fn object_entries(args: &[Value]) -> Result<Value, RuntimeError> {
     let entries: Vec<Value> = keys
         .iter()
         .map(|k| {
-            new_array_object_from_vec(vec![
+            new_array_object_from_vec(heap, vec![
                 Value::string(&k.display()),
                 to_object_get(&args[0], k),
             ])
         })
         .collect();
-    Ok(new_array_object_from_vec(entries))
+    Ok(new_array_object_from_vec(heap, entries))
 }
 
 /// `Object.fromEntries(iterable)` (ES 20.1.2.5) — the inverse of
@@ -129,7 +130,7 @@ pub fn object_entries(args: &[Value]) -> Result<Value, RuntimeError> {
 /// Entries are read through the generic property path, so array-likes and
 /// iterators materialised as objects work too; a non-object entry is a
 /// TypeError, as in the spec.
-pub fn object_from_entries(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_from_entries(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let iterable = match args.first() {
         Some(v) => v,
         None => {
@@ -163,7 +164,7 @@ pub fn object_from_entries(args: &[Value]) -> Result<Value, RuntimeError> {
             },
         );
     }
-    Ok(Value::Object(Rc::new(RefCell::new(result))))
+    Ok(Value::Object(heap.alloc(Object::Ordinary(result))))
 }
 
 pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
@@ -206,10 +207,13 @@ pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
         ));
     }
 
-    Ok(Value::Object(Rc::clone(obj)))
+    Ok(Value::Object(*obj))
 }
 
-pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_get_own_property_descriptor(
+    heap: &mut super::Heap,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     if args.len() < 2 {
         return Err(RuntimeError::TypeError(
             "Object.getOwnPropertyDescriptor requires at least 2 arguments".to_string(),
@@ -217,7 +221,7 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
     }
     // ES 19.1.2.6: ToObject(O) — string primitives expose their index keys
     // and `length`; only undefined/null raise TypeError.
-    let obj_val = super::to_object(&args[0])?;
+    let obj_val = super::to_object(heap, &args[0])?;
     let Value::Object(obj) = &obj_val else {
         return Err(RuntimeError::TypeError(
             "Object.getOwnPropertyDescriptor: first argument must be an object".to_string(),
@@ -230,12 +234,15 @@ pub fn object_get_own_property_descriptor(args: &[Value]) -> Result<Value, Runti
     };
 
     let borrowed = obj.borrow();
-    Ok(descriptor_to_value(borrowed.property_get(&key)))
+    Ok(descriptor_to_value(heap, borrowed.property_get(&key)))
 }
 
 /// A `PropertyDescriptor` as the object `Object.getOwnPropertyDescriptor` (and
 /// `Reflect.getOwnPropertyDescriptor`) answers. `None` becomes `undefined`.
-pub fn descriptor_to_value(descriptor: Option<PropertyDescriptor>) -> Value {
+pub fn descriptor_to_value(
+    heap: &mut super::Heap,
+    descriptor: Option<PropertyDescriptor>,
+) -> Value {
     let Some(desc) = descriptor else {
         return Value::Undefined;
     };
@@ -280,11 +287,14 @@ pub fn descriptor_to_value(descriptor: Option<PropertyDescriptor>) -> Value {
                 Value::Bool(desc.configurable),
             )
             .ok();
-        return Value::Object(Rc::new(RefCell::new(desc_obj)));
+        return Value::Object(heap.alloc(Object::Ordinary(desc_obj)));
     }
 }
 
-pub fn object_get_own_property_names(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_get_own_property_names(
+    heap: &mut super::Heap,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
             "Object.getOwnPropertyNames requires at least 1 argument".to_string(),
@@ -292,9 +302,9 @@ pub fn object_get_own_property_names(args: &[Value]) -> Result<Value, RuntimeErr
     }
     // ES 19.1.2.7: ToObject(O) — string primitives report index keys and
     // `length`; undefined/null raise TypeError.
-    let obj_val = super::to_object(&args[0])?;
+    let obj_val = super::to_object(heap, &args[0])?;
     let Value::Object(obj_ref) = &obj_val else {
-        return Ok(new_array_object_from_vec(vec![]));
+        return Ok(new_array_object_from_vec(heap, vec![]));
     };
     let borrowed = obj_ref.borrow();
     // String-keyed own properties only (symbols are reported by
@@ -304,12 +314,15 @@ pub fn object_get_own_property_names(args: &[Value]) -> Result<Value, RuntimeErr
         .into_iter()
         .filter_map(|k| k.as_str().map(|s| Value::string(s)))
         .collect();
-    Ok(new_array_object_from_vec(str_keys))
+    Ok(new_array_object_from_vec(heap, str_keys))
 }
 
 /// `Object.getOwnPropertySymbols(obj)` — own symbol-keyed properties, in
 /// creation order.
-pub fn object_get_own_property_symbols(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_get_own_property_symbols(
+    heap: &mut super::Heap,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let Some(Value::Object(obj_ref)) = args.first() else {
         return Err(RuntimeError::TypeError(
             "Object.getOwnPropertySymbols called on non-object".to_string(),
@@ -324,10 +337,13 @@ pub fn object_get_own_property_symbols(args: &[Value]) -> Result<Value, RuntimeE
             _ => None,
         })
         .collect();
-    Ok(new_array_object_from_vec(symbols))
+    Ok(new_array_object_from_vec(heap, symbols))
 }
 
-pub fn object_get_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_get_prototype_of(
+    heap: &mut super::Heap,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
             "Object.getPrototypeOf requires at least 1 argument".to_string(),
@@ -336,7 +352,7 @@ pub fn object_get_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
     // ES 20.1.2.9: `ToObject(O)` first — `null`/`undefined` raise a TypeError
     // and every other primitive answers the prototype of its wrapper
     // (`Number.prototype`, `String.prototype`, …).
-    let obj_val = super::to_object(&args[0])?;
+    let obj_val = super::to_object(heap, &args[0])?;
     let Value::Object(obj_ref) = &obj_val else {
         return Err(RuntimeError::TypeError(
             "Object.getPrototypeOf called on non-object".to_string(),
@@ -344,7 +360,7 @@ pub fn object_get_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
     };
     let borrowed = obj_ref.borrow();
     if let Some(proto) = borrowed.get_prototype() {
-        Ok(Value::Object(Rc::clone(&proto)))
+        Ok(Value::Object(proto))
     } else {
         Ok(Value::Null)
     }
@@ -365,7 +381,7 @@ pub fn object_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
         }
     };
     let proto = match &args[1] {
-        Value::Object(proto_ref) => Some(Rc::clone(proto_ref)),
+        Value::Object(proto_ref) => Some(*proto_ref),
         Value::Null => None,
         _ => {
             return Err(RuntimeError::TypeError(
@@ -380,11 +396,11 @@ pub fn object_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
         let borrowed = obj.borrow();
         let same = match (&proto, borrowed.get_prototype()) {
             (None, None) => true,
-            (Some(p), Some(c)) => Rc::ptr_eq(p, &c),
+            (Some(p), Some(c)) => Gc::ptr_eq(p, &c),
             _ => false,
         };
         if same {
-            return Ok(Value::Object(Rc::clone(obj)));
+            return Ok(Value::Object(*obj));
         }
     }
     if !obj.borrow().is_extensible() {
@@ -396,9 +412,9 @@ pub fn object_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
     // every subsequent lookup, so it is rejected up front (ES 20.1.2.10 step 6
     // reaches the same conclusion by recursing).
     if let Some(new_proto) = &proto {
-        let mut chain = Some(Rc::clone(new_proto));
+        let mut chain = Some(*new_proto);
         while let Some(link) = chain {
-            if Rc::ptr_eq(&link, obj) {
+            if Gc::ptr_eq(&link, obj) {
                 return Err(RuntimeError::TypeError(
                     "Cyclic __proto__ value".to_string(),
                 ));
@@ -407,17 +423,17 @@ pub fn object_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
         }
     }
     obj.borrow_mut().set_prototype(proto);
-    Ok(Value::Object(Rc::clone(obj)))
+    Ok(Value::Object(*obj))
 }
 
-pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_create(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
             "Object.create requires at least 1 argument".to_string(),
         ));
     }
     let proto = match &args[0] {
-        Value::Object(proto_ref) => Some(Rc::clone(proto_ref)),
+        Value::Object(proto_ref) => Some(*proto_ref),
         Value::Null => None,
         _ => {
             return Err(RuntimeError::TypeError(
@@ -425,7 +441,7 @@ pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
             ));
         }
     };
-    let mut new_obj = crate::vm::object::OrdinaryObject::new();
+    let mut new_obj = Object::Ordinary(crate::vm::object::OrdinaryObject::new());
     new_obj.set_prototype(proto);
 
     // Second argument: property descriptors, each applied in order.
@@ -433,7 +449,7 @@ pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
     if let Some(props) = args.get(1) {
         if !props.is_undefined() {
             let props_ref = match props {
-                Value::Object(o) => Rc::clone(o),
+                Value::Object(o) => *o,
                 _ => {
                     return Err(RuntimeError::TypeError(
                         "Object.create: properties must be an object".to_string(),
@@ -462,7 +478,7 @@ pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
         }
     }
 
-    Ok(Value::Object(Rc::new(RefCell::new(new_obj))))
+    Ok(Value::Object(heap.alloc(new_obj)))
 }
 
 /// Apply a property descriptor object (as consumed by `Object.defineProperty`
@@ -473,7 +489,7 @@ pub fn object_create(args: &[Value]) -> Result<Value, RuntimeError> {
 /// `false` for a brand-new property — the ES `[[DefineOwnProperty]]` rule for
 /// a partial descriptor.
 pub fn apply_property_descriptor(
-    obj: &mut dyn JSObject,
+    obj: &mut Object,
     key: &PropertyKey,
     desc: &Value,
 ) -> Result<bool, RuntimeError> {
@@ -601,14 +617,14 @@ pub fn apply_property_descriptor(
         .map_err(RuntimeError::from_property_error)
 }
 
-pub fn object_has_own(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_has_own(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     if args.len() < 2 {
         return Err(RuntimeError::TypeError(
             "Object.hasOwn requires at least 2 arguments".to_string(),
         ));
     }
     // ES 20.1.2.13 step 2: `? ToObject(O)` — primitives do not answer `false`.
-    let target = super::to_object(&args[0])?;
+    let target = super::to_object(heap, &args[0])?;
     match &target {
         Value::Object(obj_ref) => {
             let key = match &args[1] {
@@ -655,9 +671,9 @@ pub fn object_is(args: &[Value]) -> Result<Value, RuntimeError> {
 /// an error. `preventExtensions`/`seal`/`freeze` return it unchanged, while
 /// `isExtensible` answers `false` and `isFrozen`/`isSealed` answer `true`
 /// (a primitive has no properties to violate any invariant).
-fn integrity_target(args: &[Value]) -> Option<Rc<RefCell<dyn JSObject>>> {
+fn integrity_target(args: &[Value]) -> Option<Gc<Object>> {
     match args.first() {
-        Some(Value::Object(obj_ref)) => Some(Rc::clone(obj_ref)),
+        Some(Value::Object(obj_ref)) => Some(*obj_ref),
         _ => None,
     }
 }
@@ -709,19 +725,19 @@ pub fn object_is_sealed(args: &[Value]) -> Result<Value, RuntimeError> {
 /// invoked at this layer, so the VM wraps the whole builtin (see
 /// `VM::object_assign`) when getters need to run; this function is the
 /// data-property fallback used for direct dispatch.
-pub fn object_assign(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_assign(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let Some(target) = args.first() else {
         return Err(RuntimeError::TypeError(
             "Object.assign requires at least 1 argument".to_string(),
         ));
     };
     // ES 19.1.2.1: ToObject(target) — primitive targets are boxed.
-    let target = super::to_object(target)?;
+    let target = super::to_object(heap, target)?;
     for source in args.iter().skip(1) {
         if matches!(source, Value::Undefined | Value::Null) {
             continue;
         }
-        let source = super::to_object(source)?;
+        let source = super::to_object(heap, source)?;
         let Value::Object(source_ref) = &source else {
             continue;
         };
@@ -851,7 +867,7 @@ pub fn object_is_prototype_of(obj: &Value, args: &[Value]) -> Result<Value, Runt
         if depth > 1000 {
             break;
         }
-        if Rc::ptr_eq(&proto, target) {
+        if Gc::ptr_eq(&proto, target) {
             return Ok(Value::Bool(true));
         }
         current = proto.borrow().get_prototype();
@@ -892,27 +908,27 @@ pub fn object_property_is_enumerable(
 pub const OBJECT_TO_STRING_NATIVE: &str = "Object.prototype.toString";
 
 /// Populate `Object.prototype` with the methods every object inherits.
-pub fn register_object_prototype(proto: &Rc<RefCell<dyn JSObject>>, object_fn: &Value) {
+pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &mut Heap) {
     use super::set_prototype_method;
 
     // Dedicated native so that `.call(receiver)` keeps Array/Number semantics.
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("toString"),
-        super::method_descriptor(Value::Object(Rc::new(RefCell::new(
+        super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
             crate::vm::object::NativeFunctionObject::new(OBJECT_TO_STRING_NATIVE),
         )))),
     );
-    set_prototype_method(proto, "valueOf", |this, _args| Ok(this.clone()));
-    set_prototype_method(proto, "hasOwnProperty", |this, args| {
+    set_prototype_method(proto, heap, "valueOf", |this, _args| Ok(this.clone()));
+    set_prototype_method(proto, heap, "hasOwnProperty", |this, args| {
         object_has_own_property(this, args)
     });
-    set_prototype_method(proto, "isPrototypeOf", |this, args| {
+    set_prototype_method(proto, heap, "isPrototypeOf", |this, args| {
         object_is_prototype_of(this, args)
     });
-    set_prototype_method(proto, "propertyIsEnumerable", |this, args| {
+    set_prototype_method(proto, heap, "propertyIsEnumerable", |this, args| {
         object_property_is_enumerable(this, args)
     });
-    set_prototype_method(proto, "toLocaleString", |this, args| {
+    set_prototype_method(proto, heap, "toLocaleString", |this, args| {
         object_prototype_to_string(this, args)
     });
     let _ = proto
@@ -923,46 +939,49 @@ pub fn register_object_prototype(proto: &Rc<RefCell<dyn JSObject>>, object_fn: &
         );
 }
 
-pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins) {
-    set_static_method(object_fn, "keys", |args| object_keys(args));
-    set_static_method(object_fn, "values", |args| object_values(args));
-    set_static_method(object_fn, "entries", |args| object_entries(args));
-    set_static_method(object_fn, "assign", |args| object_assign(args));
-    set_static_method(object_fn, "defineProperty", |args| {
+pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins, heap: &mut Heap) {
+    // These closures are never invoked: `set_static_method` registers by name
+    // and dispatch happens through `call_static_method`. The real implementations
+    // need a heap, so the placeholders merely satisfy the registration shape.
+    set_static_method(object_fn, "keys", heap, |_args| Ok(Value::Undefined));
+    set_static_method(object_fn, "values", heap, |_args| Ok(Value::Undefined));
+    set_static_method(object_fn, "entries", heap, |_args| Ok(Value::Undefined));
+    set_static_method(object_fn, "assign", heap, |_args| Ok(Value::Undefined));
+    set_static_method(object_fn, "defineProperty", heap, |args| {
         object_define_property(args)
     });
-    set_static_method(object_fn, "defineProperties", |args| {
+    set_static_method(object_fn, "defineProperties", heap, |args| {
         object_define_properties(args)
     });
-    set_static_method(object_fn, "getOwnPropertyDescriptor", |args| {
-        object_get_own_property_descriptor(args)
+    set_static_method(object_fn, "getOwnPropertyDescriptor", heap, |_args| {
+        Ok(Value::Undefined)
     });
-    set_static_method(object_fn, "getOwnPropertyNames", |args| {
-        object_get_own_property_names(args)
+    set_static_method(object_fn, "getOwnPropertyNames", heap, |_args| {
+        Ok(Value::Undefined)
     });
-    set_static_method(object_fn, "getOwnPropertySymbols", |args| {
-        object_get_own_property_symbols(args)
+    set_static_method(object_fn, "getOwnPropertySymbols", heap, |_args| {
+        Ok(Value::Undefined)
     });
-    set_static_method(object_fn, "getPrototypeOf", |args| {
-        object_get_prototype_of(args)
+    set_static_method(object_fn, "getPrototypeOf", heap, |_args| {
+        Ok(Value::Undefined)
     });
-    set_static_method(object_fn, "setPrototypeOf", |args| {
+    set_static_method(object_fn, "setPrototypeOf", heap, |args| {
         object_set_prototype_of(args)
     });
-    set_static_method(object_fn, "create", |args| object_create(args));
-    set_static_method(object_fn, "hasOwn", |args| object_has_own(args));
-    set_static_method(object_fn, "is", |args| object_is(args));
+    set_static_method(object_fn, "create", heap, |_args| Ok(Value::Undefined));
+    set_static_method(object_fn, "hasOwn", heap, |_args| Ok(Value::Undefined));
+    set_static_method(object_fn, "is", heap, |args| object_is(args));
     // The integrity verbs forward to the same implementations `call_native`
     // dispatches to, so the two paths cannot drift apart: the static method is
     // only ever reached directly (`Object.freeze` referenced as a value), but
     // answering `false` there while the VM path answered `true` would be a bug
     // no test would pin down cleanly.
-    set_static_method(object_fn, "isExtensible", |args| object_is_extensible(args));
-    set_static_method(object_fn, "isFrozen", |args| object_is_frozen(args));
-    set_static_method(object_fn, "isSealed", |args| object_is_sealed(args));
-    set_static_method(object_fn, "preventExtensions", |args| {
+    set_static_method(object_fn, "isExtensible", heap, |args| object_is_extensible(args));
+    set_static_method(object_fn, "isFrozen", heap, |args| object_is_frozen(args));
+    set_static_method(object_fn, "isSealed", heap, |args| object_is_sealed(args));
+    set_static_method(object_fn, "preventExtensions", heap, |args| {
         object_prevent_extensions(args)
     });
-    set_static_method(object_fn, "seal", |args| object_seal(args));
-    set_static_method(object_fn, "freeze", |args| object_freeze(args));
+    set_static_method(object_fn, "seal", heap, |args| object_seal(args));
+    set_static_method(object_fn, "freeze", heap, |args| object_freeze(args));
 }

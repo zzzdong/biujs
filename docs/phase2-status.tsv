@@ -1,6 +1,6 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
-# 最近更新：2026-10-01
+# 最近更新：2026-10-12
 language/statements/for-of	621	33	97
 language/statements/for-in	79	19	17
 built-ins/Array/prototype/Symbol.iterator	0	0	1
@@ -74,10 +74,10 @@ language/statements/function	347	74	30
 language/statements/switch	51	54	6
 language/statements/while	28	10	0
 language/literals/string	67	6	0
-built-ins/Array	2113	113	855
+built-ins/Array	2116	113	852
 built-ins/JSON	122	29	14
 built-ins/WeakSet	80	1	4
-built-ins/Object	2848	206	357
+built-ins/Object	2849	206	356
 built-ins/String	718	178	327
 language/expressions/yield	40	3	20
 language/rest-parameters	11	0	0
@@ -94,7 +94,7 @@ language/expressions/prefix-decrement	22	5	7
 language/expressions/strict-does-not-equals	20	10	0
 language/expressions/typeof	9	6	1
 language/expressions/void	8	1	0
-language/statements/class	1410	2806	151
+language/statements/class	1412	2806	149
 language/statements/empty	1	1	0
 language/statements/if	50	19	0
 language/statements/throw	13	1	0

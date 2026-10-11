@@ -1,7 +1,5 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::JSObject;
 use crate::vm::value::Value;
 
@@ -9,11 +7,11 @@ use crate::vm::value::Value;
 // Prototype registration
 // ─────────────────────────────────────────────────────────
 
-pub fn register_boolean_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_boolean_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
 
-    set_prototype_method(proto, "valueOf", |this, _args| boolean_value_of(this));
-    set_prototype_method(proto, "toString", |this, _args| boolean_to_string(this));
+    set_prototype_method(proto, heap, "valueOf", |this, _args| boolean_value_of(this));
+    set_prototype_method(proto, heap, "toString", |this, _args| boolean_to_string(this));
 }
 
 // ─────────────────────────────────────────────────────────

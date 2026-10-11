@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::RuntimeError;
+use crate::vm::gc::{Heap, Object};
 use crate::vm::object::{NativeFunctionObject, OrdinaryObject};
 use crate::vm::property::PropertyKey;
 use crate::vm::value::Value;
@@ -11,7 +12,7 @@ use crate::vm::value::Value;
 /// `Math` is a plain object (not a constructor), so it is deliberately *not*
 /// backed by a `NativeFunctionObject`. Its methods carry qualified names
 /// (`"Math.floor"`) which the VM resolves through `call_static_method`.
-pub fn create_math_object() -> Value {
+pub fn create_math_object(heap: &mut Heap) -> Value {
     let mut math = OrdinaryObject::new();
 
     let methods: &[&str] = &[
@@ -24,7 +25,7 @@ pub fn create_math_object() -> Value {
     for name in methods {
         let _ = math.define_property(
             PropertyKey::from_str(name),
-            super::method_descriptor(Value::Object(Rc::new(RefCell::new(
+            super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(&format!("Math.{name}")),
             )))),
         );
@@ -48,7 +49,7 @@ pub fn create_math_object() -> Value {
         );
     }
 
-    Value::Object(Rc::new(RefCell::new(math)))
+    Value::Object(heap.alloc(Object::Ordinary(math)))
 }
 
 /// Dispatch `Math.<name>(...)`.

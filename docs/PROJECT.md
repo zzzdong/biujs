@@ -26,8 +26,8 @@
 |---|---|
 | test262 执行 / 通过 / 跳过 / 失败 | 19708 / **16567** / 7843 / 3141 |
 | 通过率 | **84.06%** |
-| 单元 / feature / 护栏 | 204 / 538（4 ignored）/ 7 |
-| 护栏计数 | timeout 7、step-limit 0、memory 22 |
+| 单元 / feature / 护栏 | 211 / 538（4 ignored）/ 7 |
+| 护栏计数 | timeout 4、step-limit 0、memory 25（`TEST262_MEMORY_MB=384`，见 §5.7） |
 | 全量墙钟 | 约 450s（串行 4 分片，单片 `ulimit -v` 4 GB） |
 | 源码规模 | 45 个 `.rs`，约 40.7k 行 |
 
@@ -69,6 +69,11 @@ BIUJS_DUMP=1 ./target/release/biujs file.js   # 打印字节码
 4. **实现 + 解锁 + 入册三件事同批**。只做后两件等于往池里倒垃圾。
 5. **结构变化与语义变化不要放在同一个提交里**。
 6. **改动核心类型不要分批**：半迁移状态的成本大于一次铺开（编译器会列出全部位点）。
+7. **`TEST262_MEMORY_MB` 现在是 384，不是 256**。P1 之后堆只在 VM 析构时整片释放、
+   单次 `run` 内不回收，单用例内存峰值上升。实测同一次改动下：256 MB → 通过 16562 /
+   memory 30（比基线 −5）；384 MB → 通过 16567 / memory 25（与基线逐项相同、无逐套件
+   回退）。这是**已量化的预期漂移**，不是掩盖——正解是 mark-sweep 收集器
+   （`docs/GC-DESIGN.md`），做完后预算降回 256。
 
 ## 6. 文档地图
 
@@ -78,6 +83,8 @@ BIUJS_DUMP=1 ./target/release/biujs file.js   # 打印字节码
 | **`docs/PROJECT.md`**（本文） | 项目说明、现状数字、纪律 |
 | **`docs/ARCHITECTURE.md`** | 当前架构（照实现写，不是照理想写） |
 | **`docs/PLAN.md`** | 下一阶段的任务计划 |
+| **`docs/GC-DESIGN.md`** | 堆与 GC 设计：槽布局 / 句柄契约 / 根集 / 安全点 / 不变量 / unsafe 清单 |
+| **`docs/REFACTOR-HEAP-GC.md`** | P1 堆与句柄重构的执行计划（阶段 A/B/C，每步验收与回退） |
 | `docs/es6-conformance-phase2.md` | test262 口径、批次表、快照纪律（仍在使用） |
 | `docs/phase2-status.tsv` | 逐套件基线快照（`--update` 刷新） |
 | `docs/archive/` | 11 份历史文档（操作日志、旧方案），仅供溯源 |

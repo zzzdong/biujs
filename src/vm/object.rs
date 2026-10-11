@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::property::{ObjectKind, PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
@@ -24,7 +25,7 @@ pub const MAX_DENSE_ELEMENTS: usize = 1 << 20;
 /// Core trait for all JS object types.
 ///
 /// All JS objects (Ordinary, Array, Function, etc.) implement this trait.
-/// Objects are stored as `Rc<RefCell<dyn JSObject>>` inside `Value::Object`.
+/// Objects are stored as `Gc<Object>` inside `Value::Object`.
 pub trait JSObject: fmt::Debug + Any {
     /// Returns the runtime kind of this object (Ordinary, Array, Function, etc.)
     fn kind(&self) -> ObjectKind;
@@ -66,10 +67,10 @@ pub trait JSObject: fmt::Debug + Any {
     // ── Prototype operations ──
 
     /// Get the prototype ([[Prototype]] internal slot)
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>>;
+    fn get_prototype(&self) -> Option<Gc<Object>>;
 
     /// Set the prototype ([[SetPrototypeOf]])
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>);
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>);
 
     // ── Extensibility ──
 
@@ -372,7 +373,7 @@ fn is_sealed_desc_set(obj: &dyn JSObject) -> bool {
 #[derive(Debug, Clone)]
 pub struct OrdinaryObject {
     properties: PropertyTable,
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    prototype: Option<Gc<Object>>,
     extensible: bool,
     frozen: bool,
     sealed: bool,
@@ -402,7 +403,7 @@ impl OrdinaryObject {
         }
     }
 
-    pub fn with_prototype(proto: Rc<RefCell<dyn JSObject>>) -> Self {
+    pub fn with_prototype(proto: Gc<Object>) -> Self {
         Self {
             properties: PropertyTable::new(),
             prototype: Some(proto),
@@ -521,11 +522,11 @@ impl JSObject for OrdinaryObject {
         self.properties.keys()
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         if !self.frozen {
             self.prototype = proto;
         }
@@ -595,7 +596,7 @@ pub struct ArrayObject {
     /// Array `length` starts writable; `Object.defineProperty(arr, "length",
     /// {writable: false})` can freeze it.
     length_writable: bool,
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    prototype: Option<Gc<Object>>,
     extensible: bool,
     frozen: bool,
     sealed: bool,
@@ -1204,11 +1205,11 @@ impl JSObject for ArrayObject {
         keys
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         if !self.frozen {
             self.prototype = proto;
         }
@@ -1315,23 +1316,23 @@ impl Default for ArrayObject {
 // ─────────────────────────────────────────────────────────
 
 /// Create a `Value::Object` wrapping an OrdinaryObject
-pub fn new_ordinary_object() -> Value {
-    Value::Object(Rc::new(RefCell::new(OrdinaryObject::new())))
+pub fn new_ordinary_object(heap: &mut Heap) -> Value {
+    Value::Object(heap.alloc(Object::Ordinary(OrdinaryObject::new())))
 }
 
 /// Create a `Value::Object` wrapping an OrdinaryObject with a prototype
-pub fn new_ordinary_object_with_prototype(proto: Rc<RefCell<dyn JSObject>>) -> Value {
-    Value::Object(Rc::new(RefCell::new(OrdinaryObject::with_prototype(proto))))
+pub fn new_ordinary_object_with_prototype(heap: &mut Heap, proto: Gc<Object>) -> Value {
+    Value::Object(heap.alloc(Object::Ordinary(OrdinaryObject::with_prototype(proto))))
 }
 
 /// Create a `Value::Object` wrapping an ArrayObject
-pub fn new_array_object() -> Value {
-    Value::Object(Rc::new(RefCell::new(ArrayObject::new())))
+pub fn new_array_object(heap: &mut Heap) -> Value {
+    Value::Object(heap.alloc(Object::Array(ArrayObject::new())))
 }
 
 /// Create a `Value::Object` wrapping an ArrayObject from a Vec
-pub fn new_array_object_from_vec(vec: Vec<Value>) -> Value {
-    Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(vec))))
+pub fn new_array_object_from_vec(heap: &mut Heap, vec: Vec<Value>) -> Value {
+    Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(vec))))
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1348,7 +1349,7 @@ pub struct FunctionObject {
     pub name: String,
     properties: PropertyTable,
     extensible: bool,
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    prototype: Option<Gc<Object>>,
     /// For arrow functions: captured `this` value
     pub captured_this: Option<Value>,
     /// For arrow functions: the enclosing frame's `new.target` at creation
@@ -1451,11 +1452,11 @@ impl JSObject for FunctionObject {
         self.properties.keys()
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.prototype = proto;
     }
 
@@ -1503,9 +1504,9 @@ impl JSObject for FunctionObject {
 /// rather than as the boxed function object, so that no `Rc` cycle is created
 /// (the value compares equal to the boxed form and is boxed on demand by
 /// property access).
-pub fn new_function_object(func_id: u32, name: &str, arity: usize) -> Value {
+pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usize) -> Value {
     let func_obj = FunctionObject::new(func_id, name);
-    let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
+    let obj_ref: Gc<Object> = heap.alloc(Object::Function(func_obj));
 
     /// `{ writable: false, enumerable: false, configurable: true }`
     fn fn_meta(value: Value) -> PropertyDescriptor {
@@ -1532,8 +1533,8 @@ pub fn new_function_object(func_id: u32, name: &str, arity: usize) -> Value {
 
     // `F.prototype` inherits from `Object.prototype` (ES 9.2.3 step 4).
     let proto_obj = match crate::builtins::wrapper_prototype("Object") {
-        Some(object_proto) => new_ordinary_object_with_prototype(object_proto),
-        None => new_ordinary_object(),
+        Some(object_proto) => new_ordinary_object_with_prototype(heap, object_proto),
+        None => new_ordinary_object(heap),
     };
 
     if let Value::Object(ref proto_ref) = proto_obj {
@@ -1577,6 +1578,7 @@ pub fn new_function_object(func_id: u32, name: &str, arity: usize) -> Value {
 /// An arrow is not a constructor: it owns `length` and `name` but has no
 /// `prototype` property (ES 9.2.3 applies only to non-arrow functions).
 pub fn new_arrow_function_object(
+    heap: &mut Heap,
     func_id: u32,
     name: &str,
     arity: usize,
@@ -1586,7 +1588,7 @@ pub fn new_arrow_function_object(
 ) -> Value {
     let mut func_obj = FunctionObject::new_arrow(func_id, name, captured_this, captured_vars);
     func_obj.captured_new_target = Some(captured_new_target);
-    let obj_ref: Rc<RefCell<dyn JSObject>> = Rc::new(RefCell::new(func_obj));
+    let obj_ref: Gc<Object> = heap.alloc(Object::Function(func_obj));
 
     let mut borrowed = obj_ref.borrow_mut();
     borrowed
@@ -1621,7 +1623,7 @@ pub fn new_arrow_function_object(
 pub struct NativeFunctionObject {
     pub name: String,
     /// `[[Prototype]]` of the function object itself.
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    prototype: Option<Gc<Object>>,
     /// Own properties (`length`, `name`, `prototype`, static methods, …).
     ///
     /// `length` / `name` live here like any other own property so that
@@ -1783,11 +1785,11 @@ impl JSObject for NativeFunctionObject {
         self.properties.keys()
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.prototype = proto;
     }
 
@@ -1841,12 +1843,12 @@ impl JSObject for NativeFunctionObject {
 pub struct PrimitiveWrapperObject {
     primitive: Value,
     properties: PropertyTable,
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    prototype: Option<Gc<Object>>,
     extensible: bool,
 }
 
 impl PrimitiveWrapperObject {
-    pub fn new(primitive: Value, prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+    pub fn new(primitive: Value, prototype: Option<Gc<Object>>) -> Self {
         Self {
             primitive,
             properties: PropertyTable::new(),
@@ -1995,11 +1997,11 @@ impl JSObject for PrimitiveWrapperObject {
         keys
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.prototype = proto;
     }
 
@@ -2095,7 +2097,7 @@ pub struct DateObject {
 }
 
 impl DateObject {
-    pub fn new(time_value: f64, prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+    pub fn new(time_value: f64, prototype: Option<Gc<Object>>) -> Self {
         let mut base = OrdinaryObject::with_class_name("Date");
         base.set_prototype(prototype);
         Self { time_value, base }
@@ -2147,10 +2149,10 @@ impl JSObject for DateObject {
     fn own_keys(&self) -> Vec<PropertyKey> {
         self.base.own_keys()
     }
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.base.get_prototype()
     }
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.base.set_prototype(proto)
     }
     fn is_extensible(&self) -> bool {
@@ -2201,7 +2203,7 @@ impl RegExpObject {
     pub fn new(
         source: String,
         flags: String,
-        prototype: Option<Rc<RefCell<dyn JSObject>>>,
+        prototype: Option<Gc<Object>>,
     ) -> Self {
         let mut base = OrdinaryObject::with_class_name("RegExp");
         base.set_prototype(prototype);
@@ -2316,10 +2318,10 @@ impl JSObject for RegExpObject {
     fn own_keys(&self) -> Vec<PropertyKey> {
         self.base.own_keys()
     }
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.base.get_prototype()
     }
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.base.set_prototype(proto)
     }
     fn is_extensible(&self) -> bool {
@@ -2359,7 +2361,7 @@ pub enum PromiseState {
 pub struct PromiseReaction {
     pub on_fulfilled: Option<Value>,
     pub on_rejected: Option<Value>,
-    pub target: Rc<RefCell<PromiseObject>>,
+    pub target: Gc<Object>,
 }
 
 /// A `Promise` instance: state, settled value, and the reactions waiting on it.
@@ -2380,7 +2382,7 @@ pub struct PromiseObject {
 }
 
 impl PromiseObject {
-    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>, id: u64) -> Self {
+    pub fn new(prototype: Option<Gc<Object>>, id: u64) -> Self {
         let mut base = OrdinaryObject::with_class_name("Promise");
         base.set_prototype(prototype);
         Self {
@@ -2432,10 +2434,10 @@ impl JSObject for PromiseObject {
     fn own_keys(&self) -> Vec<PropertyKey> {
         self.base.own_keys()
     }
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.base.get_prototype()
     }
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.base.set_prototype(proto)
     }
     fn is_extensible(&self) -> bool {
@@ -2563,10 +2565,10 @@ impl JSObject for GlobalObject {
             .collect()
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         None
     }
-    fn set_prototype(&mut self, _proto: Option<Rc<RefCell<dyn JSObject>>>) {}
+    fn set_prototype(&mut self, _proto: Option<Gc<Object>>) {}
     fn is_extensible(&self) -> bool {
         true
     }
@@ -2597,7 +2599,7 @@ pub struct ArrayBufferObject {
 }
 
 impl ArrayBufferObject {
-    pub fn new(byte_length: usize, prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+    pub fn new(byte_length: usize, prototype: Option<Gc<Object>>) -> Self {
         let mut base = OrdinaryObject::with_class_name("ArrayBuffer");
         base.set_prototype(prototype);
         Self {
@@ -2656,10 +2658,10 @@ impl JSObject for ArrayBufferObject {
     fn own_keys(&self) -> Vec<PropertyKey> {
         self.base.own_keys()
     }
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.base.get_prototype()
     }
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.base.set_prototype(proto)
     }
     fn is_extensible(&self) -> bool {
@@ -2813,7 +2815,7 @@ impl TypedArrayKind {
 pub struct TypedArrayObject {
     pub kind: TypedArrayKind,
     /// `[[ViewedArrayBuffer]]`.
-    pub buffer: Rc<RefCell<dyn JSObject>>,
+    pub buffer: Gc<Object>,
     /// `[[ByteOffset]]`.
     pub byte_offset: usize,
     /// `[[ArrayLength]]`.
@@ -2824,10 +2826,10 @@ pub struct TypedArrayObject {
 impl TypedArrayObject {
     pub fn new(
         kind: TypedArrayKind,
-        buffer: Rc<RefCell<dyn JSObject>>,
+        buffer: Gc<Object>,
         byte_offset: usize,
         length: usize,
-        prototype: Option<Rc<RefCell<dyn JSObject>>>,
+        prototype: Option<Gc<Object>>,
     ) -> Self {
         let mut base = OrdinaryObject::with_class_name(kind.name());
         base.set_prototype(prototype);
@@ -2984,10 +2986,10 @@ impl JSObject for TypedArrayObject {
         keys.extend(self.base.own_keys());
         keys
     }
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.base.get_prototype()
     }
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.base.set_prototype(proto)
     }
     fn is_extensible(&self) -> bool {
@@ -3022,7 +3024,7 @@ impl JSObject for TypedArrayObject {
 #[derive(Debug)]
 pub struct DataViewObject {
     /// `[[ViewedArrayBuffer]]`.
-    pub buffer: Rc<RefCell<dyn JSObject>>,
+    pub buffer: Gc<Object>,
     /// `[[ByteOffset]]` — where this view starts inside the buffer.
     pub byte_offset: usize,
     /// `[[ByteLength]]` — how many bytes this view spans.
@@ -3032,10 +3034,10 @@ pub struct DataViewObject {
 
 impl DataViewObject {
     pub fn new(
-        buffer: Rc<RefCell<dyn JSObject>>,
+        buffer: Gc<Object>,
         byte_offset: usize,
         byte_length: usize,
-        prototype: Option<Rc<RefCell<dyn JSObject>>>,
+        prototype: Option<Gc<Object>>,
     ) -> Self {
         let mut base = OrdinaryObject::with_class_name("DataView");
         base.set_prototype(prototype);
@@ -3089,10 +3091,10 @@ impl JSObject for DataViewObject {
     fn own_keys(&self) -> Vec<PropertyKey> {
         self.base.own_keys()
     }
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.base.get_prototype()
     }
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.base.set_prototype(proto)
     }
     fn is_extensible(&self) -> bool {
@@ -3138,7 +3140,7 @@ impl ProxyObject {
     pub fn new(
         target: Value,
         handler: Value,
-        prototype: Option<Rc<RefCell<dyn JSObject>>>,
+        prototype: Option<Gc<Object>>,
     ) -> Self {
         let mut base = OrdinaryObject::with_class_name("Proxy");
         base.set_prototype(prototype);
@@ -3151,9 +3153,9 @@ impl ProxyObject {
     }
 
     /// The target as an object, if it still is one.
-    fn target_object(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn target_object(&self) -> Option<Gc<Object>> {
         match &self.target {
-            Value::Object(obj_ref) => Some(Rc::clone(obj_ref)),
+            Value::Object(obj_ref) => Some(*obj_ref),
             _ => None,
         }
     }
@@ -3234,7 +3236,7 @@ impl JSObject for ProxyObject {
             None => Vec::new(),
         }
     }
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         if self.revoked {
             return self.base.get_prototype();
         }
@@ -3243,7 +3245,7 @@ impl JSObject for ProxyObject {
             None => self.base.get_prototype(),
         }
     }
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         if let Some(target) = self.target_object() {
             if !self.revoked {
                 target.borrow_mut().set_prototype(proto);
@@ -3311,14 +3313,14 @@ impl JSObject for ProxyObject {
 pub struct MapObject {
     entries: Vec<Option<(Value, Value)>>,
     properties: PropertyTable,
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    prototype: Option<Gc<Object>>,
     extensible: bool,
     frozen: bool,
     sealed: bool,
 }
 
 impl MapObject {
-    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+    pub fn new(prototype: Option<Gc<Object>>) -> Self {
         Self {
             entries: Vec::new(),
             properties: PropertyTable::new(),
@@ -3467,11 +3469,11 @@ impl JSObject for MapObject {
         self.properties.keys()
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         if !self.frozen {
             self.prototype = proto;
         }
@@ -3529,7 +3531,7 @@ pub struct WeakMapObject {
 }
 
 impl WeakMapObject {
-    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+    pub fn new(prototype: Option<Gc<Object>>) -> Self {
         Self {
             inner: MapObject::new(prototype),
         }
@@ -3597,11 +3599,11 @@ macro_rules! delegate_collection_object {
                 self.$inner.own_keys()
             }
 
-            fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+            fn get_prototype(&self) -> Option<Gc<Object>> {
                 self.$inner.get_prototype()
             }
 
-            fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+            fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
                 self.$inner.set_prototype(proto);
             }
 
@@ -3654,7 +3656,7 @@ pub struct WeakSetObject {
 }
 
 impl WeakSetObject {
-    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+    pub fn new(prototype: Option<Gc<Object>>) -> Self {
         Self {
             inner: SetObject::new(prototype),
         }
@@ -3694,14 +3696,14 @@ delegate_collection_object!(
 pub struct SetObject {
     entries: Vec<Option<Value>>,
     properties: PropertyTable,
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    prototype: Option<Gc<Object>>,
     extensible: bool,
     frozen: bool,
     sealed: bool,
 }
 
 impl SetObject {
-    pub fn new(prototype: Option<Rc<RefCell<dyn JSObject>>>) -> Self {
+    pub fn new(prototype: Option<Gc<Object>>) -> Self {
         Self {
             entries: Vec::new(),
             properties: PropertyTable::new(),
@@ -3829,11 +3831,11 @@ impl JSObject for SetObject {
         self.properties.keys()
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         if !self.frozen {
             self.prototype = proto;
         }
@@ -3942,13 +3944,44 @@ pub struct GeneratorObject {
     pub this: Value,
     pub captured_new_target: Option<Value>,
     pub captured_vars: Vec<(String, Value)>,
-    /// `Some` only while suspended at a `yield`.
-    pub suspended: Option<SuspendedFrame>,
-    prototype: Option<Rc<RefCell<dyn JSObject>>>,
+    /// `Some` 只在挂起于 `yield` 期间。
+    ///
+    /// **装箱是为了压住 `Object` 枚举的尺寸**：枚举尺寸 = 最大变体，而
+    /// `SuspendedFrame` 内联了 `[Value; 19]`（304 B）—— 不装箱它就是最大变体
+    /// （624 B），于是**每个**对象（哪怕只是个 `{}`）都要为生成器付账。
+    /// 见 `docs/GC-DESIGN.md` §4.1。
+    pub suspended: Option<Box<SuspendedFrame>>,
+    prototype: Option<Gc<Object>>,
+    /// 预先构造的原生方法 Value（`[Symbol.iterator]` / `next` / `return` / `throw`）。
+    ///
+    /// `property_get` 是 `&self`、拿不到堆；这些句柄在构造点（有堆）一次性生成。
+    iterator_fn: Value,
+    next_fn: Value,
+    return_fn: Value,
+    throw_fn: Value,
 }
 
 impl GeneratorObject {
-    pub fn new(id: u64, func_id: u32, args: Vec<Value>, this: Value) -> Self {
+    pub fn new(heap: &mut Heap, id: u64, func_id: u32, args: Vec<Value>, this: Value) -> Self {
+        let mk = |heap: &mut Heap, name: String| {
+            Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(&name))))
+        };
+        let iterator_fn = mk(
+            heap,
+            format!("{}{}", crate::vm::iterator::GENERATOR_ITERATOR_PREFIX, id),
+        );
+        let next_fn = mk(
+            heap,
+            format!("{}{}", crate::vm::iterator::GENERATOR_NEXT_PREFIX, id),
+        );
+        let return_fn = mk(
+            heap,
+            format!("{}{}", crate::vm::iterator::GENERATOR_RETURN_PREFIX, id),
+        );
+        let throw_fn = mk(
+            heap,
+            format!("{}{}", crate::vm::iterator::GENERATOR_THROW_PREFIX, id),
+        );
         Self {
             id,
             func_id,
@@ -3959,6 +3992,10 @@ impl GeneratorObject {
             captured_vars: Vec::new(),
             suspended: None,
             prototype: None,
+            iterator_fn,
+            next_fn,
+            return_fn,
+            throw_fn,
         }
     }
 }
@@ -3979,35 +4016,14 @@ impl JSObject for GeneratorObject {
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         // Generators are iterable: `gen[Symbol.iterator]()` is `gen` itself.
         if *key == crate::vm::iterator::iterator_symbol_key() {
-            return Some(PropertyDescriptor::data_descriptor(Value::Object(
-                Rc::new(RefCell::new(NativeFunctionObject::new(&format!(
-                    "{}{}",
-                    crate::vm::iterator::GENERATOR_ITERATOR_PREFIX,
-                    self.id
-                )))),
-            )));
+            return Some(PropertyDescriptor::data_descriptor(self.iterator_fn.clone()));
         }
-        let native_name = match key.as_str() {
-            Some("next") => format!(
-                "{}{}",
-                crate::vm::iterator::GENERATOR_NEXT_PREFIX,
-                self.id
-            ),
-            Some("return") => format!(
-                "{}{}",
-                crate::vm::iterator::GENERATOR_RETURN_PREFIX,
-                self.id
-            ),
-            Some("throw") => format!(
-                "{}{}",
-                crate::vm::iterator::GENERATOR_THROW_PREFIX,
-                self.id
-            ),
-            _ => return None,
-        };
-        Some(PropertyDescriptor::data_descriptor(Value::Object(
-            Rc::new(RefCell::new(NativeFunctionObject::new(&native_name))),
-        )))
+        match key.as_str() {
+            Some("next") => Some(PropertyDescriptor::data_descriptor(self.next_fn.clone())),
+            Some("return") => Some(PropertyDescriptor::data_descriptor(self.return_fn.clone())),
+            Some("throw") => Some(PropertyDescriptor::data_descriptor(self.throw_fn.clone())),
+            _ => None,
+        }
     }
 
     fn property_set(&mut self, _key: PropertyKey, _value: Value) -> Result<bool, String> {
@@ -4039,11 +4055,11 @@ impl JSObject for GeneratorObject {
         ]
     }
 
-    fn get_prototype(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    fn get_prototype(&self) -> Option<Gc<Object>> {
         self.prototype.clone()
     }
 
-    fn set_prototype(&mut self, proto: Option<Rc<RefCell<dyn JSObject>>>) {
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
         self.prototype = proto;
     }
 

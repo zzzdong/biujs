@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{JSObject, WeakMapObject, WeakSetObject};
 use crate::vm::property::ObjectKind;
 use crate::vm::value::Value;
@@ -146,7 +147,7 @@ pub fn weakset_delete(this: &Value, args: &[Value]) -> Result<Value, RuntimeErro
 /// `WeakMap.prototype.getOrInsert(key, value)` / `getOrInsertComputed(key, cb)`
 /// (ES2026 `upsert`, already in the pinned test262). `getOrInsert` is pure; the
 /// computed form needs the VM for the callback, so both are dispatched there.
-pub fn register_weakmap_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_weakmap_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     for name in [
         "set",
         "get",
@@ -155,15 +156,15 @@ pub fn register_weakmap_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
         "getOrInsert",
         "getOrInsertComputed",
     ] {
-        super::set_vm_method(proto, super::WEAKMAP_METHOD_PREFIX, name);
+        super::set_vm_method(proto, heap, super::WEAKMAP_METHOD_PREFIX, name);
     }
     super::define_string_tag(proto, "WeakMap");
 }
 
 /// Populate `WeakSet.prototype` (ES 23.4.3): `add` / `has` / `delete`.
-pub fn register_weakset_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_weakset_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     for name in ["add", "has", "delete"] {
-        super::set_vm_method(proto, super::WEAKSET_METHOD_PREFIX, name);
+        super::set_vm_method(proto, heap, super::WEAKSET_METHOD_PREFIX, name);
     }
     super::define_string_tag(proto, "WeakSet");
 }

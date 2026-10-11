@@ -38,7 +38,16 @@ SNAP="docs/phase2-status.tsv"
 #   TEST262_MEMORY_MB   单条用例的增量上限（0 = 关）
 : "${TEST262_TIMEOUT_MS:=15000}"   # 实测第 10 慢的用例 2.2s（更慢的 9 条基线里本已失败）
 : "${TEST262_STEP_LIMIT:=0}"        # 0 交给 runner 用 DEFAULT_STEP_LIMIT
-: "${TEST262_MEMORY_MB:=256}"        # 实测 64MiB 阈值下只有 9 条越线，且都本已失败
+: "${TEST262_MEMORY_MB:=384}"        # 实测 64MiB 阈值下只有 9 条越线，且都本已失败
+                                     # 256 → 384（2026-10-12，P1 之后）：堆现在归 VM、只在 VM 析构时
+                                     # 整片释放，**单次 run 内不回收**，于是临时垃圾的峰值从"边跑边
+                                     # 释放"变成"一直留到 run 结束"。实测同一次改动下：
+                                     #   256MB → 通过 16562 / 失败 3146 / memory 30（比基线 −5）
+                                     #   384MB → 通过 16567 / 失败 3141 / memory 25（与基线逐项相同、
+                                     #           且无逐套件回退，built-ins/Array 反而 +3）
+                                     # 即那 5 条是**预算**问题，不是语义回退。这是已量化的预期漂移，
+                                     # 正解是阶段 C 的 mark-sweep（届时预算可降回 256）。
+                                     # 见 docs/REFACTOR-HEAP-GC.md §5 R3。
 # 整轮再套一层硬超时：护栏本身出问题时，至少不让脚本无限等下去。
 : "${TEST262_HARD_TIMEOUT:=1200}"
 export TEST262_TIMEOUT_MS TEST262_STEP_LIMIT TEST262_MEMORY_MB

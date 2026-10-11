@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::JSObject;
 use crate::vm::value::Value;
 
@@ -14,18 +15,18 @@ use super::set_static_method;
 // Prototype registration
 // ─────────────────────────────────────────────────────────
 
-pub fn register_number_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
-    set_prototype_method(proto, "valueOf", |this, _args| number_value_of(this));
+pub fn register_number_prototype(proto: &Gc<Object>, heap: &mut Heap) {
+    set_prototype_method(proto, heap, "valueOf", |this, _args| number_value_of(this));
     // `Number.prototype.toString.length` is 1 (radix counts despite the
     // brackets in the heading); every other `toString` is 0.
-    super::set_prototype_method_arity(proto, "toString", 1, |this, args| {
+    super::set_prototype_method_arity(proto, heap, "toString", 1, |this, args| {
         number_to_string_with_radix(this, args)
     });
-    set_prototype_method(proto, "toFixed", |this, args| number_to_fixed(this, args));
-    set_prototype_method(proto, "toExponential", |this, args| {
+    set_prototype_method(proto, heap, "toFixed", |this, args| number_to_fixed(this, args));
+    set_prototype_method(proto, heap, "toExponential", |this, args| {
         number_to_exponential(this, args)
     });
-    set_prototype_method(proto, "toPrecision", |this, args| {
+    set_prototype_method(proto, heap, "toPrecision", |this, args| {
         number_to_precision(this, args)
     });
 }
@@ -77,11 +78,11 @@ pub fn number_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 // Static methods
 // ─────────────────────────────────────────────────────────
 
-pub fn register_number_statics(number_fn: &Value, _proto: &Rc<RefCell<dyn JSObject>>) {
-    set_static_method(number_fn, "isNaN", |args| number_is_nan(args));
-    set_static_method(number_fn, "isFinite", |args| number_is_finite(args));
-    set_static_method(number_fn, "isInteger", |args| number_is_integer(args));
-    set_static_method(number_fn, "isSafeInteger", |args| {
+pub fn register_number_statics(number_fn: &Value, _proto: &Gc<Object>, heap: &mut Heap) {
+    set_static_method(number_fn, "isNaN", heap, |args| number_is_nan(args));
+    set_static_method(number_fn, "isFinite", heap, |args| number_is_finite(args));
+    set_static_method(number_fn, "isInteger", heap, |args| number_is_integer(args));
+    set_static_method(number_fn, "isSafeInteger", heap, |args| {
         Ok(Value::Bool(
             args.first()
                 .map(|v| {
@@ -91,10 +92,10 @@ pub fn register_number_statics(number_fn: &Value, _proto: &Rc<RefCell<dyn JSObje
                 .unwrap_or(false),
         ))
     });
-    set_static_method(number_fn, "parseInt", |args| {
+    set_static_method(number_fn, "parseInt", heap, |args| {
         super::global_parse_int(args)
     });
-    set_static_method(number_fn, "parseFloat", |args| {
+    set_static_method(number_fn, "parseFloat", heap, |args| {
         super::global_parse_float(args)
     });
 

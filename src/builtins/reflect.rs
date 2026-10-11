@@ -10,19 +10,19 @@
 //! `defineProperty`, whose descriptor may be an accessor) are dispatched by the
 //! VM; the rest are here.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::vm::object::{ArrayObject, JSObject, NativeFunctionObject, OrdinaryObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::{SymbolData, Value};
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 
 /// The methods the VM has to run, so both halves agree on the spelling.
 pub const VM_METHODS: [&str; 5] = ["get", "set", "apply", "construct", "defineProperty"];
 
 /// The builtin-only methods, in the order `Reflect` lists them.
-pub const BUILTIN_METHODS: [(&str, fn(&[Value]) -> Result<Value, RuntimeError>); 8] = [
+pub const BUILTIN_METHODS: [(&str, fn(&mut Heap, &[Value]) -> Result<Value, RuntimeError>); 8] = [
     ("has", reflect_has),
     ("deleteProperty", reflect_delete_property),
     ("ownKeys", reflect_own_keys),
@@ -36,9 +36,9 @@ pub const BUILTIN_METHODS: [(&str, fn(&[Value]) -> Result<Value, RuntimeError>);
 /// `Reflect.*` addresses its target by index, and every method starts with "If
 /// Type(target) is not Object, throw a TypeError" — no coercion, unlike
 /// `Object.keys(1)` (ES 28.1.1).
-pub fn target_of(args: &[Value], method: &str) -> Result<Rc<RefCell<dyn JSObject>>, RuntimeError> {
+pub fn target_of(args: &[Value], method: &str) -> Result<Gc<Object>, RuntimeError> {
     match args.first() {
-        Some(Value::Object(obj_ref)) => Ok(Rc::clone(obj_ref)),
+        Some(Value::Object(obj_ref)) => Ok(*obj_ref),
         Some(other) => Err(RuntimeError::TypeError(format!(
             "Reflect.{method} called on {}",
             other.type_of()
@@ -58,7 +58,7 @@ pub fn to_key(value: &Value) -> PropertyKey {
 }
 
 /// `Reflect.has(target, key)` (ES 28.1.10) — the `in` operator.
-pub fn reflect_has(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_has(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "has")?;
     let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
     let has = crate::vm::prototype::internal_has_property(target, &key)
@@ -68,7 +68,7 @@ pub fn reflect_has(args: &[Value]) -> Result<Value, RuntimeError> {
 
 /// `Reflect.deleteProperty(target, key)` (ES 28.1.3) — `delete`, but it answers
 /// `false` instead of throwing in strict mode.
-pub fn reflect_delete_property(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_delete_property(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "deleteProperty")?;
     let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
     // `[[Delete]]` answers `true` for an absent property — the rule lives in
@@ -81,7 +81,7 @@ pub fn reflect_delete_property(args: &[Value]) -> Result<Value, RuntimeError> {
 
 /// `Reflect.ownKeys(target)` (ES 28.1.11): every own key — non-enumerable and
 /// symbol ones included — as strings first, then symbols.
-pub fn reflect_own_keys(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_own_keys(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "ownKeys")?;
     let keys = target.borrow().own_keys();
     let mut strings: Vec<Value> = Vec::new();
@@ -98,22 +98,22 @@ pub fn reflect_own_keys(args: &[Value]) -> Result<Value, RuntimeError> {
         }
     }
     strings.extend(symbols);
-    Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
-        strings,
-    )))))
+    Ok(Value::Object(heap.alloc(Object::Array(
+        ArrayObject::from_vec(strings),
+    ))))
 }
 
 /// `Reflect.getOwnPropertyDescriptor(target, key)` (ES 28.1.5) — the same answer
 /// as `Object.getOwnPropertyDescriptor`, without the `ToObject` on the target.
-pub fn reflect_get_own_property_descriptor(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_get_own_property_descriptor(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "getOwnPropertyDescriptor")?;
     let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
     let descriptor = target.borrow().property_get(&key);
-    Ok(super::object::descriptor_to_value(descriptor))
+    Ok(super::object::descriptor_to_value(heap, descriptor))
 }
 
 /// `Reflect.getPrototypeOf(target)` (ES 28.1.6).
-pub fn reflect_get_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_get_prototype_of(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "getPrototypeOf")?;
     let proto = target.borrow().get_prototype();
     Ok(match proto {
@@ -124,12 +124,12 @@ pub fn reflect_get_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
 
 /// `Reflect.setPrototypeOf(target, proto)` (ES 28.1.13) — a boolean, whereas
 /// `Object.setPrototypeOf` throws.
-pub fn reflect_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_set_prototype_of(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "setPrototypeOf")?;
     let proto = args.get(1).cloned().unwrap_or(Value::Undefined);
     let new_proto = match &proto {
         Value::Null => None,
-        Value::Object(obj_ref) => Some(Rc::clone(obj_ref)),
+        Value::Object(obj_ref) => Some(*obj_ref),
         other => {
             return Err(RuntimeError::TypeError(format!(
                 "Object prototype may only be an Object or null: {}",
@@ -144,7 +144,7 @@ pub fn reflect_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
         let current = borrowed.get_prototype();
         let same = match (&current, &new_proto) {
             (None, None) => true,
-            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+            (Some(a), Some(b)) => Gc::ptr_eq(a, b),
             _ => false,
         };
         borrowed.is_extensible() || same
@@ -156,9 +156,9 @@ pub fn reflect_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
     // every later lookup. `[[SetPrototypeOf]]` *refuses* it (ES 10.1.2.1 step 6),
     // which `Reflect` reports as `false` and `Object.setPrototypeOf` throws.
     if let Some(proto) = &new_proto {
-        let mut chain = Some(Rc::clone(proto));
+        let mut chain = Some(*proto);
         while let Some(link) = chain {
-            if Rc::ptr_eq(&link, &target) {
+            if Gc::ptr_eq(&link, &target) {
                 return Ok(Value::Bool(false));
             }
             chain = link.borrow().get_prototype();
@@ -169,14 +169,14 @@ pub fn reflect_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 /// `Reflect.isExtensible(target)` (ES 28.1.7).
-pub fn reflect_is_extensible(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_is_extensible(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "isExtensible")?;
     let extensible = target.borrow().is_extensible();
     Ok(Value::Bool(extensible))
 }
 
 /// `Reflect.preventExtensions(target)` (ES 28.1.12).
-pub fn reflect_prevent_extensions(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_prevent_extensions(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "preventExtensions")?;
     target.borrow_mut().prevent_extensions();
     Ok(Value::Bool(true))
@@ -188,7 +188,7 @@ pub fn reflect_prevent_extensions(args: &[Value]) -> Result<Value, RuntimeError>
 /// Every method is a name-only native: the VM dispatches five of them, and
 /// `call_static_method` the other eight — the closures a prototype/method
 /// descriptor carries are never called, only the name is read.
-pub fn create_reflect_object() -> Value {
+pub fn create_reflect_object(heap: &mut Heap) -> Value {
     let mut obj = OrdinaryObject::with_class_name("Reflect");
     // `Reflect` is a namespace object, not a constructor: it has no `prototype`
     // property of its own, but it *inherits* from `Object.prototype`
@@ -202,7 +202,7 @@ pub fn create_reflect_object() -> Value {
     for name in names {
         let _ = obj.define_property(
             PropertyKey::from_str(name),
-            super::method_descriptor(Value::Object(Rc::new(RefCell::new(
+            super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(&format!("Reflect.{name}")),
             )))),
         );
@@ -218,5 +218,5 @@ pub fn create_reflect_object() -> Value {
             setter: None,
         },
     );
-    Value::Object(Rc::new(RefCell::new(obj)))
+    Value::Object(heap.alloc(Object::Ordinary(obj)))
 }

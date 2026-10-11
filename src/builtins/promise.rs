@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::JSObject;
 use crate::vm::value::Value;
 
@@ -19,10 +20,10 @@ pub const PROMISE_SPECIES_NATIVE: &str = "__promise_species__";
 /// `Promise.prototype.then` / `catch` / `finally`: the VM intercepts all three
 /// before the ordinary prototype dispatch, so these are registered for lookups
 /// (`p.then` must be a function) but never reached.
-pub fn register_promise_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_promise_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
     for name in ["then", "catch", "finally"] {
-        set_prototype_method(proto, name, |_this, _args| {
+        set_prototype_method(proto, heap, name, |_this, _args| {
             Err(RuntimeError::InternalError(
                 "Promise methods are dispatched by the VM".to_string(),
             ))
@@ -37,7 +38,7 @@ pub fn register_promise_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
 /// The names have to resolve before the VM's static-method interception can
 /// claim them — without this they are `undefined` and the interception never
 /// runs.
-pub fn register_promise_statics(ctor: &Value) {
+pub fn register_promise_statics(ctor: &Value, heap: &mut Heap) {
     let Value::Object(obj_ref) = ctor else {
         return;
     };
@@ -45,7 +46,7 @@ pub fn register_promise_statics(ctor: &Value) {
         let _ = obj_ref.borrow_mut().define_property(
             crate::vm::property::PropertyKey::from_str(name),
             crate::vm::property::PropertyDescriptor {
-                value: Value::Object(Rc::new(RefCell::new(
+                value: Value::Object(heap.alloc(Object::NativeFunction(
                     crate::vm::object::NativeFunctionObject::new(&format!("Promise.{name}")),
                 ))),
                 writable: true,

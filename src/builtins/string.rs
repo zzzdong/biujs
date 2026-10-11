@@ -1,8 +1,6 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::RuntimeError;
-use crate::vm::object::{ArrayObject, JSObject};
+use crate::vm::gc::{Gc, Heap, Object};
+use crate::vm::object::{new_array_object_from_vec, JSObject};
 use crate::vm::value::Value;
 
 // ─────────────────────────────────────────────────────────
@@ -35,72 +33,68 @@ pub fn is_js_whitespace(c: char) -> bool {
     )
 }
 
-pub fn register_string_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_string_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
 
-    set_prototype_method(proto, "valueOf", |this, _args| string_value_of(this));
-    set_prototype_method(proto, "toString", |this, _args| string_to_string(this));
-    set_prototype_method(proto, "charAt", |this, args| string_char_at(this, args));
-    set_prototype_method(proto, "charCodeAt", |this, args| {
+    set_prototype_method(proto, heap, "valueOf", |this, _args| string_value_of(this));
+    set_prototype_method(proto, heap, "toString", |this, _args| string_to_string(this));
+    set_prototype_method(proto, heap, "charAt", |this, args| string_char_at(this, args));
+    set_prototype_method(proto, heap, "charCodeAt", |this, args| {
         string_char_code_at(this, args)
     });
-    set_prototype_method(proto, "concat", |this, args| string_concat(this, args));
-    set_prototype_method(proto, "includes", |this, args| string_includes(this, args));
-    set_prototype_method(proto, "indexOf", |this, args| string_index_of(this, args));
-    set_prototype_method(proto, "slice", |this, args| string_slice(this, args));
-    set_prototype_method(proto, "substring", |this, args| {
+    set_prototype_method(proto, heap, "concat", |this, args| string_concat(this, args));
+    set_prototype_method(proto, heap, "includes", |this, args| string_includes(this, args));
+    set_prototype_method(proto, heap, "indexOf", |this, args| string_index_of(this, args));
+    set_prototype_method(proto, heap, "slice", |this, args| string_slice(this, args));
+    set_prototype_method(proto, heap, "substring", |this, args| {
         string_substring(this, args)
     });
-    set_prototype_method(proto, "toUpperCase", |this, _args| string_to_upper(this));
-    set_prototype_method(proto, "toLowerCase", |this, _args| string_to_lower(this));
-    set_prototype_method(proto, "trim", |this, _args| string_trim_both(this));
-    set_prototype_method(proto, "split", |this, args| string_split(this, args));
-    set_prototype_method(proto, "match", |this, args| {
-        super::regexp::regexp_match(this, args)
-    });
+    set_prototype_method(proto, heap, "toUpperCase", |this, _args| string_to_upper(this));
+    set_prototype_method(proto, heap, "toLowerCase", |this, _args| string_to_lower(this));
+    set_prototype_method(proto, heap, "trim", |this, _args| string_trim_both(this));
+    set_prototype_method(proto, heap, "split", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "match", |_this, _args| Ok(Value::Undefined));
     // `matchAll` answers an *iterator*, which only the VM can mint (iterators
     // live in its registry so `next()` can find its state), so the method is
     // marked for the VM rather than implemented here.
-    super::mark_prototype_method(proto, "matchAll");
-    set_prototype_method(proto, "search", |this, args| {
-        super::regexp::regexp_search(this, args)
-    });
+    super::mark_prototype_method(proto, heap, "matchAll");
+    set_prototype_method(proto, heap, "search", |_this, _args| Ok(Value::Undefined));
     // A RegExp argument is routed to the regex-aware implementation in the
     // dispatch (`call_prototype_method`), not here — the closure is not what runs.
-    set_prototype_method(proto, "replace", |this, args| {
+    set_prototype_method(proto, heap, "replace", |this, args| {
         string_replace(this, args, false)
     });
-    set_prototype_method(proto, "replaceAll", |this, args| {
+    set_prototype_method(proto, heap, "replaceAll", |this, args| {
         string_replace(this, args, true)
     });
-    set_prototype_method(proto, "startsWith", |this, args| string_starts_with(this, args));
-    set_prototype_method(proto, "endsWith", |this, args| string_ends_with(this, args));
-    set_prototype_method(proto, "repeat", |this, args| string_repeat(this, args));
-    set_prototype_method(proto, "trimStart", |this, _args| {
+    set_prototype_method(proto, heap, "startsWith", |this, args| string_starts_with(this, args));
+    set_prototype_method(proto, heap, "endsWith", |this, args| string_ends_with(this, args));
+    set_prototype_method(proto, heap, "repeat", |this, args| string_repeat(this, args));
+    set_prototype_method(proto, heap, "trimStart", |this, _args| {
         string_trim(this, true)
     });
-    set_prototype_method(proto, "trimEnd", |this, _args| {
+    set_prototype_method(proto, heap, "trimEnd", |this, _args| {
         string_trim(this, false)
     });
-    set_prototype_method(proto, "codePointAt", |this, args| {
+    set_prototype_method(proto, heap, "codePointAt", |this, args| {
         string_code_point_at(this, args)
     });
-    set_prototype_method(proto, "at", |this, args| string_at(this, args));
-    set_prototype_method(proto, "normalize", |this, args| {
+    set_prototype_method(proto, heap, "at", |this, args| string_at(this, args));
+    set_prototype_method(proto, heap, "normalize", |this, args| {
         string_normalize(this, args)
     });
-    set_prototype_method(proto, "toLocaleLowerCase", |this, _args| string_to_lower(this));
-    set_prototype_method(proto, "toLocaleUpperCase", |this, _args| string_to_upper(this));
-    set_prototype_method(proto, "localeCompare", |this, args| {
+    set_prototype_method(proto, heap, "toLocaleLowerCase", |this, _args| string_to_lower(this));
+    set_prototype_method(proto, heap, "toLocaleUpperCase", |this, _args| string_to_upper(this));
+    set_prototype_method(proto, heap, "localeCompare", |this, args| {
         string_locale_compare(this, args)
     });
-    set_prototype_method(proto, "padStart", |this, args| {
+    set_prototype_method(proto, heap, "padStart", |this, args| {
         string_pad(this, args, true)
     });
-    set_prototype_method(proto, "padEnd", |this, args| {
+    set_prototype_method(proto, heap, "padEnd", |this, args| {
         string_pad(this, args, false)
     });
-    set_prototype_method(proto, "lastIndexOf", |this, args| {
+    set_prototype_method(proto, heap, "lastIndexOf", |this, args| {
         string_last_index_of(this, args)
     });
 }
@@ -137,11 +131,11 @@ pub fn string_from_code_point(args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 /// Register the `String` constructor's static methods.
-pub fn register_string_statics(string_fn: &Value) {
-    super::set_static_method(string_fn, "fromCharCode", |args| {
+pub fn register_string_statics(string_fn: &Value, heap: &mut Heap) {
+    super::set_static_method(string_fn, "fromCharCode", heap, |args| {
         string_from_char_code(args)
     });
-    super::set_static_method(string_fn, "fromCodePoint", |args| {
+    super::set_static_method(string_fn, "fromCodePoint", heap, |args| {
         string_from_code_point(args)
     });
 }
@@ -531,12 +525,14 @@ pub fn string_locale_compare(obj: &Value, args: &[Value]) -> Result<Value, Runti
     }))
 }
 
-pub fn string_split(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn string_split(
+    heap: &mut Heap,
+    obj: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
     if args.is_empty() {
-        return Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
-            vec![Value::string(&s)],
-        )))));
+        return Ok(new_array_object_from_vec(heap, vec![Value::string(&s)]));
     }
     let sep = super::to_string_throwing(&args[0])?;
     let parts: Vec<Value> = if sep.is_empty() {
@@ -544,9 +540,7 @@ pub fn string_split(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     } else {
         s.split(&sep).map(|part| Value::string(part)).collect()
     };
-    Ok(Value::Object(Rc::new(RefCell::new(ArrayObject::from_vec(
-        parts,
-    )))))
+    Ok(new_array_object_from_vec(heap, parts))
 }
 
 /// `String.prototype.replace(searchValue, replaceValue)` and

@@ -5,10 +5,8 @@
 //! of the feature (`new Uint8Array(buf)` and `buf` see each other's writes), and
 //! it is why the element type lives in the VM rather than in a `Vec<Value>`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{
     ArrayBufferObject, DataViewObject, JSObject, NativeFunctionObject, TypedArrayKind,
     TypedArrayObject,
@@ -281,24 +279,26 @@ fn checked_byte_length(requested: f64, bytes_per_element: usize) -> Result<usize
 
 /// `new ArrayBuffer(byteLength)`.
 pub fn arraybuffer_construct(
+    heap: &mut Heap,
     args: &[Value],
     proto: Option<Value>,
 ) -> Result<Value, RuntimeError> {
     let requested = args.first().map(|v| v.to_number()).unwrap_or(0.0);
     let byte_length = checked_byte_length(requested, 1)?;
-    Ok(make_buffer(byte_length, proto))
+    Ok(make_buffer(heap, byte_length, proto))
 }
 
-fn make_buffer(byte_length: usize, proto: Option<Value>) -> Value {
+fn make_buffer(heap: &mut Heap, byte_length: usize, proto: Option<Value>) -> Value {
     let mut buffer = ArrayBufferObject::new(byte_length, None);
     if let Some(Value::Object(p)) = proto {
-        buffer.set_prototype(Some(Rc::clone(&p)));
+        buffer.set_prototype(Some(p));
     }
-    Value::Object(Rc::new(RefCell::new(buffer)))
+    Value::Object(heap.alloc(Object::ArrayBuffer(buffer)))
 }
 
 /// `new DataView(buffer [, byteOffset [, byteLength]])` (ES 25.3.2.1).
 pub fn dataview_construct(
+    heap: &mut Heap,
     args: &[Value],
     proto: Option<Value>,
 ) -> Result<Value, RuntimeError> {
@@ -323,7 +323,7 @@ pub fn dataview_construct(
                 "DataView cannot view a detached ArrayBuffer".to_string(),
             ));
         }
-        (buffer.byte_length(), Rc::clone(obj_ref))
+        (buffer.byte_length(), *obj_ref)
     };
     let offset = to_index(args.get(1))?;
     if offset > buffer_len {
@@ -343,11 +343,11 @@ pub fn dataview_construct(
             len
         }
     };
-    let mut dv = DataViewObject::new(Rc::clone(&buffer_obj), offset, length, None);
+    let mut dv = DataViewObject::new(buffer_obj, offset, length, None);
     if let Some(Value::Object(p)) = proto {
-        dv.set_prototype(Some(Rc::clone(&p)));
+        dv.set_prototype(Some(p));
     }
-    Ok(Value::Object(Rc::new(RefCell::new(dv))))
+    Ok(Value::Object(heap.alloc(Object::DataView(dv))))
 }
 
 // ── getters ──────────────────────────────────────────────────────────────────
@@ -367,7 +367,7 @@ fn as_live_dataview<'a>(
 }
 
 pub fn dv_buffer(this: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::Object(Rc::clone(&as_live_dataview(this)?.buffer)))
+    Ok(Value::Object(as_live_dataview(this)?.buffer))
 }
 
 pub fn dv_byte_length(this: &Value) -> Result<Value, RuntimeError> {
@@ -476,6 +476,7 @@ fn source_numbers(value: &Value, bytes_per_element: usize) -> Result<Vec<f64>, R
 /// `new Uint8Array(…)` and friends (ES 23.2.5.1): a length, another TypedArray,
 /// an array-like / iterable, or a buffer with an optional byte offset and length.
 pub fn typedarray_construct(
+    heap: &mut Heap,
     kind: TypedArrayKind,
     args: &[Value],
     proto: Option<Value>,
@@ -529,7 +530,7 @@ pub fn typedarray_construct(
         };
         let _ = byte_offset;
         byte_offset = byte_offset.min(buffer_len);
-        return Ok(make_view(kind, buffer, byte_offset, length, proto));
+        return Ok(make_view(heap, kind, buffer, byte_offset, length, proto));
     }
 
     // Anything else is a length or something to copy — both get their own buffer.
@@ -555,11 +556,11 @@ pub fn typedarray_construct(
         other => source_numbers(other, size)?,
     };
 
-    let buffer = make_buffer(numbers.len() * size, None);
+    let buffer = make_buffer(heap, numbers.len() * size, None);
     let Value::Object(buffer_obj) = buffer else {
         unreachable!()
     };
-    let view = make_view(kind, buffer_obj.clone(), 0, numbers.len(), proto.clone());
+    let view = make_view(heap, kind, buffer_obj, 0, numbers.len(), proto);
     if let Value::Object(view_ref) = &view {
         let mut view_mut = view_ref.borrow_mut();
         if let Some(ta) = view_mut.as_any_mut().downcast_mut::<TypedArrayObject>() {
@@ -577,17 +578,18 @@ pub fn typedarray_construct(
 }
 
 fn make_view(
+    heap: &mut Heap,
     kind: TypedArrayKind,
-    buffer: Rc<RefCell<dyn JSObject>>,
+    buffer: Gc<Object>,
     byte_offset: usize,
     length: usize,
     proto: Option<Value>,
 ) -> Value {
     let mut view = TypedArrayObject::new(kind, buffer, byte_offset, length, None);
     if let Some(Value::Object(p)) = proto {
-        view.set_prototype(Some(Rc::clone(&p)));
+        view.set_prototype(Some(p));
     }
-    Value::Object(Rc::new(RefCell::new(view)))
+    Value::Object(heap.alloc(Object::TypedArray(view)))
 }
 
 // ── getters ────────────────────────────────────────────────────────────────
@@ -609,7 +611,7 @@ pub fn ta_byte_offset(this: &Value) -> Result<Value, RuntimeError> {
 
 pub fn ta_buffer(this: &Value) -> Result<Value, RuntimeError> {
     let ta = as_typedarray(this, "buffer")?;
-    Ok(Value::Object(Rc::clone(&ta.buffer)))
+    Ok(Value::Object(ta.buffer))
 }
 
 pub fn ab_byte_length(this: &Value) -> Result<Value, RuntimeError> {
@@ -672,7 +674,7 @@ pub fn ta_set(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     }
     let kind = ta.kind;
     let byte_offset = ta.byte_offset;
-    let buffer = Rc::clone(&ta.buffer);
+    let buffer = ta.buffer;
     drop(ta);
     let mut buffer_mut = buffer.borrow_mut();
     let Some(buf) = buffer_mut.as_any_mut().downcast_mut::<ArrayBufferObject>() else {
@@ -691,7 +693,7 @@ pub fn ta_set(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 /// `subarray(begin, end)` — a new view over the *same* buffer.
-pub fn ta_subarray(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn ta_subarray(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let ta = as_typedarray(this, "subarray")?;
     let length = ta.length;
     let begin = relative_index(args.first(), 0, length);
@@ -699,14 +701,14 @@ pub fn ta_subarray(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     let new_length = end.saturating_sub(begin);
     let kind = ta.kind;
     let byte_offset = ta.byte_offset + begin * kind.bytes_per_element();
-    let buffer = Rc::clone(&ta.buffer);
+    let buffer = ta.buffer;
     let proto = ta.get_prototype().map(Value::Object);
     drop(ta);
-    Ok(make_view(kind, buffer, byte_offset, new_length, proto))
+    Ok(make_view(heap, kind, buffer, byte_offset, new_length, proto))
 }
 
 /// `slice(begin, end)` — a *copy* into a fresh buffer.
-pub fn ta_slice(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn ta_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let ta = as_typedarray(this, "slice")?;
     let length = ta.length;
     let begin = relative_index(args.first(), 0, length);
@@ -721,11 +723,11 @@ pub fn ta_slice(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let kind = ta.kind;
     let proto = ta.get_prototype().map(Value::Object);
     drop(ta);
-    let buffer = make_buffer(new_length * kind.bytes_per_element(), None);
+    let buffer = make_buffer(heap, new_length * kind.bytes_per_element(), None);
     let Value::Object(buffer_obj) = buffer else {
         unreachable!()
     };
-    let view = make_view(kind, Rc::clone(&buffer_obj), 0, new_length, proto);
+    let view = make_view(heap, kind, buffer_obj, 0, new_length, proto);
     if let Value::Object(view_ref) = &view {
         let mut view_mut = view_ref.borrow_mut();
         let ta_mut = view_mut.as_any_mut().downcast_mut::<TypedArrayObject>();
@@ -749,7 +751,7 @@ pub fn ta_fill(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let end = relative_index(args.get(2), length, length);
     let kind = ta.kind;
     let byte_offset = ta.byte_offset;
-    let buffer = Rc::clone(&ta.buffer);
+    let buffer = ta.buffer;
     drop(ta);
     let mut buffer_mut = buffer.borrow_mut();
     if let Some(buf) = buffer_mut.as_any_mut().downcast_mut::<ArrayBufferObject>() {
@@ -765,7 +767,7 @@ pub fn ta_fill(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 /// `ArrayBuffer.prototype.slice(start, end)` — a copy into a new buffer.
-pub fn ab_slice(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn ab_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let Value::Object(obj_ref) = this else {
         return Err(RuntimeError::TypeError(
             "slice called on a non-object".to_string(),
@@ -784,7 +786,7 @@ pub fn ab_slice(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let start = relative_index(args.first(), 0, length);
     let end = relative_index(args.get(1), length, length);
     let copy = data[start..end].to_vec();
-    let new_buffer = make_buffer(copy.len(), proto);
+    let new_buffer = make_buffer(heap, copy.len(), proto);
     if let (Value::Object(new_ref), Value::Object(_)) = (&new_buffer, this) {
         let mut borrowed = new_ref.borrow_mut();
         if let Some(buffer) = borrowed.as_any_mut().downcast_mut::<ArrayBufferObject>() {
@@ -817,18 +819,18 @@ fn relative_index(argument: Option<&Value>, default: usize, length: usize) -> us
 
 // ── prototypes ─────────────────────────────────────────────────────────────
 
-pub fn register_arraybuffer_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_arraybuffer_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
-    set_prototype_method(proto, "slice", |this, args| ab_slice(this, args));
+    set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("byteLength"),
-        accessor(AB_BYTE_LENGTH_NATIVE),
+        accessor(heap, AB_BYTE_LENGTH_NATIVE),
     );
 }
 
 /// `DataView.prototype`: the 8 `get*` / 8 `set*` methods and the three accessors
 /// (`buffer` / `byteLength` / `byteOffset`).
-pub fn register_dataview_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_dataview_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
     let get_types: [(DataViewType, &str); 8] = [
         (DataViewType::Int8, "getInt8"),
@@ -842,7 +844,7 @@ pub fn register_dataview_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     ];
     for (ty, name) in get_types {
         let ty = ty;
-        set_prototype_method(proto, name, move |this, args| dv_get(this, args, ty));
+        set_prototype_method(proto, heap, name, move |this, args| dv_get(this, args, ty));
     }
     let set_types: [(DataViewType, &str); 8] = [
         (DataViewType::Int8, "setInt8"),
@@ -856,19 +858,19 @@ pub fn register_dataview_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
     ];
     for (ty, name) in set_types {
         let ty = ty;
-        set_prototype_method(proto, name, move |this, args| dv_set(this, args, ty));
+        set_prototype_method(proto, heap, name, move |this, args| dv_set(this, args, ty));
     }
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("buffer"),
-        accessor(DV_BUFFER_NATIVE),
+        accessor(heap, DV_BUFFER_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("byteLength"),
-        accessor(DV_BYTE_LENGTH_NATIVE),
+        accessor(heap, DV_BYTE_LENGTH_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("byteOffset"),
-        accessor(DV_BYTE_OFFSET_NATIVE),
+        accessor(heap, DV_BYTE_OFFSET_NATIVE),
     );
 }
 
@@ -881,29 +883,30 @@ pub fn register_arraybuffer_statics(ctor: &Value) {
 /// array-like, so iterating it reads `length` and the indices).
 pub fn register_typedarray_prototype(
     kind: TypedArrayKind,
-    proto: &Rc<RefCell<dyn JSObject>>,
+    proto: &Gc<Object>,
+    heap: &mut Heap,
 ) {
     use super::set_prototype_method;
-    set_prototype_method(proto, "set", |this, args| ta_set(this, args));
-    set_prototype_method(proto, "subarray", |this, args| ta_subarray(this, args));
-    set_prototype_method(proto, "slice", |this, args| ta_slice(this, args));
-    set_prototype_method(proto, "fill", |this, args| ta_fill(this, args));
+    set_prototype_method(proto, heap, "set", |this, args| ta_set(this, args));
+    set_prototype_method(proto, heap, "subarray", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method(proto, heap, "fill", |this, args| ta_fill(this, args));
 
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("length"),
-        accessor(TA_LENGTH_NATIVE),
+        accessor(heap, TA_LENGTH_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("byteLength"),
-        accessor(TA_BYTE_LENGTH_NATIVE),
+        accessor(heap, TA_BYTE_LENGTH_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("byteOffset"),
-        accessor(TA_BYTE_OFFSET_NATIVE),
+        accessor(heap, TA_BYTE_OFFSET_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("buffer"),
-        accessor(TA_BUFFER_NATIVE),
+        accessor(heap, TA_BUFFER_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("BYTES_PER_ELEMENT"),
@@ -913,7 +916,7 @@ pub fn register_typedarray_prototype(
     // here, which the VM dispatches) and then the indices.
     let _ = proto.borrow_mut().define_property(
         crate::vm::iterator::iterator_symbol_key(),
-        super::method_descriptor(Value::Object(Rc::new(RefCell::new(
+        super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME),
         )))),
     );
@@ -933,15 +936,15 @@ fn data(value: Value) -> PropertyDescriptor {
 }
 
 /// An accessor with only a getter, as every `length`-style property is.
-fn accessor(getter_name: &str) -> PropertyDescriptor {
+fn accessor(heap: &mut Heap, getter_name: &str) -> PropertyDescriptor {
     PropertyDescriptor {
         value: Value::Undefined,
         writable: true,
         enumerable: false,
         configurable: true,
-        getter: Some(Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
-            getter_name,
-        ))))),
+        getter: Some(Value::Object(heap.alloc(Object::NativeFunction(
+            NativeFunctionObject::new(getter_name),
+        )))),
         setter: None,
     }
 }

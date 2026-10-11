@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::JSObject;
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
@@ -34,7 +35,7 @@ impl Default for GetPrototypeChainOptions {
 /// Returns the raw property value. If the property is an accessor,
 /// returns `Value::Undefined` and does NOT invoke the getter.
 pub fn internal_get(
-    obj: Rc<RefCell<dyn JSObject>>,
+    obj: Gc<Object>,
     key: &PropertyKey,
     options: Option<GetPrototypeChainOptions>,
 ) -> Result<Value, String> {
@@ -81,9 +82,9 @@ fn get_property_value(desc: PropertyDescriptor, throw_on_accessor: bool) -> Resu
 /// The VM uses this to invoke accessors (which need re-entrant function calls)
 /// instead of the pure-data walk in `internal_get`.
 pub fn find_descriptor(
-    obj: Rc<RefCell<dyn JSObject>>,
+    obj: Gc<Object>,
     key: &PropertyKey,
-) -> Result<Option<(Rc<RefCell<dyn JSObject>>, PropertyDescriptor)>, String> {
+) -> Result<Option<(Gc<Object>, PropertyDescriptor)>, String> {
     let mut current = Some(obj);
     let mut depth = 0;
     while let Some(owner) = current {
@@ -92,7 +93,7 @@ pub fn find_descriptor(
         }
         let desc = owner.borrow().property_get(key);
         if let Some(desc) = desc {
-            return Ok(Some((Rc::clone(&owner), desc)));
+            return Ok(Some((owner, desc)));
         }
         current = owner.borrow().get_prototype();
         depth += 1;
@@ -108,7 +109,7 @@ pub fn find_descriptor(
 ///
 /// Returns Ok(true) if the set succeeded, Ok(false) if strict mode should throw.
 pub fn internal_set(
-    obj: Rc<RefCell<dyn JSObject>>,
+    obj: Gc<Object>,
     key: PropertyKey,
     value: Value,
 ) -> Result<bool, String> {
@@ -181,7 +182,7 @@ pub fn internal_set(
 
 /// ES6 [[HasProperty]](P) — check if a property exists in the prototype chain.
 pub fn internal_has_property(
-    obj: Rc<RefCell<dyn JSObject>>,
+    obj: Gc<Object>,
     key: &PropertyKey,
 ) -> Result<bool, String> {
     let mut current = Some(obj);
@@ -209,7 +210,7 @@ pub fn internal_has_property(
 // ─────────────────────────────────────────────────────────
 
 /// ES6 [[Delete]](P) — delete an own property.
-pub fn internal_delete(obj: Rc<RefCell<dyn JSObject>>, key: &PropertyKey) -> Result<bool, String> {
+pub fn internal_delete(obj: Gc<Object>, key: &PropertyKey) -> Result<bool, String> {
     // ES 10.1.9.1: `[[Delete]]` answers `true` when the own property is *already*
     // absent — `false` means "it is there and refuses to go" (a non-configurable
     // one). Without the first branch `delete o.missing` answered `false`, which

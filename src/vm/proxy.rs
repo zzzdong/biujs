@@ -16,10 +16,10 @@
 //!  `preventExtensions`) are therefore "forward" today: a handler that sets
 //!  them is not called. See the batch record in the plan for why.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bytecode::Module;
+use crate::vm::gc::{Gc, Object};
 use crate::vm::object::JSObject;
 use crate::vm::{ObjectKind, PropertyDescriptor, PropertyKey, REVOKE_PREFIX, RuntimeError, Value, VM};
 
@@ -221,7 +221,7 @@ impl VM {
             }
             return match &target {
                 Value::Object(obj_ref) => Ok(Some(
-                    crate::vm::prototype::internal_has_property(Rc::clone(obj_ref), key)
+                    crate::vm::prototype::internal_has_property(*obj_ref, key)
                         .map_err(RuntimeError::TypeError)?,
                 )),
                 _ => Ok(Some(false)),
@@ -273,7 +273,7 @@ impl VM {
             }
             return match &target {
                 Value::Object(obj_ref) => Ok(Some(
-                    crate::vm::prototype::internal_delete(Rc::clone(obj_ref), key)
+                    crate::vm::prototype::internal_delete(*obj_ref, key)
                         .map_err(RuntimeError::TypeError)?,
                 )),
                 _ => Ok(Some(true)),
@@ -315,7 +315,7 @@ impl VM {
         let Some((target, handler, trap)) = self.proxy_trap(proxy, "apply", module)? else {
             return Ok(None);
         };
-        let list = Value::Object(Rc::new(RefCell::new(
+        let list = Value::Object(self.heap.alloc(Object::Array(
             crate::vm::object::ArrayObject::from_vec(args.to_vec()),
         )));
         Ok(Some(self.invoke(
@@ -338,7 +338,7 @@ impl VM {
         let Some((target, handler, trap)) = self.proxy_trap(proxy, "construct", module)? else {
             return Ok(None);
         };
-        let list = Value::Object(Rc::new(RefCell::new(
+        let list = Value::Object(self.heap.alloc(Object::Array(
             crate::vm::object::ArrayObject::from_vec(args.to_vec()),
         )));
         let result = self.invoke(&trap, handler, &[target, list, new_target.clone()], module)?;
@@ -643,7 +643,7 @@ impl VM {
                     })
                     .map(Self::key_to_value)
                     .collect();
-                Ok(Some(Value::Object(Rc::new(RefCell::new(
+                Ok(Some(Value::Object(self.heap.alloc(Object::Array(
                     crate::vm::object::ArrayObject::from_vec(values),
                 )))))
             }
@@ -714,10 +714,10 @@ impl VM {
     }
 
     /// Whether a reported prototype is the one the target actually has.
-    pub(crate) fn same_prototype(actual: &Option<Rc<RefCell<dyn JSObject>>>, reported: &Value) -> bool {
+    pub(crate) fn same_prototype(actual: &Option<Gc<Object>>, reported: &Value) -> bool {
         match (actual, reported) {
             (None, Value::Null) => true,
-            (Some(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (Some(a), Value::Object(b)) => Gc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -743,6 +743,6 @@ impl VM {
                 setter: None,
             },
         );
-        Value::Object(Rc::new(RefCell::new(revoke)))
+        Value::Object(self.heap.alloc(Object::NativeFunction(revoke)))
     }
 }

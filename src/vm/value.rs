@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
-use crate::vm::object::JSObject;
+use crate::vm::gc::{Gc, Heap, Object};
 
 /// Symbol internal data
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ impl SymbolData {
 /// JavaScript Value type.
 ///
 /// Represents all JS values. Objects (including arrays, functions, etc.)
-/// use reference semantics via `Rc<RefCell<dyn JSObject>>`.
+/// use reference semantics via `Gc<Object>`.
 /// Numbers use unified f64 as per ECMAScript specification.
 #[derive(Debug)]
 pub enum Value {
@@ -50,20 +50,21 @@ pub enum Value {
     String(Rc<String>),
     Symbol(Rc<SymbolData>),
     /// All object types (ordinary, array, function, builtins, etc.)
-    Object(Rc<RefCell<dyn JSObject>>),
+    Object(Gc<Object>),
     /// Internal: reference to a bytecode function by ID (not a JS-visible type)
     Function(u32),
 }
 
 /// Bytecode function id behind a boxed `FunctionObject`, if it is one.
-fn function_object_id(obj: &Rc<RefCell<dyn JSObject>>) -> Option<u32> {
-    obj.borrow()
-        .as_any()
-        .downcast_ref::<crate::vm::object::FunctionObject>()
-        .map(|f| f.func_id)
+fn function_object_id(obj: &Gc<Object>) -> Option<u32> {
+    if let Object::Function(f) = &*obj.borrow() {
+        Some(f.func_id)
+    } else {
+        None
+    }
 }
 
-// Manual PartialEq — dyn JSObject is not PartialEq, so Object variant compares by pointer
+// Manual PartialEq — `Object` compares by slot identity
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -79,21 +80,18 @@ impl PartialEq for Value {
             }
             (Value::String(a), Value::String(b)) => Rc::ptr_eq(a, b) || a.as_str() == b.as_str(),
             (Value::Symbol(a), Value::Symbol(b)) => a.id == b.id,
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => Gc::ptr_eq(a, b),
             (Value::Function(a), Value::Function(b)) => a == b,
             _ => false,
         }
     }
 }
 
-// Manual Clone — dyn JSObject is not Clone, so we manually clone the Object variant
+// Manual Clone — the Object variant is a Copy handle, so a clone just copies it
 impl Clone for Value {
     fn clone(&self) -> Self {
         match self {
-            Value::Object(obj) => {
-                // Clone by creating a new Rc pointing to the same RefCell
-                Value::Object(Rc::clone(obj))
-            }
+            Value::Object(obj) => Value::Object(*obj),
             Value::Symbol(sym) => Value::Symbol(Rc::clone(sym)),
             Value::String(s) => Value::String(Rc::clone(s)),
             Value::Function(id) => Value::Function(*id),
@@ -161,13 +159,9 @@ impl Value {
                 if kind == ObjectKind::Proxy {
                     // A proxy is callable exactly when its target is
                     // (ES 10.5.12) — `typeof new Proxy(f, {})` is "function".
-                    return match obj
-                        .borrow()
-                        .as_any()
-                        .downcast_ref::<crate::vm::object::ProxyObject>()
-                    {
-                        Some(proxy) => proxy.target.is_callable(),
-                        None => false,
+                    return match &*obj.borrow() {
+                        Object::Proxy(proxy) => proxy.target.is_callable(),
+                        _ => false,
                     };
                 }
                 matches!(kind, ObjectKind::Function | ObjectKind::NativeFunction)
@@ -191,10 +185,10 @@ impl Value {
         }
     }
 
-    /// Unwrap the object reference, panicking if not an Object variant
-    pub fn as_object(&self) -> Option<Rc<RefCell<dyn JSObject>>> {
+    /// Unwrap the object handle, if this is an Object variant
+    pub fn as_object(&self) -> Option<Gc<Object>> {
         match self {
-            Value::Object(obj) => Some(Rc::clone(obj)),
+            Value::Object(obj) => Some(*obj),
             _ => None,
         }
     }
@@ -287,11 +281,7 @@ impl Value {
                     // Arrays stringify their elements, so a self-referencing or
                     // deeply nested array would recurse until the *host* stack
                     // overflows (an abort, not a catchable error). Bound it.
-                    if let Some(arr) = obj
-                        .borrow()
-                        .as_any()
-                        .downcast_ref::<crate::vm::object::ArrayObject>()
-                    {
+                    if let Object::Array(arr) = &*obj.borrow() {
                         if enter_to_string().is_ok() {
                             let result = arr.join_elements();
                             leave_to_string();
@@ -347,7 +337,7 @@ impl Value {
     /// with the constructor being run), without the coercion `===` implies.
     pub fn strict_eq_obj(&self, other: &Value) -> bool {
         match (self, other) {
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => Gc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -367,7 +357,7 @@ impl Value {
             }
             (Value::String(a), Value::String(b)) => a.as_str() == b.as_str(),
             (Value::Symbol(a), Value::Symbol(b)) => a.id == b.id,
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => Gc::ptr_eq(a, b),
             (Value::Function(a), Value::Function(b)) => a == b,
             // A bare function reference and its boxed `FunctionObject` denote
             // the same function: `new F()` stores the boxed object (as
@@ -761,7 +751,8 @@ mod tests {
     #[test]
     fn test_to_primitive_array() {
         use crate::vm::object::new_array_object_from_vec;
-        let arr = new_array_object_from_vec(vec![
+        let mut heap = crate::vm::gc::Heap::new();
+        let arr = new_array_object_from_vec(&mut heap, vec![
             Value::Number(1.0),
             Value::Number(2.0),
             Value::Number(3.0),
@@ -773,7 +764,8 @@ mod tests {
     #[test]
     fn test_to_primitive_empty_array() {
         use crate::vm::object::new_array_object;
-        let arr = new_array_object();
+        let mut heap = crate::vm::gc::Heap::new();
+        let arr = new_array_object(&mut heap);
         let prim = arr.to_primitive("default");
         assert_eq!(prim.to_js_string(), "");
     }
@@ -781,7 +773,8 @@ mod tests {
     #[test]
     fn test_to_primitive_array_mixed() {
         use crate::vm::object::new_array_object_from_vec;
-        let arr = new_array_object_from_vec(vec![
+        let mut heap = crate::vm::gc::Heap::new();
+        let arr = new_array_object_from_vec(&mut heap, vec![
             Value::Number(1.0),
             Value::string("hello"),
             Value::Bool(true),
@@ -795,22 +788,24 @@ mod tests {
     #[test]
     fn test_abstract_eq_object_vs_number() {
         use crate::vm::object::new_array_object_from_vec;
+        let mut heap = crate::vm::gc::Heap::new();
 
         // [1] == 1
-        let arr = new_array_object_from_vec(vec![Value::Number(1.0)]);
+        let arr = new_array_object_from_vec(&mut heap, vec![Value::Number(1.0)]);
         assert!(arr.abstract_eq(&Value::Number(1.0)));
 
         // [1,2] == 1 → ToPrimitive("1,2") → Number("1,2") = NaN → false
-        let arr2 = new_array_object_from_vec(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let arr2 = new_array_object_from_vec(&mut heap, vec![Value::Number(1.0), Value::Number(2.0)]);
         assert!(!arr2.abstract_eq(&Value::Number(1.0)));
     }
 
     #[test]
     fn test_abstract_eq_object_vs_string() {
         use crate::vm::object::new_array_object_from_vec;
+        let mut heap = crate::vm::gc::Heap::new();
 
         // [1,2,3] == "1,2,3"
-        let arr = new_array_object_from_vec(vec![
+        let arr = new_array_object_from_vec(&mut heap, vec![
             Value::Number(1.0),
             Value::Number(2.0),
             Value::Number(3.0),
@@ -818,7 +813,7 @@ mod tests {
         assert!(arr.abstract_eq(&Value::string("1,2,3")));
 
         // [] == ""
-        let empty = crate::vm::object::new_array_object();
+        let empty = crate::vm::object::new_array_object(&mut heap);
         assert!(empty.abstract_eq(&Value::string("")));
     }
 

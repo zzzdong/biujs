@@ -6,13 +6,13 @@
 //! `step` 自己处理 `Halt` / `Ret`（它们决定还要不要继续跑），其余指令
 //! 交给 `run_instruction`。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 use std::time::Instant;
 
 use crate::bytecode::{Constant, Instr, Module, Opcode, Operand, Register};
+use crate::vm::gc::Object;
 use crate::vm::object::{JSObject, PromiseState};
 use crate::vm::{
     ArrayObject, BOUND_PREFIX, BoundFunction, CallArgs, CalleeKind, Control, FrameBirth,
@@ -215,14 +215,14 @@ impl VM {
     /// Returns `None` for errors that are *not* part of the language (internal
 
     /// errors, unimplemented features) — those must abort execution.
-    pub(crate) fn as_js_exception(&self, err: &RuntimeError) -> Option<Value> {
+    pub(crate) fn as_js_exception(&mut self, err: &RuntimeError) -> Option<Value> {
         match err {
             RuntimeError::TypeError(_)
             | RuntimeError::RangeError(_)
             | RuntimeError::ReferenceError(_)
             | RuntimeError::SyntaxError(_)
             | RuntimeError::Thrown(_) => {
-                Some(crate::builtins::runtime_error_to_js_error(err, &self.builtins))
+                Some(crate::builtins::runtime_error_to_js_error(&mut self.heap, err, &self.builtins))
             }
             // Not part of the language: let it abort execution.
             _ => None,
@@ -324,7 +324,7 @@ impl VM {
                 bound_args,
             },
         );
-        Value::Object(Rc::new(RefCell::new(
+        Value::Object(self.heap.alloc(Object::NativeFunction(
             crate::vm::object::NativeFunctionObject::new(&format!("{BOUND_PREFIX}{id}")),
         )))
     }
@@ -510,7 +510,7 @@ impl VM {
             }
             Value::Object(obj_ref) => {
                 // 类构造器不能被直接调用。
-                self.check_class_ctor(&Value::Object(Rc::clone(&obj_ref)))?;
+                self.check_class_ctor(&Value::Object(*obj_ref))?;
                 let borrowed = obj_ref.borrow();
                 if borrowed.kind() != ObjectKind::Function {
                     return Err(RuntimeError::TypeError("not a function".to_string()));
@@ -531,7 +531,7 @@ impl VM {
                 // （`CallMethod`）。**这里必须用调用方给的那个**：早先写成
                 // `captured_this.unwrap_or(Value::Undefined)` 就把方法调用的 `this`
                 // 弄丢了（`f.getX()` 里 `this.x` 变成在 `undefined` 上取属性）。
-                let boxed = Value::Object(Rc::clone(&obj_ref));
+                let boxed = Value::Object(*obj_ref);
                 let frame_this = captured_this.clone().unwrap_or(this);
                 if self.generator_of(&boxed, module).is_some() {
                     let args = self.call_args_vec(args)?;
@@ -943,7 +943,7 @@ impl VM {
                 "Property description must be an object".to_string(),
             ));
         }
-        let desc = Value::Object(Rc::new(RefCell::new(
+        let desc = Value::Object(self.heap.alloc(Object::Ordinary(
             crate::vm::object::OrdinaryObject::new(),
         )));
         // ES 6.2.4.6 step 10: a descriptor that carries both accessor fields
@@ -957,7 +957,7 @@ impl VM {
             let key = PropertyKey::from_str(present_name);
             let present = match value {
                 Value::Object(obj) => {
-                    crate::vm::prototype::internal_has_property(Rc::clone(obj), &key)
+                    crate::vm::prototype::internal_has_property(*obj, &key)
                         .unwrap_or(false)
                 }
                 _ => false,
@@ -981,7 +981,7 @@ impl VM {
             let key = PropertyKey::from_str(name);
             let present = match value {
                 Value::Object(obj) => {
-                    crate::vm::prototype::internal_has_property(Rc::clone(obj), &key)
+                    crate::vm::prototype::internal_has_property(*obj, &key)
                         .unwrap_or(false)
                 }
                 _ => false,
@@ -1035,7 +1035,7 @@ impl VM {
                 })
                 .collect()
         };
-        let out = Value::Object(Rc::new(RefCell::new(
+        let out = Value::Object(self.heap.alloc(Object::Ordinary(
             crate::vm::object::OrdinaryObject::new(),
         )));
         for key in keys {
@@ -1059,12 +1059,12 @@ impl VM {
                 "Object.assign requires at least 1 argument".to_string(),
             ));
         };
-        let target = crate::builtins::to_object(target)?;
+        let target = crate::builtins::to_object(&mut self.heap, target)?;
         for source in args.iter().skip(1) {
             if matches!(source, Value::Undefined | Value::Null) {
                 continue;
             }
-            let source = crate::builtins::to_object(source)?;
+            let source = crate::builtins::to_object(&mut self.heap, source)?;
             let keys: Vec<PropertyKey> = match &source {
                 Value::Object(src_ref) => {
                     let borrowed = src_ref.borrow();
@@ -1167,7 +1167,7 @@ impl VM {
             PropertyKey::from_str(""),
             crate::vm::property::PropertyDescriptor::data_descriptor(value),
         );
-        let wrapper = Value::Object(Rc::new(RefCell::new(wrapper)));
+        let wrapper = Value::Object(self.heap.alloc(Object::Ordinary(wrapper)));
 
         let mut indent = String::new();
         let mut stack: Vec<Value> = Vec::new();
@@ -1388,7 +1388,7 @@ impl VM {
         }
         let primitive = self.to_primitive(&text_value, "string", module)?;
         let text = primitive.to_js_string();
-        let parsed = crate::builtins::json_parse(&text)?;
+        let parsed = crate::builtins::json_parse(&mut self.heap, &text)?;
 
         let reviver = args.get(1).cloned().unwrap_or(Value::Undefined);
         if !reviver.is_callable() {
@@ -1403,7 +1403,7 @@ impl VM {
             PropertyKey::from_str(""),
             crate::vm::property::PropertyDescriptor::data_descriptor(parsed),
         );
-        let holder = Value::Object(Rc::new(RefCell::new(holder)));
+        let holder = Value::Object(self.heap.alloc(Object::Ordinary(holder)));
         self.json_internalize(&holder, "", &reviver, module)
     }
 
@@ -1799,8 +1799,9 @@ impl VM {
                 let flags = match &module.constants[flags.as_immd() as usize] {
                     Constant::String(v) => v.to_string(),
                 };
-                let proto = Some(Value::Object(Rc::clone(&self.builtins.regexp_prototype)));
+                let proto = Some(Value::Object(self.builtins.regexp_prototype));
                 let value = crate::builtins::regexp_construct_value(
+                    &mut self.heap,
                     &[Value::string(&source), Value::string(&flags)],
                     proto,
                 )?;
@@ -2149,7 +2150,7 @@ impl VM {
                                     };
                                     let mut found = false;
                                     while let Some(proto_ref) = current {
-                                        if Value::Object(Rc::clone(&proto_ref)) == target_proto {
+                                        if Value::Object(proto_ref) == target_proto {
                                             found = true;
                                             break;
                                         }
@@ -2179,7 +2180,7 @@ impl VM {
                         // A `has` trap answers the `in` operator outright
                         // (ES 10.5.7); with no trap the lookup is the target's.
                         if obj_ref.borrow().kind() == ObjectKind::Proxy {
-                            let proxy_val = Value::Object(Rc::clone(&obj_ref));
+                            let proxy_val = Value::Object(obj_ref);
                             match self.proxy_has(&proxy_val, &key, module)? {
                                 Some(has) => has,
                                 None => crate::vm::prototype::internal_has_property(obj_ref, &key)
@@ -2254,8 +2255,9 @@ impl VM {
                         arr.push(val);
                     }
                 }
-                arr.set_prototype(Some(Rc::clone(&self.builtins.array_prototype)));
-                self.set_value(dst, Value::Object(Rc::new(RefCell::new(arr))))?;
+                arr.set_prototype(Some(self.builtins.array_prototype));
+                let value = Value::Object(self.heap.alloc(Object::Array(arr)));
+                self.set_value(dst, value)?;
             }
             _ => return Ok(false),
         }
@@ -2390,8 +2392,8 @@ impl VM {
             // ===== Object/Array Operations =====
             Instr::MakeArray { dst } => {
                 let mut arr = crate::vm::object::ArrayObject::new();
-                arr.set_prototype(Some(Rc::clone(&self.builtins.array_prototype)));
-                let arr_val = Value::Object(Rc::new(RefCell::new(arr)));
+                arr.set_prototype(Some(self.builtins.array_prototype));
+                let arr_val = Value::Object(self.heap.alloc(Object::Array(arr)));
                 self.set_value(dst, arr_val)?;
             }
             Instr::ArrayPushSpread { array, src } => {
@@ -2483,8 +2485,8 @@ impl VM {
         match *inst {
             Instr::MakeObject { dst } => {
                 let mut obj = crate::vm::object::OrdinaryObject::new();
-                obj.set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
-                let obj_val = Value::Object(Rc::new(RefCell::new(obj)));
+                obj.set_prototype(Some(self.builtins.object_prototype));
+                let obj_val = Value::Object(self.heap.alloc(Object::Ordinary(obj)));
                 self.set_value(dst, obj_val)?;
             }
             Instr::IndexGet { dst: a0, object: a1, index: a2 }
@@ -2546,7 +2548,7 @@ impl VM {
                     };
                     arr.push(val);
                 }
-                let obj = Value::Object(Rc::new(RefCell::new(arr)));
+                let obj = Value::Object(self.heap.alloc(Object::Array(arr)));
                 self.set_value(dst, obj)?;
             }
             Instr::StoreEnv { name, value } => {
@@ -2631,7 +2633,7 @@ impl VM {
                     let method_val = match &obj_val {
                         Value::Object(obj_ref) => {
                             match crate::vm::prototype::find_descriptor(
-                                Rc::clone(obj_ref),
+                                *obj_ref,
                                 &key,
                             )
                             .map_err(RuntimeError::TypeError)?
@@ -2745,7 +2747,7 @@ impl VM {
                         // but a static that *exists* and fails (RangeError,
                         // TypeError, …) must propagate rather than be swallowed
                         // by the fallback.
-                        match crate::builtins::call_static_method(&static_method, &args) {
+                        match crate::builtins::call_static_method(&static_method, &args, &mut self.heap) {
                             Ok(result) => {
                                 self.state.set_register(Register::Rv, result)?;
                                 self.state.jump_offset(1);
@@ -2782,7 +2784,12 @@ impl VM {
 
                 // Try built-in prototype method dispatch. As above: only
                 // "no such method" may fall through.
-                match crate::builtins::call_prototype_method(&obj_val, &method_name, &args) {
+                match crate::builtins::call_prototype_method(
+                    &mut self.heap,
+                    &obj_val,
+                    &method_name,
+                    &args,
+                ) {
                     Ok(result) => {
                         self.state.set_register(Register::Rv, result)?;
                         self.state.jump_offset(1);
@@ -3005,7 +3012,7 @@ impl VM {
                             // without one, `[[Construct]]` on the target). Both
                             // can run JavaScript, so neither can happen here.
                             drop(borrowed);
-                            let ctor = Value::Object(Rc::clone(&obj_ref));
+                            let ctor = Value::Object(obj_ref);
                             let args = self.collect_call_args(arg_count)?;
                             let rv = self.construct(&ctor, &args, module)?;
                             self.state.set_register(Register::Rv, rv)?;
@@ -3036,7 +3043,7 @@ impl VM {
                                 .unwrap_or_default();
                             drop(borrowed);
 
-                            let ctor = Value::Object(Rc::clone(&obj_ref));
+                            let ctor = Value::Object(obj_ref);
                             let args = self.collect_call_args(arg_count)?;
                             let rv = self.native_construct(&name, &ctor, &args, None, module)?;
                             self.state.set_register(Register::Rv, rv)?;
@@ -3052,7 +3059,7 @@ impl VM {
                 };
 
                 // 2. Create new ordinary object
-                let new_obj_val = Value::Object(Rc::new(RefCell::new(
+                let new_obj_val = Value::Object(self.heap.alloc(Object::Ordinary(
                     crate::vm::object::OrdinaryObject::new(),
                 )));
 
@@ -3061,14 +3068,14 @@ impl VM {
                     if let Value::Object(obj_ref) = &new_obj_val {
                         obj_ref
                             .borrow_mut()
-                            .set_prototype(Some(Rc::clone(&proto_obj)));
+                            .set_prototype(Some(proto_obj));
                     }
                 } else {
                     // Default prototype: Object.prototype
                     if let Value::Object(obj_ref) = &new_obj_val {
                         obj_ref
                             .borrow_mut()
-                            .set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
+                            .set_prototype(Some(self.builtins.object_prototype));
                     }
                 }
 
@@ -3201,6 +3208,7 @@ impl VM {
                     .map(|block| (block.name.clone(), block.arity))
                     .unwrap_or_default();
                 let obj_val = crate::vm::object::new_arrow_function_object(
+                    &mut self.heap,
                     func_id,
                     &arrow_name,
                     arrow_arity,
@@ -3269,7 +3277,7 @@ impl VM {
                     } else if let Some(value) = self.reflect_static(&name, &args, module)? {
                         Ok(value)
                     } else {
-                        crate::builtins::call_native(&name, &args)
+                        crate::builtins::call_native(&name, &args, &mut self.heap)
                     };
                     match result {
                         Ok(result) => {

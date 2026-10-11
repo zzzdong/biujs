@@ -15,6 +15,7 @@ use std::rc::Rc;
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike, Utc};
 
 use crate::RuntimeError;
+use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{DateObject, JSObject, NativeFunctionObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
@@ -255,20 +256,24 @@ fn date_value_from_args(args: &[Value]) -> f64 {
 
 /// `new Date(...)` — builds the object. `Date()` *without* `new` returns a
 /// string, so it cannot share this path (the VM routes `new` here).
-pub fn date_construct_value(args: &[Value], proto: Option<Value>) -> Result<Value, RuntimeError> {
+pub fn date_construct_value(
+    heap: &mut Heap,
+    args: &[Value],
+    proto: Option<Value>,
+) -> Result<Value, RuntimeError> {
     let time_value = date_value_from_args(args);
     let proto = match proto {
         Some(Value::Object(p)) => Some(p),
         _ => None,
     };
-    Ok(Value::Object(Rc::new(RefCell::new(DateObject::new(
+    Ok(Value::Object(heap.alloc(Object::Date(DateObject::new(
         time_value, proto,
     )))))
 }
 
 /// `Date()` called as a function: same string as `new Date().toString()`.
-pub fn date_as_function(_args: &[Value]) -> Result<Value, RuntimeError> {
-    let now = Value::Object(Rc::new(RefCell::new(DateObject::new(
+pub fn date_as_function(heap: &mut Heap, _args: &[Value]) -> Result<Value, RuntimeError> {
+    let now = Value::Object(heap.alloc(Object::Date(DateObject::new(
         Utc::now().timestamp_millis() as f64,
         None,
     ))));
@@ -292,48 +297,48 @@ pub fn date_utc(args: &[Value]) -> Result<Value, RuntimeError> {
 
 // ── prototype registration ─────────────────────────────────────────────────
 
-pub fn register_date_prototype(proto: &Rc<RefCell<dyn JSObject>>) {
+pub fn register_date_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
     // Conversions
-    set_prototype_method(proto, "getTime", |this, _| component(this, "getTime", 8, false));
-    set_prototype_method(proto, "valueOf", |this, _| date_value_of(this));
-    set_prototype_method(proto, "toISOString", |this, _| date_to_iso_string(this));
-    set_prototype_method(proto, "toJSON", |this, _| date_to_json(this));
-    set_prototype_method(proto, "toString", |this, _| date_to_string(this, &[]));
-    set_prototype_method(proto, "toDateString", |this, _| date_to_date_string(this));
-    set_prototype_method(proto, "toTimeString", |this, _| date_to_time_string(this));
-    set_prototype_method(proto, "toUTCString", |this, _| date_to_utc_string(this));
-    set_prototype_method(proto, "toLocaleString", |this, _| date_to_string(this, &[]));
-    set_prototype_method(proto, "toLocaleDateString", |this, _| date_to_date_string(this));
-    set_prototype_method(proto, "toLocaleTimeString", |this, _| date_to_time_string(this));
+    set_prototype_method(proto, heap, "getTime", |this, _| component(this, "getTime", 8, false));
+    set_prototype_method(proto, heap, "valueOf", |this, _| date_value_of(this));
+    set_prototype_method(proto, heap, "toISOString", |this, _| date_to_iso_string(this));
+    set_prototype_method(proto, heap, "toJSON", |this, _| date_to_json(this));
+    set_prototype_method(proto, heap, "toString", |this, _| date_to_string(this, &[]));
+    set_prototype_method(proto, heap, "toDateString", |this, _| date_to_date_string(this));
+    set_prototype_method(proto, heap, "toTimeString", |this, _| date_to_time_string(this));
+    set_prototype_method(proto, heap, "toUTCString", |this, _| date_to_utc_string(this));
+    set_prototype_method(proto, heap, "toLocaleString", |this, _| date_to_string(this, &[]));
+    set_prototype_method(proto, heap, "toLocaleDateString", |this, _| date_to_date_string(this));
+    set_prototype_method(proto, heap, "toLocaleTimeString", |this, _| date_to_time_string(this));
     // Local components
-    set_prototype_method(proto, "getFullYear", |this, _| component(this, "getFullYear", 0, false));
-    set_prototype_method(proto, "getMonth", |this, _| component(this, "getMonth", 1, false));
-    set_prototype_method(proto, "getDate", |this, _| component(this, "getDate", 2, false));
-    set_prototype_method(proto, "getDay", |this, _| component(this, "getDay", 3, false));
-    set_prototype_method(proto, "getHours", |this, _| component(this, "getHours", 4, false));
-    set_prototype_method(proto, "getMinutes", |this, _| component(this, "getMinutes", 5, false));
-    set_prototype_method(proto, "getSeconds", |this, _| component(this, "getSeconds", 6, false));
-    set_prototype_method(proto, "getMilliseconds", |this, _| {
+    set_prototype_method(proto, heap, "getFullYear", |this, _| component(this, "getFullYear", 0, false));
+    set_prototype_method(proto, heap, "getMonth", |this, _| component(this, "getMonth", 1, false));
+    set_prototype_method(proto, heap, "getDate", |this, _| component(this, "getDate", 2, false));
+    set_prototype_method(proto, heap, "getDay", |this, _| component(this, "getDay", 3, false));
+    set_prototype_method(proto, heap, "getHours", |this, _| component(this, "getHours", 4, false));
+    set_prototype_method(proto, heap, "getMinutes", |this, _| component(this, "getMinutes", 5, false));
+    set_prototype_method(proto, heap, "getSeconds", |this, _| component(this, "getSeconds", 6, false));
+    set_prototype_method(proto, heap, "getMilliseconds", |this, _| {
         component(this, "getMilliseconds", 7, false)
     });
-    set_prototype_method(proto, "getTimezoneOffset", |this, _| timezone_offset(this));
+    set_prototype_method(proto, heap, "getTimezoneOffset", |this, _| timezone_offset(this));
     // UTC components
-    set_prototype_method(proto, "getUTCFullYear", |this, _| component(this, "getUTCFullYear", 0, true));
-    set_prototype_method(proto, "getUTCMonth", |this, _| component(this, "getUTCMonth", 1, true));
-    set_prototype_method(proto, "getUTCDate", |this, _| component(this, "getUTCDate", 2, true));
-    set_prototype_method(proto, "getUTCDay", |this, _| component(this, "getUTCDay", 3, true));
-    set_prototype_method(proto, "getUTCHours", |this, _| component(this, "getUTCHours", 4, true));
-    set_prototype_method(proto, "getUTCMinutes", |this, _| component(this, "getUTCMinutes", 5, true));
-    set_prototype_method(proto, "getUTCSeconds", |this, _| component(this, "getUTCSeconds", 6, true));
+    set_prototype_method(proto, heap, "getUTCFullYear", |this, _| component(this, "getUTCFullYear", 0, true));
+    set_prototype_method(proto, heap, "getUTCMonth", |this, _| component(this, "getUTCMonth", 1, true));
+    set_prototype_method(proto, heap, "getUTCDate", |this, _| component(this, "getUTCDate", 2, true));
+    set_prototype_method(proto, heap, "getUTCDay", |this, _| component(this, "getUTCDay", 3, true));
+    set_prototype_method(proto, heap, "getUTCHours", |this, _| component(this, "getUTCHours", 4, true));
+    set_prototype_method(proto, heap, "getUTCMinutes", |this, _| component(this, "getUTCMinutes", 5, true));
+    set_prototype_method(proto, heap, "getUTCSeconds", |this, _| component(this, "getUTCSeconds", 6, true));
     // Setters
-    set_prototype_method(proto, "setTime", |this, args| date_set_time(this, args));
-    set_prototype_method(proto, "setFullYear", |this, args| date_set_full_year(this, args));
-    set_prototype_method(proto, "setMonth", |this, args| date_set_month(this, args));
-    set_prototype_method(proto, "setDate", |this, args| date_set_date(this, args));
+    set_prototype_method(proto, heap, "setTime", |this, args| date_set_time(this, args));
+    set_prototype_method(proto, heap, "setFullYear", |this, args| date_set_full_year(this, args));
+    set_prototype_method(proto, heap, "setMonth", |this, args| date_set_month(this, args));
+    set_prototype_method(proto, heap, "setDate", |this, args| date_set_date(this, args));
 }
 
-pub fn register_date_statics(ctor: &Value) {
+pub fn register_date_statics(ctor: &Value, heap: &mut Heap) {
     let Value::Object(obj_ref) = ctor else {
         return;
     };
@@ -341,9 +346,9 @@ pub fn register_date_statics(ctor: &Value) {
         let _ = obj_ref.borrow_mut().define_property(
             PropertyKey::from_str(name),
             PropertyDescriptor {
-                value: Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
-                    &format!("Date.{name}"),
-                )))),
+                value: Value::Object(heap.alloc(Object::NativeFunction(
+                    NativeFunctionObject::new(&format!("Date.{name}")),
+                ))),
                 writable: true,
                 enumerable: false,
                 configurable: true,

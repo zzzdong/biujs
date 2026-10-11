@@ -12,10 +12,8 @@
 //! objects and arrays fall back to `JSON.stringify` — so this stays a debugging
 //! aid rather than a spec surface.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::RuntimeError;
+use crate::vm::gc::{Heap, Object};
 use crate::vm::object::{NativeFunctionObject, OrdinaryObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
@@ -36,15 +34,15 @@ thread_local! {
 }
 
 /// Build the `console` object: a plain namespace object (not a constructor).
-pub fn create_console_object() -> Value {
+pub fn create_console_object(heap: &mut Heap) -> Value {
     let mut console = OrdinaryObject::new();
     for name in METHODS {
         let _ = console.define_property(
             PropertyKey::from_str(name),
             PropertyDescriptor {
-                value: Value::Object(Rc::new(RefCell::new(NativeFunctionObject::new(
-                    &format!("console.{name}"),
-                )))),
+                value: Value::Object(heap.alloc(Object::NativeFunction(
+                    NativeFunctionObject::new(&format!("console.{name}")),
+                ))),
                 writable: true,
                 enumerable: false,
                 configurable: true,
@@ -53,12 +51,16 @@ pub fn create_console_object() -> Value {
             },
         );
     }
-    Value::Object(Rc::new(RefCell::new(console)))
+    Value::Object(heap.alloc(Object::Ordinary(console)))
 }
 
 /// Dispatch a `console.<method>` call. Each method prints its arguments joined
 /// by a space and answers `undefined`.
-pub fn call_console_method(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn call_console_method(
+    name: &str,
+    args: &[Value],
+    heap: &mut Heap,
+) -> Result<Value, RuntimeError> {
     match name {
         "time" => {
             let label = args.first().map(|v| v.to_js_string()).unwrap_or_else(|| "default".to_string());
@@ -83,7 +85,7 @@ pub fn call_console_method(name: &str, args: &[Value]) -> Result<Value, RuntimeE
             "console.{name} is not a function"
         )));
     }
-    let line: Vec<String> = args.iter().map(format_arg).collect();
+    let line: Vec<String> = args.iter().map(|v| format_arg(heap, v)).collect();
     let line = line.join(" ");
     match name {
         // Diagnostics belong on stderr so they survive `> out.txt`.
@@ -99,10 +101,10 @@ pub fn call_console_method(name: &str, args: &[Value]) -> Result<Value, RuntimeE
 /// of `"hi"`); anything structured falls back to `JSON.stringify` so objects
 /// are inspectable rather than `[object Object]`. A value `stringify` refuses
 /// (a cycle, a `BigInt`) degrades to the ordinary `ToString`.
-fn format_arg(value: &Value) -> String {
+fn format_arg(heap: &mut Heap, value: &Value) -> String {
     match value {
         Value::String(s) => s.to_string(),
-        Value::Object(_) => match super::json::json_stringify(value) {
+        Value::Object(_) => match super::json::json_stringify(heap, value) {
             Ok(Some(text)) => text,
             _ => value.to_js_string(),
         },
