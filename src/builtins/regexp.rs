@@ -41,8 +41,7 @@ fn as_regexp<'a>(
         )));
     }
     Ok(RefMut::map(borrowed, |obj| {
-        obj.as_any_mut()
-            .downcast_mut::<crate::vm::object::RegExpObject>()
+        obj.as_regexp_mut()
             .expect("ObjectKind::RegExp implies RegExpObject")
     }))
 }
@@ -76,9 +75,7 @@ pub fn regexp_construct_value(heap: &mut Heap, args: &[Value], proto: Option<Val
         {
             let (source, own_flags) = {
                 let borrowed = obj.borrow();
-                let re = borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::RegExpObject>()
+                let re = borrowed.as_regexp()
                     .expect("ObjectKind::RegExp implies RegExpObject");
                 (re.source.clone(), re.flags.clone())
             };
@@ -376,9 +373,7 @@ fn matcher_for(heap: &mut Heap, value: &Value) -> Result<(regex::Regex, String),
             return Err(RuntimeError::TypeError("not a RegExp".to_string()));
         };
         let borrowed = obj_ref.borrow();
-        let obj = borrowed
-            .as_any()
-            .downcast_ref::<crate::vm::object::RegExpObject>()
+        let obj = borrowed.as_regexp()
             .expect("ObjectKind::RegExp implies RegExpObject");
         let Some(compiled) = obj.compiled.clone() else {
             return Err(RuntimeError::TypeError(format!(

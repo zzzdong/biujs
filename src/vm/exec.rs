@@ -16,7 +16,7 @@ use crate::vm::gc::Object;
 use crate::vm::object::{JSObject, PromiseState};
 use crate::vm::{
     ArrayObject, BOUND_PREFIX, BoundFunction, CallArgs, CalleeKind, Control, FrameBirth,
-    FrameMode, FunctionObject, GUARD_CHECK_INTERVAL, GuardFired, NativeFunctionObject,
+    FrameMode, GUARD_CHECK_INTERVAL, GuardFired,
     ObjectKind, PropertyKey, RuntimeError, SehRecord, THIS_DERIVED_BOUND,
     THIS_DERIVED_UNBOUND, THIS_NONE, Value, VM, finalize_json, is_addressable,
     memory_pressure, to_int32, to_uint32, vm_trace_steps,
@@ -350,9 +350,7 @@ impl VM {
     pub(crate) fn check_class_ctor(&self, callee: &Value) -> Result<(), RuntimeError> {
         if let Value::Object(obj_ref) = callee {
             let borrowed = obj_ref.borrow();
-            if borrowed
-                .as_any()
-                .downcast_ref::<crate::vm::object::FunctionObject>()
+            if borrowed.as_function()
                 .is_some()
                 && borrowed
                     .property_get(&PropertyKey::from_str(crate::builtins::CLASS_CTOR_FLAG))
@@ -397,9 +395,7 @@ impl VM {
         match callee {
             Value::Function(id) => Some(*id),
             Value::Object(obj_ref) => obj_ref
-                .borrow()
-                .as_any()
-                .downcast_ref::<FunctionObject>()
+                .borrow().as_function()
                 .map(|func_obj| func_obj.func_id),
             _ => None,
         }
@@ -515,9 +511,7 @@ impl VM {
                 if borrowed.kind() != ObjectKind::Function {
                     return Err(RuntimeError::TypeError("not a function".to_string()));
                 }
-                let Some(func_obj) = borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::FunctionObject>()
+                let Some(func_obj) = borrowed.as_function()
                 else {
                     return Err(RuntimeError::TypeError("not a constructor".to_string()));
                 };
@@ -648,9 +642,7 @@ impl VM {
             Value::Function(id) => (*id, this.clone(), None, Vec::new()),
             Value::Object(obj_ref) => {
                 let borrowed = obj_ref.borrow();
-                match borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::FunctionObject>()
+                match borrowed.as_function()
                 {
                     Some(func_obj) => (
                         func_obj.func_id,
@@ -2426,7 +2418,7 @@ impl VM {
                 match array_val {
                     Value::Object(obj_ref) => {
                         let mut obj = obj_ref.borrow_mut();
-                        let Some(arr) = obj.as_any_mut().downcast_mut::<ArrayObject>() else {
+                        let Some(arr) = obj.as_array_mut() else {
                             return Err(RuntimeError::TypeError(
                                 "ArrayPushSpread on non-array object".to_string(),
                             ));
@@ -2446,9 +2438,7 @@ impl VM {
                     return Ok(true);
                 };
                 let mut borrowed = obj_ref.borrow_mut();
-                if let Some(arr) = borrowed
-                    .as_any_mut()
-                    .downcast_mut::<crate::vm::object::ArrayObject>()
+                if let Some(arr) = borrowed.as_array_mut()
                 {
                     let index = arr.len().saturating_sub(1);
                     arr.mark_hole(index);
@@ -2460,7 +2450,7 @@ impl VM {
                 match array_val {
                     Value::Object(obj_ref) => {
                         let mut obj = obj_ref.borrow_mut();
-                        if let Some(arr) = obj.as_any_mut().downcast_mut::<ArrayObject>() {
+                        if let Some(arr) = obj.as_array_mut() {
                             arr.push(elem);
                             Ok(())
                         } else {
@@ -3021,7 +3011,7 @@ impl VM {
                         }
                         if borrowed.kind() == ObjectKind::Function {
                             if let Some(func_obj) =
-                                borrowed.as_any().downcast_ref::<FunctionObject>()
+                                borrowed.as_function()
                             {
                                 let id = func_obj.func_id;
                                 let proto =
@@ -3036,9 +3026,7 @@ impl VM {
                         } else if borrowed.kind() == ObjectKind::NativeFunction {
                             // Built-in constructor (`new Array(…)`, `new Object()`,
                             // `new Error(…)`, `new (f.bind(…))(…)`, …).
-                            let name = borrowed
-                                .as_any()
-                                .downcast_ref::<NativeFunctionObject>()
+                            let name = borrowed.as_native_function()
                                 .map(|f| f.name.clone())
                                 .unwrap_or_default();
                             drop(borrowed);

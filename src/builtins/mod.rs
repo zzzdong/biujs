@@ -1528,9 +1528,7 @@ fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
             match kind {
                 ObjectKind::Array => {
                     if let Some(arr) = obj_ref
-                        .borrow()
-                        .as_any()
-                        .downcast_ref::<crate::vm::object::ArrayObject>()
+                        .borrow().as_array()
                     {
                         Ok(Value::string(&arr.join_elements()))
                     } else {
@@ -1540,9 +1538,7 @@ fn dispatch_to_string(obj: &Value) -> Result<Value, RuntimeError> {
                 ObjectKind::Boolean => {
                     // Boolean wrapper — unwrap
                     if let Some(inner) = obj_ref
-                        .borrow()
-                        .as_any()
-                        .downcast_ref::<crate::vm::object::OrdinaryObject>()
+                        .borrow().as_ordinary()
                     {
                         if let Some(v) = inner.property_get(&PropertyKey::from_str("__value__")) {
                             return Ok(Value::string(&v.value.to_js_string()));
@@ -2065,9 +2061,7 @@ pub fn native_function_name(val: &Value) -> Option<String> {
         Value::Object(obj_ref) => {
             let borrowed = obj_ref.borrow();
             if borrowed.kind() == ObjectKind::NativeFunction {
-                borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::NativeFunctionObject>()
+                borrowed.as_native_function()
                     .map(|f| f.name.clone())
             } else {
                 None

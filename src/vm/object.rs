@@ -2845,7 +2845,7 @@ impl TypedArrayObject {
     /// `true` when the buffer is gone: every element read then answers
     /// `undefined` and every write is dropped.
     fn detached(&self) -> bool {
-        match self.buffer.borrow().as_any().downcast_ref::<ArrayBufferObject>() {
+        match self.buffer.borrow().as_array_buffer() {
             Some(buf) => buf.is_detached(),
             None => true,
         }
@@ -2857,7 +2857,7 @@ impl TypedArrayObject {
             return Value::Undefined;
         }
         let buffer = self.buffer.borrow();
-        let Some(buf) = buffer.as_any().downcast_ref::<ArrayBufferObject>() else {
+        let Some(buf) = buffer.as_array_buffer() else {
             return Value::Undefined;
         };
         let data = buf.data();
@@ -2879,9 +2879,7 @@ impl TypedArrayObject {
             other => other.to_number(),
         };
         let mut buffer = self.buffer.borrow_mut();
-        let Some(buf) = buffer
-            .as_any_mut()
-            .downcast_mut::<ArrayBufferObject>()
+        let Some(buf) = buffer.as_array_buffer_mut()
         else {
             return;
         };
@@ -3052,7 +3050,7 @@ impl DataViewObject {
     /// `true` once the underlying `ArrayBuffer` has been detached: every access then
     /// throws a `TypeError` (ES 25.3.1.3-5, 25.3.3).
     pub fn is_detached(&self) -> bool {
-        match self.buffer.borrow().as_any().downcast_ref::<ArrayBufferObject>() {
+        match self.buffer.borrow().as_array_buffer() {
             Some(buf) => buf.is_detached(),
             None => true,
         }

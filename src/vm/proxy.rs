@@ -39,9 +39,7 @@ impl VM {
         match proxy {
             Value::Object(obj_ref) => {
                 let borrowed = obj_ref.borrow();
-                match borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::ProxyObject>()
+                match borrowed.as_proxy()
                 {
                     Some(p) if !p.revoked => Ok((p.target.clone(), p.handler.clone())),
                     Some(_) => Err(RuntimeError::TypeError(format!(

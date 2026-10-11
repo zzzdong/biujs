@@ -19,7 +19,7 @@ pub fn function_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> 
         Value::Object(obj_ref) => {
             let borrowed = obj_ref.borrow();
             if borrowed.kind() == crate::vm::property::ObjectKind::NativeFunction {
-                if let Some(nf) = borrowed.as_any().downcast_ref::<NativeFunctionObject>() {
+                if let Some(nf) = borrowed.as_native_function() {
                     nf.name.clone()
                 } else {
                     "anonymous".to_string()

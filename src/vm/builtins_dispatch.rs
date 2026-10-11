@@ -15,7 +15,7 @@ use std::rc::Rc;
 use crate::bytecode::Module;
 use crate::vm::object::{JSObject, PromiseState};
 use crate::vm::{
-    ArrayObject, BOUND_PREFIX, ObjectKind, PropertyDescriptor, PropertyKey, REVOKE_PREFIX,
+    BOUND_PREFIX, ObjectKind, PropertyDescriptor, PropertyKey, REVOKE_PREFIX,
     RuntimeError, Value, VM,
 };
 
@@ -444,9 +444,7 @@ impl VM {
             })?;
             if let Some(Value::Object(obj_ref)) = self.revocable_proxies.get(&id) {
                 if let Some(proxy) = obj_ref
-                    .borrow_mut()
-                    .as_any_mut()
-                    .downcast_mut::<crate::vm::object::ProxyObject>()
+                    .borrow_mut().as_proxy_mut()
                 {
                     proxy.revoked = true;
                 }
@@ -584,9 +582,7 @@ impl VM {
                     obj_ref.borrow().kind() == crate::vm::property::ObjectKind::RegExp;
                 if kind_is_regexp {
                     let borrowed = obj_ref.borrow();
-                    let re = borrowed
-                        .as_any()
-                        .downcast_ref::<crate::vm::object::RegExpObject>()
+                    let re = borrowed.as_regexp()
                         .expect("ObjectKind::RegExp implies RegExpObject");
                     regex_flags = re.flags.clone();
                     global = global || regex_flags.contains('g');
@@ -859,7 +855,7 @@ impl VM {
                 }
                 if let Value::Object(obj_ref) = receiver {
                     let mut borrowed = obj_ref.borrow_mut();
-                    if let Some(arr) = borrowed.as_any_mut().downcast_mut::<ArrayObject>() {
+                    if let Some(arr) = borrowed.as_array_mut() {
                         arr.replace_elements(items);
                     }
                 }
@@ -907,9 +903,7 @@ impl VM {
                         let result = crate::vm::object::new_array_object_from_vec(&mut self.heap, out);
                         if let Value::Object(result_ref) = &result {
                             if let Some(arr) = result_ref
-                                .borrow_mut()
-                                .as_any_mut()
-                                .downcast_mut::<crate::vm::object::ArrayObject>()
+                                .borrow_mut().as_array_mut()
                             {
                                 for i in holes {
                                     arr.mark_hole(i);
@@ -948,9 +942,7 @@ impl VM {
                         if let Value::Object(obj_ref) = &mapped {
                             if obj_ref.borrow().kind() == ObjectKind::Array {
                                 let borrowed = obj_ref.borrow();
-                                if let Some(arr) = borrowed
-                                    .as_any()
-                                    .downcast_ref::<crate::vm::object::ArrayObject>()
+                                if let Some(arr) = borrowed.as_array()
                                 {
                                     for k in 0..arr.len() {
                                         if let Some(v) = arr.get(k) {

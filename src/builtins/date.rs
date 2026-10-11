@@ -44,8 +44,7 @@ fn as_date<'a>(this: &'a Value, method: &str) -> Result<RefMut<'a, DateObject>, 
         )));
     }
     Ok(RefMut::map(borrowed, |obj| {
-        obj.as_any_mut()
-            .downcast_mut::<DateObject>()
+        obj.as_date_mut()
             .expect("ObjectKind::Date implies DateObject")
     }))
 }
@@ -229,9 +228,7 @@ fn date_value_from_args(args: &[Value]) -> f64 {
         // before it reaches here; a Number object arrives as a number.
         Some(first) if args.len() == 1 => match first {
             Value::Object(obj) if obj.borrow().kind() == crate::vm::property::ObjectKind::Date => {
-                obj.borrow()
-                    .as_any()
-                    .downcast_ref::<DateObject>()
+                obj.borrow().as_date()
                     .map(|d| d.time_value)
                     .unwrap_or(f64::NAN)
             }

@@ -91,7 +91,7 @@ pub fn array_from(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError
     match source {
         Value::Object(obj_ref) => {
             let borrowed = obj_ref.borrow();
-            if let Some(arr) = borrowed.as_any().downcast_ref::<ArrayObject>() {
+            if let Some(arr) = borrowed.as_array() {
                 for i in 0..arr.len() {
                     out.push(arr.get(i).cloned().unwrap_or(Value::Undefined));
                 }
@@ -172,7 +172,7 @@ fn register_species_accessor(array_fn: &Value, heap: &mut Heap) {
 pub fn array_to_string(obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let arr = obj_ref.borrow();
-        if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
+        if let Some(array_obj) = arr.as_array() {
             return Ok(Value::string(&array_obj.join_elements()));
         }
     }
@@ -495,7 +495,7 @@ fn is_concat_spreadable(value: &Value) -> bool {
 /// (ES 23.1.3.1).
 pub fn array_at(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
-        if let Some(arr) = obj_ref.borrow().as_any().downcast_ref::<ArrayObject>() {
+        if let Some(arr) = obj_ref.borrow().as_array() {
             let len = arr.len() as i64;
             let n = super::to_integer_or_infinity_throwing(args.first())?;
             let index = if n < 0 { n + len } else { n };
@@ -523,7 +523,7 @@ pub fn array_at(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, R
 /// terms of a snapshot of the values, not of the live elements).
 pub fn array_copy_within(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let len = if let Value::Object(obj_ref) = obj {
-        if let Some(arr) = obj_ref.borrow().as_any().downcast_ref::<ArrayObject>() {
+        if let Some(arr) = obj_ref.borrow().as_array() {
             arr.len() as u64
         } else {
             generic_length(obj)
@@ -574,7 +574,7 @@ fn set_length_throwing(array_obj: &ArrayObject) -> Result<(), RuntimeError> {
 /// `Array.prototype.push(...items)` (ES 23.1.3.20).
 pub fn array_push(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
-        if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
+        if let Some(array_obj) = obj_ref.borrow_mut().as_array_mut() {
             set_length_throwing(array_obj)?;
             for arg in args {
                 array_obj.push(arg.clone());
@@ -599,7 +599,7 @@ pub fn array_push(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
 /// `Array.prototype.pop()` (ES 23.1.3.19).
 pub fn array_pop(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
-        if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
+        if let Some(array_obj) = obj_ref.borrow_mut().as_array_mut() {
             // Step 3 performs `Set(O, "length", 0, true)` even for an empty
             // array, so a non-writable length aborts before anything changes.
             set_length_throwing(array_obj)?;
@@ -624,7 +624,7 @@ pub fn array_pop(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> {
 /// `Array.prototype.shift()` (ES 23.1.3.29).
 pub fn array_shift(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
-        if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
+        if let Some(array_obj) = obj_ref.borrow_mut().as_array_mut() {
             set_length_throwing(array_obj)?;
             return Ok(array_obj.shift());
         }
@@ -645,7 +645,7 @@ pub fn array_shift(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> 
 /// `Array.prototype.unshift(...items)` (ES 23.1.3.32).
 pub fn array_unshift(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
-        if let Some(array_obj) = obj_ref.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>() {
+        if let Some(array_obj) = obj_ref.borrow_mut().as_array_mut() {
             set_length_throwing(array_obj)?;
             for arg in args.iter().rev() {
                 array_obj.unshift(arg.clone());
@@ -679,7 +679,7 @@ pub fn array_unshift(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Val
 pub fn array_reverse(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let mut borrowed = obj_ref.borrow_mut();
-        if let Some(array_obj) = borrowed.as_any_mut().downcast_mut::<ArrayObject>() {
+        if let Some(array_obj) = borrowed.as_array_mut() {
             array_obj.reverse();
             return Ok(obj.clone());
         }
@@ -729,7 +729,7 @@ pub fn array_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError
     match obj {
         Value::Object(obj_ref) => {
             let arr = obj_ref.borrow();
-            if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
+            if let Some(array_obj) = arr.as_array() {
                 if args.is_empty() {
                     return Ok(Value::Number(-1.0));
                 }
@@ -751,7 +751,7 @@ pub fn array_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError
     match obj {
         Value::Object(obj_ref) => {
             let arr = obj_ref.borrow();
-            if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
+            if let Some(array_obj) = arr.as_array() {
                 if args.is_empty() {
                     return Ok(Value::Bool(false));
                 }
@@ -768,7 +768,7 @@ pub fn array_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError
 pub fn array_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let arr = obj_ref.borrow();
-        if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
+        if let Some(array_obj) = arr.as_array() {
             let needle = args.first().cloned().unwrap_or(Value::Undefined);
             let len = array_obj.len();
             if len == 0 {
@@ -805,7 +805,7 @@ pub fn array_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, Runtime
 pub fn array_fill(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let mut arr = obj_ref.borrow_mut();
-        if let Some(array_obj) = arr.as_any_mut().downcast_mut::<ArrayObject>() {
+        if let Some(array_obj) = arr.as_array_mut() {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             let len = array_obj.len();
             let resolve = |arg: Option<&Value>, default: usize| -> Result<usize, RuntimeError> {
@@ -854,7 +854,7 @@ pub fn array_fill(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
 pub fn array_join(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let arr = obj_ref.borrow();
-        if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
+        if let Some(array_obj) = arr.as_array() {
             let sep = if args.is_empty() {
                 ","
             } else {
@@ -907,7 +907,7 @@ pub fn array_join(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
 pub fn array_slice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let arr = obj_ref.borrow();
-        if let Some(array_obj) = arr.as_any().downcast_ref::<ArrayObject>() {
+        if let Some(array_obj) = arr.as_array() {
             let len = array_obj.len();
             let start = clamped_index(args.first(), len)?;
             let end = if args.len() < 2 {
@@ -1025,7 +1025,7 @@ pub fn array_concat(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Valu
 pub fn array_splice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     if let Value::Object(obj_ref) = obj {
         let mut arr = obj_ref.borrow_mut();
-        if let Some(array_obj) = arr.as_any_mut().downcast_mut::<ArrayObject>() {
+        if let Some(array_obj) = arr.as_array_mut() {
             let len = array_obj.len();
             let start = clamped_index(args.first(), len)?;
             // Step 5 of ES 23.1.3.28: with no arguments at all `start` is not

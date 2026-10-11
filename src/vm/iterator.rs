@@ -283,9 +283,7 @@ pub fn drain_native_iterator(heap: &mut crate::vm::gc::Heap, iter_val: &Value) -
         return None;
     };
     let is_native = obj_ref
-        .borrow()
-        .as_any()
-        .downcast_ref::<NativeIteratorObject>()
+        .borrow().as_native_iterator()
         .is_some();
     if !is_native {
         return None;
@@ -296,9 +294,7 @@ pub fn drain_native_iterator(heap: &mut crate::vm::gc::Heap, iter_val: &Value) -
         // held across the call would panic on the next turn of the loop.
         let next = {
             let borrowed = obj_ref.borrow();
-            let iterator = borrowed
-                .as_any()
-                .downcast_ref::<NativeIteratorObject>()
+            let iterator = borrowed.as_native_iterator()
                 .expect("checked above");
             native_next(heap, &mut iterator.state().borrow_mut())
         };
@@ -331,9 +327,7 @@ pub fn native_next(
                 return None;
             }
             let borrowed = set.borrow();
-            let step = borrowed
-                .as_any()
-                .downcast_ref::<crate::vm::object::SetObject>()
+            let step = borrowed.as_set()
                 .and_then(|set| set.entry_from(*idx));
             match step {
                 Some((i, value)) => {
@@ -354,9 +348,7 @@ pub fn native_next(
             // `next()` calls is allowed to mutate it (that is the whole point of
             // a Map iterator being live).
             let borrowed = map.borrow();
-            let step = borrowed
-                .as_any()
-                .downcast_ref::<crate::vm::object::MapObject>()
+            let step = borrowed.as_map()
                 .and_then(|map| map.entry_from(*idx));
             match step {
                 Some((i, key, value)) => {

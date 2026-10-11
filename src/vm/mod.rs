@@ -583,7 +583,7 @@ impl VM {
         if let Value::Object(ref obj_ref) = obj {
             let mut borrowed = obj_ref.borrow_mut();
             borrowed.set_prototype(Some(self.builtins.function_prototype));
-            if let Some(func_obj) = borrowed.as_any_mut().downcast_mut::<FunctionObject>() {
+            if let Some(func_obj) = borrowed.as_function_mut() {
                 func_obj.captured_vars = captured_vars;
             }
         }
@@ -654,7 +654,7 @@ impl VM {
     fn array_like_elements(&self, val: &Value) -> Option<Vec<Value>> {
         match val {
             Value::Object(obj_ref) => {
-                if let Some(arr) = obj_ref.borrow().as_any().downcast_ref::<ArrayObject>() {
+                if let Some(arr) = obj_ref.borrow().as_array() {
                     return Some(
                         (0..arr.len())
                             .map(|i| arr.get(i).cloned().unwrap_or(Value::Undefined))
@@ -666,9 +666,7 @@ impl VM {
                 // does) answers `undefined`, and iterating a view yielded
                 // nothing at all — `[...new Uint8Array([1,2,3])]` was `[]`.
                 if let Some(view) = obj_ref
-                    .borrow()
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::TypedArrayObject>()
+                    .borrow().as_typed_array()
                 {
                     return Some((0..view.length).map(|i| view.get_element(i)).collect());
                 }
@@ -1182,9 +1180,7 @@ impl VM {
         loop {
             let step = {
                 let borrowed = obj_ref.borrow();
-                borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::SetObject>()
+                borrowed.as_set()
                     .and_then(|set| set.entry_from(idx))
             };
             let Some((next, value)) = step else {
@@ -1299,9 +1295,7 @@ impl VM {
             ));
         };
         let mut borrowed = obj_ref.borrow_mut();
-        let map = borrowed
-            .as_any_mut()
-            .downcast_mut::<crate::vm::object::MapObject>()
+        let map = borrowed.as_map_mut()
             .expect("try_map_method checked the receiver");
         match map.get(&key) {
             Some(existing) => Ok(existing),
@@ -1545,9 +1539,7 @@ impl VM {
                     ));
                 }
                 let mut borrowed = obj_ref.borrow_mut();
-                let map = borrowed
-                    .as_any_mut()
-                    .downcast_mut::<crate::vm::object::WeakMapObject>()
+                let map = borrowed.as_weak_map_mut()
                     .expect("kind checked above");
                 match map.get(&key) {
                     Some(existing) => Ok(existing),
@@ -1584,9 +1576,7 @@ impl VM {
                     ));
                 }
                 let existing = obj_ref
-                    .borrow()
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::WeakMapObject>()
+                    .borrow().as_weak_map()
                     .and_then(|map| map.get(&key));
                 if let Some(existing) = existing {
                     return Ok(existing);
@@ -1598,9 +1588,7 @@ impl VM {
                     module,
                 )?;
                 let mut borrowed = obj_ref.borrow_mut();
-                borrowed
-                    .as_any_mut()
-                    .downcast_mut::<crate::vm::object::WeakMapObject>()
+                borrowed.as_weak_map_mut()
                     .expect("kind checked above")
                     .set(key, value.clone());
                 Ok(value)
@@ -1879,9 +1867,7 @@ impl VM {
             other => other.clone(),
         };
         let existing = obj_ref
-            .borrow()
-            .as_any()
-            .downcast_ref::<crate::vm::object::MapObject>()
+            .borrow().as_map()
             .and_then(|map| map.get(&canonical));
         if let Some(existing) = existing {
             return Ok(existing);
@@ -1893,9 +1879,7 @@ impl VM {
             module,
         )?;
         let mut borrowed = obj_ref.borrow_mut();
-        let map = borrowed
-            .as_any_mut()
-            .downcast_mut::<crate::vm::object::MapObject>()
+        let map = borrowed.as_map_mut()
             .expect("try_map_method checked the receiver");
         map.set(canonical, value.clone());
         Ok(value)
@@ -1938,15 +1922,13 @@ impl VM {
                 unreachable!("Map.groupBy builds its own Map")
             };
             let mut borrowed = obj_ref.borrow_mut();
-            let map = borrowed
-                .as_any_mut()
-                .downcast_mut::<crate::vm::object::MapObject>()
+            let map = borrowed.as_map_mut()
                 .expect("Map.groupBy builds its own Map");
             // Each group is a plain array appended to in encounter order.
             let group = map.get(&key);
             match group {
                 Some(Value::Object(list)) => {
-                    if let Some(arr) = list.borrow_mut().as_any_mut().downcast_mut::<ArrayObject>()
+                    if let Some(arr) = list.borrow_mut().as_array_mut()
                     {
                         arr.push(value);
                     }
@@ -1989,9 +1971,7 @@ impl VM {
             // the map (`m.forEach(function () { m.delete(1) })`).
             let step = {
                 let borrowed = obj_ref.borrow();
-                borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::MapObject>()
+                borrowed.as_map()
                     .and_then(|map| map.entry_from(idx))
             };
             let Some((next, key, value)) = step else {
@@ -3633,9 +3613,7 @@ impl VM {
                 return Err(RuntimeError::TypeError("not a generator".to_string()));
             };
             let borrowed = obj_ref.borrow();
-            let Some(gobj) = borrowed
-                .as_any()
-                .downcast_ref::<crate::vm::object::GeneratorObject>()
+            let Some(gobj) = borrowed.as_generator()
             else {
                 return Err(RuntimeError::TypeError("not a generator".to_string()));
             };
@@ -3656,9 +3634,7 @@ impl VM {
                     return Err(RuntimeError::TypeError("not a generator".to_string()));
                 };
                 let mut gobj = obj_ref.borrow_mut();
-                match gobj
-                    .as_any_mut()
-                    .downcast_mut::<crate::vm::object::GeneratorObject>()
+                match gobj.as_generator_mut()
                 {
                     Some(gobj) if gobj.suspended.is_some() => {
                         gobj.state = crate::vm::object::GeneratorState::Executing;
@@ -3689,9 +3665,7 @@ impl VM {
                     return Err(RuntimeError::TypeError("not a generator".to_string()));
                 };
                 let gobj = obj_ref.borrow();
-                let gobj = gobj
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::GeneratorObject>()
+                let gobj = gobj.as_generator()
                     .unwrap();
                 match module.entry_pc(gobj.func_id) {
                     Some(_) => (gobj.func_id, gobj.args.clone(), gobj.this.clone(), gobj.captured_vars.clone()),
@@ -3712,9 +3686,7 @@ impl VM {
                     return Err(RuntimeError::TypeError("not a generator".to_string()));
                 };
                 let mut gobj = obj_ref.borrow_mut();
-                let gobj = gobj
-                    .as_any_mut()
-                    .downcast_mut::<crate::vm::object::GeneratorObject>()
+                let gobj = gobj.as_generator_mut()
                     .unwrap();
                 gobj.state = crate::vm::object::GeneratorState::Executing;
                 match gobj.suspended.take() {
@@ -3795,9 +3767,7 @@ impl VM {
                 return Err(RuntimeError::TypeError("not a generator".to_string()));
             };
             let mut borrowed = obj_ref.borrow_mut();
-            let Some(gobj) = borrowed
-                .as_any_mut()
-                .downcast_mut::<crate::vm::object::GeneratorObject>()
+            let Some(gobj) = borrowed.as_generator_mut()
             else {
                 return Err(RuntimeError::TypeError("not a generator".to_string()));
             };
@@ -4007,9 +3977,7 @@ impl VM {
         match &self.current_func() {
             Value::Function(id) => Some(*id),
             Value::Object(obj_ref) => obj_ref
-                .borrow()
-                .as_any()
-                .downcast_ref::<crate::vm::object::FunctionObject>()
+                .borrow().as_function()
                 .map(|f| f.func_id),
             _ => None,
         }
@@ -4166,9 +4134,7 @@ impl VM {
     ) {
         if let Value::Object(obj_ref) = gen_value {
             let mut gobj = obj_ref.borrow_mut();
-            if let Some(gobj) = gobj
-                .as_any_mut()
-                .downcast_mut::<crate::vm::object::GeneratorObject>()
+            if let Some(gobj) = gobj.as_generator_mut()
             {
                 gobj.state = state;
                 gobj.suspended = Some(Box::new(frame));
@@ -4179,9 +4145,7 @@ impl VM {
     fn mark_generator_completed(&mut self, gen_value: &Value) {
         if let Value::Object(obj_ref) = gen_value {
             let mut gobj = obj_ref.borrow_mut();
-            if let Some(gobj) = gobj
-                .as_any_mut()
-                .downcast_mut::<crate::vm::object::GeneratorObject>()
+            if let Some(gobj) = gobj.as_generator_mut()
             {
                 gobj.state = crate::vm::object::GeneratorState::Completed;
                 gobj.suspended = None;
@@ -4195,9 +4159,7 @@ impl VM {
             return None;
         };
         let borrowed = obj_ref.borrow();
-        let it = borrowed
-            .as_any()
-            .downcast_ref::<crate::vm::iterator::NativeIteratorObject>()?;
+        let it = borrowed.as_native_iterator()?;
         match &*it.state().borrow() {
             crate::vm::iterator::NativeIteratorState::Js { iterator } => Some(iterator.clone()),
             _ => None,
@@ -4431,9 +4393,7 @@ impl VM {
         // must not try to call `[Symbol.iterator]` on it (which would recurse).
         if let Value::Object(obj_ref) = &src {
             if obj_ref
-                .borrow()
-                .as_any()
-                .downcast_ref::<crate::vm::iterator::NativeIteratorObject>()
+                .borrow().as_native_iterator()
                 .is_some()
             {
                 let id = self.next_iterator_id;
@@ -4556,7 +4516,7 @@ impl VM {
 
         let is_js_iterator = {
             let borrowed = iter_obj.borrow();
-            let Some(it) = borrowed.as_any().downcast_ref::<crate::vm::iterator::NativeIteratorObject>() else {
+            let Some(it) = borrowed.as_native_iterator() else {
                 return Err(RuntimeError::TypeError(
                     "IteratorNext on non-iterator".to_string(),
                 ));
@@ -4568,9 +4528,7 @@ impl VM {
             // Slow path: `it.next()`, then read { value, done }.
             let iterator = {
                 let borrowed = iter_obj.borrow();
-                let it = borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::iterator::NativeIteratorObject>()
+                let it = borrowed.as_native_iterator()
                     .unwrap();
                 match &*it.state().borrow() {
                     NativeIteratorState::Js { iterator } => iterator.clone(),
@@ -4594,9 +4552,7 @@ impl VM {
             Ok((item, done))
         } else {
             let mut borrowed = iter_obj.borrow_mut();
-            let it = borrowed
-                .as_any_mut()
-                .downcast_mut::<crate::vm::iterator::NativeIteratorObject>()
+            let it = borrowed.as_native_iterator_mut()
                 .unwrap();
             match native_next(&mut self.heap, &mut *it.state().borrow_mut()) {
                 Some(item) => Ok((item, false)),
@@ -4627,7 +4583,7 @@ impl VM {
         };
         let iterator = {
             let borrowed = iter_obj.borrow();
-            let Some(it) = borrowed.as_any().downcast_ref::<crate::vm::iterator::NativeIteratorObject>() else {
+            let Some(it) = borrowed.as_native_iterator() else {
                 return Ok(());
             };
             match &*it.state().borrow() {
@@ -4697,9 +4653,7 @@ impl VM {
             Value::Function(id) => (*id, Vec::new()),
             Value::Object(obj_ref) => {
                 let borrowed = obj_ref.borrow();
-                match borrowed
-                    .as_any()
-                    .downcast_ref::<crate::vm::object::FunctionObject>()
+                match borrowed.as_function()
                 {
                     Some(func_obj) => (func_obj.func_id, func_obj.captured_vars.clone()),
                     None => {
@@ -4751,9 +4705,7 @@ impl VM {
                     }
                     ObjectKind::NativeFunction => {
                         let name = obj_ref
-                            .borrow()
-                            .as_any()
-                            .downcast_ref::<crate::vm::object::NativeFunctionObject>()
+                            .borrow().as_native_function()
                             .map(|f| f.name.clone())
                             .unwrap_or_default();
                         // A qualified name is a static or prototype method, and
@@ -5565,9 +5517,7 @@ fn with_set_data<R>(value: &Value, f: impl FnOnce(&mut crate::vm::object::SetObj
         return None;
     };
     let mut borrowed = obj_ref.borrow_mut();
-    borrowed
-        .as_any_mut()
-        .downcast_mut::<crate::vm::object::SetObject>()
+    borrowed.as_set_mut()
         .map(f)
 }
 
@@ -6121,7 +6071,7 @@ mod tests {
             let arr = new_array_object(&mut heap);
             if let Value::Object(ref arr_ref) = arr {
                 let mut obj = arr_ref.borrow_mut();
-                if let Some(a) = obj.as_any_mut().downcast_mut::<ArrayObject>() {
+                if let Some(a) = obj.as_array_mut() {
                     a.push(Value::Number(1.0));
                     a.push(Value::Number(2.0));
                 }

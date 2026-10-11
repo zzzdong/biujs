@@ -56,8 +56,7 @@ pub fn as_map<'a>(
         )));
     }
     Ok(std::cell::RefMut::map(borrowed, |obj| {
-        obj.as_any_mut()
-            .downcast_mut::<MapObject>()
+        obj.as_map_mut()
             .expect("ObjectKind::Map implies MapObject")
     }))
 }

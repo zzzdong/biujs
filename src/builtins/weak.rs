@@ -56,8 +56,7 @@ fn as_weak_map<'a>(
         )));
     }
     Ok(std::cell::RefMut::map(borrowed, |obj| {
-        obj.as_any_mut()
-            .downcast_mut::<WeakMapObject>()
+        obj.as_weak_map_mut()
             .expect("ObjectKind::WeakMap implies WeakMapObject")
     }))
 }
@@ -78,8 +77,7 @@ fn as_weak_set<'a>(
         )));
     }
     Ok(std::cell::RefMut::map(borrowed, |obj| {
-        obj.as_any_mut()
-            .downcast_mut::<WeakSetObject>()
+        obj.as_weak_set_mut()
             .expect("ObjectKind::WeakSet implies WeakSetObject")
     }))
 }

@@ -44,8 +44,7 @@ pub fn as_set<'a>(
         )));
     }
     Ok(std::cell::RefMut::map(borrowed, |obj| {
-        obj.as_any_mut()
-            .downcast_mut::<SetObject>()
+        obj.as_set_mut()
             .expect("ObjectKind::Set implies SetObject")
     }))
 }

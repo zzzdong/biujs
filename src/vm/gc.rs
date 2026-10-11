@@ -529,6 +529,81 @@ impl Object {
     }
 }
 
+// ─────────────────────────────────────────────────────────
+// 具名类型访问器（取代 `as_any().downcast_ref::<T>()`）
+// ─────────────────────────────────────────────────────────
+
+/// 给每个变体生成 `as_<v>()` / `as_<v>_mut()`。
+///
+/// `Object` 是**具体枚举**，所以"取某个变体的内部值"就是一次判别匹配 —— 不需要
+/// `dyn Any`，也不需要运行时类型 id 比较。调用点的形状与原先
+/// `if let Some(x) = obj.as_any().downcast_ref::<T>()` **完全一致**，所以替换是机械的、
+/// 且不会牵动多行链式调用的排版。
+macro_rules! object_accessors {
+    ( $( ($variant:ident, $ty:ty, $get:ident, $get_mut:ident) ),* $(,)? ) => {
+        impl Object {
+            $(
+                pub fn $get(&self) -> Option<&$ty> {
+                    match self {
+                        Object::$variant(v) => Some(v),
+                        _ => None,
+                    }
+                }
+                pub fn $get_mut(&mut self) -> Option<&mut $ty> {
+                    match self {
+                        Object::$variant(v) => Some(v),
+                        _ => None,
+                    }
+                }
+            )*
+        }
+    };
+}
+
+object_accessors!(
+    (Array, ArrayObject, as_array, as_array_mut),
+    (Function, FunctionObject, as_function, as_function_mut),
+    (Date, DateObject, as_date, as_date_mut),
+    (RegExp, RegExpObject, as_regexp, as_regexp_mut),
+    (Generator, GeneratorObject, as_generator, as_generator_mut),
+    (ArrayBuffer, ArrayBufferObject, as_array_buffer, as_array_buffer_mut),
+    (TypedArray, TypedArrayObject, as_typed_array, as_typed_array_mut),
+    (DataView, DataViewObject, as_data_view, as_data_view_mut),
+    (Proxy, ProxyObject, as_proxy, as_proxy_mut),
+    (Map, MapObject, as_map, as_map_mut),
+    (WeakMap, WeakMapObject, as_weak_map, as_weak_map_mut),
+    (WeakSet, WeakSetObject, as_weak_set, as_weak_set_mut),
+    (Set, SetObject, as_set, as_set_mut),
+    (NativeIterator, NativeIteratorObject, as_native_iterator, as_native_iterator_mut),
+);
+
+impl Object {
+    pub fn as_ordinary(&self) -> Option<&OrdinaryObject> {
+        match self {
+            Object::Ordinary(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_native_function(&self) -> Option<&NativeFunctionObject> {
+        match self {
+            Object::NativeFunction(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// 判别谓词（取代 `as_any().is::<T>()`）。
+    pub fn is_typed_array(&self) -> bool {
+        matches!(self, Object::TypedArray(_))
+    }
+    pub fn is_array_buffer(&self) -> bool {
+        matches!(self, Object::ArrayBuffer(_))
+    }
+    pub fn is_data_view(&self) -> bool {
+        matches!(self, Object::DataView(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

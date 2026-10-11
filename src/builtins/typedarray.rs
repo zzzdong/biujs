@@ -184,17 +184,17 @@ pub fn kind_from_name(name: &str) -> Option<TypedArrayKind> {
 
 pub fn is_typedarray_receiver(value: &Value) -> bool {
     matches!(value, Value::Object(obj_ref)
-        if obj_ref.borrow().as_any().is::<TypedArrayObject>())
+        if obj_ref.borrow().is_typed_array())
 }
 
 pub fn is_arraybuffer_receiver(value: &Value) -> bool {
     matches!(value, Value::Object(obj_ref)
-        if obj_ref.borrow().as_any().is::<ArrayBufferObject>())
+        if obj_ref.borrow().is_array_buffer())
 }
 
 pub fn is_dataview_receiver(value: &Value) -> bool {
     matches!(value, Value::Object(obj_ref)
-        if obj_ref.borrow().as_any().is::<DataViewObject>())
+        if obj_ref.borrow().is_data_view())
 }
 
 fn as_dataview<'a>(
@@ -206,14 +206,13 @@ fn as_dataview<'a>(
             "{method} called on a non-object"
         )));
     };
-    if !obj_ref.borrow().as_any().is::<DataViewObject>() {
+    if !obj_ref.borrow().is_data_view() {
         return Err(RuntimeError::TypeError(format!(
             "{method} called on an object that is not a DataView"
         )));
     }
     Ok(std::cell::RefMut::map(obj_ref.borrow_mut(), |obj| {
-        obj.as_any_mut()
-            .downcast_mut::<DataViewObject>()
+        obj.as_data_view_mut()
             .expect("checked above")
     }))
 }
@@ -224,7 +223,7 @@ fn as_typedarray<'a>(this: &'a Value, method: &str) -> Result<std::cell::RefMut<
             "{method} called on a non-object"
         )));
     };
-    let is_ta = obj_ref.borrow().as_any().is::<TypedArrayObject>();
+    let is_ta = obj_ref.borrow().is_typed_array();
     if !is_ta {
         return Err(RuntimeError::TypeError(format!(
             "{method} called on an object that is not a TypedArray"
@@ -232,8 +231,7 @@ fn as_typedarray<'a>(this: &'a Value, method: &str) -> Result<std::cell::RefMut<
     }
     let borrowed = obj_ref.borrow_mut();
     Ok(std::cell::RefMut::map(borrowed, |obj| {
-        obj.as_any_mut()
-            .downcast_mut::<TypedArrayObject>()
+        obj.as_typed_array_mut()
             .expect("checked above")
     }))
 }
@@ -313,7 +311,7 @@ pub fn dataview_construct(
             unreachable!()
         };
         let borrowed = obj_ref.borrow();
-        let Some(buffer) = borrowed.as_any().downcast_ref::<ArrayBufferObject>() else {
+        let Some(buffer) = borrowed.as_array_buffer() else {
             return Err(RuntimeError::TypeError(
                 "DataView requires an ArrayBuffer argument".to_string(),
             ));
@@ -391,7 +389,7 @@ pub fn dv_get(this: &Value, args: &[Value], ty: DataViewType) -> Result<Value, R
     }
     let little = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
     let buffer = dv.buffer.borrow();
-    let Some(abuf) = buffer.as_any().downcast_ref::<ArrayBufferObject>() else {
+    let Some(abuf) = buffer.as_array_buffer() else {
         return Err(RuntimeError::TypeError(
             "DataView buffer is not an ArrayBuffer".to_string(),
         ));
@@ -415,7 +413,7 @@ pub fn dv_set(this: &Value, args: &[Value], ty: DataViewType) -> Result<Value, R
     let value = args.get(1).cloned().unwrap_or(Value::Undefined).to_number();
     let little = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
     let mut buffer = dv.buffer.borrow_mut();
-    let Some(abuf) = buffer.as_any_mut().downcast_mut::<ArrayBufferObject>() else {
+    let Some(abuf) = buffer.as_array_buffer_mut() else {
         return Err(RuntimeError::TypeError(
             "DataView buffer is not an ArrayBuffer".to_string(),
         ));
@@ -440,11 +438,9 @@ fn source_numbers(value: &Value, bytes_per_element: usize) -> Result<Vec<f64>, R
         return Ok(out);
     };
     // A TypedArray source: read through the view.
-    if obj_ref.borrow().as_any().is::<TypedArrayObject>() {
+    if obj_ref.borrow().is_typed_array() {
         let ta = obj_ref.borrow();
-        let ta = ta
-            .as_any()
-            .downcast_ref::<TypedArrayObject>()
+        let ta = ta.as_typed_array()
             .expect("checked above");
         for i in 0..ta.length {
             out.push(match ta.get_element(i) {
@@ -491,9 +487,7 @@ pub fn typedarray_construct(
         };
         let buffer_len = {
             let borrowed = buffer.borrow();
-            borrowed
-                .as_any()
-                .downcast_ref::<ArrayBufferObject>()
+            borrowed.as_array_buffer()
                 .map(|b| b.byte_length())
                 .unwrap_or(0)
         };
@@ -563,12 +557,12 @@ pub fn typedarray_construct(
     let view = make_view(heap, kind, buffer_obj, 0, numbers.len(), proto);
     if let Value::Object(view_ref) = &view {
         let mut view_mut = view_ref.borrow_mut();
-        if let Some(ta) = view_mut.as_any_mut().downcast_mut::<TypedArrayObject>() {
+        if let Some(ta) = view_mut.as_typed_array_mut() {
             for (i, value) in numbers.iter().enumerate() {
                 // The buffer is borrowed by the view only through `Rc`, so this
                 // borrow is safe.
                 let mut buffer_mut = buffer_obj.borrow_mut();
-                if let Some(buf) = buffer_mut.as_any_mut().downcast_mut::<ArrayBufferObject>() {
+                if let Some(buf) = buffer_mut.as_array_buffer_mut() {
                     ta.kind.write(buf.data_mut(), i, *value);
                 }
             }
@@ -621,7 +615,7 @@ pub fn ab_byte_length(this: &Value) -> Result<Value, RuntimeError> {
         ));
     };
     let borrowed = obj_ref.borrow();
-    let Some(buffer) = borrowed.as_any().downcast_ref::<ArrayBufferObject>() else {
+    let Some(buffer) = borrowed.as_array_buffer() else {
         return Err(RuntimeError::TypeError(
             "byteLength called on an object that is not an ArrayBuffer".to_string(),
         ));
@@ -642,7 +636,7 @@ pub fn typedarray_elements(value: &Value) -> Option<Vec<Value>> {
         return None;
     };
     let borrowed = obj_ref.borrow();
-    let ta = borrowed.as_any().downcast_ref::<TypedArrayObject>()?;
+    let ta = borrowed.as_typed_array()?;
     Some((0..ta.length).map(|i| ta.get_element(i)).collect())
 }
 
@@ -677,7 +671,7 @@ pub fn ta_set(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let buffer = ta.buffer;
     drop(ta);
     let mut buffer_mut = buffer.borrow_mut();
-    let Some(buf) = buffer_mut.as_any_mut().downcast_mut::<ArrayBufferObject>() else {
+    let Some(buf) = buffer_mut.as_array_buffer_mut() else {
         return Ok(Value::Undefined);
     };
     // Write at the view's own offset within the shared byte block.
@@ -730,9 +724,9 @@ pub fn ta_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, 
     let view = make_view(heap, kind, buffer_obj, 0, new_length, proto);
     if let Value::Object(view_ref) = &view {
         let mut view_mut = view_ref.borrow_mut();
-        let ta_mut = view_mut.as_any_mut().downcast_mut::<TypedArrayObject>();
+        let ta_mut = view_mut.as_typed_array_mut();
         let mut buffer_mut = buffer_obj.borrow_mut();
-        let buf = buffer_mut.as_any_mut().downcast_mut::<ArrayBufferObject>();
+        let buf = buffer_mut.as_array_buffer_mut();
         if let (Some(ta_mut), Some(buf)) = (ta_mut, buf) {
             for (i, value) in numbers.iter().enumerate() {
                 ta_mut.kind.write(buf.data_mut(), i, *value);
@@ -754,7 +748,7 @@ pub fn ta_fill(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let buffer = ta.buffer;
     drop(ta);
     let mut buffer_mut = buffer.borrow_mut();
-    if let Some(buf) = buffer_mut.as_any_mut().downcast_mut::<ArrayBufferObject>() {
+    if let Some(buf) = buffer_mut.as_array_buffer_mut() {
         for i in start..end {
             let at = byte_offset + i * kind.bytes_per_element();
             if at + kind.bytes_per_element() > buf.data().len() {
@@ -775,7 +769,7 @@ pub fn ab_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, 
     };
     let (data, proto) = {
         let borrowed = obj_ref.borrow();
-        let Some(buffer) = borrowed.as_any().downcast_ref::<ArrayBufferObject>() else {
+        let Some(buffer) = borrowed.as_array_buffer() else {
             return Err(RuntimeError::TypeError(
                 "slice called on an object that is not an ArrayBuffer".to_string(),
             ));
@@ -789,7 +783,7 @@ pub fn ab_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, 
     let new_buffer = make_buffer(heap, copy.len(), proto);
     if let (Value::Object(new_ref), Value::Object(_)) = (&new_buffer, this) {
         let mut borrowed = new_ref.borrow_mut();
-        if let Some(buffer) = borrowed.as_any_mut().downcast_mut::<ArrayBufferObject>() {
+        if let Some(buffer) = borrowed.as_array_buffer_mut() {
             buffer.data_mut().copy_from_slice(&copy);
         }
     }
