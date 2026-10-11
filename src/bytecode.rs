@@ -2200,45 +2200,71 @@ mod tests {
         }
     }
 
-    /// 从 `run_instruction` 的源码里切出每条 arm：(opcode 名字列表, arm 全文)。
+    /// 从指令分派的源码里切出每条 arm：(opcode 名字列表, arm 全文)。
+    ///
+    /// `run_instruction` 现在只剩一张分派表，真正的 arm 住在各自的 `run_<group>`
+    /// 里，所以这里把源码里**每一处** `match *inst {` 都扫一遍 —— 少扫一处就少了
+    /// 一组指令，下面三条元测试的覆盖断言会立刻报出来。
     ///
     /// arm 头一定在**基线缩进**（12 空格）且以 `Instr::` 开头；or-模式的续行是
     /// 14 空格 + `| Instr::`，不会被误当成新 arm。
     fn run_instruction_arms(source: &str) -> Vec<(Vec<String>, String)> {
-        let start = source.find("fn run_instruction").expect("VM 里没有 run_instruction");
-        let rest = &source[start..];
-        let end = rest[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(rest.len());
-        let body = &rest[..end];
-        let m = body.find("match *inst {").expect("run_instruction 不再 match *inst");
-        let text = &body[m..];
-
-        let mut heads = Vec::new();
-        let mut cursor = 0;
-        for line in text.split_inclusive('\n') {
-            // 正好 12 个空格 + `Instr::` = arm 头；or-模式的续行是 14 空格 + `| `。
-            if line.starts_with("            Instr::") {
-                heads.push(cursor);
-            }
-            cursor += line.len();
-        }
         let mut arms = Vec::new();
-        for (i, &h) in heads.iter().enumerate() {
-            let slice_end = heads.get(i + 1).copied().unwrap_or(text.len());
-            let arm = &text[h..slice_end];
-            let head = &arm[..arm.find("=>").expect("arm 没有 =>")];
-            let mut ops = Vec::new();
-            let mut idx = 0;
-            while let Some(p) = head[idx..].find("Instr::") {
-                let s = idx + p + "Instr::".len();
-                let name: String = head[s..]
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                ops.push(name);
-                idx = s;
+        // 按顶层方法切块。**要**的是各 `run_<group>` —— 实现住在那里。**不要**的是
+        // 另外两处同样 `match *inst {` 的地方：
+        //   * `run_instruction` 自己：P0-4 之后它只剩一张"指令 → 组"的分派表，
+        //     表里每条 opcode 的"实现"只有一句 `self.run_x(...)`，拿它当 arm 会让
+        //     下面三条断言全部看错对象；
+        //   * `step()`：那是按 `Kind` 的分类分派，只挑出 `Halt` / `Ret`。
+        for chunk in source.split("\n    fn ") {
+            let name: String = chunk
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.starts_with("run_") || name == "run_instruction" {
+                continue;
             }
-            arms.push((ops, arm.to_string()));
+            let Some(m) = chunk.find("match *inst {") else {
+                continue;
+            };
+            let mut text = &chunk[m..];
+            // 组函数末尾的兜底臂与收尾语句不属于任何一条 arm，切掉，免得后面
+            // "arm 里含不含某段代码"的判断被它们污染。
+            if let Some(i) = text.find("            _ => return Ok(false),") {
+                text = &text[..i];
+            }
+
+            let mut heads = Vec::new();
+            let mut cursor = 0;
+            for line in text.split_inclusive('\n') {
+                // 正好 12 个空格 + `Instr::` = arm 头；or-模式的续行是 14 空格 + `| `。
+                if line.starts_with("            Instr::") {
+                    heads.push(cursor);
+                }
+                cursor += line.len();
+            }
+            for (i, &h) in heads.iter().enumerate() {
+                let slice_end = heads.get(i + 1).copied().unwrap_or(text.len());
+                let arm = &text[h..slice_end];
+                let head = &arm[..arm.find("=>").expect("arm 没有 =>")];
+                let mut ops = Vec::new();
+                let mut idx = 0;
+                while let Some(p) = head[idx..].find("Instr::") {
+                    let s = idx + p + "Instr::".len();
+                    let name: String = head[s..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    ops.push(name);
+                    idx = s;
+                }
+                arms.push((ops, arm.to_string()));
+            }
         }
+        assert!(
+            !arms.is_empty(),
+            "源码里一处 `match *inst {{` 都切不出 arm 了"
+        );
         arms
     }
 

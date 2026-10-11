@@ -2543,6 +2543,61 @@ impl VM {
         // `Operand` 而不是 `&Operand`，于是 arm 体里原来的表达式不用改类型。
         // 分组 arm（`A | B`）用位置别名 `a0/a1/a2`，因为 or-模式要求各分支绑定同名，
         // 而 `IndexGet { index }` 与 `PropGet { property }` 的字段名并不相同。
+        // 分派：`run_instruction` 只剩这一张表 —— 每条指令在这里**一次性**定位到
+        // 自己的 `run_<group>`（一次跳转表命中 + 一次调用），而不是挨个问 17 个组
+        // "这条归你吗"。后者写起来更省事，但实测解释器吞吐 -17%。
+        //
+        // 表是穷尽的（漏一条就编译不过），而它与各组 arm 的对应关系是从 arm 头
+        // 反推出来的（90 条不重不漏），不是手抄的。
+        //
+        // 组函数返回 `true` 表示"这条指令归我"：组内的 `return Ok(true)` 就是原来
+        // 的 `return Ok(())`；而不 return 的分支落到组末尾的 `jump_offset(1)`，
+        // 与搬移前落到 `match` 之后的行为一致。
+        let handled = match *inst {
+            Instr::PrologueEnd { .. } | Instr::Yield { .. } |
+              Instr::Await { .. } => self.run_suspend(inst, module)?,
+            Instr::Call { .. } | Instr::CallEx { .. } => self.run_call(inst, module)?,
+            Instr::Jump { .. } | Instr::DelayedJump { .. } | Instr::BrIf { .. } => self.run_jump(inst, module)?,
+            Instr::Mov { .. } | Instr::Push { .. } | Instr::Pop { .. } | Instr::AddC { .. } | Instr::SubC { .. } => self.run_stack(inst, module)?,
+            Instr::LoadConst { .. } | Instr::MakeRegExp { .. } | Instr::DeclareLexical { .. } |
+              Instr::InitLexical { .. } | Instr::SetFunctionName { .. } | Instr::LoadEnv { .. } => self.run_load(inst, module)?,
+            Instr::Addx { .. } | Instr::Subx { .. } | Instr::Mulx { .. } | Instr::Divx { .. } |
+              Instr::Remx { .. } | Instr::Pow { .. } | Instr::Not { .. } |
+              Instr::BitNot { .. } | Instr::BitAnd { .. } | Instr::BitOr { .. } |
+              Instr::BitXor { .. } | Instr::Shl { .. } | Instr::Shr { .. } |
+              Instr::UShr { .. } | Instr::Neg { .. } => self.run_arith(inst, module)?,
+            Instr::And { .. } | Instr::Or { .. } | Instr::Greater { .. } |
+              Instr::GreaterEqual { .. } | Instr::Less { .. } | Instr::LessEqual { .. } |
+              Instr::Equal { .. } | Instr::NotEqual { .. } | Instr::StrictEqual { .. } |
+              Instr::StrictNotEqual { .. } => self.run_compare(inst, module)?,
+            Instr::TypeOf { .. } | Instr::TypeOfEnv { .. } | Instr::InstanceOf { .. } | Instr::In { .. } => self.run_type(inst, module)?,
+            Instr::DelegateOpen { .. } | Instr::DelegateClose { .. } | Instr::MakeIter { .. } |
+              Instr::IterNext { .. } | Instr::IterClose { .. } |
+              Instr::RequireObjectCoercible { .. } | Instr::MakeRest { .. } => self.run_iteration(inst, module)?,
+            Instr::CallSpread { .. } | Instr::CallSuperSpread { .. } | Instr::NewSpread { .. } => self.run_call_spread(inst, module)?,
+            Instr::ToString { .. } | Instr::ToNumber { .. } => self.run_convert(inst, module)?,
+            Instr::MakeArray { .. } | Instr::ArrayPushSpread { .. } | Instr::MarkHole { .. } |
+              Instr::ArrayPush { .. } => self.run_array(inst, module)?,
+            Instr::MakeObject { .. } | Instr::IndexGet { .. } | Instr::PropGet { .. } |
+              Instr::IndexSet { .. } | Instr::PropSet { .. } | Instr::IndexDelete { .. } |
+              Instr::PropDelete { .. } | Instr::Arguments { .. } | Instr::StoreEnv { .. } |
+              Instr::CallMethod { .. } => self.run_object(inst, module)?,
+            Instr::Try { .. } | Instr::EndTry { .. } | Instr::ThrowExc { .. } | Instr::LoadException { .. } => self.run_exception(inst, module)?,
+            Instr::CreateClosure { .. } | Instr::New { .. } => self.run_construct(inst, module)?,
+            Instr::LoadThis { .. } | Instr::LoadNewTarget { .. } |
+              Instr::LoadCurrentFunction { .. } | Instr::MakeFuncObj { .. } |
+              Instr::MakeArrowFuncObj { .. } | Instr::ClosureVar { .. } | Instr::CallNative { .. } => self.run_function(inst, module)?,
+            Instr::Halt { .. } | Instr::Ret { .. } | Instr::ResumeExc { .. } => self.run_halt(inst, module)?,
+        };
+        if !handled {
+            // 两处写法漂了才会到这里：兜底成"空操作 + 前进一步"，不静默改语义。
+            self.state.jump_offset(1);
+        }
+        Ok(())
+    }
+
+    /// `PrologueEnd`/`Yield`/`Await`
+    fn run_suspend(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
         match *inst {
             // `yield expr`: suspend the enclosing generator. The frame stays on
             // the value stack; `generator_next` lifts it out before rewinding
@@ -2585,6 +2640,15 @@ impl VM {
                 let awaited = self.await_value(value, module)?;
                 self.set_value(dst, awaited)?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
+
+    /// `Call`/`CallEx`
+    fn run_call(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Control Flow =====
             Instr::Call { func, argc } => {
                 let func_id = func.as_immd();
@@ -2608,7 +2672,7 @@ impl VM {
                     )?;
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
                 match module.entry_pc(func_id as u32) {
                     Some(location) => {
@@ -2629,7 +2693,7 @@ impl VM {
                             closure_depth,
                             seh_depth,
                         });
-                        return Ok(());
+                        return Ok(true);
                     }
                     None => {
                         return Err(RuntimeError::ReferenceError(format!(
@@ -2658,15 +2722,24 @@ impl VM {
                     module,
                 )? {
                     // 帧已压好：接着跑被调方（不递归 —— 普通调用没有额外开销）。
-                    Control::Entered => return Ok(()),
+                    Control::Entered => return Ok(true),
                     // 结果已写进 `Rv`；收尾照跑（见 `CallMethod` 那条同名注释）。
-                    Control::Done => return Ok(()),
+                    Control::Done => return Ok(true),
                 }
             }
+            // 本组每一条分支都自己决定 pc（调用点自己推进），所以没有"落到组末尾"
+            // 的分支 —— match 各臂全部分歧，它就是函数的尾表达式。
+            _ => return Ok(false),
+        }
+    }
+
+    /// `Jump`/`DelayedJump`/`BrIf`
+    fn run_jump(&mut self, inst: &Instr, _module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             Instr::Jump { offset } => {
                 let offset = offset.as_immd();
                 self.state.jump_offset(offset);
-                return Ok(());
+                return Ok(true);
             }
             Instr::DelayedJump { target, seh_depth } => {
                 let offset = target.as_immd();
@@ -2695,7 +2768,7 @@ impl VM {
                         record.delayed_jump_target = Some(offset);
                     }
                     self.state.jump(finally_pc);
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 // No `finally` to run anywhere on the way out: leave the frames
@@ -2711,7 +2784,7 @@ impl VM {
                     self.state.seh_stack.pop();
                 }
                 self.state.jump(offset.max(0) as usize);
-                return Ok(());
+                return Ok(true);
             }
             Instr::BrIf { condition, true_target, false_target } => {
                 let cond = self.get_value(condition)?;
@@ -2722,10 +2795,17 @@ impl VM {
                     false_target.as_immd()
                 };
                 self.state.jump_offset(offset);
-                return Ok(());
+                return Ok(true);
             }
             // Opcode::Ret is handled directly in run()
+            // 跳转组的每条分支都自己设置 pc，同样没有落到组末尾的分支。
+            _ => return Ok(false),
+        }
+    }
 
+    /// `Mov`/`Push`/`Pop`/`AddC`/`SubC`
+    fn run_stack(&mut self, inst: &Instr, _module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Stack / Register Manipulation =====
             Instr::Mov { dst, src } => {
                 let value = self.get_value(src)?;
@@ -2759,7 +2839,15 @@ impl VM {
                     )));
                 }
             },
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `LoadConst`/`MakeRegExp`/`DeclareLexical`/`InitLexical`/`SetFunctionName`/`LoadEnv`
+    fn run_load(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Load Instructions =====
             Instr::LoadConst { dst, index } => {
                 let const_index = index.as_immd();
@@ -2833,7 +2921,15 @@ impl VM {
                     }
                 }
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `Addx`/`Subx`/`Mulx`/`Divx`/`Remx`/`Pow`/`Not`/`BitNot`/`BitAnd`/`Shl`/`Neg`
+    fn run_arith(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Arithmetic =====
             Instr::Addx { dst, lhs, rhs } => {
                 let lhs = self.get_value(lhs)?;
@@ -2956,7 +3052,15 @@ impl VM {
                 let result = -value;
                 self.set_value(dst, result)?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `And`/`Or`/`Greater`/`GreaterEqual`/`Less`/`LessEqual`/`Equal`/`NotEqual`/`StrictEqual`/`StrictNotEqual`
+    fn run_compare(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Logical =====
             Instr::And { dst, lhs, rhs } => {
                 let lhs = self.get_value(lhs)?;
@@ -3030,7 +3134,15 @@ impl VM {
                 let result = !lhs.strict_eq(&rhs);
                 self.set_value(dst, Value::Bool(result))?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `TypeOf`/`TypeOfEnv`/`InstanceOf`/`In`
+    fn run_type(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Type =====
             Instr::TypeOf { dst, src } => {
                 let value = self.get_value(src)?;
@@ -3148,7 +3260,15 @@ impl VM {
                 };
                 self.set_value(dst, Value::Bool(result))?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `DelegateOpen`/`DelegateClose`/`MakeIter`/`IterNext`/`IterClose`/`RequireObjectCoercible`/`MakeRest`
+    fn run_iteration(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Iteration =====
             Instr::DelegateOpen { iter } => {
                 let iter = self.get_value(iter)?;
@@ -3199,6 +3319,15 @@ impl VM {
                 arr.set_prototype(Some(Rc::clone(&self.builtins.array_prototype)));
                 self.set_value(dst, Value::Object(Rc::new(RefCell::new(arr))))?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
+
+    /// `CallSpread`/`CallSuperSpread`/`NewSpread`
+    fn run_call_spread(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             Instr::CallSpread { callee, this, args } => {
                 // operands: (callee, this, args-array); result goes to Rv.
                 let callee = self.get_value(callee)?;
@@ -3284,6 +3413,15 @@ impl VM {
                 let constructed = self.construct(&ctor, &args, module)?;
                 self.set_value(dst, constructed)?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
+
+    /// `ToString`/`ToNumber`
+    fn run_convert(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             Instr::ToString { dst, src } => {
                 let src = self.get_value(src)?;
                 let s = match self.to_primitive(&src, "string", module) {
@@ -3302,7 +3440,15 @@ impl VM {
                 };
                 self.set_value(dst, Value::Number(prim.to_number()))?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `MakeArray`/`ArrayPushSpread`/`MarkHole`/`ArrayPush`
+    fn run_array(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Object/Array Operations =====
             Instr::MakeArray { dst } => {
                 let mut arr = crate::vm::object::ArrayObject::new();
@@ -3357,7 +3503,7 @@ impl VM {
             }
             Instr::MarkHole { array } => {
                 let Value::Object(obj_ref) = self.get_value(array)? else {
-                    return Ok(());
+                    return Ok(true);
                 };
                 let mut borrowed = obj_ref.borrow_mut();
                 if let Some(arr) = borrowed
@@ -3388,6 +3534,15 @@ impl VM {
                     )),
                 }?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
+
+    /// `MakeObject`/`IndexGet`/`IndexSet`/`IndexDelete`/`Arguments`/`StoreEnv`/`CallMethod`
+    fn run_object(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             Instr::MakeObject { dst } => {
                 let mut obj = crate::vm::object::OrdinaryObject::new();
                 obj.set_prototype(Some(Rc::clone(&self.builtins.object_prototype)));
@@ -3558,7 +3713,7 @@ impl VM {
                         self.invoke(&method_val, obj_val.clone(), &args, module)?;
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 // `f.call(thisArg, …)` / `f.apply(thisArg, argsArray)` — the
@@ -3571,7 +3726,7 @@ impl VM {
                     let wrapper = self.make_bound(obj_val, this_arg, bound_args);
                     self.state.set_register(Register::Rv, wrapper)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 if (method_name == "call" || method_name == "apply") && obj_val.is_callable() {
@@ -3580,7 +3735,7 @@ impl VM {
                     let result = self.invoke(&obj_val, this_arg, &call_args, module)?;
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 // Array callback methods (`map`, `filter`, `reduce`, `sort`, …)
@@ -3590,7 +3745,7 @@ impl VM {
                 {
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 // A function replacer for `String.prototype.replace` runs here
@@ -3600,7 +3755,7 @@ impl VM {
                 {
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
                 // `then` / `catch` / `finally` likewise (they call the handler).
                 // This is the second method-call path — a chained call like
@@ -3610,7 +3765,7 @@ impl VM {
                 {
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 // First check: is this a static method on a native function (constructor)?
@@ -3621,7 +3776,7 @@ impl VM {
                         let result = self.object_assign(&args, module)?;
                         self.state.set_register(Register::Rv, result)?;
                         self.state.jump_offset(1);
-                        return Ok(());
+                        return Ok(true);
                     }
                     // Statics that read their inputs through `[[Get]]` (a
                     // descriptor object's fields may be accessors) can only be
@@ -3656,7 +3811,7 @@ impl VM {
                             Ok(result) => {
                                 self.state.set_register(Register::Rv, result)?;
                                 self.state.jump_offset(1);
-                                return Ok(());
+                                return Ok(true);
                             }
                             Err(err) if crate::builtins::is_unknown_builtin(&err) => {}
                             Err(err) => return Err(err),
@@ -3672,7 +3827,7 @@ impl VM {
                 {
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 // `matchAll` answers an iterator, which the builtin layer cannot
@@ -3684,7 +3839,7 @@ impl VM {
                 {
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 // Try built-in prototype method dispatch. As above: only
@@ -3693,7 +3848,7 @@ impl VM {
                     Ok(result) => {
                         self.state.set_register(Register::Rv, result)?;
                         self.state.jump_offset(1);
-                        return Ok(());
+                        return Ok(true);
                     }
                     Err(err) if crate::builtins::is_unknown_builtin(&err) => {}
                     Err(err) => return Err(err),
@@ -3707,7 +3862,7 @@ impl VM {
                 if matches!(method_val, Value::Undefined) {
                     self.state.set_register(Register::Rv, Value::Undefined)?;
                     self.state.jump_offset(1);
-                    return Ok(());
+                    return Ok(true);
                 }
                 // 其余全部交给统一入口（P1-2c）：原生原型方法 / 生成器方法 /
                 // async 方法 / 两种 callee 形状的开帧。`this` 是接收者；参数是
@@ -3736,7 +3891,7 @@ impl VM {
                     module,
                 )? {
                     // 帧已压好：接着跑被调方（不递归）。
-                    Control::Entered => return Ok(()),
+                    Control::Entered => return Ok(true),
                     // 结果已写进 `Rv`，**收尾照跑**，不再"跳过下一条指令"。
                     //
                     // 以前这里要多推进一步，因为被跳过的那条是 `movc rsp, rbp`：
@@ -3745,10 +3900,18 @@ impl VM {
                     // 收尾改成 `popc rsp`（复位到 `pushc rsp` 显式保存的"实参之后"）
                     // 之后，`rsp` 的复位不再依赖 `rbp` ⇒ `Entered` 与 `Done` 两条
                     // 路径的收尾**第一次完全一致**，这条隐式约定就此消失。
-                    Control::Done => return Ok(()),
+                    Control::Done => return Ok(true),
                 }
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `Try`/`EndTry`/`ThrowExc`/`LoadException`
+    fn run_exception(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Exception Handling =====
             Instr::Try { .. } => {
                 // **以 EH 表为准**（M1.1 之后它才可信：区域由编译期声明、配对是结构化的）。
@@ -3826,13 +3989,21 @@ impl VM {
                     }
                     _ => self.get_value(value)?,
                 };
-                return self.handle_throw(exc_val);
+                return self.handle_throw(exc_val).map(|_| true);
             }
             Instr::LoadException { dst } => {
                 let exc_val = self.state.get_register(Register::Rv)?;
                 self.set_value(dst, exc_val)?;
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `CreateClosure`/`New`
+    fn run_construct(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             // ===== Function/Closure =====
             Instr::CreateClosure { dst, func } => {
                 let func_id = func.as_immd();
@@ -3901,7 +4072,7 @@ impl VM {
                             let rv = self.construct(&ctor, &args, module)?;
                             self.state.set_register(Register::Rv, rv)?;
                             self.state.jump_offset(1);
-                            return Ok(());
+                            return Ok(true);
                         }
                         if borrowed.kind() == ObjectKind::Function {
                             if let Some(func_obj) =
@@ -3932,7 +4103,7 @@ impl VM {
                             let rv = self.native_construct(&name, &ctor, &args, None, module)?;
                             self.state.set_register(Register::Rv, rv)?;
                             self.state.jump_offset(1);
-                            return Ok(());
+                            return Ok(true);
                         } else {
                             return Err(RuntimeError::TypeError("not a constructor".to_string()));
                         }
@@ -4002,7 +4173,7 @@ impl VM {
                             closure_depth,
                             seh_depth,
                         });
-                        return Ok(());
+                        return Ok(true);
                     }
                     None => {
                         return Err(RuntimeError::ReferenceError(format!(
@@ -4011,6 +4182,15 @@ impl VM {
                     }
                 }
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
+
+    /// `LoadThis`/`LoadNewTarget`/`LoadCurrentFunction`/`MakeFuncObj`/`MakeArrowFuncObj`/`ClosureVar`/`CallNative`
+    fn run_function(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             Instr::LoadThis { dst } => {
                 if self.state.frames.last().map(|f| f.this_state) == Some(THIS_DERIVED_UNBOUND) {
                     return Err(self.this_not_initialized());
@@ -4167,7 +4347,15 @@ impl VM {
                     ));
                 }
             }
+            _ => return Ok(false),
+        }
+        self.state.jump_offset(1);
+        Ok(true)
+    }
 
+    /// `Halt`/`ResumeExc`
+    fn run_halt(&mut self, inst: &Instr, module: &Module) -> Result<bool, RuntimeError> {
+        match *inst {
             Instr::Halt {  }
               | Instr::Ret {  } => {
                 // These are handled in run(), not here
@@ -4232,17 +4420,17 @@ impl VM {
                             }
                             self.state.set_register(Register::Rv, exc)?;
                             self.state.jump(handler_pc);
-                            return Ok(());
+                            return Ok(true);
                         } else {
                             self.state.seh_stack.pop();
-                            return self.handle_throw(exc);
+                            return self.handle_throw(exc).map(|_| true);
                         }
                     } else if let Some(target_pc) = delayed_jump {
                         // Delayed jump after finally execution. `target_pc` is an
                         // absolute address (see Codegen for DelayedJump).
                         self.state.seh_stack.pop();
                         self.state.jump(target_pc.max(0) as usize);
-                        return Ok(());
+                        return Ok(true);
                     } else if delayed_return {
                         // Delayed return after finally execution: jump back to
                         // the function's trailing `Ret` (the return value is
@@ -4262,7 +4450,7 @@ impl VM {
                         {
                             self.state.jump(pc);
                         }
-                        return Ok(());
+                        return Ok(true);
                     }
                 } else if let Some(record) = self.state.seh_stack.last_mut() {
                     if record.in_finally {
@@ -4270,10 +4458,10 @@ impl VM {
                     }
                 }
             }
+            _ => return Ok(false),
         }
-
         self.state.jump_offset(1);
-        Ok(())
+        Ok(true)
     }
 
     /// Snapshot of an array-like receiver's elements (arrays and strings).
