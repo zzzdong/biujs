@@ -2200,65 +2200,53 @@ mod tests {
         }
     }
 
-    /// 从指令分派的源码里切出每条 arm：(opcode 名字列表, arm 全文)。
-    ///
-    /// `run_instruction` 现在只剩一张分派表，真正的 arm 住在各自的 `run_<group>`
-    /// 里，所以这里把源码里**每一处** `match *inst {` 都扫一遍 —— 少扫一处就少了
-    /// 一组指令，下面三条元测试的覆盖断言会立刻报出来。
+    /// 从 `run_instruction` 的源码里切出每条 arm：(opcode 名字列表, arm 全文)。
     ///
     /// arm 头一定在**基线缩进**（12 空格）且以 `Instr::` 开头；or-模式的续行是
     /// 14 空格 + `| Instr::`，不会被误当成新 arm。
-    fn run_instruction_arms(source: &str) -> Vec<(Vec<String>, String)> {
-        let mut arms = Vec::new();
-        // 按顶层方法切块。**要**的是各 `run_<group>` —— 实现住在那里。**不要**的是
-        // 另外两处同样 `match *inst {` 的地方：
-        //   * `run_instruction` 自己：P0-4 之后它只剩一张"指令 → 组"的分派表，
-        //     表里每条 opcode 的"实现"只有一句 `self.run_x(...)`，拿它当 arm 会让
-        //     下面三条断言全部看错对象；
-        //   * `step()`：那是按 `Kind` 的分类分派，只挑出 `Halt` / `Ret`。
-        for chunk in source.split("\n    fn ") {
-            let name: String = chunk
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if !name.starts_with("run_") || name == "run_instruction" {
-                continue;
-            }
-            let Some(m) = chunk.find("match *inst {") else {
-                continue;
-            };
-            let mut text = &chunk[m..];
-            // 组函数末尾的兜底臂与收尾语句不属于任何一条 arm，切掉，免得后面
-            // "arm 里含不含某段代码"的判断被它们污染。
-            if let Some(i) = text.find("            _ => return Ok(false),") {
-                text = &text[..i];
-            }
+    /// 指令分派住在哪些文件里 —— 下面三条元测试直接读这些源码取证。搬动文件后
+    /// 这里要跟着更新：漏掉一个，覆盖断言会立刻报出来，而不是悄悄少验一组指令。
+    fn vm_dispatch_sources() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("vm/mod.rs", include_str!("vm/mod.rs")),
+            ("vm/exec.rs", include_str!("vm/exec.rs")),
+        ]
+    }
 
-            let mut heads = Vec::new();
-            let mut cursor = 0;
-            for line in text.split_inclusive('\n') {
-                // 正好 12 个空格 + `Instr::` = arm 头；or-模式的续行是 14 空格 + `| `。
-                if line.starts_with("            Instr::") {
-                    heads.push(cursor);
+    /// 从各指令分派文件里切出每条 arm：(opcode 名字列表, arm 全文)。
+    ///
+    /// 只认名字以 `run_` 开头、且函数体里真的 `match *inst {` 的方法 —— 也就是
+    /// 各 `run_<group>`。两处同样 `match *inst {` 但**不是**实现的地方会被跳过：
+    /// `run_instruction` 自己（P0-4 之后只剩一张"指令 → 组"的分派表，每条
+    /// opcode 的"实现"只有一句 `self.run_x(...)`）和 `step()`（按 `Kind` 的
+    /// 分类分派，只挑出 `Halt` / `Ret`）。
+    ///
+    /// arm 头一定在**基线缩进**（12 空格）且以 `Instr::` 开头；or-模式的续行是
+    /// 14 空格 + `| Instr::`，不会被误当成新 arm。
+    fn run_instruction_arms(sources: &[(&str, &str)]) -> Vec<(Vec<String>, String)> {
+        let mut arms = Vec::new();
+        for (_path, source) in sources {
+            // 搬到 `exec.rs` 之后方法头多了 `pub(crate)` 前缀，切分前先归一掉，
+            // 好让两个文件里的同类方法被同样对待。
+            let normalized = source.replace("\n    pub(crate) fn ", "\n    fn ");
+            for chunk in normalized.split("\n    fn ") {
+                let name: String = chunk
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+                if !name.starts_with("run_") || name == "run_instruction" {
+                    continue;
                 }
-                cursor += line.len();
-            }
-            for (i, &h) in heads.iter().enumerate() {
-                let slice_end = heads.get(i + 1).copied().unwrap_or(text.len());
-                let arm = &text[h..slice_end];
-                let head = &arm[..arm.find("=>").expect("arm 没有 =>")];
-                let mut ops = Vec::new();
-                let mut idx = 0;
-                while let Some(p) = head[idx..].find("Instr::") {
-                    let s = idx + p + "Instr::".len();
-                    let name: String = head[s..]
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    ops.push(name);
-                    idx = s;
+                let Some(m) = chunk.find("match *inst {") else {
+                    continue;
+                };
+                let mut text = &chunk[m..];
+                // 组函数末尾的兜底臂与收尾语句不属于任何一条 arm，切掉，免得
+                // 后面"arm 里含不含某段代码"的判断被它们污染。
+                if let Some(i) = text.find("            _ => return Ok(false),") {
+                    text = &text[..i];
                 }
-                arms.push((ops, arm.to_string()));
+                collect_arms(text, &mut arms);
             }
         }
         assert!(
@@ -2266,6 +2254,38 @@ mod tests {
             "源码里一处 `match *inst {{` 都切不出 arm 了"
         );
         arms
+    }
+
+    /// 从一个 `match *inst { ... }` 的源码块里切出每条 arm。
+    ///
+    /// arm 头一定在**基线缩进**（12 空格）且以 `Instr::` 开头；or-模式的续行是
+    /// 14 空格 + `| Instr::`，不会被误当成新 arm。
+    fn collect_arms(text: &str, arms: &mut Vec<(Vec<String>, String)>) {
+        let mut heads = Vec::new();
+        let mut cursor = 0;
+        for line in text.split_inclusive('\n') {
+            if line.starts_with("            Instr::") {
+                heads.push(cursor);
+            }
+            cursor += line.len();
+        }
+        for (i, &h) in heads.iter().enumerate() {
+            let slice_end = heads.get(i + 1).copied().unwrap_or(text.len());
+            let arm = &text[h..slice_end];
+            let head = &arm[..arm.find("=>").expect("arm 没有 =>")];
+            let mut ops = Vec::new();
+            let mut idx = 0;
+            while let Some(p) = head[idx..].find("Instr::") {
+                let s = idx + p + "Instr::".len();
+                let name: String = head[s..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                ops.push(name);
+                idx = s;
+            }
+            arms.push((ops, arm.to_string()));
+        }
     }
 
     /// **元测试**：kind 标记说的是"这条指令执行时会发生什么"，而唯一能证明它没说谎的
@@ -2277,8 +2297,8 @@ mod tests {
     /// 它们能跑 JS，但自身形状不是"一次调用"，仍算 `Normal`。
     #[test]
     fn kind_matches_the_vm_implementation() {
-        let source = include_str!("vm/mod.rs");
-        let arms = run_instruction_arms(source);
+        let source = vm_dispatch_sources();
+        let arms = run_instruction_arms(&source);
 
         // 覆盖性：表里的每一条都要能在这段源码里找到（也就顺带验证了上面的切分器
         // 没有漏掉多行模式）。
@@ -2373,7 +2393,7 @@ mod tests {
     /// 这样一来 `desc()` 里的读写集**不是**第三份人肉维护的知识，而是被实现校验过的派生。
     #[test]
     fn roles_match_the_vm_implementation() {
-        let arms = run_instruction_arms(include_str!("vm/mod.rs"));
+        let arms = run_instruction_arms(&vm_dispatch_sources());
 
         // 两处例外：`-1`（"无操作数"）约定让 VM 先 match 字段再取值，于是证据长成
         //     match value { Operand::Immd(-1) => …, src => self.get_value(src)? }
@@ -2496,7 +2516,7 @@ mod tests {
     /// 现在有两个断言钉住它（P0b 的类型收紧要靠它决定 `RelPc` / `AbsPc`）。
     #[test]
     fn jump_offsets_are_relative_or_absolute() {
-        let arms = run_instruction_arms(include_str!("vm/mod.rs"));
+        let arms = run_instruction_arms(&vm_dispatch_sources());
         let arm_of = |want: &str| {
             arms.iter()
                 .find(|(ops, _)| ops.iter().any(|o| o == want))
