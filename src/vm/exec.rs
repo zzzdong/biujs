@@ -28,6 +28,26 @@ impl VM {
     /// to continue. This is factored out so that other methods can run a nested
     /// execution loop (e.g. for re-entrant function calls such as ToPrimitive).
     pub(crate) fn step(&mut self, module: &Module) -> Result<bool, RuntimeError> {
+        // ── GC 安全点 ──
+        //
+        // `alloc()` 内部**绝不**触发收集（INV-4）：那会在调用方栈上的临时 `Gc`
+        // 还没入根时就把对象收走。收集只在这里 —— **指令边界** —— 发生，此刻
+        // 所有活着的 JS 值都在 VM 的状态里（`data_stack` / `registers` / `frames`…），
+        // 由 `Trace for VM` 精确枚举。
+        //
+        // 两段式借用：先 `&self` 收根，再 `&mut self.heap` 收集。
+        //
+        // **`invoke_boundaries` 非空 ⇒ 跳过收集**：此刻正有一段由原生内建驱动的
+        // 调用在飞行中（`Array.prototype.map` 的回调、Map/Set 构造器的迭代协议、
+        // `JSON.parse` 的 reviver…），那些原生把 `Value` 握在 **Rust 局部变量**里，
+        // 而收集器看不见机器栈 —— 收一次就会把它们收走（GC stress 实测 6 条失败：
+        // "Map constructor: 'set' is not callable"）。宿主侧入根（`Scope`）是正解，
+        // 但在那之前，这是不让收集器踩空的闸门。
+        if self.invoke_boundaries.is_empty() && self.heap.should_collect() {
+            let mut roots = crate::vm::gc::Worklist::new();
+            crate::vm::gc::Trace::trace(self, &mut roots);
+            self.heap.collect(roots);
+        }
         // Borrowed, not cloned: `module` and `self` are distinct, so the
         // instruction can be matched in place — no 48-byte copy per step.
         let inst = match module.instructions.get(self.state.pc()) {

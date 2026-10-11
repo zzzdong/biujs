@@ -363,3 +363,34 @@ pub fn native_next(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────
+// GC：迭代器的子引用（INV-3）
+// ─────────────────────────────────────────────────────────
+
+use crate::vm::gc::{Trace, Worklist};
+
+impl Trace for NativeIteratorState {
+    fn trace(&self, out: &mut Worklist) {
+        match self {
+            NativeIteratorState::Array { items, .. } => items.trace(out),
+            NativeIteratorState::String { chars, .. } => chars.trace(out),
+            NativeIteratorState::Js { iterator } => iterator.trace(out),
+            NativeIteratorState::Map { map, .. } => map.trace(out),
+            NativeIteratorState::Set { set, .. } => set.trace(out),
+        }
+    }
+}
+
+impl Trace for NativeIteratorObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.iterator_fn.trace(out);
+        self.next_fn.trace(out);
+        self.return_fn.trace(out);
+        // 绝不 panic：正在被可变借用时跳过（INV-5）。
+        if let Ok(state) = self.state.try_borrow() {
+            state.trace(out);
+        }
+    }
+}

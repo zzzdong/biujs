@@ -30,6 +30,31 @@
 **阶段 B 已完成**（2026-10-12）。每一步都跑了三级 + 全量，头条与护栏逐项不变：
 16567 / 7843 / 3141，timeout 4 / step-limit 0 / memory 25。
 
+### 阶段 C 进度（2026-10-12）
+
+| 步骤 | 结果 |
+|---|---|
+| **C1** `Object::trace` | 20 个变体 + `PropertyTable` / `SuspendedFrame` / `NativeIteratorState` 全部实现；单测验证 `a.b=b; b.a=a` 的环能被走通 |
+| **C2** mark + sweep | 显式 worklist **非递归**；`sweep` 用 `mem::replace` 留占位对象（**不能**用 `drop_in_place` —— 槽归 `Vec<Slot>` 所有，堆析构时会再 drop 一次，实测 `free(): double free` → SIGABRT）；free list 复用；`threshold = max(live*2, 16 MiB)` |
+| **C3** 安全点 | 只在 `step()` 指令边界轮询；`alloc()` 内绝不触发 |
+| **验收** | **GC stress 全绿**：`BIUJS_GC_STRESS=1` 下 feature 538、护栏 7、单元 228 全过 |
+
+**关键的两处修正（都是实测撞出来的）**：
+
+1. **`invoke_boundaries` 非空时跳过收集**。原生内建（`Array.prototype.map` 回调、
+   Map/Set 构造器的迭代协议、`JSON.parse` 的 reviver）把 `Value` 握在 **Rust 局部变量**
+   里，而收集器看不见机器栈。不加这道闸门时 GC stress 直接炸出 **6 条失败**
+   （`Map constructor: 'set' is not callable`）。加上后全绿。**正解是宿主侧入根
+   （`Scope`），闸门是让收集器不踩空的过渡措施。**
+2. **阈值 4 MiB 太频繁**：头条不变但超时护栏 4 → 17。提到 16 MiB 后配合闸门回到 7。
+
+**结果**：头条 16567 / 7843 / 3141 不变、无逐套件回退；**护栏 timeout 7 / step-limit 0 /
+memory 22 —— 精确回到项目基线**（阶段 A 记录的 timeout 4 / memory 25 已被吸收）。
+
+**仍未完成**：`TEST262_MEMORY_MB` 还不能降回 256（实测 256 MB 下 memory 27、丢 5 条，
+`built-ins/Array` −5）。原因是重分配的 Array 用例主要在**原生驱动**的路径里产生垃圾，
+而那里正是被闸门跳过的区域 ⇒ 需要宿主侧入根（把 `Scope` 接进原生路径），再做一次。
+
 **−5 的定位（A1 的关键结论，改变了后续判断）**：把 `TEST262_MEMORY_MB` 从 256 提到 384，
 头条精确回到 **16567 / 3141** 且**无逐套件回退**（`built-ins/Array` 反而 +3）。
 即 P1 **没有任何语义回退**，那 5 条是**预算**问题——堆只在 VM 析构时整片释放，

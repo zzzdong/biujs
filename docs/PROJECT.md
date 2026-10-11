@@ -27,7 +27,7 @@
 | test262 执行 / 通过 / 跳过 / 失败 | 19708 / **16567** / 7843 / 3141 |
 | 通过率 | **84.06%** |
 | 单元 / feature / 护栏 | 211 / 538（4 ignored）/ 7 |
-| 护栏计数 | timeout 4、step-limit 0、memory 25（`TEST262_MEMORY_MB=384`，见 §5.7） |
+| 护栏计数 | timeout 7、step-limit 0、memory 22（`TEST262_MEMORY_MB=384`，见 §5.7） |
 | 全量墙钟 | 约 450s（串行 4 分片，单片 `ulimit -v` 4 GB） |
 | 源码规模 | 45 个 `.rs`，约 40.7k 行 |
 
@@ -72,8 +72,10 @@ BIUJS_DUMP=1 ./target/release/biujs file.js   # 打印字节码
 7. **`TEST262_MEMORY_MB` 现在是 384，不是 256**。P1 之后堆只在 VM 析构时整片释放、
    单次 `run` 内不回收，单用例内存峰值上升。实测同一次改动下：256 MB → 通过 16562 /
    memory 30（比基线 −5）；384 MB → 通过 16567 / memory 25（与基线逐项相同、无逐套件
-   回退）。这是**已量化的预期漂移**，不是掩盖——正解是 mark-sweep 收集器
-   （`docs/GC-DESIGN.md`），做完后预算降回 256。
+   回退）。这是**已量化的预期漂移**，不是掩盖。
+   **收集器上线后**（`docs/GC-DESIGN.md`）：384 MB 下护栏已回到 timeout 7 / memory 22
+   ——即本文 §3 记的项目基线。但 256 MB 下仍差 5 条（memory 27、`built-ins/Array` −5），
+   所以预算维持 384。差的那 5 条要靠"宿主侧入根"（把 `Scope` 接进原生内建路径）才能补上。
 
 ## 6. 文档地图
 

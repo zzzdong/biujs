@@ -462,6 +462,13 @@ impl crate::vm::gc::Trace for Builtins {
     }
 }
 
+impl crate::vm::gc::Trace for ProtoObject {
+    fn trace(&self, out: &mut crate::vm::gc::Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+    }
+}
+
 impl Builtins {
     pub fn new(heap: &mut Heap) -> Self {
         let object_proto = new_proto(heap, None, "Object");

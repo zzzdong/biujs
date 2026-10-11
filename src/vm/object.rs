@@ -4087,3 +4087,205 @@ impl JSObject for GeneratorObject {
         Ok(Value::string("[object Generator]"))
     }
 }
+
+// ─────────────────────────────────────────────────────────
+// GC：对象的**子引用**（`docs/GC-DESIGN.md` §8.1）
+//
+// ⚠️ 每个含 `Gc` / `Value` 字段的类型都必须在这里出现。**漏一个字段不会报错**，
+//    只会在某次收集之后读到一个已被回收的槽 —— 静默 UAF（INV-3）。
+//    新增这类字段时，必须同步补进来。
+//
+// **trace 绝不 panic**：内部 `RefCell` 一律用 `try_borrow()`，撞上正在进行的可变
+//    借用就跳过 —— 少标记一个对象只会让它多活一轮，绝不会造成 UAF（INV-5）。
+// ─────────────────────────────────────────────────────────
+
+use crate::vm::gc::{Trace, Worklist};
+
+impl Trace for PropertyTable {
+    fn trace(&self, out: &mut Worklist) {
+        for desc in self.values.values() {
+            desc.trace(out);
+        }
+    }
+}
+
+impl Trace for PropertyDescriptor {
+    fn trace(&self, out: &mut Worklist) {
+        self.value.trace(out);
+        self.getter.trace(out);
+        self.setter.trace(out);
+    }
+}
+
+impl Trace for OrdinaryObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+    }
+}
+
+impl Trace for ArrayObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+        self.elements.trace(out);
+    }
+}
+
+impl Trace for FunctionObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+        self.captured_this.trace(out);
+        self.captured_new_target.trace(out);
+        // `Vec<(String, Value)>`：容器 impl 覆盖不到元组，手工拆。
+        for (_, v) in &self.captured_vars {
+            v.trace(out);
+        }
+    }
+}
+
+impl Trace for NativeFunctionObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+    }
+}
+
+impl Trace for PrimitiveWrapperObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+        self.primitive.trace(out);
+    }
+}
+
+impl Trace for DateObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.base.trace(out);
+    }
+}
+
+impl Trace for RegExpObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.base.trace(out);
+    }
+}
+
+impl Trace for PromiseObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.base.trace(out);
+        self.value.trace(out);
+        self.reactions.trace(out);
+    }
+}
+
+impl Trace for GlobalObject {
+    fn trace(&self, out: &mut Worklist) {
+        // 全局对象的属性就是那个共享的 `store`（它不是 PropertyTable）。
+        if let Ok(store) = self.store.try_borrow() {
+            for v in store.values() {
+                v.trace(out);
+            }
+        }
+    }
+}
+
+impl Trace for ArrayBufferObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.base.trace(out);
+    }
+}
+
+impl Trace for TypedArrayObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.base.trace(out);
+        self.buffer.trace(out);
+    }
+}
+
+impl Trace for DataViewObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.base.trace(out);
+        self.buffer.trace(out);
+    }
+}
+
+impl Trace for ProxyObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.base.trace(out);
+        self.target.trace(out);
+        self.handler.trace(out);
+    }
+}
+
+impl Trace for MapObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+        // `Vec<Option<(Value, Value)>>`
+        for entry in &self.entries {
+            if let Some((k, v)) = entry {
+                k.trace(out);
+                v.trace(out);
+            }
+        }
+    }
+}
+
+impl Trace for SetObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+        for entry in &self.entries {
+            entry.trace(out);
+        }
+    }
+}
+
+/// WeakMap / WeakSet 的条目本轮**按强引用** trace。
+///
+/// 不 trace 会让一个仍可达的 WeakMap 读到已被回收的槽（UAF）；强 trace 的代价是
+/// "条目不回收" —— 与当前行为一致，无回归。真正的弱语义要 ephemeron marking，另做。
+impl Trace for WeakMapObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.inner.trace(out);
+    }
+}
+
+impl Trace for WeakSetObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.inner.trace(out);
+    }
+}
+
+impl Trace for SuspendedFrame {
+    fn trace(&self, out: &mut Worklist) {
+        self.data.trace(out);
+        self.this.trace(out);
+        self.function_val.trace(out);
+        self.closure_maps.trace(out);
+        self.registers.trace(out);
+        self.delegates.trace(out);
+        // `Vec<SehRecord>`：`Trace for SehRecord` 在 `vm::trace`。
+        self.seh.trace(out);
+    }
+}
+
+impl Trace for GeneratorObject {
+    fn trace(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.args.trace(out);
+        self.this.trace(out);
+        self.captured_new_target.trace(out);
+        for (_, v) in &self.captured_vars {
+            v.trace(out);
+        }
+        // `Option<Box<SuspendedFrame>>`：只在挂起期间有值。
+        self.suspended.trace(out);
+        self.iterator_fn.trace(out);
+        self.next_fn.trace(out);
+        self.return_fn.trace(out);
+        self.throw_fn.trace(out);
+    }
+}

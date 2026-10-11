@@ -132,15 +132,35 @@ impl<T> std::fmt::Debug for Gc<T> {
 /// 旧槽地址不动。
 pub struct Heap {
     chunks: Vec<Vec<Slot>>,
-    /// 已分配槽位的累计字节数（`alloc` 已是 `&mut self`，不需要 `Cell`）。
+    /// 已回收、可复用的槽（free list）。
+    free: Vec<NonNull<Slot>>,
+    /// mark 阶段的 worklist，**复用**（不每轮新建）。
+    mark_queue: Worklist,
+    /// 存活槽位的字节数（alloc 加、sweep 减）。
     bytes: usize,
+    /// 达到此值即触发收集。按存活量的倍数增长。
+    threshold: usize,
+    /// `BIUJS_GC_STRESS=1`：每次分配都收集（用于把 rooting bug 炸出来）。
+    /// **只读一次**环境变量（纪律 #2：路径上的东西不要每步读）。
+    stress: bool,
 }
+
+/// 收集阈值的下限。
+///
+/// 4 MiB（≈ 2 万个槽）实测**太频繁**：头条不变但超时护栏从 4 涨到 17 —— 每次收集
+/// 都要扫一遍全堆 + 遍历整个存活图，而多数脚本的存活量远小于此。16 MiB 是折中：
+/// 仍然把内存护栏压下来，但不至于把墙钟烧在重复扫描上。
+const MIN_THRESHOLD: usize = 16 * 1024 * 1024;
 
 impl Heap {
     pub fn new() -> Self {
         Self {
             chunks: Vec::new(),
+            free: Vec::new(),
+            mark_queue: Vec::new(),
             bytes: 0,
+            threshold: MIN_THRESHOLD,
+            stress: std::env::var_os("BIUJS_GC_STRESS").is_some(),
         }
     }
 
@@ -152,6 +172,22 @@ impl Heap {
     /// 唯一分配入口。`&mut self` 让"分配"与"借用已有对象"在类型层面互斥
     /// （borrow 走 `Gc`、不碰堆），因而不需要内部可变性。
     pub fn alloc(&mut self, obj: Object) -> Gc<Object> {
+        // 优先复用已回收的槽（否则内存不下降，等于没收集）。
+        // 槽里留着 sweep 放进去的占位对象，赋值会把它正常 drop 掉。
+        if let Some(ptr) = self.free.pop() {
+            let slot = unsafe { &mut *ptr.as_ptr() };
+            if let Ok(mut cell) = slot.cell.try_borrow_mut() {
+                *cell = obj;
+                slot.state.set(SlotState::Unmarked);
+                self.bytes += std::mem::size_of::<Slot>();
+                return Gc {
+                    ptr,
+                    _t: PhantomData,
+                };
+            }
+            // 极罕见：刚回收的槽正被借用 —— 退回 free list，走下面的新槽路径。
+            self.free.push(ptr);
+        }
         let per_chunk = Self::slots_per_chunk();
         let chunk = match self.chunks.last_mut() {
             Some(c) if c.len() < c.capacity() => c,
@@ -172,12 +208,110 @@ impl Heap {
         }
     }
 
-    /// 已分配槽位的累计字节数（近似值，用于调试）。
-    ///
-    /// 注意它**不含**对象内 `Vec` / `HashMap` 持有的堆外内存（数组元素、属性表才是
-    /// 大头），所以**不能**拿来当内存护栏的预算 —— 见 `docs/GC-DESIGN.md` §11。
+    /// 存活槽位的字节数（`docs/GC-DESIGN.md` §11：不含对象内 `Vec`/`HashMap`
+    /// 的堆外内存，所以**不作**内存护栏的预算）。
     pub fn bytes_allocated(&self) -> usize {
         self.bytes
+    }
+
+    /// 是否该收集了。由 VM 在安全点轮询 —— **`alloc` 内部绝不触发**（INV-4）。
+    pub(crate) fn should_collect(&self) -> bool {
+        self.stress || self.bytes >= self.threshold
+    }
+
+    /// 把所有 `Marked` 复位为 `Unmarked`（放弃本轮 / 收集结束都用它）。
+    fn reset_marks(&self) {
+        for chunk in &self.chunks {
+            for slot in chunk {
+                if slot.state.get() == SlotState::Marked {
+                    slot.state.set(SlotState::Unmarked);
+                }
+            }
+        }
+    }
+
+    /// 精确标记：从 `roots` 出发传播可达性。**非递归**（worklist），深链不爆栈。
+    ///
+    /// 返回 `false` 表示本轮撞上了正在进行的可变借用 —— 调用方必须**放弃本轮**，
+    /// 绝不能 panic（release 下 `panic = "abort"`，一次 panic 会带走整个进程及其
+    /// 所在分片的全部结果；INV-5）。
+    pub(crate) fn mark(&mut self, roots: Worklist) -> bool {
+        self.mark_queue.clear();
+        self.mark_queue.extend(roots);
+        while let Some(g) = self.mark_queue.pop() {
+            if g.state() == SlotState::Marked {
+                continue;
+            }
+            // 读/写标记位**不需要借用**对象（标记位在 `RefCell` 外面）。
+            g.set_state(SlotState::Marked);
+            let Ok(obj) = g.try_borrow() else {
+                return false;
+            };
+            obj.trace(&mut self.mark_queue);
+        }
+        true
+    }
+
+    /// 回收本轮未被标记的对象，返回回收的槽数。
+    ///
+    /// **为什么用 `mem::replace` 而不是 `drop_in_place`**：槽归 `Vec<Slot>` 所有，
+    /// 堆析构时每个槽会被再 drop 一次。若把对象"就地挖空"，那第二次 drop 就是
+    /// **双重释放**（实测 `free(): double free detected` → SIGABRT）。所以回收时
+    /// 必须往槽里留下一个**有效**的占位对象，再把旧对象取出来 drop。
+    ///
+    /// 另外：先把所有待回收对象挑出来、再逐个 drop（`mem::replace` 之后槽里立刻
+    /// 就是有效值），所以某个 `Drop` 读到别的 `Gc` 字段时读到的要么是原对象、
+    /// 要么是占位对象 —— 都是合法内存，不会 UAF。
+    pub(crate) fn sweep(&mut self) -> usize {
+        // 单遍扫描：同时挑出待回收的、并把 Marked 复位为 Unmarked
+        // （省掉一次全堆遍历 —— 回收是热的，全堆扫描是它的主要成本之一）。
+        let mut doomed: Vec<NonNull<Slot>> = Vec::new();
+        for chunk in &self.chunks {
+            for slot in chunk {
+                match slot.state.get() {
+                    SlotState::Unmarked => doomed.push(NonNull::from(slot)),
+                    SlotState::Marked => slot.state.set(SlotState::Unmarked),
+                    SlotState::Free => {}
+                }
+            }
+        }
+        let mut freed = 0;
+        for ptr in doomed {
+            let slot = unsafe { &mut *ptr.as_ptr() };
+            // 绝不 panic：正被借用就本轮先放着（下一轮再来）。
+            let Ok(mut cell) = slot.cell.try_borrow_mut() else {
+                continue;
+            };
+            let old = std::mem::replace(&mut *cell, Object::Ordinary(OrdinaryObject::new()));
+            drop(old);
+            slot.state.set(SlotState::Free);
+            self.free.push(ptr);
+            freed += 1;
+        }
+        self.bytes = self
+            .bytes
+            .saturating_sub(freed * std::mem::size_of::<Slot>());
+        freed
+    }
+
+    /// 一次完整的 mark + sweep。`roots` 由调用方（VM）吐出。
+    ///
+    /// 返回回收的槽数；`None` = 本轮放弃（撞上活跃借用，INV-5）。
+    pub(crate) fn collect(&mut self, roots: Worklist) -> Option<usize> {
+        if !self.mark(roots) {
+            self.reset_marks();
+            // 放弃本轮时把阈值抬高，避免在同样的借用状态下反复空转。
+            self.threshold = (self.bytes * 2).max(MIN_THRESHOLD);
+            return None;
+        }
+        let freed = self.sweep();
+        self.threshold = (self.bytes * 2).max(MIN_THRESHOLD);
+        Some(freed)
+    }
+
+    /// 已回收、等待复用的槽数（测试/调试用）。
+    pub(crate) fn free_len(&self) -> usize {
+        self.free.len()
     }
 }
 
@@ -255,10 +389,55 @@ impl<K, V: Trace> Trace for std::collections::HashMap<K, V> {
     }
 }
 
+impl<T: Trace> Trace for [T] {
+    fn trace(&self, out: &mut Worklist) {
+        for v in self {
+            v.trace(out);
+        }
+    }
+}
+
 impl<T: Trace, const N: usize> Trace for [T; N] {
     fn trace(&self, out: &mut Worklist) {
         for v in self {
             v.trace(out);
+        }
+    }
+}
+
+impl<T: Trace> Trace for Box<T> {
+    fn trace(&self, out: &mut Worklist) {
+        (**self).trace(out);
+    }
+}
+
+/// 对象的**子引用** —— mark 阶段由它把可达性传播下去。
+///
+/// 各变体的具体字段实现见 `object.rs` / `iterator.rs` / `builtins/mod.rs`
+/// （字段多为私有，所以实现必须写在各自的结构体所在模块）。
+impl Trace for Object {
+    fn trace(&self, out: &mut Worklist) {
+        match self {
+            Object::Ordinary(o) => o.trace(out),
+            Object::Array(o) => o.trace(out),
+            Object::Function(o) => o.trace(out),
+            Object::NativeFunction(o) => o.trace(out),
+            Object::PrimitiveWrapper(o) => o.trace(out),
+            Object::Date(o) => o.trace(out),
+            Object::RegExp(o) => o.trace(out),
+            Object::Promise(o) => o.trace(out),
+            Object::Global(o) => o.trace(out),
+            Object::ArrayBuffer(o) => o.trace(out),
+            Object::TypedArray(o) => o.trace(out),
+            Object::DataView(o) => o.trace(out),
+            Object::Proxy(o) => o.trace(out),
+            Object::Map(o) => o.trace(out),
+            Object::WeakMap(o) => o.trace(out),
+            Object::WeakSet(o) => o.trace(out),
+            Object::Set(o) => o.trace(out),
+            Object::Generator(o) => o.trace(out),
+            Object::NativeIterator(o) => o.trace(out),
+            Object::Proto(o) => o.trace(out),
         }
     }
 }
@@ -781,6 +960,39 @@ mod tests {
         assert!(!Gc::ptr_eq(&a, &b));
     }
 
+    /// 13b. 对象的**子引用**：`a.b = b; b.a = a` 这个环必须能被 trace 走通。
+    /// 漏一个字段不会报错，只会让活对象被回收（UAF）—— 所以这条是 INV-3 的守卫。
+    #[test]
+    fn trace_follows_object_children_through_a_cycle() {
+        let mut h = Heap::new();
+        let a = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        a.borrow_mut()
+            .property_set(key("b"), Value::Object(b))
+            .unwrap();
+        b.borrow_mut()
+            .property_set(key("a"), Value::Object(a))
+            .unwrap();
+
+        // 根 → a
+        let mut wl = Worklist::new();
+        Value::Object(a).trace(&mut wl);
+        assert_eq!(wl.len(), 1);
+        assert!(Gc::ptr_eq(&wl[0], &a));
+
+        // a → b（属性表里的 `Value::Object`）
+        let mut next = Worklist::new();
+        wl[0].try_borrow().expect("a 未被借用").trace(&mut next);
+        assert_eq!(next.len(), 1);
+        assert!(Gc::ptr_eq(&next[0], &b));
+
+        // b → a：环闭合
+        let mut back = Worklist::new();
+        next[0].try_borrow().expect("b 未被借用").trace(&mut back);
+        assert_eq!(back.len(), 1);
+        assert!(Gc::ptr_eq(&back[0], &a));
+    }
+
     /// 13. 非对象值不占根槽位（否则 LIFO 断言会对不上）。
     #[test]
     fn root_value_ignores_non_objects() {
@@ -788,6 +1000,74 @@ mod tests {
         let none = s.root_value(&Value::Number(1.0)).handle().is_none();
         assert!(none);
         assert!(s.roots().is_empty());
+    }
+
+    /// 14. 收集：不可达的被回收，可达的活着（**没误回收**的证明）。
+    #[test]
+    fn collect_reclaims_unreachable_objects() {
+        let mut h = Heap::new();
+        let live = h.alloc(Object::Ordinary(OrdinaryObject::with_class_name("live")));
+        let _garbage = h.alloc(Object::Ordinary(OrdinaryObject::with_class_name("garbage")));
+
+        assert_eq!(h.collect(vec![live]).expect("本轮没有活跃借用"), 1);
+        assert_eq!(h.free_len(), 1);
+        // 活着的那个仍然可读。
+        assert_eq!(live.borrow().class_name(), "live");
+        // 标记位已复位，供下一轮。
+        assert_eq!(live.state(), SlotState::Unmarked);
+    }
+
+    /// 15. **环能被回收** —— 这是整个 P1/P2 的动机
+    /// （`Builtins::teardown` 那条 23 项手工断环清单就是为了它存在的）。
+    #[test]
+    fn collect_reclaims_a_cycle() {
+        let mut h = Heap::new();
+        let a = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        a.borrow_mut()
+            .property_set(key("b"), Value::Object(b))
+            .unwrap();
+        b.borrow_mut()
+            .property_set(key("a"), Value::Object(a))
+            .unwrap();
+
+        // 只有 a 是根：b 经环可达 ⇒ 两个都活着。
+        assert_eq!(h.collect(vec![a]).expect("本轮没有活跃借用"), 0);
+        // 断掉根 ⇒ 整环不可达 ⇒ 两个都被回收。Rc 时代这是不可能的。
+        assert_eq!(h.collect(Vec::new()).expect("本轮没有活跃借用"), 2);
+    }
+
+    /// 16. 回收后的槽会被**复用** —— 否则内存不下降，等于没收集。
+    #[test]
+    fn freed_slots_are_reused() {
+        let mut h = Heap::new();
+        let keep = h.alloc(Object::Ordinary(OrdinaryObject::with_class_name("keep")));
+        let _tmp = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        h.collect(vec![keep]).expect("本轮没有活跃借用");
+
+        let before = h.bytes_allocated();
+        let reused = h.alloc(Object::Ordinary(OrdinaryObject::with_class_name("reused")));
+        assert_eq!(h.bytes_allocated(), before + std::mem::size_of::<Slot>());
+        assert_eq!(h.free_len(), 0);
+        assert_eq!(reused.borrow().class_name(), "reused");
+    }
+
+    /// 17. trace 撞上正在进行的可变借用 ⇒ **放弃本轮**，绝不 panic（INV-5）。
+    /// release 下 `panic = "abort"`，一次 panic 会带走整个进程及其分片的全部结果。
+    #[test]
+    fn collect_gives_up_instead_of_panicking() {
+        let mut h = Heap::new();
+        let a = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        a.borrow_mut()
+            .property_set(key("b"), Value::Object(b))
+            .unwrap();
+
+        let _guard = b.borrow_mut(); // b 正被可变借用
+        assert!(h.collect(vec![a]).is_none());
+        assert_eq!(h.free_len(), 0, "放弃的那一轮什么都不能回收");
+        // 标记位已复位 ⇒ 下一轮可以正常进行。
+        assert_eq!(a.state(), SlotState::Unmarked);
     }
 
     /// 6. 枚举转发在 3 个变体上一致。

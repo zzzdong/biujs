@@ -74,7 +74,10 @@ impl Trace for BoundFunction {
 
 impl Trace for State {
     fn trace(&self, out: &mut Worklist) {
-        self.data_stack.trace(out);
+        // 只 trace **活跃**的那一段：`rsp` 以上是已经弹出的槽，把它们当根会白白
+        // 留住垃圾（`data_stack.len()` 是历史最高水位，不是当前栈顶）。
+        let live = self.rsp.min(self.data_stack.len());
+        self.data_stack[..live].trace(out);
         self.registers.trace(out);
         self.seh_stack.trace(out);
         // `globals` 刻意仍是 `Rc<RefCell<..>>`：它不是堆对象，是全局对象的另一面视图。
@@ -127,6 +130,8 @@ mod tests {
         let mut vm = VM::new();
         let g = vm.heap.alloc(Object::Ordinary(OrdinaryObject::new()));
         vm.state.data_stack.push(Value::Object(g));
+        // `rsp` 是活跃栈顶，push 必然伴随它前进（`State::trace` 只 trace `..rsp`）。
+        vm.state.rsp = vm.state.data_stack.len();
         assert!(traced_contains(&vm, &g));
     }
 
