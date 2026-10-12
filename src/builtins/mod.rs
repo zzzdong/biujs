@@ -715,12 +715,64 @@ impl Builtins {
         Self::link_constructor_prototype(&dv_fn_val, &dv_proto);
         globals.insert("DataView".to_string(), dv_fn_val);
 
+        // ── `%TypedArray%`（ES 22.2.1）──
+        //
+        // 八个视图构造器的 `[[Prototype]]`，其 `.prototype` 承载全部共享方法。
+        // **它是内建，不是全局变量** —— ES 里没有 `TypedArray` 这个全局；test262
+        // 通过 `Object.getPrototypeOf(Uint8Array)` 取到它
+        // （`harness/testTypedArray.js` 就是这么定义的）。
+        //
+        // 以前这个基类根本不存在：每个视图 prototype 直接挂 `Object.prototype`，
+        // 共享方法在八个 prototype 上各注册一份。于是 `built-ins/TypedArray` 整批
+        // 用例拿不到 `%TypedArray%`（实测 882 条失败，`Symbol.species/*` 报
+        // "Cannot read properties of undefined (reading 'get')"）。
+        let ta_proto = new_proto(heap, Some(self.object_prototype), "TypedArray");
+        // 共享方法在基类上注册一份；具体 prototype 仍各自持有一份（历史行为，
+        // 与 `%TypedArray%.prototype` 上的重复，留待去重）。
+        typedarray::register_typedarray_prototype(
+            typedarray::TYPED_ARRAY_KINDS[0],
+            &ta_proto,
+            heap,
+        );
+        let ta_ctor = Value::Object(heap.alloc(Object::NativeFunction(
+            NativeFunctionObject::new("TypedArray"),
+        )));
+        Self::link_constructor_prototype(&ta_ctor, &ta_proto);
+        let ta_ctor_gc = match &ta_ctor {
+            Value::Object(g) => *g,
+            _ => unreachable!("刚分配的构造器"),
+        };
+        if let Value::Object(ta_obj) = &ta_ctor {
+            // `%TypedArray%[Symbol.species]`（22.2.2.4）：返回接收者的取值器，
+            // `length` 0、`configurable` true、`set` 为 undefined。
+            let species_getter = Value::Object(heap.alloc(Object::NativeFunction(
+                NativeFunctionObject::new(typedarray::TA_SPECIES_NATIVE),
+            )));
+            let _ = ta_obj.borrow_mut().define_property(
+                species_symbol_key(),
+                PropertyDescriptor {
+                    value: Value::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: Some(species_getter),
+                    setter: None,
+                },
+            );
+        }
+
         for kind in typedarray::TYPED_ARRAY_KINDS {
             let name = kind.name();
-            let proto = new_proto(heap, Some(self.object_prototype), name);
+            // 具体 prototype 继承 `%TypedArray%.prototype`，而非 `Object.prototype`。
+            let proto = new_proto(heap, Some(ta_proto), name);
             let ctor_val = Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(name),
             )));
+            // 构造器的 `[[Prototype]]` 指向 `%TypedArray%` —— `Object
+            // .getPrototypeOf(Uint8Array)` 必须拿到它。
+            if let Value::Object(ctor_gc) = &ctor_val {
+                ctor_gc.borrow_mut().set_prototype(Some(ta_ctor_gc));
+            }
             typedarray::register_typedarray_prototype(kind, &proto, heap);
             Self::link_constructor_prototype(&ctor_val, &proto);
             // `Uint8Array.BYTES_PER_ELEMENT` (ES 23.2.5.3), read-only.

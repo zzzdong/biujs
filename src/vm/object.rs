@@ -1655,6 +1655,9 @@ impl NativeFunctionObject {
         } else if self.name == crate::builtins::MAP_SPECIES_NATIVE
             || self.name == crate::builtins::SET_SPECIES_NATIVE
             || self.name == crate::builtins::PROMISE_SPECIES_NATIVE
+            // `%TypedArray%[Symbol.species]` 的取值器同样叫 "get [Symbol.species]"
+            // （22.2.2.4 —— `built-ins/TypedArray/Symbol.species/name.js` 断言它）。
+            || self.name == crate::builtins::typedarray::TA_SPECIES_NATIVE
         {
             "get [Symbol.species]".to_string()
         } else if self.name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
