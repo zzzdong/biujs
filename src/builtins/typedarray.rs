@@ -974,6 +974,9 @@ fn relative_index(argument: Option<&Value>, default: usize, length: usize) -> us
 
 pub fn register_arraybuffer_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
+    // 同 TypedArray 的 `subarray` / `slice`：这个闭包**永不被调用**，
+    // `ArrayBuffer.prototype.slice` 实际由 `call_prototype_method` 按名字分派到
+    // `ab_slice`（它需要 `heap`，而闭包签名拿不到）。
     set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("byteLength"),
@@ -1031,16 +1034,18 @@ pub fn register_arraybuffer_statics(ctor: &Value) {
     let _ = ctor;
 }
 
-/// One TypedArray prototype: the shared methods, the four getters,
-/// `BYTES_PER_ELEMENT`, and `Symbol.iterator` (the generic factory: a view is
-/// array-like, so iterating it reads `length` and the indices).
-pub fn register_typedarray_prototype(
-    kind: TypedArrayKind,
-    proto: &Gc<Object>,
-    heap: &mut Heap,
-) {
+/// `%TypedArray%.prototype` 的**共享**部分：方法族 + 四个取值器 + `Symbol.iterator`
+/// （泛型工厂：视图是类数组的，迭代时读 `length` 再读下标）。
+///
+/// 只应在 `%TypedArray%.prototype` 上调用一次 —— 八个具体 prototype 经原型链继承
+/// 即可。以前是八个 prototype 各注册一份（与基类重复），已去重；与类型有关的
+/// 那一项见 [`register_typedarray_bytes_per_element`]。
+pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
     set_prototype_method(proto, heap, "set", |this, args| ta_set(this, args));
+    // 下面这两个闭包**永不被调用**：`set_prototype_method` 只登记名字，实际分派
+    // 在 `call_prototype_method` 里按名字走（`ta_subarray` / `ta_slice`）。留着
+    // 只是为了满足签名，别被它误导成"subarray/slice 返回 undefined"。
     set_prototype_method(proto, heap, "subarray", |_this, _args| Ok(Value::Undefined));
     set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
     set_prototype_method(proto, heap, "fill", |this, args| ta_fill(this, args));
@@ -1073,10 +1078,6 @@ pub fn register_typedarray_prototype(
         PropertyKey::from_str("buffer"),
         accessor(heap, TA_BUFFER_NATIVE),
     );
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("BYTES_PER_ELEMENT"),
-        data(Value::Number(kind.bytes_per_element() as f64)),
-    );
     // Iterating a view yields its elements: the factory reads `length` (a getter
     // here, which the VM dispatches) and then the indices.
     let _ = proto.borrow_mut().define_property(
@@ -1084,6 +1085,17 @@ pub fn register_typedarray_prototype(
         super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME),
         )))),
+    );
+}
+
+/// 具体 prototype 上唯一**与类型有关**的一项：`BYTES_PER_ELEMENT`（ES 23.2.5.3）。
+///
+/// 它是数据属性且不可配置，所以必须逐类型给值 —— 不能放到共享基类上
+/// （`%TypedArray%.prototype` 上并没有这一项）。
+pub fn register_typedarray_bytes_per_element(kind: TypedArrayKind, proto: &Gc<Object>) {
+    let _ = proto.borrow_mut().define_property(
+        PropertyKey::from_str("BYTES_PER_ELEMENT"),
+        data(Value::Number(kind.bytes_per_element() as f64)),
     );
 }
 

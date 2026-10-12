@@ -18,11 +18,12 @@ P1 的 `Value::Object` 已从 `Rc<RefCell<dyn JSObject>>` 换成 `Gc<Object>`，
 | `&mut Heap` 形参 | 117 处 | 显式传堆，无 TLS |
 | `borrow()` / `borrow_mut()` 站点 | 235 处 | 文本不变（`Gc` 提供同名方法） |
 | `Gc::ptr_eq` | 14 处 | 取代 `Rc::ptr_eq` |
-| `as_any` / `downcast_ref` | 95 处 | 待去（见 §9） |
+| `as_any` / `downcast_ref` | 0 处（原 95） | **已去完**（§9），`dyn Any` 彻底消失 |
 
 - `dyn` 已消失：`Object` 是**具体枚举**（20 个变体，对应原 `JSObject` 的 20 个实现体）。
 - **`RefCell` 没有消失**，只是从各对象类型内部**上移到堆槽**：`chunks: Vec<Vec<RefCell<Object>>>`。
-- **P1 不回收**。堆归 `VM` 持有，VM 析构时整片释放。环的回收留给 P2。
+- **P1 不回收**（P2 的 mark-sweep 已落地：环与不可达对象现在都能回收，详见 §7；
+  这句是 P1 当时的状态）。堆归 `VM` 持有，VM 析构时整片释放。
 
 ---
 
@@ -312,11 +313,19 @@ self.threshold = (live_bytes * 2).max(MIN_THRESHOLD);
 
 ---
 
-## 9. 去 `as_any` / `downcast`（顺带）
+## 9. 去 `as_any` / `downcast` —— **已完成（2026-10-12）**
 
-`Object` 已是具体枚举，95 处 `obj.borrow().as_any().downcast_ref::<T>()` 应改成
-`if let Object::T(x) = &*obj.borrow()`。这是**纯机械替换**，不夹带语义变化——
-但要与槽改造（§4.2）**分开提交**（纪律 #6）。
+`Object` 已是具体枚举，原来的 `obj.borrow().as_any().downcast_ref::<T>()` 已全部去掉，
+分两个独立提交落地：
+
+1. 57 处**调用点**换成 `Object` 上的具名访问器（`as_array` / `as_array_mut` /
+   `is_typed_array` …）。与计划里写的"改成 `if let Object::T(x)` 枚举 match"略有偏差：
+   实际只有 27 处是单行 `if let` 形态，其余是跨行链式调用，改 match 会牵动大量多行
+   结构；访问器语义等价（同样是枚举判别，不再走 `dyn Any`），diff 小且可审。
+2. 删掉 42 处 `as_any` / `as_any_mut` **定义**（trait 声明 + 20 个结构体实现 +
+   `Object` 转发）。
+
+至此 `dyn Any` 与运行时类型 id 比较在本引擎里彻底消失 —— 剩下的只有枚举判别匹配。
 
 ---
 

@@ -138,7 +138,7 @@ pub struct Gc<T> { ptr: NonNull<RefCell<T>> }   // Copy，无 Drop、无引用�
 
 | # | 弱点 | 后果 |
 |---|---|---|
-| 1 | **P1 已有堆与句柄，但还没有回收器**：`Heap` 只在 VM 析构时整片释放，单次 `run` 内不回收 | 临时垃圾一直留到 run 结束 ⇒ 单用例内存峰值上升（实测 `TEST262_MEMORY_MB` 须 256→384 才维持原头条）。正解是 P2 的 mark-sweep，见 `docs/GC-DESIGN.md` |
+| 1 | **P1 已有堆与句柄，但还没有回收器**：`Heap` 只在 VM 析构时整片释放，单次 `run` 内不回收 | 临时垃圾一直留到 run 结束 ⇒ 单用例内存峰值上升（实测 `TEST262_MEMORY_MB` 曾须 256→384（P2 mark-sweep + 宿主侧入根落地后已**降回 256** 且回到原头条））。正解是 P2 的 mark-sweep，见 `docs/GC-DESIGN.md` |
 | 2 | 闭包是 `HashMap<String, Value>` 的**创建时快照** | "闭包共享可变单元"不成立（`counter()` 仍返回 `0,0,0`）—— 这是**语义 bug**，不是性能问题 |
 | 3 | 内建分派按名字字符串 | arity 表 / 前缀约定 / 旁路名单；加一个原型方法要动多处 |
 | 4 | `Value::Function(u32)` 双表示 | `strict_eq` 特判、`materialize_function`、`callable_func_id` |

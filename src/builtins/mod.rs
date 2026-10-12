@@ -729,11 +729,7 @@ impl Builtins {
         let ta_proto = new_proto(heap, Some(self.object_prototype), "TypedArray");
         // 共享方法在基类上注册一份；具体 prototype 仍各自持有一份（历史行为，
         // 与 `%TypedArray%.prototype` 上的重复，留待去重）。
-        typedarray::register_typedarray_prototype(
-            typedarray::TYPED_ARRAY_KINDS[0],
-            &ta_proto,
-            heap,
-        );
+        typedarray::register_typedarray_prototype(&ta_proto, heap);
         let ta_ctor = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new("TypedArray"),
         )));
@@ -787,7 +783,9 @@ impl Builtins {
             if let Value::Object(ctor_gc) = &ctor_val {
                 ctor_gc.borrow_mut().set_prototype(Some(ta_ctor_gc));
             }
-            typedarray::register_typedarray_prototype(kind, &proto, heap);
+            // 共享方法**不再**在这里注册 —— 它们在 `%TypedArray%.prototype` 上，
+            // 具体 prototype 经原型链继承。这里只放与类型有关的 `BYTES_PER_ELEMENT`。
+            typedarray::register_typedarray_bytes_per_element(kind, &proto);
             Self::link_constructor_prototype(&ctor_val, &proto);
             // `Uint8Array.BYTES_PER_ELEMENT` (ES 23.2.5.3), read-only.
             if let Value::Object(ctor_obj) = &ctor_val {
