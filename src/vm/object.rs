@@ -3289,6 +3289,46 @@ impl MapObject {
         self.entries.clear();
     }
 
+    // ── Ephemeron 支持（`WeakMap` 的弱语义，见 `docs/GC-DESIGN.md`） ──
+    //
+    // `WeakMap` 的条目是**弱引用**：键活着才保住值，键死了条目就该消失。
+    // 收集器在主 mark 阶段**不** trace 这些条目（`Trace for WeakMapObject` 只
+    // trace 自身属性与原型），否则键会被 map 自己保活，"weak" 就不成立。真正的
+    // 处理放在 mark 之后、sweep 之前的 ephemeron 阶段，由下面三个方法配合完成。
+
+    /// 只 trace 原型与自身属性 —— **不含条目**。
+    pub(crate) fn trace_shallow(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+    }
+
+    /// 把**键存活**的条目的值追加到 `out`，供收集器继续标记。
+    pub(crate) fn values_of_alive_keys(
+        &self,
+        alive: &dyn Fn(&Value) -> bool,
+        out: &mut Worklist,
+    ) {
+        for (k, v) in self.entries.iter().flatten() {
+            if alive(k) {
+                v.trace(out);
+            }
+        }
+    }
+
+    /// 删掉**键不存活**的条目（留墓碑，与 `delete` 一致），返回删掉的条数。
+    pub(crate) fn retain_alive_keys(&mut self, alive: &dyn Fn(&Value) -> bool) -> usize {
+        let mut removed = 0;
+        for slot in self.entries.iter_mut() {
+            if let Some((k, _)) = slot {
+                if !alive(k) {
+                    *slot = None;
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     /// The live entry at `idx`, skipping tombstones — the step a Map iterator
     /// makes. `None` means the iteration is finished.
     pub fn entry_from(&self, idx: usize) -> Option<(usize, Value, Value)> {
@@ -3416,11 +3456,12 @@ impl JSObject for MapObject {
 
 /// `WeakMap` instance.
 ///
-/// **Registered deviation (plan §8)**: the engine holds values in `Rc`, so
-/// entries are not collected when the key becomes unreachable — the "weak" part
-/// is not observable here. What *is* implemented is everything else the spec
-/// pins: object-only keys, no `size`, no iteration, no `clear`, and the
-/// `get`/`has`/`delete` non-object answers.
+/// **弱语义已落地**（`Heap::mark_ephemerons`）：条目**不**保活键，键死了条目就在
+/// 收集时被删掉；键活着则值被保住（含"值只被 WeakMap 指着"的情形 —— 由 ephemeron
+/// 阶段迭代到不动点处理）。`Trace` 只 trace 自身属性与原型，条目是弱引用。
+///
+/// 规格其余部分照旧：对象键、`get`/`has`/`delete` 对非对象的回答、无 `size`、
+/// 不可迭代、无 `clear`。
 #[derive(Debug)]
 pub struct WeakMapObject {
     inner: MapObject,
@@ -3449,6 +3490,17 @@ impl WeakMapObject {
 
     pub fn delete(&mut self, key: &Value) -> bool {
         self.inner.delete(key)
+    }
+
+    /// Ephemeron 阶段用：先把键存活的条目的值交给收集器标记，再删掉键已死的条目。
+    /// `alive` 由收集器给出（键的槽是否被 Marked）。返回删掉的条数。
+    pub(crate) fn weak_ephemeron_step(
+        &mut self,
+        alive: &dyn Fn(&Value) -> bool,
+        out: &mut Worklist,
+    ) -> usize {
+        self.inner.values_of_alive_keys(alive, out);
+        self.inner.retain_alive_keys(alive)
     }
 }
 
@@ -3538,7 +3590,7 @@ delegate_collection_object!(
     "WeakMap"
 );
 
-/// `WeakSet` instance — same deviation note as [`WeakMapObject`].
+/// `WeakSet` instance — 弱语义同 [`WeakMapObject`]（值即键，故只需"死了就删"）。
 #[derive(Debug)]
 pub struct WeakSetObject {
     inner: SetObject,
@@ -3562,6 +3614,12 @@ impl WeakSetObject {
 
     pub fn delete(&mut self, value: &Value) -> bool {
         self.inner.delete(value)
+    }
+
+    /// Ephemeron 阶段用：`WeakSet` 的值就是键，所以只需删掉已死的条目。
+    /// 返回删掉的条数。
+    pub(crate) fn weak_ephemeron_step(&mut self, alive: &dyn Fn(&Value) -> bool) -> usize {
+        self.inner.retain_alive(alive)
     }
 }
 
@@ -3639,6 +3697,31 @@ impl SetObject {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    // ── Ephemeron 支持（`WeakSet` 的弱语义） ──
+    //
+    // `WeakSet` 条目的值**就是**键，所以只需"值活着就留着，死了就删"，没有需要
+    // 额外标记的值（`MapObject` 那边还要标记值，见那里的同名注释）。
+
+    /// 只 trace 原型与自身属性 —— **不含条目**。
+    pub(crate) fn trace_shallow(&self, out: &mut Worklist) {
+        self.prototype.trace(out);
+        self.properties.trace(out);
+    }
+
+    /// 删掉**不存活**的条目（留墓碑，与 `delete` 一致），返回删掉的条数。
+    pub(crate) fn retain_alive(&mut self, alive: &dyn Fn(&Value) -> bool) -> usize {
+        let mut removed = 0;
+        for slot in self.entries.iter_mut() {
+            if let Some(v) = slot {
+                if !alive(v) {
+                    *slot = None;
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 
     /// The live value at or after `idx`, skipping tombstones (ES 23.2.5.2.1).
@@ -4124,15 +4207,21 @@ impl Trace for SetObject {
 ///
 /// 不 trace 会让一个仍可达的 WeakMap 读到已被回收的槽（UAF）；强 trace 的代价是
 /// "条目不回收" —— 与当前行为一致，无回归。真正的弱语义要 ephemeron marking，另做。
+/// `WeakMap` / `WeakSet` 的条目是**弱引用**，所以这里只 trace 自身属性与原型 ——
+/// **条目不 trace**，否则键会被容器自己保活，"weak" 就不成立。
+///
+/// 真正的处理在收集器的 ephemeron 阶段（mark 之后、sweep 之前）：键已标记 ⇒
+/// 把值标记（值可能牵出新的可达对象，故要迭代到不动点）；键未标记 ⇒ 条目删掉。
+/// 见 `Heap::mark_ephemerons`。
 impl Trace for WeakMapObject {
     fn trace(&self, out: &mut Worklist) {
-        self.inner.trace(out);
+        self.inner.trace_shallow(out);
     }
 }
 
 impl Trace for WeakSetObject {
     fn trace(&self, out: &mut Worklist) {
-        self.inner.trace(out);
+        self.inner.trace_shallow(out);
     }
 }
 

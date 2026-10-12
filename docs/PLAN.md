@@ -51,8 +51,10 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 
 **验收结果**：三级全绿（211 / 538 / 7）；全量 **16567 / 7843 / 3141（84.06%）**，
 **无逐套件回退**。唯一漂移是内存护栏：堆在单次 `run` 内不回收，单用例峰值上升，
-故 `TEST262_MEMORY_MB` 默认由 256 提到 384（成因已量化并定位，**正解是下面的 P2
-收集器**，届时预算可降回 256）。顺带收益：超时护栏 7 → 4（P1 更快）、
+故 `TEST262_MEMORY_MB` 默认曾由 256 提到 384（成因已量化并定位：那 5 条是**预算**问题，
+不是语义回退）。**P2 收集器 + 阶段 E 宿主侧入根完成后已降回 256** 且回到 16567
+（护栏 memory 22 → 12；代价是同一批 ~29 条问题用例从 memory 守卫挪到 timeout 守卫，
+timeout 7 → 17，无新增坏测试）。见 `docs/REFACTOR-HEAP-GC.md` §5 R3 / 阶段 E。
 `built-ins/Array` +3、`language/statements/class` +2、`built-ins/Object` +1。
 
 后续步骤见 `docs/REFACTOR-HEAP-GC.md`（阶段 B 铺路 / 阶段 C 收集器）。
@@ -62,7 +64,11 @@ test262 **84.06%**（16567 / 执行 19708）。剩下的 16% 绝大多数是**�
 1. `sweep` + free list + 阈值触发。
 2. **GC stress 模式**（每次分配都收集 + 释放时填 `0xDD`）跑 feature 全套，
    把所有 rooting bug 炸出来。
-3. 弱引用 → `WeakMap`/`WeakSet` 从"条目永不回收"改成真回收。
+3. **弱引用 → `WeakMap`/`WeakSet` 从"条目永不回收"改成真回收** —— **已完成**（2026-10-12，
+   ephemeron marking）：`Trace for WeakMapObject`/`WeakSetObject` 改为只 trace 自身属性与
+   原型（条目不再保活键），收集器在 mark 之后、sweep 之前补一遍 `Heap::mark_ephemerons`：
+   键已标记 ⇒ 标记值（迭代到不动点，因为标记一个值可能让*另一个* WeakMap 的键变活）；
+   键未标记 ⇒ 删掉条目。单测覆盖了"键死 ⇒ 键值皆回收、条目清空"与"键活 ⇒ 值被保住"两个方向。
 4. ~~护栏的堆预算改读 `Heap::bytes_allocated`~~ —— **已撤销**：该口径只算
    `size_of::<Object>()`，**不含**对象内 `Vec` / `HashMap` 持有的堆外内存
    （数组元素、属性表才是大头），比现有的全局分配器代理更差。见 `GC-DESIGN.md` §11。

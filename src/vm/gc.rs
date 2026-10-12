@@ -253,6 +253,68 @@ impl Heap {
         true
     }
 
+    /// Ephemeron 阶段：`WeakMap` / `WeakSet` 的**弱语义**（ES 23.3 / 23.4）。
+    ///
+    /// 主 mark **不** trace 弱容器的条目（`Trace for WeakMapObject` 只 trace 自身
+    /// 属性与原型），否则键会被容器自己保活，"weak" 就不成立。故这里在 mark 之后、
+    /// sweep 之前补一遍：
+    ///
+    /// - 键已 `Marked` ⇒ 该条目的**值**要标记（值可能牵出新的可达对象）
+    /// - 键未 `Marked` ⇒ 条目已死，删掉（留墓碑，与 `delete` 一致）
+    ///
+    /// **必须迭代到不动点**：标记一个值可能让*另一个* `WeakMap` 的键变活
+    /// （`wm1.set(a, wm2)` 而 `wm2` 只被这条引用 —— 单遍会漏掉）。标记是单调的，
+    /// 故循环必然终止。
+    ///
+    /// 返回 `false` 表示撞上活跃借用 ⇒ 调用方必须放弃本轮（INV-5）。
+    fn mark_ephemerons(&mut self) -> bool {
+        loop {
+            for chunk in &self.chunks {
+                for slot in chunk {
+                    // 容器本身不可达 ⇒ 条目随它一起消失，无需处理。
+                    if slot.state.get() != SlotState::Marked {
+                        continue;
+                    }
+                    let Ok(mut cell) = slot.cell.try_borrow_mut() else {
+                        return false;
+                    };
+                    // 槽的标记位在 `RefCell` 外面，判定存活不需要借用对象。
+                    let alive = |v: &Value| match v {
+                        Value::Object(g) => g.state() == SlotState::Marked,
+                        // ES 要求弱容器的键是对象；非对象不该出现，保活更安全。
+                        _ => true,
+                    };
+                    match &mut *cell {
+                        Object::WeakMap(wm) => {
+                            wm.weak_ephemeron_step(&alive, &mut self.mark_queue);
+                        }
+                        Object::WeakSet(ws) => {
+                            ws.weak_ephemeron_step(&alive);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // 排空 worklist：值牵出的新对象要标记，它们又可能让别的弱条目变活。
+            let mut progress = false;
+            while let Some(g) = self.mark_queue.pop() {
+                if g.state() == SlotState::Marked {
+                    continue;
+                }
+                g.set_state(SlotState::Marked);
+                progress = true;
+                let Ok(obj) = g.try_borrow() else {
+                    return false;
+                };
+                obj.trace(&mut self.mark_queue);
+            }
+            if !progress {
+                break;
+            }
+        }
+        true
+    }
+
     /// 回收本轮未被标记的对象，返回回收的槽数。
     ///
     /// **为什么用 `mem::replace` 而不是 `drop_in_place`**：槽归 `Vec<Slot>` 所有，
@@ -302,6 +364,12 @@ impl Heap {
         if !self.mark(roots) {
             self.reset_marks();
             // 放弃本轮时把阈值抬高，避免在同样的借用状态下反复空转。
+            self.threshold = (self.bytes * 2).max(MIN_THRESHOLD);
+            return None;
+        }
+        // 弱容器的条目要在 mark 之后、sweep 之前单独过一遍（ephemeron 语义）。
+        if !self.mark_ephemerons() {
+            self.reset_marks();
             self.threshold = (self.bytes * 2).max(MIN_THRESHOLD);
             return None;
         }
@@ -895,6 +963,71 @@ mod tests {
         let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         assert!(Gc::ptr_eq(&a, &a));
         assert!(!Gc::ptr_eq(&a, &b));
+    }
+
+    /// `WeakMap` 的**弱**语义：条目不该把自己的键（和值）保活。
+    ///
+    /// 根集里只有 WeakMap 本身；键与值都只被这条弱引用指着 ⇒ 收集后它们应当消失，
+    /// 条目本身也应当被 ephemeron 阶段清掉。
+    #[test]
+    fn weak_map_entries_do_not_keep_their_key_alive() {
+        let mut h = Heap::new();
+        let key = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        let val = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        let wm = h.alloc(Object::WeakMap(WeakMapObject::new(None)));
+        {
+            let mut b = wm.borrow_mut();
+            match &mut *b {
+                Object::WeakMap(m) => m.set(Value::Object(key), Value::Object(val)),
+                _ => unreachable!("刚分配的 WeakMap"),
+            }
+        }
+        // 根集只有 WeakMap —— key / val 都不在根里（收集器看不见机器栈上的它们）。
+        let mut roots = Worklist::new();
+        roots.push(wm);
+        h.collect(roots);
+        assert_eq!(key.state(), SlotState::Free, "WeakMap 的键不该被容器保活");
+        assert_eq!(val.state(), SlotState::Free, "键死了 ⇒ 值也不该留着");
+        let b = wm.borrow();
+        if let Object::WeakMap(m) = &*b {
+            assert!(
+                !m.has(&Value::Object(key)),
+                "键已死的条目应被 ephemeron 阶段删掉"
+            );
+        }
+    }
+
+    /// 反过来：键**存活**时，值必须被 ephemeron 阶段保住 ——
+    /// 否则"只被 WeakMap 指向的值"会被误收（静默丢失）。
+    #[test]
+    fn weak_map_keeps_the_value_when_its_key_is_alive() {
+        let mut h = Heap::new();
+        let key = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        let val = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        let wm = h.alloc(Object::WeakMap(WeakMapObject::new(None)));
+        {
+            let mut b = wm.borrow_mut();
+            match &mut *b {
+                Object::WeakMap(m) => m.set(Value::Object(key), Value::Object(val)),
+                _ => unreachable!("刚分配的 WeakMap"),
+            }
+        }
+        // 根集是 WeakMap **和键**：值只被这条弱引用指着 ⇒ 必须靠 ephemeron 保住。
+        let mut roots = Worklist::new();
+        roots.push(wm);
+        roots.push(key);
+        h.collect(roots);
+        assert_eq!(key.state(), SlotState::Unmarked, "键在根里 ⇒ 存活");
+        assert_eq!(
+            val.state(),
+            SlotState::Unmarked,
+            "键存活 ⇒ 值必须被 ephemeron 阶段标记保住"
+        );
+        let b = wm.borrow();
+        if let Object::WeakMap(m) = &*b {
+            assert!(m.has(&Value::Object(key)), "键存活 ⇒ 条目必须留着");
+            assert_eq!(m.get(&Value::Object(key)), Some(Value::Object(val)));
+        }
     }
 
     /// 4. 整堆释放：drop `Heap` 会析构堆内对象（用 `Rc` 强计数观测）。
