@@ -736,6 +736,24 @@ impl Builtins {
                         setter: None,
                     },
                 );
+                // `Uint8Array[Symbol.species]` (ES 23.2.2.2)：返回接收者的取值器。
+                // `slice` / `subarray` / `map` 都要查它，缺了就整批用例失败
+                // （实测 TypedArray 套件的 Symbol.species/* 全败，报
+                // "Cannot read properties of undefined (reading 'get')"）。
+                let species_getter = Value::Object(heap.alloc(Object::NativeFunction(
+                    NativeFunctionObject::new(typedarray::TA_SPECIES_NATIVE),
+                )));
+                let _ = ctor_obj.borrow_mut().define_property(
+                    species_symbol_key(),
+                    PropertyDescriptor {
+                        value: Value::Undefined,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        getter: Some(species_getter),
+                        setter: None,
+                    },
+                );
             }
             globals.insert(name.to_string(), ctor_val);
         }

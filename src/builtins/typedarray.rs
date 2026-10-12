@@ -176,6 +176,10 @@ pub const TYPED_ARRAY_KINDS: [TypedArrayKind; 9] = [
     TypedArrayKind::Float64,
 ];
 
+/// Native name of the `get Uint8Array[Symbol.species]` accessor (ES 23.2.2.2):
+/// 同 `Map` / `Set` / `Array` 的 species，取值器返回它的接收者。
+pub const TA_SPECIES_NATIVE: &str = "__typedarray_species__";
+
 /// The kind whose constructor is `name`, so the VM can route `new Uint8Array(…)`
 /// without a match of its own.
 pub fn kind_from_name(name: &str) -> Option<TypedArrayKind> {

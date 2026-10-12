@@ -139,6 +139,8 @@ impl VM {
         if name == crate::builtins::MAP_SPECIES_NATIVE
             || name == crate::builtins::SET_SPECIES_NATIVE
             || name == crate::builtins::PROMISE_SPECIES_NATIVE
+            // `%TypedArray%[Symbol.species]` (23.2.2.2) 同样是"返回接收者"。
+            || name == crate::builtins::typedarray::TA_SPECIES_NATIVE
         {
             return Ok(this);
         }
