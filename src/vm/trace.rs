@@ -107,6 +107,10 @@ impl Trace for VM {
         self.func_objs.trace(out);
         self.bound_functions.trace(out);
         self.revocable_proxies.trace(out);
+        // 宿主侧入根的 `Value`：原生内建握在 Rust 局部变量里、跨一次"回调进 JS"
+        // 仍然要用的那些。**漏了这一行，入根就等于没做** —— 收集时它们照样会被
+        // 回收（实测：GC stress 下 `Builtins.map_prototype` 被扫成占位对象）。
+        self.scope.roots().trace(out);
         // `invoke_boundaries` / `current_code` / 三个护栏字段 / 三个计数器都不是值。
     }
 }
@@ -175,6 +179,41 @@ mod tests {
             seh_depth: 0,
         });
         assert!(traced_contains(&vm, &g));
+    }
+
+    /// 内建的 23 个 prototype 必须是根（`Builtins::trace`）。
+    #[test]
+    fn vm_roots_include_the_builtins_prototypes() {
+        let vm = VM::new();
+        let mut wl = Worklist::new();
+        vm.trace(&mut wl);
+        assert!(
+            wl.iter().any(|g| Gc::ptr_eq(g, &vm.builtins.map_prototype)),
+            "Builtins::map_prototype 不在根集里"
+        );
+        assert!(wl.iter().any(|g| Gc::ptr_eq(g, &vm.builtins.object_prototype)));
+    }
+
+    /// `Map.prototype.set` 必须**经属性表**可达 —— 这是 GC stress 曾经炸出
+    /// "Map constructor: 'set' is not callable" 的那个对象。
+    #[test]
+    fn map_prototype_methods_are_reachable() {
+        let vm = VM::new();
+        let mut wl = Worklist::new();
+        vm.trace(&mut wl);
+        // 第一轮：Builtins 的 prototype
+        assert!(wl.iter().any(|g| Gc::ptr_eq(g, &vm.builtins.map_prototype)));
+        // 第二轮：从 map_prototype 传播一层，必须能摸到它的方法
+        let mut children = Worklist::new();
+        let proto = wl
+            .iter()
+            .find(|g| Gc::ptr_eq(g, &vm.builtins.map_prototype))
+            .expect("上面已断言过");
+        proto.try_borrow().expect("未被借用").trace(&mut children);
+        assert!(
+            !children.is_empty(),
+            "Map.prototype 没有任何子引用 —— 属性表没被 trace"
+        );
     }
 
     /// 反例：只活在 Rust 局部变量里的对象**不在**根集里 —— 这正是 `Root` 存在的理由。

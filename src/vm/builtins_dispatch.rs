@@ -789,6 +789,15 @@ impl VM {
         // Second argument is `thisArg`: undefined means "call with undefined
         // `this`" (only relevant for non-strict callbacks, but observable).
         let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+        // 宿主侧入根：`entries` 是**本地快照**（`array_like_entries` 拷出来的一份
+        // `Vec<Value>`），`callback` / `this_arg` 也是本地量 —— 而下面每次调用
+        // 用户回调都会跑字节码、到达 GC 安全点。收集器看不见机器栈，不登记的话
+        // 这些槽会被回收再分配，快照里就留下悬垂/占位对象
+        // （GC stress 实测：`species_target_receives_the_elements` 输出一串 hole）。
+        let _roots = self.root_all(&entries.iter().flatten().cloned().collect::<Vec<_>>());
+        let _root_cb = self.root(&callback);
+        let _root_this = self.root(&this_arg);
+        let _root_recv = self.root(receiver);
         // The callback's third argument is `O` — `ToObject(this value)` — not the
         // primitive receiver itself: `Array.prototype.reduce.call(false, cb, 1)`
         // is asserted with `obj instanceof Boolean`, which is only true for the

@@ -510,6 +510,24 @@ impl Scope {
     pub fn roots(&self) -> Vec<Gc<Object>> {
         self.roots.borrow().clone()
     }
+
+    /// 一次登记多个 `Value`（非对象值不占槽位）。`Drop` 时逆序注销。
+    pub fn root_all(self: Rc<Self>, vs: &[Value]) -> Roots {
+        let ptrs: Vec<Gc<Object>> = vs
+            .iter()
+            .filter_map(|v| match v {
+                Value::Object(g) => Some(*g),
+                _ => None,
+            })
+            .collect();
+        {
+            let mut roots = self.roots.borrow_mut();
+            for g in &ptrs {
+                roots.push(*g);
+            }
+        }
+        Roots::new(Rc::clone(&self), ptrs)
+    }
 }
 
 impl Default for Scope {
@@ -541,6 +559,33 @@ impl Drop for Root {
     fn drop(&mut self) {
         // Rust 局部变量**逆序** drop ⇒ 天然 LIFO，故可以直接断言（INV-6）。
         if let Some(g) = self.ptr {
+            let popped = self.scope.roots.borrow_mut().pop();
+            debug_assert!(
+                popped.is_some_and(|p| Gc::ptr_eq(&p, &g)),
+                "根栈必须 LIFO 弹出"
+            );
+        }
+    }
+}
+
+/// 一组根的守卫，用于一次登记多个 `Value`（例如某个原生存下来的**本地快照**）。
+///
+/// **`Drop` 必须逆序注销**：登记是正序压栈，而栈只能从顶上弹 —— 正序 drop 会
+/// 先把别人的根弹掉，`debug_assert` 会当场报出来。
+pub struct Roots {
+    scope: Rc<Scope>,
+    ptrs: Vec<Gc<Object>>,
+}
+
+impl Roots {
+    fn new(scope: Rc<Scope>, ptrs: Vec<Gc<Object>>) -> Self {
+        Self { scope, ptrs }
+    }
+}
+
+impl Drop for Roots {
+    fn drop(&mut self) {
+        while let Some(g) = self.ptrs.pop() {
             let popped = self.scope.roots.borrow_mut().pop();
             debug_assert!(
                 popped.is_some_and(|p| Gc::ptr_eq(&p, &g)),

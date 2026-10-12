@@ -257,14 +257,20 @@ pub struct VM {
     next_revoke_id: u32,
     /// Control-stack depth of the caller for each frame driven by
     /// `invoke_with_new_target` / `invoke_construct` (Rust-driven calls: native
-    /// callbacks, `call`/`apply`, `new` from a native).
-    ///
+    /// callbacks, `call`/`apply`, `new` from a native).    ///
     /// An exception raised inside such a frame must *not* be dispatched to a
     /// handler in the outer frame from within the nested loop: the native that
     /// requested the call (e.g. `Array.prototype.forEach`) has to see the error
     /// so it can abandon its own work. Records at or below the boundary are
     /// therefore turned back into `RuntimeError::Thrown` and propagated.
     invoke_boundaries: Vec<usize>,
+    /// 宿主侧根栈（`docs/GC-DESIGN.md` §6.2）。
+    ///
+    /// 收集器**看不见机器栈**，所以原生内建握在 Rust 局部变量里的 `Value`
+    /// 必须显式登记到这里。持有 `Rc`（而不是内嵌值）是为了让 `Root` 守卫
+    /// 不借任何东西 —— 否则一个存活的守卫会把整个 VM 锁住，native 就再也
+    /// 调不了 `self.invoke(..)`。
+    scope: std::rc::Rc<crate::vm::gc::Scope>,
     /// 对象堆。**声明在最后**，因此按字段声明顺序析构时 heap 晚于 `state` /
     /// `builtins` 释放 —— 这是 `Gc` 句柄不悬垂的前提（`Drop for VM` 体先于
     /// 所有字段析构运行，故 `clear_wrapper_prototypes()` 也早于堆释放）。
@@ -275,6 +281,20 @@ impl VM {
     /// Control-stack depth outside the innermost Rust-driven call frame, if any.
     fn invoke_boundary(&self) -> Option<usize> {
         self.invoke_boundaries.last().copied()
+    }
+
+    /// 把一个 `Value` 登记为**宿主侧根**，返回 RAII 守卫。
+    ///
+    /// 收集器看不见机器栈，所以原生内建握在 Rust 局部变量里的 `Value`
+    /// （跨一次"回调进 JS"仍然要用的那些）必须显式登记。守卫 `Drop` 时自动注销，
+    /// 且不借任何东西（持 `Rc`），所以登记后照样能继续调 `self.invoke(..)`。
+    fn root(&self, v: &Value) -> crate::vm::gc::Root {
+        std::rc::Rc::clone(&self.scope).root_value(v)
+    }
+
+    /// 一次登记多个 `Value`（例如原生留在本地的快照）。
+    fn root_all(&self, vs: &[Value]) -> crate::vm::gc::Roots {
+        std::rc::Rc::clone(&self.scope).root_all(vs)
     }
 
     /// Whether `val` carries the `length` + integer-key shape the
@@ -430,6 +450,7 @@ impl VM {
             revocable_proxies: HashMap::new(),
             next_revoke_id: 0,
             invoke_boundaries: Vec::new(),
+            scope: std::rc::Rc::new(crate::vm::gc::Scope::new()),
             heap,
         }
     }
@@ -1247,6 +1268,7 @@ impl VM {
         };
         let set_obj = crate::vm::object::SetObject::new(prototype);
         let set_val = Value::Object(self.heap.alloc(Object::Set(set_obj)));
+        let _root_set = self.root(&set_val);
 
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
@@ -1265,6 +1287,8 @@ impl VM {
                     "Set constructor: 'add' is not callable".to_string(),
                 ));
             }
+            // `adder` 同为主机侧局部量，整个循环里每次迭代都可能跑用户代码。
+            let _root_adder = self.root(&adder);
             loop {
                 let (value, done) = match self.iterator_next(iter.clone(), None, module) {
                     Ok(step) => step,
@@ -1632,6 +1656,7 @@ impl VM {
         };
         let map_obj = crate::vm::object::WeakMapObject::new(prototype);
         let map_val = Value::Object(self.heap.alloc(Object::WeakMap(map_obj)));
+        let _root_wm = self.root(&map_val);
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
             let iter = self.make_iterator(iterable, module)?;
@@ -1649,6 +1674,7 @@ impl VM {
                     "WeakMap constructor: 'set' is not callable".to_string(),
                 ));
             }
+            let _root_adder = self.root(&adder);
             loop {
                 let (item, done) = match self.iterator_next(iter.clone(), None, module) {
                     Ok(step) => step,
@@ -1704,6 +1730,7 @@ impl VM {
         };
         let set_obj = crate::vm::object::WeakSetObject::new(prototype);
         let set_val = Value::Object(self.heap.alloc(Object::WeakSet(set_obj)));
+        let _root_ws = self.root(&set_val);
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
             let iter = self.make_iterator(iterable, module)?;
@@ -1720,6 +1747,7 @@ impl VM {
                     "WeakSet constructor: 'add' is not callable".to_string(),
                 ));
             }
+            let _root_adder = self.root(&adder);
             loop {
                 let (value, done) = match self.iterator_next(iter.clone(), None, module) {
                     Ok(step) => step,
@@ -2044,6 +2072,9 @@ impl VM {
         };
         let map_obj = crate::vm::object::MapObject::new(prototype);
         let map_val = Value::Object(self.heap.alloc(Object::Map(map_obj)));
+        // 宿主侧入根：下面 `make_iterator` / 回调会一路跑字节码到达 GC 安全点，
+        // 而这个 map 只活在 Rust 局部变量里（收集器看不见机器栈）。
+        let _root_map = self.root(&map_val);
 
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
@@ -2064,6 +2095,9 @@ impl VM {
                     "Map constructor: 'set' is not callable".to_string(),
                 ));
             }
+            // `adder` 同样是宿主侧局部量，而整个循环里每次 `iterator_next`
+            // 都可能跑用户代码 ⇒ 必须入根。
+            let _root_adder = self.root(&adder);
             loop {
                 // 9.b–d: `IteratorStep` + `IteratorValue`, and 9.l: any abrupt
                 // completion closes the iterator before it is propagated.
