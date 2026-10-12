@@ -435,7 +435,17 @@ const IN_SCOPE_PENDING: &[&str] = &[
     // `Proxy` (B45) and `Reflect` (B44/B46) are implemented and their suites
     // are enrolled below, so neither is pending — this list is the
     // "not implemented yet" list only.
-    "TypedArray",
+    //
+    // `TypedArray` 已从这里摘掉（2026-10-13）：八个视图构造器、buffer /
+    // byteOffset / byteLength / length 四个取值器、set / subarray / slice / fill，
+    // 以及 indexOf / lastIndexOf / includes / join / reverse / at / copyWithin
+    // 都已落地，`built-ins/TypedArray` 也进了 `SUITES`。按 §2.2 的定义，
+    // "实现 + 摘标签 + 入分母"三步要一起做，只做前两步不会体现在任何数字上。
+    //
+    // 仍未实现（所以这批用例入池后会有失败，属预期）：需要回调的那一族
+    // （map / filter / reduce / every / some / forEach / find / findIndex / sort）
+    // 要走 VM 路径；`entries` / `keys` / `values`、`with` / `toReversed` /
+    // `toSorted` / `findLast*`，以及可分离（detached）缓冲区语义。
 ];
 
 /// Every feature tag whose tests this engine currently cannot pass.
@@ -879,6 +889,13 @@ const SUITES: &[&str] = &[
     "built-ins/Set",
     "built-ins/WeakMap",
     "built-ins/WeakSet",
+    // `built-ins/TypedArray` 入分母（2026-10-13）：视图类型与上面那批方法已实现，
+    // 同时把 `TypedArray` 从 `IN_SCOPE_PENDING` 里摘掉 —— 两步必须一起做，否则
+    // 套件虽然登记了、用例仍被 feature 标签跳过，数字纹丝不动（§2.2）。
+    // 入池后会出现一批失败，是"之前看不见的债"变成看得见的债，属预期。
+    // `built-ins/DataView` / `built-ins/ArrayBuffer` 暂不入池：前者 40%，缺的
+    // 是可分离缓冲区语义，先补完再说。
+    "built-ins/TypedArray",
     "built-ins/Math",
     "built-ins/NativeErrors",
     "built-ins/Number",
