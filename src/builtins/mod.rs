@@ -738,6 +738,20 @@ impl Builtins {
             NativeFunctionObject::new("TypedArray"),
         )));
         Self::link_constructor_prototype(&ta_ctor, &ta_proto);
+        // `%TypedArray%.from` / `%TypedArray%.of`（22.2.2.1 / 22.2.2.2）：要迭代、
+        // 可能回调、还要 `new C(len)`，只有 VM 能做 —— 故登记在这里、由 VM 分派
+        // （限定名 "TypedArray.from" / "TypedArray.of"）。八个具体构造器经
+        // `[[Prototype]]` 继承即可，不必各自再登记一份。
+        set_static_method(&ta_ctor, "from", heap, |_args| {
+            Err(RuntimeError::TypeError(
+                "TypedArray.from is dispatched by the VM".to_string(),
+            ))
+        });
+        set_static_method(&ta_ctor, "of", heap, |_args| {
+            Err(RuntimeError::TypeError(
+                "TypedArray.of is dispatched by the VM".to_string(),
+            ))
+        });
         let ta_ctor_gc = match &ta_ctor {
             Value::Object(g) => *g,
             _ => unreachable!("刚分配的构造器"),

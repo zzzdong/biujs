@@ -363,6 +363,17 @@ impl VM {
             if name == "Object.assign" {
                 return self.object_assign(args, module);
             }
+            // `%TypedArray%.from` / `%TypedArray%.of`：迭代、可选回调、再
+            // `new C(len)` —— 三样都只有 VM 能做。
+            if name == "TypedArray.from" {
+                let source = args.first().cloned().unwrap_or(Value::Undefined);
+                let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+                return self.typed_array_from(&this, &source, &mapfn, &this_arg, module);
+            }
+            if name == "TypedArray.of" {
+                return self.typed_array_of(&this, args, module);
+            }
             // `Map.groupBy(items, callbackfn)`: iterates and calls back.
             if name == "Map.groupBy" {
                 let items = args.first().cloned().unwrap_or(Value::Undefined);

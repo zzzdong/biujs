@@ -1936,6 +1936,76 @@ impl VM {
     /// it is the same iteration + callback machinery the `Map` constructor
     /// needs. Keys are used as-is (`SameValueZero`), with `-0` normalised —
     /// there is no `ToPropertyKey` coercion.
+    /// `%TypedArray%.from(source, mapfn, thisArg)`（ES 22.2.2.1）。
+    ///
+    /// 三步：迭代出元素 → 可选回调（会跑用户代码）→ `new C(len)` 再写入。
+    /// 回调期间 `items` 只活在 Rust 局部，故必须入根（收集器看不见机器栈）。
+    fn typed_array_from(
+        &mut self,
+        ctor: &Value,
+        source: &Value,
+        mapfn: &Value,
+        this_arg: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let mut items: Vec<Value> = Vec::new();
+        let iter = self.make_iterator(source.clone(), module)?;
+        loop {
+            let (value, done) = self.iterator_next(iter.clone(), None, module)?;
+            if done {
+                break;
+            }
+            items.push(value);
+        }
+        if mapfn.is_callable() {
+            let mut acc = self.roots();
+            for v in items.iter() {
+                acc.push(v);
+            }
+            for (i, v) in items.iter_mut().enumerate() {
+                let mapped = self.invoke(
+                    mapfn,
+                    this_arg.clone(),
+                    &[v.clone(), Value::Number(i as f64)],
+                    module,
+                )?;
+                *v = mapped;
+                acc.push(v);
+            }
+        }
+        let new_ta = self.construct(ctor, &[Value::Number(items.len() as f64)], module)?;
+        let _root = self.root(&new_ta);
+        if let Value::Object(o) = &new_ta {
+            let mut b = o.borrow_mut();
+            if let Some(ta) = b.as_typed_array_mut() {
+                for (i, v) in items.iter().enumerate() {
+                    ta.set_element(i, v.clone());
+                }
+            }
+        }
+        Ok(new_ta)
+    }
+
+    /// `%TypedArray%.of(...items)`（ES 22.2.2.2）：`new C(items.length)` 后写入。
+    fn typed_array_of(
+        &mut self,
+        ctor: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let new_ta = self.construct(ctor, &[Value::Number(args.len() as f64)], module)?;
+        let _root = self.root(&new_ta);
+        if let Value::Object(o) = &new_ta {
+            let mut b = o.borrow_mut();
+            if let Some(ta) = b.as_typed_array_mut() {
+                for (i, v) in args.iter().enumerate() {
+                    ta.set_element(i, v.clone());
+                }
+            }
+        }
+        Ok(new_ta)
+    }
+
     fn map_group_by(
         &mut self,
         items: &Value,
