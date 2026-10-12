@@ -30,10 +30,6 @@ pub trait JSObject: fmt::Debug + Any {
     /// Returns the runtime kind of this object (Ordinary, Array, Function, etc.)
     fn kind(&self) -> ObjectKind;
 
-    /// Downcasting support
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-
     // ── Property operations ──
 
     /// Get a property descriptor by key
@@ -459,13 +455,6 @@ impl JSObject for OrdinaryObject {
         ObjectKind::Ordinary
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.properties.get(key).cloned()
@@ -867,13 +856,6 @@ impl JSObject for ArrayObject {
         ObjectKind::Array
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         match key {
@@ -1399,13 +1381,6 @@ impl JSObject for FunctionObject {
         ObjectKind::Function
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.properties.get(key).cloned()
@@ -1730,13 +1705,6 @@ impl JSObject for NativeFunctionObject {
         ObjectKind::NativeFunction
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.properties.get(key).cloned()
@@ -1876,13 +1844,6 @@ impl JSObject for PrimitiveWrapperObject {
         }
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         if let Value::String(s) = &self.primitive {
@@ -2117,13 +2078,6 @@ impl JSObject for DateObject {
         ObjectKind::Date
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 
     // Everything below is the ordinary object behaviour, delegated: a Date has
     // no exotic properties, only an internal slot.
@@ -2244,13 +2198,6 @@ impl JSObject for RegExpObject {
         ObjectKind::RegExp
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         // `lastIndex`, `source`, `flags` and the boolean flag reads are the
@@ -2404,13 +2351,6 @@ impl JSObject for PromiseObject {
         ObjectKind::Promise
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.base.property_get(key)
@@ -2506,13 +2446,6 @@ impl JSObject for GlobalObject {
         ObjectKind::Ordinary
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         let name = Self::key_name(key)?;
@@ -2629,14 +2562,7 @@ impl ArrayBufferObject {
 impl JSObject for ArrayBufferObject {
     fn kind(&self) -> ObjectKind {
         ObjectKind::Buffer
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+    }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.base.property_get(key)
     }
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
@@ -2909,14 +2835,7 @@ impl TypedArrayObject {
 impl JSObject for TypedArrayObject {
     fn kind(&self) -> ObjectKind {
         ObjectKind::TypedArray
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+    }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         if let Some(index) = Self::canonical_index(key) {
             if index < self.length {
                 return Some(PropertyDescriptor {
@@ -3060,14 +2979,7 @@ impl DataViewObject {
 impl JSObject for DataViewObject {
     fn kind(&self) -> ObjectKind {
         ObjectKind::DataView
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+    }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.base.property_get(key)
     }
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
@@ -3172,14 +3084,7 @@ impl JSObject for ProxyObject {
         } else {
             "object"
         }
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+    }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         if self.revoked {
             return None;
         }
@@ -3403,13 +3308,6 @@ impl JSObject for MapObject {
         ObjectKind::Map
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.properties.get(key).cloned()
@@ -3561,13 +3459,6 @@ macro_rules! delegate_collection_object {
                 $kind
             }
 
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-
-            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-                self
-            }
 
             fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
                 self.$inner.property_get(key)
@@ -3765,13 +3656,6 @@ impl JSObject for SetObject {
         ObjectKind::Set
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.properties.get(key).cloned()
@@ -4003,13 +3887,6 @@ impl JSObject for GeneratorObject {
         ObjectKind::Generator
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         // Generators are iterable: `gen[Symbol.iterator]()` is `gen` itself.

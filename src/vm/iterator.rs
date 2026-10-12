@@ -188,13 +188,6 @@ impl JSObject for NativeIteratorObject {
         ObjectKind::Ordinary
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         // A native iterator is itself iterable: `it[Symbol.iterator]` is the

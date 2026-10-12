@@ -16,6 +16,7 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 use crate::builtins::ProtoObject;
 use crate::vm::iterator::NativeIteratorObject;
@@ -469,16 +470,19 @@ impl Scope {
     }
 
     /// 登记 `g` 为根。返回的守卫必须在 `g` 不再需要之前保持存活。
-    pub fn root(&self, g: Gc<Object>) -> Root<'_> {
+    ///
+    /// 取 `Rc<Self>`（而不是 `&self`）是因为守卫要能跨越 `vm.invoke(..)` 这类
+    /// `&mut self` 调用 —— 借用版会把整个 VM 锁住。克隆一个 `Rc` 很便宜。
+    pub fn root(self: Rc<Self>, g: Gc<Object>) -> Root {
         self.roots.borrow_mut().push(g);
         Root {
-            scope: self,
+            scope: Rc::clone(&self),
             ptr: Some(g),
         }
     }
 
     /// 登记 `v` 里的对象（非对象值不占根槽位）。
-    pub fn root_value(&self, v: &Value) -> Root<'_> {
+    pub fn root_value(self: Rc<Self>, v: &Value) -> Root {
         let ptr = match v {
             Value::Object(g) => Some(*g),
             _ => None,
@@ -486,15 +490,18 @@ impl Scope {
         if let Some(g) = ptr {
             self.roots.borrow_mut().push(g);
         }
-        Root { scope: self, ptr }
+        Root {
+            scope: Rc::clone(&self),
+            ptr,
+        }
     }
 
     /// 分配 + 立即入根，消掉"已分配、还没入根"这个窗口（`GC-DESIGN.md` §6.2）。
-    pub fn alloc(&self, heap: &mut Heap, obj: Object) -> (Gc<Object>, Root<'_>) {
+    pub fn alloc(self: Rc<Self>, heap: &mut Heap, obj: Object) -> (Gc<Object>, Root) {
         let g = heap.alloc(obj);
         self.roots.borrow_mut().push(g);
         (g, Root {
-            scope: self,
+            scope: Rc::clone(&self),
             ptr: Some(g),
         })
     }
@@ -516,13 +523,13 @@ impl Default for Scope {
 /// **不引入 `Rooted<'s, T>` 第二套值类型**（G2）：根的类型仍是 `Gc<Object>` / `Value`，
 /// 这里只是多一层"已登记"的担保。
 #[allow(dead_code)]
-pub struct Root<'s> {
-    scope: &'s Scope,
+pub struct Root {
+    scope: Rc<Scope>,
     /// 登记的那个句柄（非对象值为 `None`），只用于 `Drop` 时的 LIFO 断言。
     ptr: Option<Gc<Object>>,
 }
 
-impl Root<'_> {
+impl Root {
     /// 被登记的那个句柄（非对象值为 `None`）。
     #[allow(dead_code)]
     pub fn handle(&self) -> Option<Gc<Object>> {
@@ -530,7 +537,7 @@ impl Root<'_> {
     }
 }
 
-impl Drop for Root<'_> {
+impl Drop for Root {
     fn drop(&mut self) {
         // Rust 局部变量**逆序** drop ⇒ 天然 LIFO，故可以直接断言（INV-6）。
         if let Some(g) = self.ptr {
@@ -605,18 +612,6 @@ macro_rules! forward {
 impl Object {
     pub fn kind(&self) -> ObjectKind {
         forward!(self, kind)
-    }
-
-    /// 动态类型探测：把枚举内层具体对象作为 `&dyn Any` 暴露。
-    ///
-    /// `Object` 是具体枚举，但原先大量 `obj_ref.borrow().as_any().downcast_ref::<T>()`
-    /// 探测位点仍按 trait 对象写法存在；转发到各变体的 `JSObject::as_any` 即可原样工作。
-    pub fn as_any(&self) -> &dyn std::any::Any {
-        forward!(self, as_any)
-    }
-
-    pub fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        forward!(self, as_any_mut)
     }
 
     /// 若本对象是 Promise，返回其内部 `PromiseObject`（否则 `None`）。
@@ -931,13 +926,13 @@ mod tests {
     #[test]
     fn scope_registers_and_unregisters_roots() {
         let mut h = Heap::new();
-        let s = Scope::new();
+        let s = Rc::new(Scope::new());
         let a = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         assert!(s.roots().is_empty());
         {
-            let ra = s.root(a);
-            let rb = s.root(b);
+            let ra = Rc::clone(&s).root(a);
+            let rb = Rc::clone(&s).root(b);
             assert_eq!(s.roots().len(), 2);
             assert!(Gc::ptr_eq(&ra.handle().expect("已登记"), &a));
             assert!(Gc::ptr_eq(&rb.handle().expect("已登记"), &b));
@@ -950,8 +945,8 @@ mod tests {
     #[test]
     fn can_allocate_while_holding_a_root() {
         let mut h = Heap::new();
-        let s = Scope::new();
-        let (a, _ra) = s.alloc(&mut h, Object::Ordinary(OrdinaryObject::new()));
+        let s = Rc::new(Scope::new());
+        let (a, _ra) = Rc::clone(&s).alloc(&mut h, Object::Ordinary(OrdinaryObject::new()));
         // 守卫 `_ra` 还活着，分配仍然可用。
         let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         let roots = s.roots();
@@ -996,8 +991,8 @@ mod tests {
     /// 13. 非对象值不占根槽位（否则 LIFO 断言会对不上）。
     #[test]
     fn root_value_ignores_non_objects() {
-        let s = Scope::new();
-        let none = s.root_value(&Value::Number(1.0)).handle().is_none();
+        let s = Rc::new(Scope::new());
+        let none = Rc::clone(&s).root_value(&Value::Number(1.0)).handle().is_none();
         assert!(none);
         assert!(s.roots().is_empty());
     }

@@ -1745,14 +1745,7 @@ impl ProtoObject {
 impl JSObject for ProtoObject {
     fn kind(&self) -> ObjectKind {
         ObjectKind::Ordinary
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+    }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.properties.get(key).cloned()
     }
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
