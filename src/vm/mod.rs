@@ -1355,10 +1355,17 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         let other = args.first().cloned().unwrap_or(Value::Undefined);
         let record = self.get_set_record(&other, method, module)?;
+        // 宿主侧入根：下面各分支要么新建 `result` 跨 `iterator_next`/`invoke`
+        // 循环存活，要么跨 `invoke` 持有 `this`（isSubsetOf 等）。收集器看不见
+        // 机器栈，不登记会被回收（GC stress 下 `set_methods_operate_on_set_like_`
+        // `arguments` 输出错位）。
+        let _root_this = self.root(this);
+        let mut roots = self.roots();
         match method {
             // Copy `this`, then append everything from `other` that is new.
             "union" => {
                 let result = self.set_copy_of(this);
+                roots.push(&result);
                 let iter = self.iter_from_method(&record.object, &record.keys, module)?;
                 loop {
                     let (value, done) = self.iterator_next(iter.clone(), None, module)?;
@@ -1378,6 +1385,7 @@ impl VM {
                 let this_size = set_data_size(this);
                 if record.size >= this_size {
                     let result = set_data_new(&mut self.heap, Some(self.builtins.set_prototype));
+                    roots.push(&result);
                     for value in set_data_values(this) {
                         let keep = self.invoke(
                             &record.has,
@@ -1392,6 +1400,7 @@ impl VM {
                     Ok(result)
                 } else {
                     let result = set_data_new(&mut self.heap, Some(self.builtins.set_prototype));
+                    roots.push(&result);
                     let iter = self.iter_from_method(&record.object, &record.keys, module)?;
                     loop {
                         let (value, done) = self.iterator_next(iter.clone(), None, module)?;
@@ -1412,6 +1421,7 @@ impl VM {
             "difference" => {
                 if set_data_size(this) <= record.size {
                     let result = set_data_new(&mut self.heap, Some(self.builtins.set_prototype));
+                    roots.push(&result);
                     for value in set_data_values(this) {
                         let found = self.invoke(
                             &record.has,
@@ -1426,6 +1436,7 @@ impl VM {
                     Ok(result)
                 } else {
                     let result = self.set_copy_of(this);
+                roots.push(&result);
                     let iter = self.iter_from_method(&record.object, &record.keys, module)?;
                     loop {
                         let (value, done) = self.iterator_next(iter.clone(), None, module)?;
@@ -1440,6 +1451,7 @@ impl VM {
             // Copy `this`; each of `other`'s keys toggles membership.
             "symmetricDifference" => {
                 let result = self.set_copy_of(this);
+                roots.push(&result);
                 let iter = self.iter_from_method(&record.object, &record.keys, module)?;
                 loop {
                     let (value, done) = self.iterator_next(iter.clone(), None, module)?;
@@ -1937,6 +1949,9 @@ impl VM {
         }
         let map_obj = crate::vm::object::MapObject::new(Some(self.builtins.map_prototype));
         let map_val = Value::Object(self.heap.alloc(Object::Map(map_obj)));
+        // 宿主侧入根：`map_val` 跨下面的 `invoke` 循环存活，而每次 `invoke` 都会
+        // 跑用户回调到达 GC 安全点。收集器看不见机器栈，不登记会被回收。
+        let _root_map = self.root(&map_val);
         let iter = self.make_iterator(items.clone(), module)?;
         let mut index = 0usize;
         loop {
@@ -4832,6 +4847,12 @@ impl VM {
             new_obj.set_prototype(Some(self.builtins.object_prototype));
         }
         let new_obj_val = Value::Object(self.heap.alloc(Object::Ordinary(new_obj)));
+        // 宿主侧入根：`new_obj_val` 跨下面 `invoke_construct` 跑构造函数体（JS）
+        // 存活，而构造函数体（尤其用户定义的 @@species 构造器）会到达 GC 安全点。
+        // 收集器看不见机器栈，不登记 ⇒ 新实例被回收再分配 ⇒ 返回的是一个占位对象
+        // （实测：`array_species::species_target_receives_the_elements` 在 GC stress
+        // 下 map/filter 结果变成空对象）。
+        let _root_new = self.root(&new_obj_val);
 
         self.invoke_construct(&boxed_ctor, new_obj_val, args, new_target, module)
     }

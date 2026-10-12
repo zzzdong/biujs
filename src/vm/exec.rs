@@ -43,7 +43,7 @@ impl VM {
         // 而收集器看不见机器栈 —— 收一次就会把它们收走（GC stress 实测 6 条失败：
         // "Map constructor: 'set' is not callable"）。宿主侧入根（`Scope`）是正解，
         // 但在那之前，这是不让收集器踩空的闸门。
-        if self.invoke_boundaries.is_empty() && self.heap.should_collect() {
+        if self.heap.should_collect() {
             let mut roots = crate::vm::gc::Worklist::new();
             crate::vm::gc::Trace::trace(self, &mut roots);
             self.heap.collect(roots);
@@ -1428,7 +1428,12 @@ impl VM {
         reviver: &Value,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        // 宿主侧入根：`holder` 与 `value` 都跨下面的 `self.invoke(reviver, …)`
+        // 存活，而 reviver 是用户函数 ⇒ 必须登记（否则被回收 ⇒ 测试
+        // `json::parse_reviver_walks_bottom_up` 在 GC stress 下输出错位）。
+        let _root_holder = self.root(holder);
         let value = self.get_member(holder, &PropertyKey::from_str(name), module)?;
+        let _root_value = self.root(&value);
         if matches!(&value, Value::Object(_)) {
             let is_array = matches!(&value, Value::Object(o) if o.borrow().kind() == ObjectKind::Array);
             let keys: Vec<String> = if is_array {

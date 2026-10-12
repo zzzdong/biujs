@@ -61,6 +61,24 @@ memory 22 —— 精确回到项目基线**（阶段 A 记录的 timeout 4 / mem
 单次 `run` 内不回收，单用例峰值上升。故脚本默认预算改为 384 并记入成因；
 **正解是阶段 C 的 mark-sweep**，做完后降回 256。
 
+### 阶段 E — 宿主侧入根（收掉 C 的过渡闸门，2026-10-12）
+
+把 `Scope` 接进原生路径、撤掉 `invoke_boundaries` 闸门。这是 C 留的"正解"那一步。
+
+| 步骤 | 结果 |
+|---|---|
+| **E1** `Scope` 挂 `Rc`、可增长 `Roots::push` | `Root`/`Roots` 不再借任何东西（否则跨 `self.invoke(..)` 会 E0499）；累加器边算边 `push` 入根 |
+| **E2** `VM.scope` 字段 + `Trace for VM` 并入 | 漏掉 `self.scope.roots().trace(out)` 那次编辑曾**静默失败**，致入根完全无效（已修，列为纪律教训） |
+| **E3** 原生路径入根 | Map/Set/WeakMap/WeakSet 构造器（`map_val`/`set_val` + `adder`）；数组回调快速路径（`entries` 快照 + `callback`/`thisArg`/`receiver` + `species`）；`map`/`flatMap`/`filter` 的累加器；`map_group_by` 的 `map_val`；`json_internalize` 的 `holder`/`value`；`set_like_method` 的 `result`/`this`；`construct_with_new_target` 的 `new_obj_val` |
+| **验收** | GC stress 全绿（feature 538 / 护栏 7 / 单元 230）；全量 **16567 / 7843 / 3141** 无回退 |
+
+**撤闸门后 4 条 GC stress 残余失败的根因定位**（都是"原生自建的累加器跨回调未入根"同一类）：
+
+1. `array_species::species_target_receives_the_elements` —— 先插桩验证 `construct` 里的 `new_obj_val` **未被回收**、且 `array_species_create` 返回的对象 `made=true` 有效；再用断言左右值比对，发现**其实只有 `filter` 坏了**（`filtered.made` 空、`filtered[0]=0`），`map` 一直正常。
+2. 根因：`filter`（及 `flatMap`）分支**漏给 `species` 入根**——`map` 分支有、它俩没有。回调循环里 GC 把 `species` 收成占位对象，于是 `filtered` 变成空 `Ordinary`。补上 `acc.push(sp)` 后即全绿。
+
+**护栏变化（闸门撤掉后，正常条件、非 stress）**：`timeout 7 → 17`、`memory 22 → 12`，总数恒为 **29**——同一批 ~29 条问题用例只是从 memory 守卫挪到了 timeout 守卫，**无新增坏测试**。这是已知的小幅 wall-clock 成本。收益：`TEST262_MEMORY_MB` 可降回 **256** 且回到 16567（那 5 条回收）。脚本默认值已改回 256。
+
 **评审发现的两处必修**（详见 `GC-DESIGN.md` §4）：
 
 | # | 问题 | 证据 |

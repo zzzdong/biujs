@@ -891,7 +891,11 @@ impl VM {
                 let mut values: Vec<(usize, Value)> = Vec::with_capacity(entries.len());
                 // 累加器是 Rust 局部量，而 `call` 每次都会跑用户代码 ⇒ 每产出一个
                 // 值就必须立刻入根，否则中途一次收集会把已产出的那部分收走。
+                // `species` 自身也跨整个循环存活，同样要入根。
                 let mut acc = self.roots();
+                if let Some(ref sp) = species {
+                    acc.push(sp);
+                }
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
                         let v = call(self, &callback, e, i)?;
@@ -950,6 +954,9 @@ impl VM {
                 let species = self.array_species_create(receiver, entries.len(), module)?;
                 let mut values: Vec<Value> = Vec::new();
                 let mut acc = self.roots();
+                if let Some(ref sp) = species {
+                    acc.push(sp);
+                }
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
                         let mapped = call(self, &callback, e, i)?;
@@ -998,6 +1005,9 @@ impl VM {
                 let species = self.array_species_create(receiver, entries.len(), module)?;
                 let mut out: Vec<Value> = Vec::new();
                 let mut acc = self.roots();
+                if let Some(ref sp) = species {
+                    acc.push(sp);
+                }
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
                         if call(self, &callback, e, i)?.to_boolean() {
