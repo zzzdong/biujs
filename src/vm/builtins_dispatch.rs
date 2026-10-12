@@ -889,9 +889,14 @@ impl VM {
                 // (CreateDataPropertyOrThrow).
                 let species = self.array_species_create(receiver, entries.len(), module)?;
                 let mut values: Vec<(usize, Value)> = Vec::with_capacity(entries.len());
+                // 累加器是 Rust 局部量，而 `call` 每次都会跑用户代码 ⇒ 每产出一个
+                // 值就必须立刻入根，否则中途一次收集会把已产出的那部分收走。
+                let mut acc = self.roots();
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
-                        values.push((i, call(self, &callback, e, i)?));
+                        let v = call(self, &callback, e, i)?;
+                        acc.push(&v);
+                        values.push((i, v));
                     }
                 }
                 Ok(Some(match species {
@@ -944,6 +949,7 @@ impl VM {
                 // `RangeError`, not a 16 GiB allocation).
                 let species = self.array_species_create(receiver, entries.len(), module)?;
                 let mut values: Vec<Value> = Vec::new();
+                let mut acc = self.roots();
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
                         let mapped = call(self, &callback, e, i)?;
@@ -955,6 +961,7 @@ impl VM {
                                 {
                                     for k in 0..arr.len() {
                                         if let Some(v) = arr.get(k) {
+                                            acc.push(v);
                                             values.push(v.clone());
                                         }
                                     }
@@ -963,6 +970,7 @@ impl VM {
                             }
                         }
                         if !flattened {
+                            acc.push(&mapped);
                             values.push(mapped);
                         }
                     }
@@ -989,9 +997,11 @@ impl VM {
                 // not a 16 GiB allocation).
                 let species = self.array_species_create(receiver, entries.len(), module)?;
                 let mut out: Vec<Value> = Vec::new();
+                let mut acc = self.roots();
                 for (i, e) in entries.iter().enumerate() {
                     if let Some(e) = e {
                         if call(self, &callback, e, i)?.to_boolean() {
+                            acc.push(e);
                             out.push(e.clone());
                         }
                     }

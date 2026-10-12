@@ -581,6 +581,18 @@ impl Roots {
     fn new(scope: Rc<Scope>, ptrs: Vec<Gc<Object>>) -> Self {
         Self { scope, ptrs }
     }
+
+    /// 增量入根：原生边算边累积时，每产出一个值就立刻登记。
+    ///
+    /// 之所以需要它：累加器（`map` 的 `values`、`groupBy` 的结果表…）是
+    /// **Rust 局部量**，而每次调用用户回调都会跑到 GC 安全点。等到函数返回再
+    /// 统一入根就晚了 —— 中间任何一次收集都会把已产出的那部分收走。
+    pub fn push(&mut self, v: &Value) {
+        if let Value::Object(g) = v {
+            self.scope.roots.borrow_mut().push(*g);
+            self.ptrs.push(*g);
+        }
+    }
 }
 
 impl Drop for Roots {

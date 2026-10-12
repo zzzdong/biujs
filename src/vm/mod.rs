@@ -297,6 +297,11 @@ impl VM {
         std::rc::Rc::clone(&self.scope).root_all(vs)
     }
 
+    /// 一个**可增长**的根组：原生边算边累积时，每产出一个值就 `push` 一次。
+    fn roots(&self) -> crate::vm::gc::Roots {
+        std::rc::Rc::clone(&self.scope).root_all(&[])
+    }
+
     /// Whether `val` carries the `length` + integer-key shape the
     /// `Array.prototype` methods operate on (real arrays, array-likes, string
     /// wrappers). Strings are excluded: they use substring search.
