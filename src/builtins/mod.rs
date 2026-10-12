@@ -1277,6 +1277,14 @@ pub fn call_prototype_method(
             "subarray" => return typedarray::ta_subarray(heap, obj, args),
             "slice" => return typedarray::ta_slice(heap, obj, args),
             "fill" => return typedarray::ta_fill(obj, args),
+            // 只读 / 原地的一族：`Array.prototype` 有同名方法，故必须由接收者先判定。
+            "indexOf" => return typedarray::ta_index_of(obj, args),
+            "lastIndexOf" => return typedarray::ta_last_index_of(obj, args),
+            "includes" => return typedarray::ta_includes(obj, args),
+            "join" => return typedarray::ta_join(obj, args),
+            "reverse" => return typedarray::ta_reverse(obj, args),
+            "at" => return typedarray::ta_at(obj, args),
+            "copyWithin" => return typedarray::ta_copy_within(obj, args),
             _ => {}
         }
     }

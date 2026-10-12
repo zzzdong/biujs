@@ -755,8 +755,13 @@ impl VM {
         // fall through to the collection's own method. Every *other* receiver
         // keeps the old behaviour, including primitives
         // (`Array.prototype.forEach.call(true, cb)` iterates nothing).
+        // `TypedArray` 同理，而且更微妙：`indexOf` / `lastIndexOf` 也在上面的
+        // `CALLBACK_METHODS` 名单里，若不让出去就会被数组那条路截胡 —— 于是用上
+        // 数组的相等判定（`NaN` 能被 `indexOf` 找到）而不是 TypedArray 自己的
+        // 严格相等。让出去之后由 `call_prototype_method` 的
+        // `is_typedarray_receiver` 分支接管（`ta_index_of` / `ta_last_index_of`）。
         if matches!(receiver, Value::Object(o)
-            if matches!(o.borrow().kind(), ObjectKind::Map | ObjectKind::Set))
+            if matches!(o.borrow().kind(), ObjectKind::Map | ObjectKind::Set | ObjectKind::TypedArray))
         {
             return Ok(None);
         }

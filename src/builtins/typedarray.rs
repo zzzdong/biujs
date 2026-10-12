@@ -760,6 +760,161 @@ pub fn ta_fill(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(this.clone())
 }
 
+// ── `%TypedArray%.prototype` 的只读 / 原地方法 ──
+//
+// 这几个都不需要调用户代码（所以不需要 VM，只要 `heap`/`this` 就够），可以像
+// `ta_fill` 那样在 `call_prototype_method` 里直接分派。需要**回调**的那一族
+// （`map` / `filter` / `reduce` …）必须走 VM，另做。
+
+/// 严格相等（ES `IsStrictlyEqual`）在 TypedArray 上的形态：元素恒为 Number，
+/// 所以只要 needle 不是 Number 就永假；`NaN !== NaN` 由 f64 的 `==` 天然给出。
+fn number_needle(args: &[Value]) -> Option<f64> {
+    match args.first() {
+        Some(Value::Number(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// `indexOf(searchElement, fromIndex)` —— 严格相等，找不到返回 `-1`。
+pub fn ta_index_of(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let Some(needle) = number_needle(args) else {
+        return Ok(Value::Number(-1.0));
+    };
+    let ta = as_typedarray(this, "indexOf")?;
+    let len = ta.length;
+    let from = relative_index(args.get(1), 0, len);
+    for i in from..len {
+        if let Value::Number(n) = ta.get_element(i) {
+            if n == needle {
+                return Ok(Value::Number(i as f64));
+            }
+        }
+    }
+    Ok(Value::Number(-1.0))
+}
+
+/// `lastIndexOf(searchElement, fromIndex)` —— 从 `fromIndex` 往左找。
+///
+/// `fromIndex` 缺省是 `length - 1`；为负是 `length + fromIndex`；大于 `length - 1`
+/// 夹到 `length - 1`（ES 23.2.3.19）。
+pub fn ta_last_index_of(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let Some(needle) = number_needle(args) else {
+        return Ok(Value::Number(-1.0));
+    };
+    let ta = as_typedarray(this, "lastIndexOf")?;
+    let len = ta.length;
+    let from = match args.get(1) {
+        None => len as isize - 1,
+        Some(v) => {
+            let raw = v.to_number();
+            if raw.is_nan() {
+                len as isize - 1
+            } else {
+                let n = raw.trunc();
+                if n < 0.0 {
+                    len as isize + n as isize
+                } else {
+                    (n as isize).min(len as isize - 1)
+                }
+            }
+        }
+    };
+    let mut i = from;
+    while i >= 0 {
+        if let Value::Number(n) = ta.get_element(i as usize) {
+            if n == needle {
+                return Ok(Value::Number(i as f64));
+            }
+        }
+        i -= 1;
+    }
+    Ok(Value::Number(-1.0))
+}
+
+/// `includes(searchElement, fromIndex)` —— **SameValueZero**，`NaN` 能找到自己
+/// （与 `indexOf` 的严格相等不同，这是两者唯一的分歧点）。
+pub fn ta_includes(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let Some(needle) = number_needle(args) else {
+        return Ok(Value::Bool(false));
+    };
+    let ta = as_typedarray(this, "includes")?;
+    let len = ta.length;
+    let from = relative_index(args.get(1), 0, len);
+    for i in from..len {
+        if let Value::Number(n) = ta.get_element(i) {
+            if n == needle || (n.is_nan() && needle.is_nan()) {
+                return Ok(Value::Bool(true));
+            }
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+/// `join(separator)` —— 分隔符缺省 `","`；`undefined` / `null` 元素当空串。
+pub fn ta_join(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let ta = as_typedarray(this, "join")?;
+    let len = ta.length;
+    let sep = match args.first() {
+        None | Some(Value::Undefined) => ",".to_string(),
+        Some(v) => v.to_js_string(),
+    };
+    let mut out = String::new();
+    for i in 0..len {
+        if i > 0 {
+            out.push_str(&sep);
+        }
+        match ta.get_element(i) {
+            Value::Undefined | Value::Null => {}
+            v => out.push_str(&v.to_js_string()),
+        }
+    }
+    Ok(Value::string(&out))
+}
+
+/// `reverse()` —— **原地**反转，返回 `this`（不是副本）。
+pub fn ta_reverse(this: &Value, _args: &[Value]) -> Result<Value, RuntimeError> {
+    let mut ta = as_typedarray(this, "reverse")?;
+    let len = ta.length;
+    let mut vals: Vec<Value> = (0..len).map(|i| ta.get_element(i)).collect();
+    vals.reverse();
+    for (i, v) in vals.into_iter().enumerate() {
+        ta.set_element(i, v);
+    }
+    drop(ta);
+    Ok(this.clone())
+}
+
+/// `at(index)` —— 负索引从末尾算；越界是 `undefined`。
+pub fn ta_at(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let ta = as_typedarray(this, "at")?;
+    let len = ta.length;
+    let raw = args.first().map(|v| v.to_number()).unwrap_or(0.0);
+    let idx = if raw.is_nan() { 0.0 } else { raw.trunc() };
+    let i = if idx < 0.0 { len as f64 + idx } else { idx };
+    if i < 0.0 || i >= len as f64 {
+        return Ok(Value::Undefined);
+    }
+    Ok(ta.get_element(i as usize))
+}
+
+/// `copyWithin(target, start, end)` —— **原地**搬运，返回 `this`。
+///
+/// 源区间与目标区间可能重叠，所以先整段读出来再写回。
+pub fn ta_copy_within(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let mut ta = as_typedarray(this, "copyWithin")?;
+    let len = ta.length;
+    let target = relative_index(args.first(), 0, len);
+    let start = relative_index(args.get(1), 0, len);
+    let end = relative_index(args.get(2), len, len);
+    let count = end.saturating_sub(start).min(len.saturating_sub(target));
+    let src: Vec<Value> = (start..start + count).map(|i| ta.get_element(i)).collect();
+    for (k, v) in src.into_iter().enumerate() {
+        ta.set_element(target + k, v);
+    }
+    drop(ta);
+    Ok(this.clone())
+}
+
 /// `ArrayBuffer.prototype.slice(start, end)` — a copy into a new buffer.
 pub fn ab_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let Value::Object(obj_ref) = this else {
@@ -885,6 +1040,18 @@ pub fn register_typedarray_prototype(
     set_prototype_method(proto, heap, "subarray", |_this, _args| Ok(Value::Undefined));
     set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
     set_prototype_method(proto, heap, "fill", |this, args| ta_fill(this, args));
+    // 只读 / 原地的一族（不需要回调 ⇒ 不需要 VM）：
+    set_prototype_method(proto, heap, "indexOf", |this, args| ta_index_of(this, args));
+    set_prototype_method(proto, heap, "lastIndexOf", |this, args| {
+        ta_last_index_of(this, args)
+    });
+    set_prototype_method(proto, heap, "includes", |this, args| ta_includes(this, args));
+    set_prototype_method(proto, heap, "join", |this, args| ta_join(this, args));
+    set_prototype_method(proto, heap, "reverse", |this, args| ta_reverse(this, args));
+    set_prototype_method(proto, heap, "at", |this, args| ta_at(this, args));
+    set_prototype_method(proto, heap, "copyWithin", |this, args| {
+        ta_copy_within(this, args)
+    });
 
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("length"),

@@ -79,5 +79,7 @@ mod variables;
 mod weak_collections;
 #[path = "features/well_known_symbols.rs"]
 mod well_known_symbols;
+#[path = "features/typedarray_methods.rs"]
+mod typedarray_methods;
 #[path = "features/known_bugs.rs"]
 mod known_bugs;
