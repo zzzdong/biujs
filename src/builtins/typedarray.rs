@@ -1062,6 +1062,23 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         ta_copy_within(this, args)
     });
 
+    // 回调一族（`map` / `filter` / …）：闭包**永不被调用**，实际由 VM 的
+    // `try_typedarray_callback_method` 接手（它们要 invoke 回调，还得按 species
+    // 建出同类视图，builtins 层拿不到 VM）。
+    for m in [
+        "map",
+        "filter",
+        "forEach",
+        "some",
+        "every",
+        "find",
+        "findIndex",
+        "reduce",
+        "reduceRight",
+    ] {
+        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+    }
+
     let _ = proto.borrow_mut().define_property(
         PropertyKey::from_str("length"),
         accessor(heap, TA_LENGTH_NATIVE),

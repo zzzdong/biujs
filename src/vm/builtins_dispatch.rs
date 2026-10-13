@@ -280,6 +280,12 @@ impl VM {
             if let Some(result) = self.try_array_callback_method(&this, method, args, module)? {
                 return Ok(result);
             }
+            // TypedArray 的回调一族：上面那条对 TypedArray 接收者直接让出（那里
+            // 产出的是 Array），由这里接手 —— `map` / `filter` 的结果必须是
+            // **同类视图**，不是普通数组。
+            if let Some(result) = self.try_typedarray_callback_method(&this, method, args, module)? {
+                return Ok(result);
+            }
             // `Promise.prototype.then` has to *call* the handlers, so it is
             // dispatched here rather than in the builtin table.
             if let Some(result) = self.try_promise_method(&this, method, args, module)? {
@@ -722,6 +728,233 @@ impl VM {
                             Some(rejected),
                         )))
                     }
+                }
+            }
+        }
+    }
+
+    /// `%TypedArray%.prototype` 的**回调**一族（ES 23.2.3.x）。
+    ///
+    /// [`Self::try_array_callback_method`] 对 TypedArray 接收者直接让出（那里产出
+    /// 的是 Array，且 `indexOf` / `lastIndexOf` 用的是数组的相等判定），故由本函数
+    /// 接手：`map` / `filter` 的结果必须是**同类视图**，不是普通数组。
+    ///
+    /// 建结果的构造器走 `@@species`（`TypedArraySpeciesCreate`），所以子类化视图
+    /// 也能拿到自己类型的新实例。
+    pub(crate) fn try_typedarray_callback_method(
+        &mut self,
+        receiver: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        const TA_CALLBACK_METHODS: &[&str] = &[
+            "map",
+            "filter",
+            "forEach",
+            "some",
+            "every",
+            "find",
+            "findIndex",
+            "reduce",
+            "reduceRight",
+        ];
+        if !TA_CALLBACK_METHODS.contains(&method) {
+            return Ok(None);
+        }
+        if !crate::builtins::typedarray::is_typedarray_receiver(receiver) {
+            return Ok(None);
+        }
+        // 先把元素读成一份本地快照。视图元素恒为数字，但回调可以返回任意值。
+        let (len, elements) = {
+            let Value::Object(o) = receiver else {
+                return Ok(None);
+            };
+            let mut b = o.borrow_mut();
+            let Some(ta) = b.as_typed_array_mut() else {
+                return Ok(None);
+            };
+            let len = ta.length;
+            let mut els = Vec::with_capacity(len);
+            for i in 0..len {
+                els.push(ta.get_element(i));
+            }
+            (len, els)
+        };
+        let callback = args.first().cloned().unwrap_or(Value::Undefined);
+        if !callback.is_callable() {
+            return Err(RuntimeError::TypeError(format!(
+                "TypedArray.prototype.{method} callback is not a function"
+            )));
+        }
+        // 入根：回调期间 `elements` / 中间结果只活在 Rust 局部（收集器看不见机器栈）。
+        let mut acc = self.roots();
+        for e in &elements {
+            acc.push(e);
+        }
+        acc.push(&callback);
+        let _root_recv = self.root(receiver);
+
+        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+        match method {
+            "forEach" => {
+                for (i, e) in elements.iter().enumerate() {
+                    self.invoke(
+                        &callback,
+                        this_arg.clone(),
+                        &[e.clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                }
+                Ok(Some(Value::Undefined))
+            }
+            // `some` / `every` 只差"命中即返回哪一个布尔"。
+            "some" | "every" => {
+                let hit = method == "some";
+                for (i, e) in elements.iter().enumerate() {
+                    let r = self.invoke(
+                        &callback,
+                        this_arg.clone(),
+                        &[e.clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                    if r.to_boolean() == hit {
+                        return Ok(Some(Value::Bool(hit)));
+                    }
+                }
+                Ok(Some(Value::Bool(!hit)))
+            }
+            "find" => {
+                for (i, e) in elements.iter().enumerate() {
+                    let r = self.invoke(
+                        &callback,
+                        this_arg.clone(),
+                        &[e.clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                    if r.to_boolean() {
+                        return Ok(Some(e.clone()));
+                    }
+                }
+                Ok(Some(Value::Undefined))
+            }
+            "findIndex" => {
+                for (i, e) in elements.iter().enumerate() {
+                    let r = self.invoke(
+                        &callback,
+                        this_arg.clone(),
+                        &[e.clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                    if r.to_boolean() {
+                        return Ok(Some(Value::Number(i as f64)));
+                    }
+                }
+                Ok(Some(Value::Number(-1.0)))
+            }
+            "map" => {
+                let mut out = Vec::with_capacity(len);
+                for (i, e) in elements.iter().enumerate() {
+                    let v = self.invoke(
+                        &callback,
+                        this_arg.clone(),
+                        &[e.clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                    acc.push(&v);
+                    out.push(v);
+                }
+                let result = self.typed_array_species_create(receiver, len, module)?;
+                let _r = self.root(&result);
+                self.write_typed_array_elements(&result, &out);
+                Ok(Some(result))
+            }
+            "filter" => {
+                let mut kept = Vec::new();
+                for (i, e) in elements.iter().enumerate() {
+                    let r = self.invoke(
+                        &callback,
+                        this_arg.clone(),
+                        &[e.clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                    if r.to_boolean() {
+                        kept.push(e.clone());
+                    }
+                }
+                let result = self.typed_array_species_create(receiver, kept.len(), module)?;
+                let _r = self.root(&result);
+                self.write_typed_array_elements(&result, &kept);
+                Ok(Some(result))
+            }
+            // `reduce` / `reduceRight`：回调是 (acc, value, index, ta)。
+            // 无初值时累加器取首/末元素，从第二个开始；空视图且无初值要 TypeError。
+            _ => {
+                let right = method == "reduceRight";
+                let has_init = args.len() >= 2;
+                if !has_init && len == 0 {
+                    return Err(RuntimeError::TypeError(
+                        "Reduce of empty TypedArray with no initial value".to_string(),
+                    ));
+                }
+                let order: Vec<usize> = if right {
+                    (0..len).rev().collect()
+                } else {
+                    (0..len).collect()
+                };
+                let (mut acc_val, skip) = if has_init {
+                    (args[1].clone(), 0usize)
+                } else {
+                    (elements[order[0]].clone(), 1usize)
+                };
+                for i in order.into_iter().skip(skip) {
+                    acc_val = self.invoke(
+                        &callback,
+                        Value::Undefined,
+                        &[
+                            acc_val.clone(),
+                            elements[i].clone(),
+                            Value::Number(i as f64),
+                            receiver.clone(),
+                        ],
+                        module,
+                    )?;
+                    acc.push(&acc_val);
+                }
+                Ok(Some(acc_val))
+            }
+        }
+    }
+
+    /// `TypedArraySpeciesCreate(O, len)`：结果的构造器由 `O.constructor` 的
+    /// `@@species` 决定（ES 23.2.3.x），故 `map` / `filter` 产出的是**同类视图**。
+    fn typed_array_species_create(
+        &mut self,
+        receiver: &Value,
+        len: usize,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let ctor = self.get_member(receiver, &PropertyKey::from_str("constructor"), module)?;
+        let species = if ctor.is_object() {
+            let s = self.get_member(&ctor, &crate::builtins::species_symbol_key(), module)?;
+            if matches!(s, Value::Undefined | Value::Null) {
+                ctor.clone()
+            } else {
+                s
+            }
+        } else {
+            ctor.clone()
+        };
+        self.construct(&species, &[Value::Number(len as f64)], module)
+    }
+
+    /// 把一批值写进已按 `len` 建好的视图（元素会按视图类型做数值转换）。
+    fn write_typed_array_elements(&mut self, ta: &Value, vals: &[Value]) {
+        if let Value::Object(o) = ta {
+            let mut b = o.borrow_mut();
+            if let Some(t) = b.as_typed_array_mut() {
+                for (i, v) in vals.iter().enumerate() {
+                    t.set_element(i, v.clone());
                 }
             }
         }
