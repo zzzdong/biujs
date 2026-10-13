@@ -286,6 +286,14 @@ impl VM {
             if let Some(result) = self.try_typedarray_callback_method(&this, method, args, module)? {
                 return Ok(result);
             }
+            // TypedArray 的迭代器三件套（ES 23.2.3.x）：`keys` / `values` /
+            // `entries` 返回迭代器，只有 VM 能构造。必须排在数组那条路之后、
+            // 且只认 TypedArray 接收者（`Array.prototype` 有同名方法）。
+            if matches!(method, "keys" | "values" | "entries")
+                && crate::builtins::typedarray::is_typedarray_receiver(&this)
+            {
+                return self.make_typed_array_iterator(&this, method);
+            }
             // `Promise.prototype.then` has to *call* the handlers, so it is
             // dispatched here rather than in the builtin table.
             if let Some(result) = self.try_promise_method(&this, method, args, module)? {

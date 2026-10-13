@@ -1065,6 +1065,11 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // 回调一族（`map` / `filter` / …）：闭包**永不被调用**，实际由 VM 的
     // `try_typedarray_callback_method` 接手（它们要 invoke 回调，还得按 species
     // 建出同类视图，builtins 层拿不到 VM）。
+    // `keys` / `values` / `entries`：返回迭代器，同样由 VM 构造
+    // （`make_typed_array_iterator`），闭包永不被调用。
+    for m in ["keys", "values", "entries"] {
+        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+    }
     for m in [
         "map",
         "filter",

@@ -135,6 +135,32 @@ fn copy_within_shifts_in_place() {
 }
 
 #[test]
+fn keys_values_entries_return_iterators() {
+    // `values()` 与 `Symbol.iterator` 同款：产出元素。
+    assert_eq!(
+        eval_string("var a = new Uint8Array([1, 2, 3]); var s = ''; for (var v of a.values()) { s += v; } s"),
+        "123"
+    );
+    // `keys()` 产出下标（数字），不是字符串键。
+    assert_eq!(
+        eval_string("var a = new Uint8Array([7, 8]); var s = ''; for (var k of a.keys()) { s += k; } s"),
+        "01"
+    );
+    // `entries()` 产出 [下标, 值] 的二元数组。
+    assert_eq!(
+        eval_string(
+            "var a = new Uint8Array([5, 6]); var s = ''; \
+             for (var e of a.entries()) { s += e[0] + ':' + e[1] + ' '; } s.trim()"
+        ),
+        "0:5 1:6"
+    );
+    // 三者都返回迭代器对象（可 `next()`），且不是数组。
+    assert!(eval_bool(
+        "var a = new Uint8Array([1]); typeof a.keys().next === 'function'"
+    ));
+}
+
+#[test]
 fn typedarray_methods_win_over_the_array_ones() {
     // 同名方法在 `Array.prototype` 上也有 —— 接收者必须先按 TypedArray 判定，
     // 否则 `join` 会走数组那条路（而 TypedArray 不是数组对象）。

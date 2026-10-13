@@ -4507,6 +4507,62 @@ impl VM {
     ///
     /// Fast path for arrays/strings/`arguments`; otherwise call
     /// `src[Symbol.iterator]()`.
+    /// `%TypedArray%.prototype` 的 `keys()` / `values()` / `entries()`。
+    ///
+    /// 三者都返回**迭代器**，只有 VM 能构造。做法是复用 `Array` 那条快照迭代器
+    /// （`NativeIteratorState::Array`），只是预先把 items 算成各自该有的形态：
+    ///   `values`  → 元素值
+    ///   `keys`    → 下标（数字）
+    ///   `entries` → `[下标, 值]` 的二元数组
+    fn make_typed_array_iterator(
+        &mut self,
+        receiver: &Value,
+        method: &str,
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::iterator::{NativeIteratorObject, NativeIteratorState};
+        let (len, elements) = {
+            let Value::Object(o) = receiver else {
+                return Err(RuntimeError::TypeError(
+                    "TypedArray iterator called on a non-object".to_string(),
+                ));
+            };
+            let mut b = o.borrow_mut();
+            let Some(ta) = b.as_typed_array_mut() else {
+                return Err(RuntimeError::TypeError(
+                    "TypedArray iterator called on a non-TypedArray".to_string(),
+                ));
+            };
+            let len = ta.length;
+            let mut els = Vec::with_capacity(len);
+            for i in 0..len {
+                els.push(ta.get_element(i));
+            }
+            (len, els)
+        };
+        // 入根：`entries` 要为每个下标新建数组，期间会分配。
+        let _roots = self.root_all(&elements);
+        let items: Vec<Value> = match method {
+            "keys" => (0..len).map(|i| Value::Number(i as f64)).collect(),
+            "values" => elements,
+            // `entries`
+            _ => (0..len)
+                .map(|i| {
+                    crate::vm::object::new_array_object_from_vec(
+                        &mut self.heap,
+                        vec![Value::Number(i as f64), elements[i].clone()],
+                    )
+                })
+                .collect(),
+        };
+        let id = self.next_iterator_id;
+        self.next_iterator_id += 1;
+        let iter_obj =
+            NativeIteratorObject::new(&mut self.heap, id, NativeIteratorState::Array { items, idx: 0 });
+        let iter_val = Value::Object(self.heap.alloc(Object::NativeIterator(iter_obj)));
+        self.iterator_registry.insert(id, iter_val.clone());
+        Ok(iter_val)
+    }
+
     fn make_iterator(&mut self, src: Value, module: &Module) -> Result<Value, RuntimeError> {
         use crate::vm::iterator::NativeIteratorState;
         if std::env::var("BIUJS_TRACE_ITER").is_ok() {
