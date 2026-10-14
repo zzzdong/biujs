@@ -772,6 +772,8 @@ impl VM {
             "with",
             "toReversed",
             "toSorted",
+            // `sort` 原地排序（比较器可选），行为上更接近这一族
+            "sort",
         ];
         if !TA_CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -1014,6 +1016,64 @@ impl VM {
                 let _r = self.root(&result);
                 self.write_typed_array_elements(&result, &out);
                 Ok(Some(result))
+            }
+            // `sort(comparefn)`：**原地**排序，返回接收者（与 `Array.prototype.sort`
+            // 同）。无比较器时按**数值**升序（TypedArray 的默认是数值序，不是
+            // 字符串序）；`total_cmp` 给出含 NaN 的全序（NaN 排到最后）。
+            // 有比较器时用自底向上归并排序：O(n log n)，且合并循环里能 invoke
+            // —— `sort_by` 的闭包拿不到 `&mut self`。
+            "sort" => {
+                let cmp = args.first().cloned().unwrap_or(Value::Undefined);
+                let mut out = elements.clone();
+                if cmp.is_callable() {
+                    // 这些句柄在合并过程中只会被 clone，故一次性入根即可。
+                    for v in &out {
+                        acc.push(v);
+                    }
+                    let mut buf = out.clone();
+                    let mut width = 1usize;
+                    while width < len {
+                        let mut i = 0usize;
+                        while i < len {
+                            let mid = (i + width).min(len);
+                            let end = (i + 2 * width).min(len);
+                            let (mut a, mut b, mut k) = (i, mid, i);
+                            while a < mid && b < end {
+                                let r = self.invoke(
+                                    &cmp,
+                                    Value::Undefined,
+                                    &[out[a].clone(), out[b].clone()],
+                                    module,
+                                )?;
+                                if r.to_number() <= 0.0 {
+                                    buf[k] = out[a].clone();
+                                    a += 1;
+                                } else {
+                                    buf[k] = out[b].clone();
+                                    b += 1;
+                                }
+                                k += 1;
+                            }
+                            while a < mid {
+                                buf[k] = out[a].clone();
+                                a += 1;
+                                k += 1;
+                            }
+                            while b < end {
+                                buf[k] = out[b].clone();
+                                b += 1;
+                                k += 1;
+                            }
+                            i = end;
+                        }
+                        std::mem::swap(&mut out, &mut buf);
+                        width *= 2;
+                    }
+                } else {
+                    out.sort_by(|a, b| a.to_number().total_cmp(&b.to_number()));
+                }
+                self.write_typed_array_elements(receiver, &out);
+                Ok(Some(receiver.clone()))
             }
             // `reduce` / `reduceRight`：回调是 (acc, value, index, ta)。
             // 无初值时累加器取首/末元素，从第二个开始；空视图且无初值要 TypeError。

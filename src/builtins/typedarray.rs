@@ -1075,6 +1075,10 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     for m in ["with", "toReversed", "toSorted", "findLast", "findLastIndex"] {
         set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
+    // `sort`：比较器可选，且是**原地**排序（与 Array.prototype.sort 同）。
+    for m in ["sort"] {
+        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+    }
     for m in [
         "map",
         "filter",

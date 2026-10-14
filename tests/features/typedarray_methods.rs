@@ -207,3 +207,31 @@ fn es2023_with_to_reversed_to_sorted_find_last() {
         3.0
     );
 }
+
+#[test]
+fn sort_is_numeric_and_in_place() {
+    // 无比较器 ⇒ 按**数值**升序（不是 Array 的字符串序）。
+    assert_eq!(
+        eval_string("new Uint8Array([10, 2, 33, 1]).sort().join()"),
+        "1,2,10,33"
+    );
+    // 有比较器 ⇒ 按比较器排序。
+    assert_eq!(
+        eval_string("new Uint8Array([1, 2, 3]).sort(function (a, b) { return b - a; }).join()"),
+        "3,2,1"
+    );
+    // **原地**排序：返回的就是接收者本身。
+    assert_eq!(
+        eval_string(
+            "var a = new Uint8Array([3, 1, 2]);
+             var r = a.sort();
+             [r === a, a.join()].join('|')"
+        ),
+        "true|1,2,3"
+    );
+    // NaN 排到最后。
+    assert_eq!(
+        eval_string("new Float64Array([2, NaN, 1]).sort().join('|')"),
+        "1|2|NaN"
+    );
+}
