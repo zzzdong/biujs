@@ -197,6 +197,11 @@ impl VM {
         if name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
             return self.make_iterator(this, module);
         }
+        // `get %TypedArray%.prototype[@@toStringTag]`：返回接收者自己的
+        // TypedArray 名（23.2.3.32）。
+        if name == crate::builtins::typedarray::TA_TO_STRING_TAG_NATIVE {
+            return crate::builtins::typedarray::ta_to_string_tag(&this);
+        }
         // `String(value)` is ToString(value): an object converts through
         // ToPrimitive (hint "string"), which can run user code, so it has to
         // happen here rather than in the builtin layer.

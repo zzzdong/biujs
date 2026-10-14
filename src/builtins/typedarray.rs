@@ -176,7 +176,25 @@ pub const TYPED_ARRAY_KINDS: [TypedArrayKind; 9] = [
     TypedArrayKind::Float64,
 ];
 
-/// Native name of the `get Uint8Array[Symbol.species]` accessor (ES 23.2.2.2):
+/// Native name of the `get %TypedArray%.prototype[@@toStringTag]` accessor
+/// （ES 23.2.3.32）：它**不是**常量，而是返回接收者自己的 TypedArray 名
+/// （`new Uint8Array()[Symbol.toStringTag] === "Uint8Array"`）；接收者没有
+/// [[TypedArrayName]]（例如 `%TypedArray%.prototype` 本身）时返回 undefined。
+pub const TA_TO_STRING_TAG_NATIVE: &str = "__ta_to_string_tag__";
+
+/// `get [Symbol.toStringTag]` 的实现：返回接收者的 TypedArray 名，否则 undefined。
+pub fn ta_to_string_tag(this: &Value) -> Result<Value, RuntimeError> {
+    let Value::Object(o) = this else {
+        return Ok(Value::Undefined);
+    };
+    let mut b = o.borrow_mut();
+    match b.as_typed_array_mut() {
+        Some(ta) => Ok(Value::string(ta.kind.name())),
+        None => Ok(Value::Undefined),
+    }
+}
+
+/// `get Uint8Array[Symbol.species]` accessor (ES 23.2.2.2):
 /// 同 `Map` / `Set` / `Array` 的 species，取值器返回它的接收者。
 pub const TA_SPECIES_NATIVE: &str = "__typedarray_species__";
 
@@ -1079,6 +1097,17 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     for m in ["sort"] {
         set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
+    // `toString` / `toLocaleString`（23.2.3.37 / 23.2.3.38）：都是 join(",")，
+    // 闭包永不被调用，实际分派在 `call_prototype_method`。
+    for m in ["toString", "toLocaleString"] {
+        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+    }
+    // `get %TypedArray%.prototype[@@toStringTag]`（23.2.3.32）：返回接收者自己的
+    // TypedArray 名，不是常量 —— 故必须是取值器而非数据属性。
+    let _ = proto.borrow_mut().define_property(
+        crate::builtins::to_string_tag_symbol_key(),
+        accessor(heap, TA_TO_STRING_TAG_NATIVE),
+    );
     for m in [
         "map",
         "filter",

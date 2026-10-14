@@ -235,3 +235,25 @@ fn sort_is_numeric_and_in_place() {
         "1|2|NaN"
     );
 }
+
+#[test]
+fn to_string_and_to_string_tag() {
+    // `toString()` 就是 join(",")（ES 23.2.3.37）。
+    assert_eq!(eval_string("new Uint8Array([1, 2, 3]).toString()"), "1,2,3");
+    assert_eq!(eval_string("new Uint8Array([1, 2, 3]).toLocaleString()"), "1,2,3");
+    // `get %TypedArray%.prototype[@@toStringTag]` 返回**接收者自己的** TypedArray 名
+    // （23.2.3.32），不是常量 —— 这也是 `Object.prototype.toString` 得出
+    // "[object Uint8Array]" 而非 "[object TypedArray]" 的原因。
+    assert_eq!(
+        eval_string("new Uint8Array([1])[Symbol.toStringTag]"),
+        "Uint8Array"
+    );
+    assert_eq!(
+        eval_string("new Float32Array([1])[Symbol.toStringTag]"),
+        "Float32Array"
+    );
+    assert_eq!(
+        eval_string("Object.prototype.toString.call(new Uint8Array([1]))"),
+        "[object Uint8Array]"
+    );
+}

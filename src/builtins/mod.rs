@@ -1367,6 +1367,8 @@ pub fn call_prototype_method(
             "reverse" => return typedarray::ta_reverse(obj, args),
             "at" => return typedarray::ta_at(obj, args),
             "copyWithin" => return typedarray::ta_copy_within(obj, args),
+            // `toString` / `toLocaleString` 都是 join(",")（23.2.3.37 / .38）。
+            "toString" | "toLocaleString" => return typedarray::ta_join(obj, args),
             _ => {}
         }
     }
