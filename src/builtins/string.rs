@@ -138,6 +138,14 @@ pub fn register_string_statics(string_fn: &Value, heap: &mut Heap) {
     super::set_static_method(string_fn, "fromCodePoint", heap, |args| {
         string_from_code_point(args)
     });
+    // `String.raw`（ES 22.1.2.3）：模板字面量的标签函数。闭包**永不被调用** ——
+    // 它要读 `template.raw`（可能触发 getter）并逐个 ToString 替换值，只有 VM 能
+    // 做，故由 VM 按限定名 "String.raw" 分派。
+    super::set_static_method(string_fn, "raw", heap, |_args| {
+        Err(RuntimeError::TypeError(
+            "String.raw is dispatched by the VM".to_string(),
+        ))
+    });
 }
 
 pub fn string_starts_with(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {

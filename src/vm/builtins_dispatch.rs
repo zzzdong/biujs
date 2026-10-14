@@ -382,6 +382,12 @@ impl VM {
             if name == "Object.assign" {
                 return self.object_assign(args, module);
             }
+            // `String.raw(template, ...subs)`（ES 22.1.2.3）：读 `template.raw`
+            // 用的是真 [[Get]]（可能是 getter），且每个替换值要 ToString（可能触发
+            // `toString`） —— builtins 层拿不到 VM，故在这里做。
+            if name == "String.raw" {
+                return self.string_raw(args, module);
+            }
             // `%TypedArray%.from` / `%TypedArray%.of`：迭代、可选回调、再
             // `new C(len)` —— 三样都只有 VM 能做。
             if name == "TypedArray.from" {
@@ -744,6 +750,38 @@ impl VM {
                 }
             }
         }
+    }
+
+    /// `String.raw(template, ...substitutions)`（ES 22.1.2.3）。
+    ///
+    /// 结果是 `template.raw` 的各段依次与替换值交错拼接：
+    /// `raw[0] + sub0 + raw[1] + sub1 + …`。注意用的是 **raw**（未转义的原始串），
+    /// 这正是它存在的意义 —— `` String.raw`\n` `` 得到字面的反斜杠 n。
+    fn string_raw(&mut self, args: &[Value], module: &Module) -> Result<Value, RuntimeError> {
+        let template = args.first().cloned().unwrap_or(Value::Undefined);
+        // 第一步是 ToObject：非对象（含 undefined / null）是 TypeError。
+        if !matches!(template, Value::Object(_)) {
+            return Err(RuntimeError::TypeError(
+                "String.raw: template must be an object".to_string(),
+            ));
+        }
+        // `Get(template, "raw")` —— 走真 [[Get]]，getter 可以抛。
+        let raw = self.get_member(&template, &PropertyKey::from_str("raw"), module)?;
+        let len = self
+            .array_like_elements(&raw)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let mut out = String::new();
+        for i in 0..len {
+            let chunk = self.get_member(&raw, &PropertyKey::from_str(&i.to_string()), module)?;
+            // 每个替换值都 ToString（`undefined` / `null` 走 ToString 而非跳过 ——
+            // `String.raw` 不做 `join` 那样的空串替换）。
+            out.push_str(&chunk.to_js_string());
+            if i + 1 < args.len() {
+                out.push_str(&args[i + 1].to_js_string());
+            }
+        }
+        Ok(Value::string(&out))
     }
 
     /// `%TypedArray%.prototype` 的**回调**一族（ES 23.2.3.x）。

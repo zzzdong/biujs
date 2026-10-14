@@ -158,3 +158,28 @@ fn update_expressions_coerce_through_to_number() {
     );
     assert_eq!(eval_string("(function () { var x = new Number(1.1); return x++ + \"\"; })()"), "1.1");
 }
+
+#[test]
+fn string_raw_joins_the_raw_chunks() {
+    // 直接用调用点对象：`String.raw` 取的是 **raw**（未转义）段。
+    assert_eq!(
+        eval_string("String.raw({ raw: ['a', 'b'] }, 'X')"),
+        "aXb"
+    );
+    // 没有替换值时就是各段直接拼起来。
+    assert_eq!(eval_string("String.raw({ raw: ['a', 'b'] })"), "ab");
+    // 替换值逐个 ToString（含 undefined / null —— 不是当空串跳过）。
+    assert_eq!(
+        eval_string("String.raw({ raw: ['', '-', ''] }, 1, undefined)"),
+        "1-undefined"
+    );
+    // 段数多于替换值时，多出来的段照常拼上。
+    assert_eq!(
+        eval_string("String.raw({ raw: ['a', 'b', 'c'] }, 'X')"),
+        "aXbc"
+    );
+    // 非对象模板是 TypeError。
+    assert!(eval_bool(
+        "(function () { try { String.raw(undefined); return false; } catch (e) { return true; } })()"
+    ));
+}
