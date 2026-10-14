@@ -55,6 +55,15 @@ pub fn register_array_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         "find",
         "findIndex",
         "sort",
+        // ES2023：`findLast` / `findLastIndex` 需要谓词；`toReversed` /
+        // `toSorted` / `toSpliced` / `with` 不需要回调，但结果要走
+        // `ArraySpeciesCreate`（子类必须拿到子类实例），所以同样归 VM。
+        "findLast",
+        "findLastIndex",
+        "toReversed",
+        "toSorted",
+        "toSpliced",
+        "with",
     ] {
         mark_prototype_method(proto, heap, name);
     }

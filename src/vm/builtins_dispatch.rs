@@ -1191,6 +1191,57 @@ impl VM {
         }
     }
 
+    /// 把类数组快照里的空洞补成 `undefined`（`toReversed` / `toSorted` 等
+    /// ES2023 方法的结果都是密集数组，不再保留空洞）。
+    fn dense_entries(entries: &[Option<Value>]) -> Vec<Value> {
+        entries
+            .iter()
+            .map(|e| e.clone().unwrap_or(Value::Undefined))
+            .collect()
+    }
+
+    /// 用 `ArraySpeciesCreate` 建一个新数组并写入 `vals`。
+    ///
+    /// 走 species 是因为子类（`class My extends Array {}`）的这些方法也必须
+    /// 返回子类实例，不能用 `new_array_object_from_vec` 直接造普通数组。
+    fn array_result_from(
+        &mut self,
+        receiver: &Value,
+        vals: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let species = self.array_species_create(receiver, vals.len(), module)?;
+        match species {
+            None => Ok(crate::vm::object::new_array_object_from_vec(
+                &mut self.heap,
+                vals.to_vec(),
+            )),
+            Some(target) => {
+                for (i, v) in vals.iter().enumerate() {
+                    self.set_member(
+                        &target,
+                        PropertyKey::from_str(&i.to_string()),
+                        v.clone(),
+                        module,
+                    )?;
+                }
+                Ok(target)
+            }
+        }
+    }
+
+    /// `splice` / `toSpliced` 的 `start`：负数从末尾算，再夹到 `[0, len]`。
+    fn splice_start(&self, arg: Option<&Value>, len: usize) -> usize {
+        let raw = arg.map(|v| v.to_number()).unwrap_or(0.0);
+        let idx = if raw.is_nan() { 0.0 } else { raw.trunc() };
+        let i = if idx < 0.0 {
+            (len as f64 + idx).max(0.0)
+        } else {
+            idx.min(len as f64)
+        };
+        i as usize
+    }
+
     pub(crate) fn try_array_callback_method(
         &mut self,
         receiver: &Value,
@@ -1214,6 +1265,15 @@ impl VM {
             // `Array.prototype.indexOf.call({length: 2, 0: 'a'}, 'a')`.
             "indexOf",
             "lastIndexOf",
+            // ES2023：`findLast` / `findLastIndex` 需要谓词；`toReversed` /
+            // `toSorted` / `toSpliced` / `with` 不需要回调，但同样要那份
+            // 类数组元素清单，且结果要走 `ArraySpeciesCreate`。
+            "findLast",
+            "findLastIndex",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "with",
         ];
         if !CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -1552,6 +1612,106 @@ impl VM {
                     }
                 }
                 Ok(Some(Value::Number(-1.0)))
+            }
+            // ── ES2023 ──
+            // `findLast` / `findLastIndex`：从**末尾**往前找第一个命中的。
+            "findLast" => {
+                for (i, e) in entries.iter().enumerate().rev() {
+                    if let Some(e) = e {
+                        if call(self, &callback, e, i)?.to_boolean() {
+                            return Ok(Some(e.clone()));
+                        }
+                    }
+                }
+                Ok(Some(Value::Undefined))
+            }
+            "findLastIndex" => {
+                for (i, e) in entries.iter().enumerate().rev() {
+                    if let Some(e) = e {
+                        if call(self, &callback, e, i)?.to_boolean() {
+                            return Ok(Some(Value::Number(i as f64)));
+                        }
+                    }
+                }
+                Ok(Some(Value::Number(-1.0)))
+            }
+            // `toReversed()`：返回**新**数组，元素逆序（不改原数组）。
+            "toReversed" => {
+                let mut vals = Self::dense_entries(&entries);
+                vals.reverse();
+                Ok(Some(self.array_result_from(receiver, &vals, module)?))
+            }
+            // `toSorted(comparefn)`：返回**新**数组。注意 **Array 的默认比较是
+            // 字符串序**（与 `TypedArray.prototype.toSorted` 的数值序不同）。
+            "toSorted" => {
+                let cmp = args.first().cloned().unwrap_or(Value::Undefined);
+                let mut vals = Self::dense_entries(&entries);
+                if cmp.is_callable() {
+                    // 插入排序：顺序比较便于在循环里 invoke —— `sort_by` 的闭包
+                    // 拿不到 `&mut self`。
+                    let mut i = 1usize;
+                    while i < vals.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let r = self.invoke(
+                                &cmp,
+                                Value::Undefined,
+                                &[vals[j - 1].clone(), vals[j].clone()],
+                                module,
+                            )?;
+                            if r.to_number() > 0.0 {
+                                vals.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                } else {
+                    vals.sort_by(|a, b| a.to_js_string().cmp(&b.to_js_string()));
+                }
+                Ok(Some(self.array_result_from(receiver, &vals, module)?))
+            }
+            // `with(index, value)`：返回**新**数组，指定下标换成新值；下标越界
+            // 是 RangeError（ES 23.1.3.31）。负下标从末尾算。
+            "with" => {
+                let mut vals = Self::dense_entries(&entries);
+                let len = vals.len();
+                let raw = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+                let idx = if raw.is_nan() { 0.0 } else { raw.trunc() };
+                let i = if idx < 0.0 { len as f64 + idx } else { idx };
+                if i < 0.0 || i >= len as f64 {
+                    return Err(RuntimeError::RangeError(
+                        "Array.prototype.with: index out of range".to_string(),
+                    ));
+                }
+                vals[i as usize] = args.get(1).cloned().unwrap_or(Value::Undefined);
+                Ok(Some(self.array_result_from(receiver, &vals, module)?))
+            }
+            // `toSpliced(start, deleteCount, ...items)`：返回**新**数组，等价于
+            // 在副本上做一次 `splice`（不改原数组）。
+            "toSpliced" => {
+                let vals = Self::dense_entries(&entries);
+                let len = vals.len();
+                let start = self.splice_start(args.first(), len);
+                let delete_count = match args.get(1) {
+                    None | Some(Value::Undefined) => len - start,
+                    Some(v) => {
+                        let n = v.to_number();
+                        if n.is_nan() {
+                            0usize
+                        } else {
+                            n.trunc().max(0.0) as usize
+                        }
+                    }
+                }
+                .min(len - start);
+                let mut out = Vec::with_capacity(len - delete_count + args.len().saturating_sub(2));
+                out.extend_from_slice(&vals[..start]);
+                out.extend(args.iter().skip(2).cloned());
+                out.extend_from_slice(&vals[start + delete_count..]);
+                Ok(Some(self.array_result_from(receiver, &out, module)?))
             }
             "reduce" | "reduceRight" => {
                 // Indices are visited in order (or reverse) and holes skipped;
