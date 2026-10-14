@@ -170,3 +170,40 @@ fn typedarray_methods_win_over_the_array_ones() {
         0.0
     );
 }
+
+#[test]
+fn es2023_with_to_reversed_to_sorted_find_last() {
+    // `with(index, value)`：返回**新**视图，原视图不变。
+    assert_eq!(
+        eval_string(
+            "var a = new Uint8Array([1, 2, 3]);
+             var b = a.with(1, 9);
+             [a.join(), b.join()].join('|')"
+        ),
+        "1,2,3|1,9,3"
+    );
+    // 负下标从末尾算。
+    assert_eq!(eval_string("new Uint8Array([1, 2, 3]).with(-1, 7).join()"), "1,2,7");
+    // `toReversed()`：新视图逆序，原视图不变。
+    assert_eq!(
+        eval_string(
+            "var a = new Uint8Array([1, 2, 3]);
+             var b = a.toReversed();
+             [a.join(), b.join()].join('|')"
+        ),
+        "1,2,3|3,2,1"
+    );
+    // `toSorted()`：无比较器时按数值升序。
+    assert_eq!(eval_string("new Uint8Array([3, 1, 2]).toSorted().join()"), "1,2,3");
+    // `findLast` / `findLastIndex`：从**末尾**往前找第一个命中的。
+    assert_eq!(
+        eval_number("new Uint8Array([1, 2, 3, 2]).findLast(function (v) { return v === 2; })"),
+        2.0
+    );
+    assert_eq!(
+        eval_number(
+            "new Uint8Array([1, 2, 3, 2]).findLastIndex(function (v) { return v === 2; })"
+        ),
+        3.0
+    );
+}

@@ -766,6 +766,12 @@ impl VM {
             "findIndex",
             "reduce",
             "reduceRight",
+            // ES2023 的一族
+            "findLast",
+            "findLastIndex",
+            "with",
+            "toReversed",
+            "toSorted",
         ];
         if !TA_CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -789,8 +795,24 @@ impl VM {
             }
             (len, els)
         };
+        // 只有这一族的首参是**回调**。`with` 的首参是下标、`toReversed` 没有参数、
+        // `toSorted` 的比较器是可选的 —— 它们不能被这条检查拦住。
+        let needs_callback = matches!(
+            method,
+            "map"
+                | "filter"
+                | "forEach"
+                | "some"
+                | "every"
+                | "find"
+                | "findIndex"
+                | "reduce"
+                | "reduceRight"
+                | "findLast"
+                | "findLastIndex"
+        );
         let callback = args.first().cloned().unwrap_or(Value::Undefined);
-        if !callback.is_callable() {
+        if needs_callback && !callback.is_callable() {
             return Err(RuntimeError::TypeError(format!(
                 "TypedArray.prototype.{method} callback is not a function"
             )));
@@ -893,6 +915,104 @@ impl VM {
                 let result = self.typed_array_species_create(receiver, kept.len(), module)?;
                 let _r = self.root(&result);
                 self.write_typed_array_elements(&result, &kept);
+                Ok(Some(result))
+            }
+            // `findLast` / `findLastIndex`：从**末尾**往前找第一个命中的。
+            "findLast" => {
+                for (i, e) in elements.iter().enumerate().rev() {
+                    let r = self.invoke(
+                        &callback,
+                        this_arg.clone(),
+                        &[e.clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                    if r.to_boolean() {
+                        return Ok(Some(e.clone()));
+                    }
+                }
+                Ok(Some(Value::Undefined))
+            }
+            "findLastIndex" => {
+                for (i, e) in elements.iter().enumerate().rev() {
+                    let r = self.invoke(
+                        &callback,
+                        this_arg.clone(),
+                        &[e.clone(), Value::Number(i as f64), receiver.clone()],
+                        module,
+                    )?;
+                    if r.to_boolean() {
+                        return Ok(Some(Value::Number(i as f64)));
+                    }
+                }
+                Ok(Some(Value::Number(-1.0)))
+            }
+            // `with(index, value)`：返回**新**视图，指定下标换成新值（不改动原视图）；
+            // 下标越界是 RangeError（ES 23.2.3.30）。
+            "with" => {
+                let raw = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+                let idx = if raw.is_nan() { 0.0 } else { raw.trunc() };
+                let i = if idx < 0.0 { len as f64 + idx } else { idx };
+                if i < 0.0 || i >= len as f64 {
+                    return Err(RuntimeError::RangeError(
+                        "TypedArray.prototype.with: index out of range".to_string(),
+                    ));
+                }
+                let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let mut out = elements.clone();
+                out[i as usize] = value;
+                let result = self.typed_array_species_create(receiver, len, module)?;
+                let _r = self.root(&result);
+                self.write_typed_array_elements(&result, &out);
+                Ok(Some(result))
+            }
+            // `toReversed()`：返回**新**视图，元素逆序（不改动原视图）。
+            "toReversed" => {
+                let mut out = elements.clone();
+                out.reverse();
+                let result = self.typed_array_species_create(receiver, len, module)?;
+                let _r = self.root(&result);
+                self.write_typed_array_elements(&result, &out);
+                Ok(Some(result))
+            }
+            // `toSorted(comparefn)`：返回**新**视图，元素排序。
+            // 无比较器时按数值升序；有比较器时用插入排序 —— 顺序比较便于在循环里
+            // invoke，`sort_by` 的闭包拿不到 `&mut self`。
+            "toSorted" => {
+                let cmp = args.first().cloned().unwrap_or(Value::Undefined);
+                let mut out = elements.clone();
+                if cmp.is_callable() {
+                    let mut i = 1usize;
+                    while i < len {
+                        let mut j = i;
+                        while j > 0 {
+                            let r = self.invoke(
+                                &cmp,
+                                Value::Undefined,
+                                &[out[j - 1].clone(), out[j].clone()],
+                                module,
+                            )?;
+                            if r.to_number() > 0.0 {
+                                out.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                } else {
+                    out.sort_by(|a, b| {
+                        a.to_number()
+                            .partial_cmp(&b.to_number())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                for v in &out {
+                    acc.push(v);
+                }
+                let result = self.typed_array_species_create(receiver, len, module)?;
+                let _r = self.root(&result);
+                self.write_typed_array_elements(&result, &out);
                 Ok(Some(result))
             }
             // `reduce` / `reduceRight`：回调是 (acc, value, index, ta)。

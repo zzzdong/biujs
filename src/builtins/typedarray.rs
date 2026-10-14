@@ -1070,6 +1070,11 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     for m in ["keys", "values", "entries"] {
         set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
+    // ES2023 的一族：同样由 VM 分派 —— `findLast*` 要 invoke 谓词，`toSorted` 要
+    // invoke 比较器，`with` / `toReversed` / `toSorted` 还要按 species 建新视图。
+    for m in ["with", "toReversed", "toSorted", "findLast", "findLastIndex"] {
+        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+    }
     for m in [
         "map",
         "filter",
