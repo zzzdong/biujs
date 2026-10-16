@@ -759,7 +759,7 @@ impl VM {
         argc: usize,
         this: Value,
         function_val: Value,
-        captured_vars: &[(String, Value)],
+        captured_vars: &[(String, crate::vm::EnvCell)],
         construct: bool,
         new_target: Value,
         module: &Module,
@@ -774,10 +774,16 @@ impl VM {
         // 读取 —— 两件事做完之后，"只在开帧时设定一次"才第一次成为可能。
         self.state.rbp = self.state.rsp;
         self.state.enter_frame()?;
-        for (name, value) in captured_vars {
-            let mut map = std::collections::HashMap::new();
-            map.insert(name.clone(), value.clone());
-            self.state.closure_var_stack.push(map);
+        // The callee inherits its captured **cells** — the very objects the
+        // The frame's environment starts **here**: everything pushed from this
+        // point on belongs to this frame — the cells it inherits first, its own
+        // captured locals after. `env_cell` scans from this boundary, and the
+        // frame releases this whole range when it returns.
+        let closure_depth = self.state.closure_var_stack.len();
+        // The callee inherits its captured **cells** — the very objects the
+        // defining frame holds, not copies of their current contents.
+        for (name, cell) in captured_vars {
+            self.state.push_env_cell(name.clone(), cell.clone());
         }
         let location = match module.entry_pc(func_id) {
             Some(location) => location,
@@ -787,7 +793,6 @@ impl VM {
                 )));
             }
         };
-        let closure_depth = self.state.closure_var_stack.len();
         let seh_depth = self.state.seh_stack.len();
         self.state.note_frame(FrameBirth {
             pc: location,
@@ -820,12 +825,13 @@ impl VM {
         func_id: u32,
         callee: &Value,
         args: &[Value],
-        captured_vars: &[(String, Value)],
+        captured_vars: &[(String, crate::vm::EnvCell)],
         mode: FrameMode,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         let saved_rsp = self.state.rsp;
         let saved_closure = self.state.closure_var_stack.len();
+        let saved_pending = self.state.pending_captured.len();
         let saved_seh = self.state.seh_stack.len();
         // **边界 = 调用方的帧深度**，一个值同时回答两个问题：
         // 1. 嵌套循环什么时候停（`frames.len() <= boundary`）；
@@ -928,6 +934,7 @@ impl VM {
         // base"**零例外**，而 `handle_throw` / `restore_execution_state` 那两处
         // 不成立 —— 它们跨生成器的挂起边界，快照属于**挂起前**那一次几何。
         self.unwind_frames_to(boundary, saved_closure, saved_seh);
+        self.state.pending_captured.truncate(saved_pending);
         // 快照**压过** `unwind_frames_to` 刚定好的派生值：这里是 Rust 驱动调用，
         // `saved_rsp` 是驱动**之前**记录的（实参压栈之前），而派生值是"被弹出那一帧
         // 的出生 `rsp"`（实参压栈之后）—— 两者不同，所以这份快照必须赢。
@@ -1541,7 +1548,7 @@ impl VM {
             Instr::CreateClosure { .. } | Instr::New { .. } => self.run_construct(inst, module)?,
             Instr::LoadThis { .. } | Instr::LoadNewTarget { .. } |
               Instr::LoadCurrentFunction { .. } | Instr::MakeFuncObj { .. } |
-              Instr::MakeArrowFuncObj { .. } | Instr::ClosureVar { .. } | Instr::CallNative { .. } => self.run_function(inst, module)?,
+              Instr::MakeArrowFuncObj { .. } | Instr::MakeCell { .. } | Instr::ClosureVar { .. } | Instr::CallNative { .. } => self.run_function(inst, module)?,
             Instr::Halt { .. } | Instr::Ret { .. } | Instr::ResumeExc { .. } => self.run_halt(inst, module)?,
         };
         if !handled {
@@ -1842,7 +1849,15 @@ impl VM {
                 // Ends the dead zone. This is the declaration's own write, so it
                 // is allowed even though a plain `StoreEnv` to an uninitialized
                 // binding would throw.
-                self.state.script_env.insert(name, Some(value));
+                //
+                // A captured lexical has the same two states — its cell starts
+                // uninitialized (`MakeCell`), and this is the one write that
+                // fills it in.
+                if let Some(cell) = self.state.env_cell(&name) {
+                    *cell.borrow_mut() = Some(value);
+                } else {
+                    self.state.script_env.insert(name, Some(value));
+                }
             }
             Instr::SetFunctionName { func, name } => {
                 let func = self.get_value(func)?;
@@ -2572,18 +2587,34 @@ impl VM {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 let value = self.get_value(value)?;
-                match self.state.script_env.get_mut(&name) {
-                    Some(slot @ Some(_)) => *slot = Some(value),
-                    // Writing into a binding that has not been initialized is the
-                    // dead zone too (a `let x;` declared after the loop that
-                    // assigns to it).
-                    Some(None) => {
+                // A captured local lives in its **cell**: write through it, or
+                // every closure that captured the binding would keep seeing the
+                // creation-time value (the `counter()` answering `1,1,1` bug).
+                // The cell check comes first: a function-local cell shadows a
+                // script-level binding of the same name.
+                if let Some(cell) = self.state.env_cell(&name) {
+                    // Still in its dead zone: only the declaration's
+                    // `InitLexical` may fill an uninitialized cell in.
+                    if cell.borrow().is_none() {
                         return Err(RuntimeError::ReferenceError(format!(
                             "Cannot access '{name}' before initialization"
-                        )))
+                        )));
                     }
-                    None => {
-                        self.state.globals.borrow_mut().insert(name, value);
+                    *cell.borrow_mut() = Some(value);
+                } else {
+                    match self.state.script_env.get_mut(&name) {
+                        Some(slot @ Some(_)) => *slot = Some(value),
+                        // Writing into a binding that has not been initialized is the
+                        // dead zone too (a `let x;` declared after the loop that
+                        // assigns to it).
+                        Some(None) => {
+                            return Err(RuntimeError::ReferenceError(format!(
+                                "Cannot access '{name}' before initialization"
+                            )))
+                        }
+                        None => {
+                            self.state.globals.borrow_mut().insert(name, value);
+                        }
                     }
                 }
             }
@@ -3256,16 +3287,55 @@ impl VM {
                 }
                 self.set_value(dst, obj_val)?;
             }
-            Instr::ClosureVar { name, value } => {
+            Instr::MakeCell { name } => {
+                let name_index = name.as_immd() as usize;
+                let name = match &module.constants[name_index] {
+                    Constant::String(s) => s.as_str().to_string(),
+                };
+                // A captured function-local gets its cell **at frame entry**:
+                // the prologue emits one `MakeCell` per name a nested function
+                // captures, so the cell exists before any closure can look it
+                // up — including a closure created by a hoisted declaration,
+                // which runs before the rest of the body.
+                //
+                // `None` = not yet initialized: a captured `let` has a *dynamic*
+                // dead zone (a closure can read it before its declaration has
+                // run), so the cell has to carry that state instead of starting
+                // out `undefined`. `var`s and parameters are initialized to
+                // `undefined` by the hoisting / parameter prologue.
+                let cell = crate::vm::new_env_cell(None);
+                self.state.push_env_cell(name, cell);
+            }
+            Instr::ClosureVar {
+                name,
+                value,
+                fallback,
+            } => {
                 let name_index = name.as_immd() as usize;
                 let name = match &module.constants[name_index] {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 let value = self.get_value(value)?;
-                // Push as a single-entry map onto closure_var_stack
-                let mut map = HashMap::new();
-                map.insert(name, value);
-                self.state.closure_var_stack.push(map);
+                let copy_fallback = fallback.as_immd() != 0;
+                // Capture the **cell**, not the value. The cell is looked up by
+                // name in the current frame's environment, so a name captured
+                // from an enclosing frame resolves to that very cell (the chain
+                // works at any depth) and a name that is this frame's own
+                // captured local resolves to its prologue cell.
+                if let Some(cell) = self.state.env_cell(&name) {
+                    self.state.pending_captured.push((name, cell));
+                } else if copy_fallback {
+                    // No cell: a block-scoped local (a `for (let …)` head, a
+                    // block's `let`). Those keep the copy semantics on purpose —
+                    // a per-iteration binding is *supposed* to hand each
+                    // iteration's closure its own value.
+                    let cell = crate::vm::new_env_cell(Some(value));
+                    self.state.pending_captured.push((name, cell));
+                }
+                // Otherwise the name is neither a local here nor a cell in
+                // scope: it resolves through the global environment at read
+                // time, and capturing a snapshot would shadow the global with a
+                // frozen `undefined`.
             }
             Instr::CallNative { callee, argc } => {
                 let callable = self.get_value(callee)?;

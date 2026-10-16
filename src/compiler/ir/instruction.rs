@@ -535,10 +535,22 @@ pub enum Instruction {
         func_id: Value,
         captured_this: Value,
     },
-    /// ClosureVar - Push a captured variable for the next MakeArrowFuncObj
+    /// MakeCell - Bind the shared cell of a captured function-local in the
+    /// current frame's environment (see `ClosureVar`).
+    MakeCell {
+        name: Value,
+    },
+    /// ClosureVar - Capture the cell named `name` for the next Make*FuncObj.
+    ///
+    /// `fallback` says what to do when no cell of that name is in scope: with
+    /// `true` the operand value is copied into a fresh cell (the name is a real
+    /// local binding — a block-scoped one, whose per-iteration semantics the
+    /// copy preserves); with `false` the name is left alone so it resolves
+    /// through the global environment at run time.
     ClosureVar {
         name: Value,
         value: Value,
+        fallback: bool,
     },
 }
 
@@ -749,7 +761,12 @@ impl Instruction {
                 func_id,
                 captured_this,
             } => (vec![*dst], vec![*func_id, *captured_this]),
-            Instruction::ClosureVar { name, value } => (vec![], vec![*name, *value]),
+            Instruction::ClosureVar {
+                name,
+                value,
+                fallback: _,
+            } => (vec![], vec![*name, *value]),
+            Instruction::MakeCell { name } => (vec![], vec![*name]),
         }
     }
 }
@@ -1081,9 +1098,19 @@ impl std::fmt::Display for Instruction {
             } => {
                 write!(f, "{dst} = make_arrow_func_obj {func_id} {captured_this}")
             }
-            Instruction::ClosureVar { name, value } => {
-                write!(f, "closure_var {name}, {value}")
+            Instruction::ClosureVar {
+                name,
+                value,
+                fallback,
+            } => {
+                write!(f, "closure_var {name}, {value}")?;
+                if !fallback {
+                    write!(f, " (no-fallback)")
+                } else {
+                    Ok(())
+                }
             }
+            Instruction::MakeCell { name } => write!(f, "make_cell {name}"),
         }
     }
 }

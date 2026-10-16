@@ -364,6 +364,29 @@ pub struct JSASTLower<'a> {
     /// record's entry — it is not a property of the global object, so
     /// `globalThis.x` stays `undefined`.
     script_lexical: std::collections::HashSet<String>,
+    /// This function's own bindings that a **nested** function captures.
+    ///
+    /// They stop living in registers and start living in shared cells
+    /// (`Opcode::MakeCell` in the prologue, `LoadEnv`/`StoreEnv` at every use),
+    /// so a closure sees the binding itself instead of a snapshot of its value
+    /// at closure-creation time. Everything else keeps register storage:
+    /// block-scoped bindings (loop heads included) deliberately keep the
+    /// *copy* semantics, which is what gives `for (let i …) fns.push(() => i)`
+    /// its per-iteration values.
+    ///
+    /// The script's own scope is exempt: its bindings are already shared
+    /// (script record / global object), so the script lowerer never allocates
+    /// cells.
+    captured_locals: std::collections::HashSet<String>,
+    /// True while a parameter's default value is being lowered.
+    ///
+    /// ES 9.2.10 step 27: when a function has parameter expressions, its body's
+    /// `var`s live in a *separate* environment, so a closure created in the
+    /// parameter list must not see them (`function f(_ = () => x) { var x = 1 }`
+    /// answers the outer `x`). Those names are not bound yet at this point,
+    /// which is how they are told apart from the parameters — a parameter *is*
+    /// visible to the defaults that follow it.
+    in_param_default: bool,
 }
 
 impl<'a> JSASTLower<'a> {
@@ -387,6 +410,8 @@ impl<'a> JSASTLower<'a> {
             seh_frames: Vec::new(),
             global_names: std::collections::HashSet::new(),
             script_lexical: std::collections::HashSet::new(),
+            captured_locals: std::collections::HashSet::new(),
+            in_param_default: false,
         }
     }
 
@@ -449,6 +474,157 @@ impl<'a> JSASTLower<'a> {
                 .insert_at(self.var_scope, name.to_string(), variable);
         } else {
             self.symbols.insert(name.to_string(), variable);
+        }
+    }
+
+    // --------------------------- captured locals ---------------------------
+    //
+    // A binding a nested function captures stops being a register and becomes a
+    // shared cell (see `captured_locals`). The three helpers below are the only
+    // places that decide which storage a name uses; every read and write of a
+    // *binding* goes through them.
+
+    /// Fill in `captured_locals` for the function about to be lowered.
+    ///
+    /// Runs before anything is emitted: the prologue has to know the names
+    /// before the parameter binding (a captured parameter's value must land in
+    /// its cell) and before any hoisted declaration creates a closure that
+    /// looks the cell up.
+    fn prepare_captured_locals(&mut self, params: &FormalParameters<'_>, body: &FunctionBody<'_>) {
+        self.captured_locals.clear();
+        if self.is_script {
+            // Script-scope bindings are already shared (script record / global
+            // object), so the script itself never needs cells.
+            return;
+        }
+        let mut nested_refs = std::collections::HashSet::new();
+        let mut scratch = std::collections::HashSet::new();
+        self.collect_free_idents_from_body(body, &mut nested_refs, &mut scratch, true);
+        let scope_names = self.function_scope_names(params, body);
+        for name in nested_refs {
+            let name = name.to_string();
+            if !scope_names.contains(&name)
+                || self.global_names.contains(&name)
+                || self.script_lexical.contains(&name)
+            {
+                continue;
+            }
+            self.captured_locals.insert(name);
+        }
+    }
+
+    /// Every name bound in **this function's own scope**: parameters, `var`s
+    /// (hoisted out of every block), the top-level `function` declarations, the
+    /// top-level `let`/`const`/`class`, and `arguments`.
+    ///
+    /// Deliberately *not* the block-scoped bindings: those keep the copy
+    /// semantics (a `for (let …)` head hands each iteration its own value).
+    fn function_scope_names(
+        &self,
+        params: &FormalParameters<'_>,
+        body: &FunctionBody<'_>,
+    ) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        let mut scratch = Vec::new();
+        for p in &params.items {
+            scratch.clear();
+            collect_binding_names(&p.pattern, &mut scratch);
+            names.extend(scratch.drain(..));
+        }
+        if let Some(rest) = params.rest.as_deref() {
+            scratch.clear();
+            collect_binding_names(&rest.rest.argument, &mut scratch);
+            names.extend(scratch.drain(..));
+        }
+        let mut vars = Vec::new();
+        collect_var_names(&body.statements, &mut vars);
+        names.extend(vars);
+        let mut lexicals = Vec::new();
+        collect_lexical_names(&body.statements, &mut lexicals);
+        names.extend(lexicals);
+        for stmt in &body.statements {
+            if let Statement::FunctionDeclaration(func) = stmt
+                && let Some(id) = &func.id
+            {
+                names.insert(id.name.to_string());
+            }
+        }
+        names.insert("arguments".to_string());
+        names
+    }
+
+    /// Whether `name` is one of this function's captured locals — i.e. whether
+    /// reads and writes must go through its cell.
+    ///
+    /// The depth check is what keeps a *block-scoped* shadow out: `lookup_depth`
+    /// answers with the scope the innermost binding lives in, and only the
+    /// function's own scope (`var_scope`) is cell-backed.
+    fn is_env_backed(&self, name: &str) -> bool {
+        self.is_captured_local(name) && self.symbols.lookup_depth(name) == Some(self.var_scope)
+    }
+
+    /// Whether `name` is a captured local, ignoring the symbol table.
+    ///
+    /// The declaration sites (parameters, hoisted functions, `arguments`) run
+    /// *before* the binding is recorded, so `is_env_backed`'s depth check would
+    /// answer `false` there. Parameters always live in this function's scope, so
+    /// the name alone is enough.
+    fn is_captured_local(&self, name: &str) -> bool {
+        !self.is_script && self.captured_locals.contains(name)
+    }
+
+    /// Read a binding: through its cell when it is captured, from its register
+    /// otherwise.
+    fn load_binding(&mut self, name: &str) -> Value {
+        if self.is_env_backed(name) {
+            return self.builder.load_env(name);
+        }
+        match self.symbols.lookup(name) {
+            Some(var) => var.slot,
+            None => self.builder.load_external_variable(name.to_string()),
+        }
+    }
+
+    /// Write a binding: through its cell when it is captured, into its register
+    /// otherwise. A name with no binding at all is a global assignment.
+    fn store_binding(&mut self, name: &str, value: Value) {
+        if self.is_env_backed(name) {
+            self.builder.store_env(name, value);
+            return;
+        }
+        if let Some(var) = self.symbols.lookup(name) {
+            self.builder.assign(var.slot, value);
+        }
+    }
+
+    /// Initialize a captured binding: the one write that may fill an
+    /// uninitialized cell in (`InitLexical`), or the binding's own register.
+    ///
+    /// Declaration sites use this; ordinary assignments use `store_binding`,
+    /// which refuses to write a cell that is still in its dead zone.
+    fn init_binding(&mut self, name: &str, value: Value) {
+        if self.is_captured_local(name) {
+            let name_const = self.make_name_constant(name);
+            self.builder.init_lexical(name_const, value);
+            return;
+        }
+        if let Some(var) = self.symbols.lookup(name) {
+            self.builder.assign(var.slot, value);
+        }
+    }
+
+    /// Emit one `MakeCell` per captured local, in the function prologue.
+    fn emit_captured_cells(&mut self) {
+        if self.captured_locals.is_empty() {
+            return;
+        }
+        // Sorted for determinism: the set's iteration order is arbitrary, and
+        // the emitted instruction stream should not be.
+        let mut names: Vec<String> = self.captured_locals.iter().cloned().collect();
+        names.sort();
+        for name in names {
+            let name_const = self.make_name_constant(&name);
+            self.builder.make_cell(name_const);
         }
     }
 
@@ -722,11 +898,26 @@ impl<'a> JSASTLower<'a> {
         // `q`), and that scope stays open for the rest of the definition so the
         // body can see the name too.
         let has_own_name = class.id.is_some();
-        if has_own_name {
+        // A class declared at a function's top level has a *function-scoped*
+        // name, and a nested method that reads it captures it — so the name has
+        // to live in the same shared cell every other captured local uses. That
+        // only works if the binding sits in this function's own scope, so the
+        // extra shadowing scope is skipped in that one case; everywhere else
+        // (a block-level class, a class expression) the name belongs to its own
+        // scope and is captured as a value.
+        let name_at_function_scope = self.symbols.scope_count() == self.var_scope + 1;
+        let name_cell_backed =
+            has_own_name && name_at_function_scope && self.captured_locals.contains(&class_name);
+        let name_own_scope = has_own_name && !name_cell_backed;
+        if name_own_scope {
             self.symbols.enter_scope();
             let dst = self.builder.alloc();
             self.builder
                 .assign(dst, Value::Primitive(Primitive::Undefined));
+            self.symbols
+                .insert(class_name.clone(), Variable::uninitialized(dst));
+        } else if has_own_name {
+            let dst = self.builder.alloc();
             self.symbols
                 .insert(class_name.clone(), Variable::uninitialized(dst));
         }
@@ -755,18 +946,26 @@ impl<'a> JSASTLower<'a> {
             if let Member::Constructor(func) = member {
                 // `C.name` is the class name (ES 14.5.14 ClassDefinitionEvaluation
                 // sets the constructor's name to the binding identifier).
+                // The instance-field initialisers run in the constructor's scope,
+                // so their references are the constructor's captures too.
+                let captured = self.free_idents_of_class_member(
+                    &func.params,
+                    func.body.as_deref(),
+                    &instance_fields,
+                );
                 constructor_id = Some(self.lower_function_inner(
                     ctor_name.clone(),
                     &func.params,
                     func.body.as_ref().unwrap(),
                     None,
                     false,
-                    &[],
+                    &captured,
                     false,
                     &instance_fields,
                     false,
                     false,
                     has_heritage,));
+                self.emit_closure_vars(&captured);
             }
         }
 
@@ -820,13 +1019,21 @@ impl<'a> JSASTLower<'a> {
         //    the prototype) exist *before* the body members, which is why a
         //    computed `['constructor']` member can overwrite the back-reference
         //    and why `prototype` comes first in property order.
-        // The class value exists now, so its own name has left the dead zone; the
-        // scope that held it ends with the definition.
+        let func_obj = self.builder.make_func_obj(constructor_id);
+        // The class value exists now, so its own name has left the dead zone;
+        // the scope that held it ends with the definition. The name is written
+        // *before* the members are installed: a method that captures it (by
+        // cell, or by value for a block-scoped class) has to see the class, not
+        // the pre-definition placeholder.
         if has_own_name {
             self.symbols.mark_initialized(&class_name);
-            self.symbols.leave_scope();
+            // An initialization: the cell starts uninitialized, and a plain
+            // `StoreEnv` would hit the dead-zone check.
+            self.init_binding(&class_name, func_obj);
+            if name_own_scope {
+                self.symbols.leave_scope();
+            }
         }
-        let func_obj = self.builder.make_func_obj(constructor_id);
         let proto_desc = self.data_descriptor(proto, true, false, false);
         self.define_property_named(func_obj, "prototype", proto_desc);
         let ctor_desc = self.data_descriptor(func_obj, true, false, true);
@@ -870,54 +1077,63 @@ impl<'a> JSASTLower<'a> {
                 Member::Constructor(_) => {}
                 Member::Method { key, func } => {
                     let name = member_display_name(&class_name, key);
+                    let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
                         Some(name),
                         &func.params,
                         func.body.as_ref().unwrap(),
                         None,
                         false,
-                        &[],
+                        &captured,
                         false,
                         &[],
                         func.generator,
                 func.r#async,
                 false,);
+                    self.emit_closure_vars(&captured);
+                    let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
                     let desc = self.method_descriptor(func_val);
                     self.define_member(proto, key, desc);
                 }
                 Member::StaticMethod { key, func } => {
                     let name = member_display_name(&class_name, key);
+                    let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
                         Some(name),
                         &func.params,
                         func.body.as_ref().unwrap(),
                         None,
                         false,
-                        &[],
+                        &captured,
                         false,
                         &[],
                         func.generator,
                 func.r#async,
                 false,);
+                    self.emit_closure_vars(&captured);
+                    let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
                     let desc = self.method_descriptor(func_val);
                     self.define_member(func_obj, key, desc);
                 }
                 Member::Accessor { key, is_get, func } => {
                     let name = member_display_name(&class_name, key);
+                    let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
                         Some(name),
                         &func.params,
                         func.body.as_ref().unwrap(),
                         None,
                         false,
-                        &[],
+                        &captured,
                         false,
                         &[],
                         func.generator,
                 func.r#async,
                 false,);
+                    self.emit_closure_vars(&captured);
+                    let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
                     let (getter, setter) = if *is_get {
                         (Some(func_val), None)
@@ -929,18 +1145,21 @@ impl<'a> JSASTLower<'a> {
                 }
                 Member::StaticAccessor { key, is_get, func } => {
                     let name = member_display_name(&class_name, key);
+                    let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
                         Some(name),
                         &func.params,
                         func.body.as_ref().unwrap(),
                         None,
                         false,
-                        &[],
+                        &captured,
                         false,
                         &[],
                         func.generator,
                 func.r#async,
                 false,);
+                    self.emit_closure_vars(&captured);
+                    let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
                     let (getter, setter) = if *is_get {
                         (Some(func_val), None)
@@ -1058,8 +1277,21 @@ impl<'a> JSASTLower<'a> {
                     Some(var) => var.slot,
                     None => self.builder.alloc(),
                 };
+                // A captured local: the write goes to the cell, never to the
+                // placeholder register.
+                let cell_backed = self.is_env_backed(&name);
                 if let Some(value) = value {
-                    self.builder.assign(dst, value);
+                    if cell_backed {
+                        // A `let`/`const` declaration *ends* the dead zone; a
+                        // `var` assignment is an ordinary write.
+                        if is_var {
+                            self.store_binding(&name, value);
+                        } else {
+                            self.init_binding(&name, value);
+                        }
+                    } else {
+                        self.builder.assign(dst, value);
+                    }
                     if is_var && self.at_script_var_scope() || !is_var && self.at_script_scope() {
                         self.define_global(&name, value);
                     }
@@ -1069,6 +1301,9 @@ impl<'a> JSASTLower<'a> {
                     // `var x;` / `let x;` — publish the (undefined) binding so
                     // nested reads resolve to undefined instead of ReferenceError.
                     self.define_global(&name, Value::Primitive(Primitive::Undefined));
+                } else if cell_backed && !is_var {
+                    // `let x;` with no initializer still ends the dead zone.
+                    self.init_binding(&name, Value::Primitive(Primitive::Undefined));
                 }
                 // else: dst stays as default (undefined)
                 match hoisted {
@@ -1101,8 +1336,13 @@ impl<'a> JSASTLower<'a> {
             // name is already declared here".
             if self.symbols.lookup_at(self.current_scope(), &name).is_none() {
                 let dst = self.builder.alloc();
-                self.builder
-                    .assign(dst, Value::Primitive(Primitive::Undefined));
+                // A captured `let` lives in its cell (created by the prologue's
+                // `MakeCell`), so the placeholder register is never written —
+                // reading it would only ever produce `undefined` anyway.
+                if !self.is_env_backed(&name) {
+                    self.builder
+                        .assign(dst, Value::Primitive(Primitive::Undefined));
+                }
                 self.symbols
                     .insert(name.clone(), Variable::uninitialized(dst));
             }
@@ -1137,11 +1377,21 @@ impl<'a> JSASTLower<'a> {
     fn hoist_var_bindings(&mut self, stmts: &[Statement<'_>]) {
         let mut names = Vec::new();
         collect_var_names(stmts, &mut names);
+
         for name in names {
             if self.symbols.lookup(&name).is_none() {
                 let dst = self.builder.alloc();
-                self.builder
-                    .assign(dst, Value::Primitive(Primitive::Undefined));
+                if self.is_captured_local(&name) {
+                    // A captured `var` is *hoisted*: its cell exists from frame
+                    // entry and starts holding `undefined`. That first write
+                    // initializes the cell, so it goes through `InitLexical`
+                    // (a plain `StoreEnv` would hit the dead-zone check).
+                    self.builder
+                        .init_lexical_name(&name, Value::Primitive(Primitive::Undefined));
+                } else {
+                    self.builder
+                        .assign(dst, Value::Primitive(Primitive::Undefined));
+                }
                 self.insert_binding(&name, Variable::new(dst));
                 if self.at_script_var_scope() {
                     self.define_global(&name, Value::Primitive(Primitive::Undefined));
@@ -2125,6 +2375,11 @@ impl<'a> JSASTLower<'a> {
             if is_script_binding && self.global_names.contains(ident.name.as_str()) {
                 return self.builder.load_external_variable(ident.name.to_string());
             }
+            // A captured local lives in its cell: read the cell, or a closure
+            // would observe the creation-time value instead of the live one.
+            if self.is_env_backed(ident.name.as_str()) {
+                return self.builder.load_env(ident.name.as_str());
+            }
             var.slot
         } else {
             // Try loading as external/global variable
@@ -2282,10 +2537,12 @@ impl<'a> JSASTLower<'a> {
                     // `x++` reads *and* writes, so a dead-zone binding fails here
                     // as well.
                     Some(var) if !var.initialized => self.throw_tdz(ident.name.as_str()),
-                    Some(var) => {
-                        let current = var.slot;
+                    Some(_) => {
+                        // A captured local: read-modify-write through the cell,
+                        // exactly like the global path above.
+                        let current = self.load_binding(ident.name.as_str());
                         let (old_num, new_val) = self.lower_update_step(current, op);
-                        self.builder.assign(current, new_val);
+                        self.store_binding(ident.name.as_str(), new_val);
                         self.sync_global(&ident.name.to_string(), new_val);
                         // prefix returns new value, postfix returns old value
                         if update.prefix { new_val } else { old_num }
@@ -2456,14 +2713,16 @@ impl<'a> JSASTLower<'a> {
                     // ReferenceError, not a silent assignment (`store_into_ident
                     // ifier` covers the destructuring target, this the plain one).
                     Some(var) if !var.initialized => self.throw_tdz(ident.name.as_str()),
-                    Some(var) => {
-                        let current = var.slot;
+                    Some(_) => {
+                        // A captured local: the compound read and the write both
+                        // go through the cell, so a closure sees the new value.
+                        let current = self.load_binding(ident.name.as_str());
                         let hint = self.assignment_name_hint(assign, ident.name.as_str());
                         let rhs = self.lower_expression_named(&assign.right, hint);
                         let value = self
                             .compound_binop(assign.operator, current, rhs)
                             .unwrap_or(rhs);
-                        self.builder.assign(current, value);
+                        self.store_binding(ident.name.as_str(), value);
                         self.sync_global(&ident.name.to_string(), value);
                         value
                     }
@@ -2975,11 +3234,52 @@ impl<'a> JSASTLower<'a> {
             .iter()
             .map(|p| self.binding_pattern_name(&p.pattern))
             .collect();
+        if let Some(rest) = params.rest.as_deref() {
+            declared.insert(self.binding_pattern_name(&rest.rest.argument));
+        }
         // `arguments` belongs to the function itself (ES 10.2.5 creates it in the
         // function's own environment), so it is never an outer variable.
         declared.insert("arguments".to_string());
         let mut referenced = std::collections::HashSet::new();
-        self.collect_free_idents_from_body(body, &mut referenced, &mut declared);
+        self.collect_free_idents_from_body(body, &mut referenced, &mut declared, false);
+        referenced
+            .into_iter()
+            .filter(|name| !declared.contains(*name))
+            .map(String::from)
+            .collect()
+    }
+
+    /// Same, for a class member: the constructor also owns the instance-field
+    /// initialisers (they run in its scope), so their references count as the
+    /// constructor's free identifiers too.
+    fn free_idents_of_class_member(
+        &self,
+        params: &FormalParameters<'_>,
+        body: Option<&FunctionBody<'_>>,
+        instance_fields: &[&PropertyDefinition<'_>],
+    ) -> Vec<String> {
+        let Some(body) = body else { return Vec::new() };
+        let mut declared: std::collections::HashSet<String> = params
+            .items
+            .iter()
+            .map(|p| self.binding_pattern_name(&p.pattern))
+            .collect();
+        if let Some(rest) = params.rest.as_deref() {
+            declared.insert(self.binding_pattern_name(&rest.rest.argument));
+        }
+        declared.insert("arguments".to_string());
+        let mut referenced = std::collections::HashSet::new();
+        self.collect_free_idents_from_body(body, &mut referenced, &mut declared, false);
+        for field in instance_fields {
+            if let Some(init) = &field.value {
+                self.collect_free_idents_from_expression(
+                    init,
+                    &mut referenced,
+                    &mut declared,
+                    false,
+                );
+            }
+        }
         referenced
             .into_iter()
             .filter(|name| !declared.contains(*name))
@@ -3004,14 +3304,36 @@ impl<'a> JSASTLower<'a> {
             {
                 continue;
             }
-            if let Some(var) = self.symbols.lookup(name.as_str()) {
-                let name_const = self
-                    .builder
-                    .make_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
-                        name.clone(),
-                    )));
-                let value = var.slot;
-                self.builder.closure_var(name_const, value);
+            // A closure in the parameter list must not capture a body-declared
+            // binding: the two live in different environments (see the field's
+            // comment). Parameters themselves are bound by now, so they still
+            // capture normally.
+            if self.in_param_default
+                && self.is_captured_local(name.as_str())
+                && self.symbols.lookup(name.as_str()).is_none()
+            {
+                continue;
+            }
+            let slot = self.symbols.lookup(name.as_str()).map(|v| v.slot);
+            let name_const = self
+                .builder
+                .make_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
+                    name.clone(),
+                )));
+            match slot {
+                // A cell-backed name captures the *cell*; a block-scoped one
+                // captures its current value (per-iteration semantics).
+                Some(slot) => {
+                    let copy_fallback = !self.is_env_backed(name.as_str());
+                    self.builder.closure_var(name_const, slot, copy_fallback);
+                }
+                // No binding here: the callee must resolve the name through the
+                // environment (or a cell it inherited) at read time.
+                None => self.builder.closure_var(
+                    name_const,
+                    Value::Primitive(Primitive::Undefined),
+                    false,
+                ),
             }
         }
     }
@@ -3038,7 +3360,7 @@ impl<'a> JSASTLower<'a> {
         for p in &param_names {
             declared.insert(p.clone());
         }
-        self.collect_free_idents_from_body(&arrow.body, &mut referenced, &mut declared);
+        self.collect_free_idents_from_body(&arrow.body, &mut referenced, &mut declared, false);
         let free_idents: std::collections::HashSet<&str> = referenced
             .iter()
             .filter(|name| !declared.contains(**name))
@@ -3067,18 +3389,11 @@ impl<'a> JSASTLower<'a> {
         // an arrow that only calls `super()` must not trip over reading it —
         // `MakeArrowFuncObj` takes the frame's `this` instead.
 
-        // Capture each free variable that exists in the current symbol table
-        for name in &free_idents {
-            if let Some(var) = self.symbols.lookup(name) {
-                let name_const = self
-                    .builder
-                    .make_constant(crate::bytecode::Constant::String(std::sync::Arc::new(
-                        String::from(*name),
-                    )));
-                let value = var.slot;
-                self.builder.closure_var(name_const, value);
-            }
-        }
+        // Capture each free variable — the same rule a `function` expression
+        // follows (cell for a shared binding, value for a block-scoped one,
+        // nothing at all for a script-scope global).
+        let free_idents: Vec<String> = free_idents.iter().map(|s| String::from(*s)).collect();
+        self.emit_closure_vars(&free_idents);
 
         // Create arrow function object with captured `this` and captured vars
         self.builder
@@ -3181,21 +3496,43 @@ impl<'a> JSASTLower<'a> {
             // A hoisted `function` cannot be handled by the snapshot capture
             // model: its object is created before the enclosing body runs, so a
             // snapshot would freeze the pre-declaration (hoisted) value of every
-            // outer binding. It needs the shared-cell model — see the batch
-            // record's residual.
+            // outer binding. It needs the shared-cell model — which is what the
+            // captures below give it (`ClosureVar` hands over the *cell*).
+            // At script scope this runs *before* the entry block exists (the
+            // script's first pass), so nothing can be emitted here — and nothing
+            // needs to be: script-scope bindings are shared through the script
+            // record / global object, so a hoisted script-level function has no
+            // cells to capture anyway.
+            if self.is_script {
+                let func_id_val = self.lower_function_inner(
+                    Some(name.clone()),
+                    &func.params,
+                    body,
+                    None,
+                    false,
+                    &[],
+                    false,
+                    &[],
+                    func.generator,
+                    func.r#async,
+                    false,);
+                return Some((name, func_id_val));
+            }
+            let captured = self.free_idents_of_function(&func.params, body);
             let func_id_val = self.lower_function_inner(
                 Some(name.clone()),
                 &func.params,
                 body,
                 None,
                 false,
-                &[],
+                &captured,
                 false,
                 &[],
                 func.generator,
                 func.r#async,
                 false,);
-            Some((name, func_id_val))
+            self.emit_closure_vars(&captured);
+            Some((name, self.builder.make_func_obj(func_id_val)))
         } else {
             None
         }
@@ -3274,6 +3611,13 @@ impl<'a> JSASTLower<'a> {
         func_lower.builder.set_entry(entry);
         func_lower.builder.switch_to_block(entry);
 
+        // Which of this function's own bindings a nested function captures.
+        // Decided before anything is emitted: the cells have to exist before
+        // the parameter binding writes them and before any hoisted declaration
+        // creates a closure that looks them up.
+        func_lower.prepare_captured_locals(formal_params, body);
+        func_lower.emit_captured_cells();
+
         // Load arguments and bind parameters. A parameter with an initializer
         // (default value) gets an `undefined` check: the initializer runs only
         // when the argument was not passed (or was passed as `undefined`).
@@ -3282,11 +3626,18 @@ impl<'a> JSASTLower<'a> {
         for (idx, param) in params.iter().enumerate() {
             let arg = func_lower.builder.load_arg(idx);
             let param_name = func_lower.binding_pattern_name(&param.pattern);
+            // A captured parameter lives in its cell: the argument register is
+            // only the delivery vehicle, so the value is copied into the cell
+            // once (after the default, if any) and the symbol table keeps a
+            // placeholder register that nothing reads.
+            let param_cell = func_lower.is_captured_local(&param_name);
 
-            if let BindingPattern::BindingIdentifier(_) = &param.pattern {
+            if let BindingPattern::BindingIdentifier(_) = &param.pattern
+                && !param_cell
+            {
                 func_lower
                     .symbols
-                    .insert(param_name, Variable::new(arg));
+                    .insert(param_name.clone(), Variable::new(arg));
             }
 
             if let Some(init) = &param.initializer {
@@ -3301,11 +3652,24 @@ impl<'a> JSASTLower<'a> {
                 func_lower.builder.switch_to_block(default_blk);
                 // `function f(x = function () {}) {}` names the function `x`.
                 let hint = func_lower.name_hint(pattern_hint_name(&param.pattern));
+                func_lower.in_param_default = true;
                 let default_val = func_lower.lower_expression_named(init, hint);
-                func_lower.builder.assign(arg, default_val);
+                func_lower.in_param_default = false;
+                if param_cell {
+                    func_lower.builder.store_env(&param_name, default_val);
+                } else {
+                    func_lower.builder.assign(arg, default_val);
+                }
                 func_lower.builder.jump(merge_blk);
 
                 func_lower.builder.switch_to_block(merge_blk);
+            }
+
+            if param_cell {
+                func_lower.builder.init_lexical_name(&param_name, arg);
+                func_lower
+                    .symbols
+                    .insert(param_name, Variable::new(func_lower.builder.alloc()));
             }
 
             // Destructuring parameter (`function f([a, b]) {}`): bind after
@@ -3329,9 +3693,19 @@ impl<'a> JSASTLower<'a> {
         // which clone this symbol table, resolve `arguments` lexically.
         if !is_arrow {
             let args_val = func_lower.builder.arguments_object();
-            func_lower
-                .symbols
-                .insert("arguments".to_string(), Variable::new(args_val));
+            if func_lower.is_captured_local("arguments") {
+                // A nested function reads `arguments` through the cell, so the
+                // object is stored there; the register is a placeholder.
+                func_lower.builder.init_lexical_name("arguments", args_val);
+                let dst = func_lower.builder.alloc();
+                func_lower
+                    .symbols
+                    .insert("arguments".to_string(), Variable::new(dst));
+            } else {
+                func_lower
+                    .symbols
+                    .insert("arguments".to_string(), Variable::new(args_val));
+            }
         }
 
         // A generator binds its parameters — and builds `arguments` — when it is
@@ -3361,7 +3735,14 @@ impl<'a> JSASTLower<'a> {
         // Assign hoisted nested functions to this function's symbol table
         for (inner_name, func_val) in &hoisted_funcs {
             let dst = func_lower.builder.alloc();
-            func_lower.builder.assign(dst, *func_val);
+            // A hoisted declaration a nested function captures is reachable
+            // through its cell, and it is bound *before* the body runs — the
+            // closure reads the cell whenever it is finally called.
+            if func_lower.is_captured_local(inner_name) {
+                func_lower.builder.init_lexical_name(inner_name, *func_val);
+            } else {
+                func_lower.builder.assign(dst, *func_val);
+            }
             func_lower
                 .symbols
                 .insert(inner_name.clone(), Variable::new(dst));
@@ -3371,7 +3752,11 @@ impl<'a> JSASTLower<'a> {
         if let Some(ref func_name) = name {
             let func_val = Value::Function(func_id);
             let dst = func_lower.builder.alloc();
-            func_lower.builder.assign(dst, func_val);
+            if func_lower.is_captured_local(func_name) {
+                func_lower.builder.init_lexical_name(func_name, func_val);
+            } else {
+                func_lower.builder.assign(dst, func_val);
+            }
             func_lower
                 .symbols
                 .insert(func_name.clone(), Variable::new(dst));
@@ -3486,13 +3871,24 @@ impl<'a> JSASTLower<'a> {
     fn bind_pattern(&mut self, pattern: &BindingPattern<'_>, value: Value, publish_global: bool) {
         match pattern {
             BindingPattern::BindingIdentifier(id) => {
-                self.insert_binding(id.name.as_str(), Variable::new(value));
+                let name = id.name.as_str();
+                if self.is_captured_local(name) {
+                    // Captured local: bind first (at whatever scope this
+                    // declaration belongs to), then let `store_binding` decide —
+                    // a function-scope binding writes the cell, a block-scoped
+                    // one writes its own register.
+                    let dst = self.builder.alloc();
+                    self.insert_binding(name, Variable::new(dst));
+                    self.init_binding(name, value.clone());
+                } else {
+                    self.insert_binding(name, Variable::new(value));
+                }
                 if publish_global && self.publishes_as_global() {
                     // Through `define_global`, not a raw store: a script-scope
                     // `let`/`const` bound by a *pattern* (`const [x] = [1]`) is
                     // initialized here, and initialization is the one write that
                     // may end the binding's dead zone.
-                    self.define_global(id.name.as_str(), value.clone());
+                    self.define_global(name, value.clone());
                 }
             }
             BindingPattern::AssignmentPattern(ap) => {
@@ -4156,22 +4552,98 @@ impl<'a> JSASTLower<'a> {
 
     /// Recursively collect referenced and declared identifiers from a function body.
     /// `referenced` tracks names used in expressions; `declared` tracks names declared locally.
+    /// Free identifiers of a function **nested** inside the one being analysed,
+    /// merged into `referenced`.
+    ///
+    /// A fresh `declared` set per boundary is what keeps a deeper function's
+    /// locals from polluting the outer name set — with one shared set,
+    /// `function f() { var g = function () { var x = 2; return x; }; return () => x; }`
+    /// stopped capturing `f`'s `x` because `g`'s declaration of the same name
+    /// had already been recorded as "declared".
+    fn collect_free_idents_of_nested_function<'b>(
+        &self,
+        params: &FormalParameters<'b>,
+        body: Option<&'b FunctionBody<'b>>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+    ) {
+        let Some(body) = body else { return };
+        let mut inner_ref = std::collections::HashSet::new();
+        let mut inner_decl = std::collections::HashSet::new();
+        for p in &params.items {
+            inner_decl.insert(self.binding_pattern_name(&p.pattern));
+        }
+        if let Some(rest) = params.rest.as_deref() {
+            inner_decl.insert(self.binding_pattern_name(&rest.rest.argument));
+        }
+        self.collect_free_idents_from_body(body, &mut inner_ref, &mut inner_decl, false);
+        for name in inner_ref {
+            if !inner_decl.contains(name) {
+                referenced.insert(name);
+            }
+        }
+    }
+
+    /// References from every function-like part of a class body: method bodies,
+    /// accessor bodies, static blocks and field initialisers. Computed *keys*
+    /// are deliberately **not** collected — they are evaluated in the enclosing
+    /// frame, which reads its own registers directly.
+    fn collect_free_idents_of_nested_class<'b>(
+        &self,
+        class: &'b Class<'b>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+    ) {
+        for element in &class.body.body {
+            match element {
+                ClassElement::MethodDefinition(method) => {
+                    self.collect_free_idents_of_nested_function(
+                        &method.value.params,
+                        method.value.body.as_deref(),
+                        referenced,
+                    );
+                }
+                ClassElement::PropertyDefinition(field) => {
+                    if let Some(init) = &field.value {
+                        self.collect_free_idents_from_expression(
+                            init,
+                            referenced,
+                            &mut std::collections::HashSet::new(),
+                            false,
+                        );
+                    }
+                }
+                ClassElement::StaticBlock(block) => {
+                    for stmt in &block.body {
+                        self.collect_free_idents_from_statement(
+                            stmt,
+                            referenced,
+                            &mut std::collections::HashSet::new(),
+                            false,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn collect_free_idents_from_body<'b>(
         &self,
-        body: &FunctionBody<'b>,
+        body: &'b FunctionBody<'b>,
         referenced: &mut std::collections::HashSet<&'b str>,
         declared: &mut std::collections::HashSet<String>,
+        nested_only: bool,
     ) {
         for stmt in &body.statements {
-            self.collect_free_idents_from_statement(stmt, referenced, declared);
+            self.collect_free_idents_from_statement(stmt, referenced, declared, nested_only);
         }
     }
 
     fn collect_free_idents_from_statement<'b>(
         &self,
-        stmt: &Statement<'b>,
+        stmt: &'b Statement<'b>,
         referenced: &mut std::collections::HashSet<&'b str>,
         declared: &mut std::collections::HashSet<String>,
+        nested_only: bool,
     ) {
         match stmt {
             Statement::ExpressionStatement(expr_stmt) => {
@@ -4179,11 +4651,12 @@ impl<'a> JSASTLower<'a> {
                     &expr_stmt.expression,
                     referenced,
                     declared,
+                    nested_only,
                 );
             }
             Statement::ReturnStatement(ret) => {
                 if let Some(arg) = &ret.argument {
-                    self.collect_free_idents_from_expression(arg, referenced, declared);
+                    self.collect_free_idents_from_expression(arg, referenced, declared, nested_only);
                 }
             }
             Statement::VariableDeclaration(decl) => {
@@ -4191,20 +4664,32 @@ impl<'a> JSASTLower<'a> {
                     let name = self.binding_pattern_name(&d.id);
                     declared.insert(name);
                     if let Some(init) = &d.init {
-                        self.collect_free_idents_from_expression(init, referenced, declared);
+                        self.collect_free_idents_from_expression(
+                            init, referenced, declared, nested_only,
+                        );
                     }
                 }
             }
             Statement::BlockStatement(block) => {
                 for s in &block.body {
-                    self.collect_free_idents_from_statement(s, referenced, declared);
+                    self.collect_free_idents_from_statement(s, referenced, declared, nested_only);
                 }
             }
             Statement::IfStatement(if_stmt) => {
-                self.collect_free_idents_from_expression(&if_stmt.test, referenced, declared);
-                self.collect_free_idents_from_statement(&if_stmt.consequent, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &if_stmt.test,
+                    referenced,
+                    declared,
+                    nested_only,
+                );
+                self.collect_free_idents_from_statement(
+                    &if_stmt.consequent,
+                    referenced,
+                    declared,
+                    nested_only,
+                );
                 if let Some(alt) = &if_stmt.alternate {
-                    self.collect_free_idents_from_statement(alt, referenced, declared);
+                    self.collect_free_idents_from_statement(alt, referenced, declared, nested_only);
                 }
             }
             Statement::ForStatement(for_stmt) => {
@@ -4216,7 +4701,7 @@ impl<'a> JSASTLower<'a> {
                                 declared.insert(name);
                                 if let Some(init) = &d.init {
                                     self.collect_free_idents_from_expression(
-                                        init, referenced, declared,
+                                        init, referenced, declared, nested_only,
                                     );
                                 }
                             }
@@ -4224,39 +4709,61 @@ impl<'a> JSASTLower<'a> {
                         _ => {
                             if let Some(expr) = init.as_expression() {
                                 self.collect_free_idents_from_expression(
-                                    expr, referenced, declared,
+                                    expr, referenced, declared, nested_only,
                                 );
                             }
                         }
                     }
                 }
                 if let Some(test) = &for_stmt.test {
-                    self.collect_free_idents_from_expression(test, referenced, declared);
+                    self.collect_free_idents_from_expression(test, referenced, declared, nested_only);
                 }
                 if let Some(update) = &for_stmt.update {
-                    self.collect_free_idents_from_expression(update, referenced, declared);
+                    self.collect_free_idents_from_expression(
+                        update, referenced, declared, nested_only,
+                    );
                 }
-                self.collect_free_idents_from_statement(&for_stmt.body, referenced, declared);
+                self.collect_free_idents_from_statement(
+                    &for_stmt.body,
+                    referenced,
+                    declared,
+                    nested_only,
+                );
             }
             Statement::WhileStatement(while_stmt) => {
-                self.collect_free_idents_from_expression(&while_stmt.test, referenced, declared);
-                self.collect_free_idents_from_statement(&while_stmt.body, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &while_stmt.test,
+                    referenced,
+                    declared,
+                    nested_only,
+                );
+                self.collect_free_idents_from_statement(
+                    &while_stmt.body,
+                    referenced,
+                    declared,
+                    nested_only,
+                );
             }
             Statement::ThrowStatement(throw) => {
-                self.collect_free_idents_from_expression(&throw.argument, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &throw.argument,
+                    referenced,
+                    declared,
+                    nested_only,
+                );
             }
             Statement::TryStatement(try_stmt) => {
                 for s in &try_stmt.block.body {
-                    self.collect_free_idents_from_statement(s, referenced, declared);
+                    self.collect_free_idents_from_statement(s, referenced, declared, nested_only);
                 }
                 if let Some(handler) = &try_stmt.handler {
                     for s in &handler.body.body {
-                        self.collect_free_idents_from_statement(s, referenced, declared);
+                        self.collect_free_idents_from_statement(s, referenced, declared, nested_only);
                     }
                 }
                 if let Some(finalizer) = &try_stmt.finalizer {
                     for s in &finalizer.body {
-                        self.collect_free_idents_from_statement(s, referenced, declared);
+                        self.collect_free_idents_from_statement(s, referenced, declared, nested_only);
                     }
                 }
             }
@@ -4265,13 +4772,16 @@ impl<'a> JSASTLower<'a> {
                     &switch.discriminant,
                     referenced,
                     declared,
+                    nested_only,
                 );
                 for case in &switch.cases {
                     if let Some(test) = &case.test {
-                        self.collect_free_idents_from_expression(test, referenced, declared);
+                        self.collect_free_idents_from_expression(
+                            test, referenced, declared, nested_only,
+                        );
                     }
                     for s in &case.consequent {
-                        self.collect_free_idents_from_statement(s, referenced, declared);
+                        self.collect_free_idents_from_statement(s, referenced, declared, nested_only);
                     }
                 }
             }
@@ -4279,6 +4789,13 @@ impl<'a> JSASTLower<'a> {
                 if let Some(id) = &func.id {
                     declared.insert(id.name.to_string());
                 }
+                self.collect_free_idents_of_nested_function(&func.params, func.body.as_deref(), referenced);
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    declared.insert(id.name.to_string());
+                }
+                self.collect_free_idents_of_nested_class(class, referenced);
             }
             _ => {}
         }
@@ -4286,115 +4803,197 @@ impl<'a> JSASTLower<'a> {
 
     fn collect_free_idents_from_expression<'b>(
         &self,
-        expr: &Expression<'b>,
+        expr: &'b Expression<'b>,
         referenced: &mut std::collections::HashSet<&'b str>,
         declared: &mut std::collections::HashSet<String>,
+        nested_only: bool,
     ) {
         match expr {
             Expression::Identifier(ident) => match ident.name.as_str() {
                 "undefined" | "NaN" | "Infinity" | "this" => {}
                 _ => {
-                    referenced.insert(ident.name.as_str());
+                    if !nested_only {
+                        referenced.insert(ident.name.as_str());
+                    }
                 }
             },
             Expression::BinaryExpression(bin) => {
-                self.collect_free_idents_from_expression(&bin.left, referenced, declared);
-                self.collect_free_idents_from_expression(&bin.right, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &bin.left, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &bin.right, referenced, declared, nested_only,
+                );
             }
             Expression::UnaryExpression(unary) => {
-                self.collect_free_idents_from_expression(&unary.argument, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &unary.argument, referenced, declared, nested_only,
+                );
             }
             Expression::LogicalExpression(logical) => {
-                self.collect_free_idents_from_expression(&logical.left, referenced, declared);
-                self.collect_free_idents_from_expression(&logical.right, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &logical.left, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &logical.right, referenced, declared, nested_only,
+                );
             }
             Expression::AssignmentExpression(assign) => {
                 match &assign.left {
                     AssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                        referenced.insert(ident.name.as_str());
+                        if !nested_only {
+                            referenced.insert(ident.name.as_str());
+                        }
                     }
                     _ => {}
                 }
-                self.collect_free_idents_from_expression(&assign.right, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &assign.right, referenced, declared, nested_only,
+                );
             }
             Expression::CallExpression(call) => {
-                self.collect_free_idents_from_expression(&call.callee, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &call.callee, referenced, declared, nested_only,
+                );
                 for arg in &call.arguments {
                     if let Some(expr) = arg.as_expression() {
-                        self.collect_free_idents_from_expression(expr, referenced, declared);
+                        self.collect_free_idents_from_expression(expr, referenced, declared, nested_only);
                     }
                 }
             }
             Expression::ConditionalExpression(cond) => {
-                self.collect_free_idents_from_expression(&cond.test, referenced, declared);
-                self.collect_free_idents_from_expression(&cond.consequent, referenced, declared);
-                self.collect_free_idents_from_expression(&cond.alternate, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &cond.test, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &cond.consequent, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &cond.alternate, referenced, declared, nested_only,
+                );
             }
             Expression::StaticMemberExpression(member) => {
-                self.collect_free_idents_from_expression(&member.object, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
             }
             Expression::ComputedMemberExpression(member) => {
-                self.collect_free_idents_from_expression(&member.object, referenced, declared);
-                self.collect_free_idents_from_expression(&member.expression, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &member.expression, referenced, declared, nested_only,
+                );
             }
             Expression::PrivateFieldExpression(member) => {
-                self.collect_free_idents_from_expression(&member.object, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
             }
             Expression::SequenceExpression(seq) => {
                 for e in &seq.expressions {
-                    self.collect_free_idents_from_expression(e, referenced, declared);
+                    self.collect_free_idents_from_expression(e, referenced, declared, nested_only);
                 }
             }
             Expression::ParenthesizedExpression(paren) => {
-                self.collect_free_idents_from_expression(&paren.expression, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &paren.expression, referenced, declared, nested_only,
+                );
             }
             Expression::TemplateLiteral(tpl) => {
                 for exp in &tpl.expressions {
-                    self.collect_free_idents_from_expression(exp, referenced, declared);
+                    self.collect_free_idents_from_expression(exp, referenced, declared, nested_only);
                 }
             }
             Expression::UpdateExpression(update) => match &update.argument {
                 SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                    referenced.insert(ident.name.as_str());
+                    if !nested_only {
+                        referenced.insert(ident.name.as_str());
+                    }
                 }
                 _ => {}
             },
             Expression::ArrayExpression(arr) => {
                 for elem in &arr.elements {
                     if let Some(expr) = elem.as_expression() {
-                        self.collect_free_idents_from_expression(expr, referenced, declared);
+                        self.collect_free_idents_from_expression(expr, referenced, declared, nested_only);
                     }
                 }
             }
             Expression::ObjectExpression(obj) => {
                 for prop in &obj.properties {
                     if let ObjectPropertyKind::ObjectProperty(p) = prop {
-                        self.collect_free_idents_from_expression(&p.value, referenced, declared);
+                        self.collect_free_idents_from_expression(
+                            &p.value, referenced, declared, nested_only,
+                        );
                     }
                 }
             }
             Expression::NewExpression(new) => {
-                self.collect_free_idents_from_expression(&new.callee, referenced, declared);
+                self.collect_free_idents_from_expression(
+                    &new.callee, referenced, declared, nested_only,
+                );
                 for arg in &new.arguments {
                     if let Some(expr) = arg.as_expression() {
-                        self.collect_free_idents_from_expression(expr, referenced, declared);
+                        self.collect_free_idents_from_expression(expr, referenced, declared, nested_only);
                     }
                 }
             }
             Expression::ArrowFunctionExpression(arrow) => {
                 // Recurse into nested arrow bodies so outer arrows can discover
-                // variables that need capturing (e.g. `(y) => (z) => x + y + z`)
-                // Also mark the inner arrow's params as declared
-                for param in &arrow.params.items {
-                    let name = self.binding_pattern_name(&param.pattern);
-                    declared.insert(name);
+                // variables that need capturing (e.g. `(y) => (z) => x + y + z`).
+                // Fresh `declared` set at the boundary, like every other nested
+                // function: the inner arrow's own parameters are its own.
+                let mut inner_ref = std::collections::HashSet::new();
+                let mut inner_decl = std::collections::HashSet::new();
+                for p in &arrow.params.items {
+                    inner_decl.insert(self.binding_pattern_name(&p.pattern));
                 }
                 for stmt in &arrow.body.statements {
-                    self.collect_free_idents_from_statement(stmt, referenced, declared);
+                    self.collect_free_idents_from_statement(
+                        stmt, &mut inner_ref, &mut inner_decl, false,
+                    );
+                }
+                for name in inner_ref {
+                    if !inner_decl.contains(name) {
+                        referenced.insert(name);
+                    }
                 }
             }
-            Expression::FunctionExpression(_) => {
-                // Don't recurse into regular function expressions
+            Expression::FunctionExpression(func) => {
+                if let Some(body) = &func.body {
+                    self.collect_free_idents_of_nested_function(
+                        &func.params,
+                        Some(&**body),
+                        referenced,
+                    );
+                }
+            }
+            Expression::ClassExpression(class) => {
+                self.collect_free_idents_of_nested_class(class, referenced);
+            }
+            // `yield x` / `yield* x`: the operand is an ordinary reference, and
+            // missing this arm is how a generator body looked capture-free.
+            Expression::YieldExpression(yield_expr) => {
+                if let Some(arg) = &yield_expr.argument {
+                    self.collect_free_idents_from_expression(arg, referenced, declared, nested_only);
+                }
+            }
+            Expression::AwaitExpression(await_expr) => {
+                self.collect_free_idents_from_expression(
+                    &await_expr.argument, referenced, declared, nested_only,
+                );
+            }
+            // `tag`..``: the tag and every substitution are references.
+            Expression::TaggedTemplateExpression(tagged) => {
+                self.collect_free_idents_from_expression(
+                    &tagged.tag, referenced, declared, nested_only,
+                );
+                for expr in &tagged.quasi.expressions {
+                    self.collect_free_idents_from_expression(
+                        expr, referenced, declared, nested_only,
+                    );
+                }
             }
             _ => {}
         }

@@ -19,6 +19,8 @@ mod arrow_functions_return;
 mod builtins_tests;
 #[path = "features/class_super.rs"]
 mod class_super;
+#[path = "features/closures.rs"]
+mod closures;
 #[path = "features/complex.rs"]
 mod complex;
 #[path = "features/const_var_test.rs"]

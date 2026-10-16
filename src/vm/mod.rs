@@ -31,6 +31,26 @@ use crate::bytecode::{
     CodeBlock, Constant, Instr, Module, Operand, Primitive, Register,
 };
 
+/// The shared, mutable cell a **captured** local binding lives in.
+///
+/// A closure captures the cell, never the value: both the defining frame and
+/// every closure that captured it read and write the same `Rc`, which is what
+/// makes `function counter() { let c = 0; return () => ++c; }` count instead of
+/// answering the frozen creation-time snapshot. `None` is the uninitialised
+/// (dead-zone) state; reads through the environment then raise, writes other
+/// than the declaration's are refused by the compiler.
+///
+/// It is deliberately **not** a heap object: cells are VM bookkeeping (frames,
+/// function objects, suspended generator frames), never reachable from JS, and
+/// the collector reaches them through the `Trace` impls on exactly those
+/// containers — `vm/trace.rs` and `vm/object.rs`.
+pub type EnvCell = Rc<RefCell<Option<Value>>>;
+
+/// A fresh cell holding `value` (`None` for the uninitialised state).
+pub(crate) fn new_env_cell(value: Option<Value>) -> EnvCell {
+    Rc::new(RefCell::new(value))
+}
+
 /// Size of the pre-allocated value stack. Slots are addressed directly, so the
 /// whole frame area is materialized up front (it used to be a tiny 4 KiB stack,
 /// which deep programs overflowed instantly).
@@ -564,25 +584,14 @@ impl VM {
     ///
     /// The mapping is memoized for the lifetime of a `run` so that `F.prototype`
     /// and any properties hung off the function object remain observable.
-    /// Pop the pending `ClosureVar` entries for the function object being
+    /// Drain the cells pushed by `ClosureVar` for the function object being
     /// created, in the order the lowering emitted them.
     ///
-    /// `ClosureVar` pushes one-entry maps; an empty map is the boundary that
-    /// says "the current frame's captures start here" (pushed when a function
-    /// frame opens), so the walk stops there and never steals an outer frame's
-    /// captures.
-    fn take_pending_captured_vars(&mut self) -> Vec<(String, Value)> {
-        let mut captured_vars: Vec<(String, Value)> = Vec::new();
-        while let Some(vars) = self.state.closure_var_stack.last() {
-            if vars.is_empty() {
-                break;
-            }
-            let entry = self.state.closure_var_stack.pop().unwrap();
-            for (k, v) in entry {
-                captured_vars.push((k, v));
-            }
-        }
-        captured_vars
+    /// The pending stack is **separate** from the environment: draining it never
+    /// touches the frame's own cells or the ones it inherited (see
+    /// [`State::pending_captured`]).
+    fn take_pending_captured_vars(&mut self) -> Vec<(String, EnvCell)> {
+        std::mem::take(&mut self.state.pending_captured)
     }
 
     /// A fresh (never memoized) function object carrying `captured_vars`.
@@ -599,7 +608,7 @@ impl VM {
     fn make_capturing_function_object(
         &mut self,
         func_id: u32,
-        captured_vars: Vec<(String, Value)>,
+        captured_vars: Vec<(String, EnvCell)>,
     ) -> Value {
         let (name, arity) = self
             .code(func_id)
@@ -2967,6 +2976,11 @@ impl VM {
         };
         self.state.frames.truncate(frame_depth);
         self.state.closure_var_stack.truncate(closure_depth);
+        // `pending_captured` only ever holds entries between a `ClosureVar` and
+        // the `Make*FuncObj` that drains it — no user code runs in between, so a
+        // frame can only be closing with its *own* (always empty) set here.
+        // Clearing is hygiene, not semantics.
+        self.state.pending_captured.clear();
         self.state.seh_stack.truncate(seh_depth);
         self.state.rbp = self.state.frame_base();
         if let Some(rsp) = restore_rsp {
@@ -3563,7 +3577,7 @@ impl VM {
         func_id: u32,
         this: Value,
         args: Vec<Value>,
-        captured_vars: Vec<(String, Value)>,
+        captured_vars: Vec<(String, EnvCell)>,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         let id = self.next_generator_id;
@@ -3610,6 +3624,17 @@ impl VM {
         Ok(value)
     }
 
+    /// The environment base of the frame currently on top.
+    ///
+    /// `run_generator_frame*` needs the *base* (what the frame owns), not the
+    /// current top: the body may have pushed more cells since it opened.
+    fn current_frame_closure_depth(&self) -> usize {
+        self.state
+            .frames
+            .last()
+            .map_or(self.state.closure_var_stack.len(), |f| f.closure_depth)
+    }
+
     /// Push a generator frame onto the stacks, positioned at its entry point.
     ///
     /// Shared by the eager parameter prologue (`create_generator`) and by the
@@ -3621,7 +3646,7 @@ impl VM {
         func_id: u32,
         this: &Value,
         args: &[Value],
-        captured_vars: &[(String, Value)],
+        captured_vars: &[(String, EnvCell)],
         module: &Module,
     ) -> Result<(), RuntimeError> {
         let Some(location) = module.entry_pc(func_id) else {
@@ -3635,12 +3660,12 @@ impl VM {
         self.state.rbp = self.state.rsp;
         self.state.enter_frame()?;
         let callee_func = self.materialize_function(func_id);
-        for (name, value) in captured_vars {
-            let mut map = std::collections::HashMap::new();
-            map.insert(name.clone(), value.clone());
-            self.state.closure_var_stack.push(map);
-        }
+        // Same boundary rule as `open_frame`: the frame's environment starts
+        // before the inherited cells, so `env_cell` can scan from here.
         let closure_depth = self.state.closure_var_stack.len();
+        for (name, cell) in captured_vars {
+            self.state.push_env_cell(name.clone(), cell.clone());
+        }
         let seh_depth = self.state.seh_stack.len();
                         self.state.note_frame(FrameBirth {
             pc: location,
@@ -3667,7 +3692,7 @@ impl VM {
         func_id: u32,
         this: &Value,
         args: &[Value],
-        captured_vars: &[(String, Value)],
+        captured_vars: &[(String, EnvCell)],
         module: &Module,
     ) -> Result<(), RuntimeError> {
         let saved = self.save_execution_state();
@@ -3675,7 +3700,14 @@ impl VM {
         // delegates and closure maps are what the snapshot has to carry.
         let delegate_depth = self.delegate_stack.len();
         self.push_generator_frame(func_id, this, args, captured_vars, module)?;
-        let closure_depth = self.state.closure_var_stack.len();
+        // The prologue's snapshot boundary is the frame's environment *base*,
+        // the same value `push_generator_frame` recorded — everything the frame
+        // owns (inherited cells and its own `MakeCell`s alike) has to be in it.
+        let closure_depth = self
+            .state
+            .frames
+            .last()
+            .map_or(self.state.closure_var_stack.len(), |f| f.closure_depth);
         // Save and *restore*: a parameter default may create another generator
         // (`function* g() {…}` called as `[[,] = g()]`), and that nested prologue
         // used to clear this flag on its way out. The outer method's `PrologueEnd`
@@ -3773,7 +3805,7 @@ impl VM {
                 // No value to deliver: nothing is waiting for `next(v)`'s
                 // argument, because the barrier is not a `yield`.
                 self.state.jump(resume_pc + 1);
-                let closure_depth = self.state.closure_var_stack.len();
+                let closure_depth = self.current_frame_closure_depth();
                 let run = self.run_generator_frame_or_complete(
                     &saved,
                     closure_depth,
@@ -4025,7 +4057,7 @@ impl VM {
                 self.restore_generator_frame(&frame, module)?;
                 match self.handle_throw(reason) {
                     Ok(()) => {
-                        let closure_depth = self.state.closure_var_stack.len();
+                        let closure_depth = self.current_frame_closure_depth();
                         let run = self.run_generator_frame_or_complete(
                             &saved,
                             closure_depth,
@@ -4342,13 +4374,15 @@ impl VM {
         self.state.rsp = self.state.rbp + frame.bp_offset;
         let callee_func = frame.function_val.clone();
         self.state.enter_frame()?;
+        // Same boundary rule as `open_frame`: the restored maps belong to this
+        // frame, so its environment starts *before* them.
+        let closure_depth = self.state.closure_var_stack.len();
         for map in &frame.closure_maps {
             self.state.closure_var_stack.push(map.clone());
         }
         // The body's live exception handlers come back with the frame; a
         // `finally` that had not run yet must still run.
         self.state.seh_stack.extend(frame.seh.iter().cloned());
-        let closure_depth = self.state.closure_var_stack.len();
         let seh_depth = self.state.seh_stack.len();
                         self.state.note_frame(FrameBirth {
             pc: module.instructions.len(),
@@ -5346,8 +5380,21 @@ struct State {
     /// names minted by `try_promise_method`.
     finally_handlers: HashMap<u64, Value>,
     next_finally_id: u64,
-    /// Stack of captured variable maps for active closure scopes
-    closure_var_stack: Vec<HashMap<String, Value>>,
+    /// Stack of captured-variable **cells** for active closure scopes.
+    ///
+    /// Every entry is a shared cell (`Rc<RefCell<..>>`): a closure captures the
+    /// *cell*, never a copy of the value, so writes through either side are
+    /// visible to the other. A frame's own captured locals get their cells from
+    /// `MakeCell` (emitted in the function prologue); the cells it inherited from
+    /// enclosing frames are pushed by `open_frame` when the frame opens.
+    closure_var_stack: Vec<HashMap<String, EnvCell>>,
+    /// Cells pushed by `ClosureVar` for the `Make*FuncObj` that follows.
+    ///
+    /// A separate stack from `closure_var_stack` on purpose: capturing must not
+    /// *consume* the frame's environment (the old single-stack protocol popped
+    /// the frame's own maps when a closure was created, which is how a nested
+    /// function declaration lost its enclosing scope).
+    pending_captured: Vec<(String, EnvCell)>,
     /// 每个活跃调用帧一条。切片 1e 之后它是**唯一的**按帧状态 ——
     /// 以前并存的那些平行栈（`ctrl_stack` / `function_stack` / `this_stack` /
     /// `this_state` / `frame_argc` / `construct_stack` / `new_target_stack`）全部退役。
@@ -5379,6 +5426,7 @@ impl State {
             finally_handlers: HashMap::new(),
             next_finally_id: 0,
             closure_var_stack: Vec::new(),
+            pending_captured: Vec::new(),
             frames: Vec::new(),
             rsp: 0,
             rbp: 0,
@@ -5622,12 +5670,14 @@ impl State {
 
     /// Resolve `name` in the environment.
     ///
-    /// Order: the script's **declarative record** first (the truth for
-    /// script-scope `let`/`const`/`class`, and the carrier of their temporal dead
-    /// zone), then the closure snapshots, then the global object. Splitting this
-    /// out matters because `typeof` has to consult exactly the same chain — a
-    /// `typeof` that skipped the record answered `"undefined"` for a name the
-    /// ordinary read resolves to a function.
+    /// Order: the **closure cells** of the active frames first (innermost
+    /// wins — a function-local binding shadows a script-level one of the same
+    /// name), then the script's declarative record (the truth for script-scope
+    /// `let`/`const`/`class`, and the carrier of their temporal dead zone),
+    /// then the global object. Splitting this out matters because `typeof` has
+    /// to consult exactly the same chain — a `typeof` that skipped the record
+    /// answered `"undefined"` for a name the ordinary read resolves to a
+    /// function.
     fn resolve_env_name(&self, name: &str) -> Result<Option<Value>, RuntimeError> {
         // `globalThis` is answered from the realm's global object rather than
         // from the globals map: publishing it *in* the map would make
@@ -5635,6 +5685,18 @@ impl State {
         // whole `State` — measured as a shard that outgrew its `ulimit`.
         if name == "globalThis" {
             return Ok(Some(self.global_object.clone()));
+        }
+        if let Some(cell) = self.env_cell(name) {
+            // A cell is only ever created for a *declared* binding, so it is
+            // always initialised by the time anything can read it through the
+            // environment. `None` would be the dead zone of a `let` that a
+            // closure captured before its declaration ran.
+            let value = cell.borrow().clone().ok_or_else(|| {
+                RuntimeError::ReferenceError(format!(
+                    "Cannot access '{name}' before initialization"
+                ))
+            })?;
+            return Ok(Some(value));
         }
         match self.script_env.get(name) {
             Some(Some(value)) => return Ok(Some(value.clone())),
@@ -5645,15 +5707,29 @@ impl State {
             }
             None => {}
         }
-        if let Some(value) = self
-            .closure_var_stack
+        Ok(self.get_global(name))
+    }
+
+    /// The cell `name` resolves to in the **current frame's** environment: its
+    /// own captured locals plus everything it captured from enclosing frames.
+    ///
+    /// The scan stops at the frame's base (`frames.last().closure_depth`): the
+    /// entries below it belong to enclosing frames and are visible here only
+    /// through the copies `open_frame` pushed into this frame's range.
+    pub(crate) fn env_cell(&self, name: &str) -> Option<EnvCell> {
+        let base = self.frames.last().map_or(0, |f| f.closure_depth);
+        self.closure_var_stack
+            .get(base..)?
             .iter()
             .rev()
             .find_map(|map| map.get(name).cloned())
-        {
-            return Ok(Some(value));
-        }
-        Ok(self.get_global(name))
+    }
+
+    /// Bind `cell` under `name` in the current frame's environment.
+    pub(crate) fn push_env_cell(&mut self, name: String, cell: EnvCell) {
+        let mut map = HashMap::new();
+        map.insert(name, cell);
+        self.closure_var_stack.push(map);
     }
 
     fn get_global(&self, name: &str) -> Option<Value> {

@@ -1338,8 +1338,10 @@ pub struct FunctionObject {
     /// time. Arrows have no `[[Construct]]`, so `new.target` inside an arrow
     /// must resolve to the constructor that created the enclosing frame.
     pub captured_new_target: Option<Value>,
-    /// Captured outer variables as (name, value) pairs
-    pub captured_vars: Vec<(String, Value)>,
+    /// Captured outer variables as (name, **cell**) pairs. The cell — not a
+    /// value snapshot — is what makes the binding shared between the defining
+    /// frame and this function (see [`crate::vm::EnvCell`]).
+    pub captured_vars: Vec<(String, crate::vm::EnvCell)>,
 }
 
 impl FunctionObject {
@@ -1361,7 +1363,7 @@ impl FunctionObject {
         func_id: u32,
         name: &str,
         captured_this: Value,
-        captured_vars: Vec<(String, Value)>,
+        captured_vars: Vec<(String, crate::vm::EnvCell)>,
     ) -> Self {
         Self {
             func_id,
@@ -1559,7 +1561,7 @@ pub fn new_arrow_function_object(
     arity: usize,
     captured_this: Value,
     captured_new_target: Value,
-    captured_vars: Vec<(String, Value)>,
+    captured_vars: Vec<(String, crate::vm::EnvCell)>,
 ) -> Value {
     let mut func_obj = FunctionObject::new_arrow(func_id, name, captured_this, captured_vars);
     func_obj.captured_new_target = Some(captured_new_target);
@@ -3881,7 +3883,7 @@ pub struct SuspendedFrame {
     pub pc: usize,
     pub this: Value,
     pub function_val: Value,
-    pub closure_maps: Vec<std::collections::HashMap<String, Value>>,
+    pub closure_maps: Vec<std::collections::HashMap<String, crate::vm::EnvCell>>,
     /// The 19-slot register file. It is **global**, not per frame, so a value
     /// held in a register across a `yield` has to travel with the frame.
     pub registers: [Value; 19],
@@ -3911,7 +3913,9 @@ pub struct GeneratorObject {
     pub args: Vec<Value>,
     pub this: Value,
     pub captured_new_target: Option<Value>,
-    pub captured_vars: Vec<(String, Value)>,
+    /// Captured cells, exactly like [`FunctionObject::captured_vars`]: the
+    /// generator's body sees the *same* bindings its defining scope does.
+    pub captured_vars: Vec<(String, crate::vm::EnvCell)>,
     /// `Some` 只在挂起于 `yield` 期间。
     ///
     /// **装箱是为了压住 `Object` 枚举的尺寸**：枚举尺寸 = 最大变体，而
@@ -4101,9 +4105,10 @@ impl Trace for FunctionObject {
         self.properties.trace(out);
         self.captured_this.trace(out);
         self.captured_new_target.trace(out);
-        // `Vec<(String, Value)>`：容器 impl 覆盖不到元组，手工拆。
-        for (_, v) in &self.captured_vars {
-            v.trace(out);
+        // `Vec<(String, EnvCell)>`：容器 impl 覆盖不到元组，手工拆；
+        // `Trace for EnvCell` 会追进 cell 里的值（见 `vm::gc`）。
+        for (_, cell) in &self.captured_vars {
+            cell.trace(out);
         }
     }
 }
@@ -4233,7 +4238,12 @@ impl Trace for SuspendedFrame {
         self.data.trace(out);
         self.this.trace(out);
         self.function_val.trace(out);
-        self.closure_maps.trace(out);
+        // `Vec<HashMap<String, EnvCell>>`：容器 impl 覆盖不到 cell，手工拆。
+        for map in &self.closure_maps {
+            for cell in map.values() {
+                cell.trace(out);
+            }
+        }
         self.registers.trace(out);
         self.delegates.trace(out);
         // `Vec<SehRecord>`：`Trace for SehRecord` 在 `vm::trace`。
@@ -4247,8 +4257,8 @@ impl Trace for GeneratorObject {
         self.args.trace(out);
         self.this.trace(out);
         self.captured_new_target.trace(out);
-        for (_, v) in &self.captured_vars {
-            v.trace(out);
+        for (_, cell) in &self.captured_vars {
+            cell.trace(out);
         }
         // `Option<Box<SuspendedFrame>>`：只在挂起期间有值。
         self.suspended.trace(out);

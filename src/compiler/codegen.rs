@@ -500,11 +500,23 @@ impl Codegen {
                         let captured_this = self.gen_operand(captured_this);
                         self.codes.push(Instr::MakeArrowFuncObj { dst: dst, func: func_id, captured_this: captured_this });
                     }
-                    Instruction::ClosureVar { name, value } => {
+                    Instruction::ClosureVar {
+                        name,
+                        value,
+                        fallback,
+                    } => {
                         let name = name.to_operand();
                         let value = self.gen_operand(value);
-                        self.codes
-                            .push(Instr::ClosureVar { name: name, value: value });
+                        let fallback = Operand::new_immd(if fallback { 1 } else { 0 });
+                        self.codes.push(Instr::ClosureVar {
+                            name: name,
+                            value: value,
+                            fallback: fallback,
+                        });
+                    }
+                    Instruction::MakeCell { name } => {
+                        let name = name.to_operand();
+                        self.codes.push(Instr::MakeCell { name: name });
                     }
 
                     // Control Flow Instructions

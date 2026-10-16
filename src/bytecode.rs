@@ -808,7 +808,8 @@ define_instrs! {
         LoadCurrentFunction { dst: w },
         Arguments { dst: w },
         IterClose { iter: r },
-        RequireObjectCoercible { src: r }
+        RequireObjectCoercible { src: r },
+        MakeCell { name: n }
     ;
 // ── arity 2 ──
         LoadConst { dst: w, index: n },
@@ -833,7 +834,6 @@ define_instrs! {
         CreateClosure { dst: w, func: n },
         New { callee: rw, argc: n } @Call,
         MakeFuncObj { dst: w, func: n },
-        ClosureVar { name: n, value: r },
         Yield { dst: w, value: r } @Suspend,
         Await { dst: w, src: r } @Suspend,
         ToString { dst: w, src: r },
@@ -842,6 +842,7 @@ define_instrs! {
     ;
 // ── arity 3 ──
         MakeRegExp { dst: w, source: n, flags: n },
+        ClosureVar { name: n, value: r, fallback: n },
         AddC { dst: n, src: n, value: n } @Bookkeeping,
         SubC { dst: n, src: n, value: n } @Bookkeeping,
         BrIf { condition: r, true_target: jr, false_target: jr } @Jump,
@@ -1062,7 +1063,13 @@ pub enum Opcode {
     MakeFuncObj,
     /// make_arrow_func_obj dst, func_id, captured_this
     MakeArrowFuncObj,
-    /// closure_var name, value — push a captured variable for the next MakeArrowFuncObj
+    /// make_cell name — allocate the shared cell of a captured function-local
+    /// binding and bind it in the current frame's environment
+    MakeCell,
+    /// closure_var name, value, fallback — capture the *cell* named `name` for
+    /// the next `Make*FuncObj`. With no cell in scope, `fallback` decides
+    /// whether the operand value is copied into a fresh cell (a real local
+    /// binding) or the name is left to resolve through the global environment.
     ClosureVar,
     /// arguments dst — materialise the current frame's `arguments` object
     Arguments,
@@ -1184,6 +1191,7 @@ impl fmt::Display for Opcode {
             Opcode::LoadCurrentFunction => write!(f, "load_current_function"),
             Opcode::MakeFuncObj => write!(f, "make_func_obj"),
             Opcode::MakeArrowFuncObj => write!(f, "make_arrow_func_obj"),
+            Opcode::MakeCell => write!(f, "make_cell"),
             Opcode::ClosureVar => write!(f, "closure_var"),
             Opcode::Arguments => write!(f, "arguments"),
             Opcode::IterClose => write!(f, "iter_close"),
@@ -1803,7 +1811,8 @@ mod tests {
     /// 它同时也是"标记没被手滑删掉"的守卫 —— 删掉一个 `@Call`，这里立刻红。
     #[test]
     fn kind_markers_cover_the_table() {
-        assert_eq!(Instr::ALL.len(), 90, "表里的指令条数");
+        // `MakeCell` 入表（闭包共享单元，见 `vm::EnvCell`）后是 91。
+        assert_eq!(Instr::ALL.len(), 91, "表里的指令条数");
         assert_eq!(count_of(Kind::Call), 8, "Call* / New*");
         assert_eq!(count_of(Kind::Jump), 4, "Jump / BrIf / DelayedJump / ResumeExc");
         assert_eq!(count_of(Kind::Return), 2, "Ret / Halt");

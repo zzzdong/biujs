@@ -168,8 +168,14 @@ timeout 7 → 17，无新增坏测试）。见 `docs/REFACTOR-HEAP-GC.md` §5 R3
 
 ## 4. 两条待定的语义 bug（属于"修 bug"，不是重构）
 
-1. **闭包共享可变单元**：闭包变量是 `HashMap<String, Value>` 的创建时快照，
-   所以多个闭包不共享同一个可变单元。正确实现是 scope slot。
+1. ✅ **闭包共享可变单元**（2026-10-16 已修）：被嵌套函数捕获的绑定现在住在
+   共享单元（`EnvCell`）里 —— 序言 `MakeCell`，读写走 `LoadEnv`/`StoreEnv`，
+   闭包捕获的是单元而不是创建时的快照。连带的三处语义一并落定：
+   ① 块级绑定（`for (let …)` 头）**保留**按值捕获，那是"每次迭代一个值"；
+   ② 被捕获的 `let` 的死区是**动态**的（单元有"未初始化"态，声明写入走
+   `InitLexical`）；③ 参数默认值里的闭包看不到函数体的 `var`
+   （ES 9.2.10 step 27，参数作用域与 var 环境分开）。
+   验收：`tests/features/closures.rs`（18 条）+ 全量 +144、零逐套件回退。
 2. **`handle_throw` 在 catch 路径多弹一次 `seh_stack`**（历史 known bug #4），
    由帧上的 try 栈按构造消除 —— 验收标准是"去掉那条 `#[ignore]` 后变绿"。
 

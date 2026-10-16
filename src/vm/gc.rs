@@ -480,6 +480,24 @@ impl<T: Trace> Trace for Box<T> {
     }
 }
 
+/// 闭包捕获的共享单元（`vm::EnvCell`）。
+///
+/// 它不是堆对象，而是 VM / 函数对象 / 挂起生成器帧里的 `Rc`；收集器经由这些
+/// 容器的 `Trace` 实现追到它，所以这里必须把**cell 里的值**继续往下传 ——
+/// 漏了它，一个只活在闭包变量里的对象会在某次收集后变成悬垂句柄（INV-3）。
+impl Trace for crate::vm::EnvCell {
+    fn trace(&self, out: &mut Worklist) {
+        // `try_borrow` 而不是 `borrow`：与对象同一契约（INV-5）——
+        // 撞上一处正在进行的可变借用时放弃本轮传播，而不是 panic
+        // （release 下 `panic = "abort"`，一次 panic 带走整个分片）。
+        if let Ok(guard) = self.try_borrow()
+            && let Some(value) = &*guard
+        {
+            value.trace(out);
+        }
+    }
+}
+
 /// 对象的**子引用** —— mark 阶段由它把可达性传播下去。
 ///
 /// 各变体的具体字段实现见 `object.rs` / `iterator.rs` / `builtins/mod.rs`

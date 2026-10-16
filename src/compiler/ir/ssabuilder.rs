@@ -978,9 +978,14 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_use(func_id, stacks);
                 SSABuilder::rename_use(captured_this, stacks);
             }
-            Instruction::ClosureVar { name: _, value } => {
+            Instruction::ClosureVar {
+                name: _,
+                value,
+                fallback: _,
+            } => {
                 SSABuilder::rename_use(value, stacks);
             }
+            Instruction::MakeCell { .. } => {}
         }
     }
 

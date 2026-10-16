@@ -444,6 +444,37 @@ pub trait InstBuilder {
         self.emit(Instruction::StoreEnv { name, value });
     }
 
+    /// Initialize a captured binding by name (`InitLexical`).
+    ///
+    /// The write that fills an uninitialized cell in — `store_env` refuses to,
+    /// which is what gives a captured `let` its dead zone.
+    fn init_lexical_name(&mut self, name: &str, value: Value) {
+        let name = self.make_constant(name.to_string().into());
+        self.emit(Instruction::InitLexical { name, value });
+    }
+
+    /// Write an environment binding by name (`StoreEnv`).
+    ///
+    /// `store_external_variable` is the same instruction; this entry point takes
+    /// `&str` so a binding's write site reads as "store into the binding".
+    fn store_env(&mut self, name: &str, value: Value) {
+        let name = self.make_constant(name.to_string().into());
+        self.emit(Instruction::StoreEnv { name, value });
+    }
+
+    /// Read an environment binding by name (`LoadEnv`).
+    ///
+    /// Same instruction `load_external_variable` emits; the separate entry point
+    /// exists so call sites read as "resolve this name in the environment"
+    /// (a captured local's cell, a script-scope binding, a global) rather than
+    /// "load an external".
+    fn load_env(&mut self, name: &str) -> Value {
+        let dst = self.alloc();
+        let name = self.make_constant(name.to_string().into());
+        self.emit(Instruction::LoadEnv { dst, name });
+        dst
+    }
+
     fn typeof_(&mut self, src: Value) -> Value {
         let dst = self.alloc();
         self.emit(Instruction::TypeOf { dst, src });
@@ -505,8 +536,24 @@ pub trait InstBuilder {
         dst
     }
 
-    fn closure_var(&mut self, name: Value, value: Value) {
-        self.emit(Instruction::ClosureVar { name, value });
+    /// Capture the **cell** named `name` for the next `make_func_obj` /
+    /// `make_arrow_func_obj` (see `Instruction::ClosureVar`).
+    ///
+    /// `copy_fallback` is `true` when `name` is a real local binding here (the
+    /// VM may copy the operand into a fresh cell), `false` when it can only be a
+    /// cell inherited from an enclosing frame (or nothing at all).
+    fn closure_var(&mut self, name: Value, value: Value, copy_fallback: bool) {
+        self.emit(Instruction::ClosureVar {
+            name,
+            value,
+            fallback: copy_fallback,
+        });
+    }
+
+    /// Bind the shared cell of a captured function-local in this frame's
+    /// environment (see `Instruction::MakeCell`).
+    fn make_cell(&mut self, name: Value) {
+        self.emit(Instruction::MakeCell { name });
     }
 
     /// 登记一条受保护区域：`body` 是区域的入口块，也是它的身份（见 `Instruction::PushSeh`）。
