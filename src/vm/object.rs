@@ -664,6 +664,22 @@ impl ArrayObject {
         self.elements.get_mut(index)
     }
 
+    /// The dense elements when **every** index is a plain data property.
+    ///
+    /// `None` as soon as there is a hole or an accessor element (`holes` covers
+    /// both: an accessor definition turns its dense slot into a hole, see
+    /// `define_property`). Read families use this to skip the per-element
+    /// `[[Get]]` walk — without it `join` / `slice` / `concat` / spread on a
+    /// plain array cost two property lookups per element (measured 2× slower on
+    /// a 20k-element loop).
+    pub fn dense_elements(&self) -> Option<&[Value]> {
+        if self.holes.is_empty() {
+            Some(&self.elements)
+        } else {
+            None
+        }
+    }
+
     /// Join array elements with comma separator (like Array.prototype.toString)
     pub fn join_elements(&self) -> String {
         self.join(",")

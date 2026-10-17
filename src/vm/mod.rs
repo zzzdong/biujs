@@ -767,6 +767,15 @@ impl VM {
             return Ok(Vec::new());
         };
         let obj = *obj_ref;
+        // Fast path: a plain dense array (no holes, no accessor elements) — the
+        // dense slots *are* the `[[Get]]` results, so the whole walk below can be
+        // skipped. Holes/accessors fall through to the generic path.
+        {
+            let borrowed = obj_ref.borrow();
+            if let Some(dense) = borrowed.as_array().and_then(|a| a.dense_elements()) {
+                return Ok(dense.iter().cloned().map(Some).collect());
+            }
+        }
         // The full `[[Get]]`: `length` may live on the prototype chain *and* be
         // an accessor (`Array.prototype.indexOf.call(instance)` where the
         // constructor's prototype defines `get length()`). Reading it with
@@ -4725,12 +4734,29 @@ impl VM {
         };
 
         let state = match &src {
-            Value::Object(obj_ref) if is_default_factory => {
-                match obj_ref.borrow().kind() {
-                    ObjectKind::Array => {
-                        let items = self.array_like_elements(&src).unwrap_or_default();
-                        Some(NativeIteratorState::Array { items, idx: 0 })
-                    }
+            Value::Object(_) if is_default_factory => {
+                // Read the kind and release the borrow: the element list below is
+                // read through `[[Get]]`, which needs `&mut self`.
+                let kind = match &src {
+                    Value::Object(obj_ref) => obj_ref.borrow().kind(),
+                    _ => unreachable!(),
+                };
+                // The elements are read through `[[Get]]` (`array_like_entries`),
+                // not out of the dense store: `Object.defineProperty(a, 0, {get})`
+                // must be *invoked* by `[...a]` / `for (x of a)` / `f(...a)`, and
+                // a hole yields `undefined` (ES 23.1.5.2.1).
+                let read_entries = |vm: &mut Self| -> Result<Vec<Value>, RuntimeError> {
+                    Ok(vm
+                        .array_like_entries(&src, module)?
+                        .into_iter()
+                        .map(|e| e.unwrap_or(Value::Undefined))
+                        .collect())
+                };
+                match kind {
+                    ObjectKind::Array => Some(NativeIteratorState::Array {
+                        items: read_entries(self)?,
+                        idx: 0,
+                    }),
                     // A String *wrapper* iterates its characters. Its built-in
                     // `@@iterator` is the same native factory as the array's, so
                     // without this arm the factory would route straight back
@@ -4751,7 +4777,7 @@ impl VM {
                     // the process). An object without a usable `length` iterates
                     // as empty, which is what `ToLength(undefined)` gives.
                     _ => Some(NativeIteratorState::Array {
-                        items: self.array_like_elements(&src).unwrap_or_default(),
+                        items: read_entries(self)?,
                         idx: 0,
                     }),
                 }

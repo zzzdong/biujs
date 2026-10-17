@@ -2738,6 +2738,16 @@ impl VM {
                     self.state.jump_offset(1);
                     return Ok(true);
                 }
+                // The read family (`join` / `slice` / `includes` / `at` /
+                // `concat` / `reverse`) reads elements through `[[Get]]`, so it
+                // also has to run here rather than in the builtin layer.
+                if let Some(result) =
+                    self.try_array_read_method(&obj_val, &method_name, &args, module)?
+                {
+                    self.state.set_register(Register::Rv, result)?;
+                    self.state.jump_offset(1);
+                    return Ok(true);
+                }
 
                 // A function replacer for `String.prototype.replace` runs here
                 // for the same reason (it calls user code).

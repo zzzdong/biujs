@@ -166,6 +166,29 @@ timeout 7 → 17，无新增坏测试）。见 `docs/REFACTOR-HEAP-GC.md` §5 R3
 > `CalleeKind`）也要提为 `pub(crate)`。bytecode.rs 的元测试直接读 VM 源码取证，范围
 > 从单文件变成 `vm/dispatch_sources()` 列表，漏掉一个文件覆盖断言立刻报出来。
 
+### P3.6 — Array 读族改走 `[[Get]]`（2026-10-17 已完成，M7-P1 第一批）
+
+`join` / `slice` / `includes` / `at` / `concat` / `reverse` 原来在 `ArrayObject`
+的密集存储上工作，三件事同时错：访问器元素读成空位（`Object.defineProperty(a,0,{get})`
+之后 `a.join()` 得到 `",2"`）、类数组接收者走不通、原型链上的 `length` 访问器看不到。
+
+交付（`vm/builtins_dispatch.rs::try_array_read_method`）：
+1. 元素清单统一走 `array_like_entries`（`[[Get]]` + `HasProperty`），与
+   `map`/`filter`/`indexOf` 同一条路；
+2. **稠密快速路径**（`ArrayObject::dense_elements`）：无洞、无访问器元素时直接
+   用密集槽位，否则 20k 元素循环实测慢 2×；
+3. 接收者允许清单（Array / Ordinary / Arguments / Function / Proxy），把
+   `String.prototype.{slice,includes,at,concat}`、TypedArray、`ArrayBuffer.prototype.slice`
+   的同名方法让出去（这三处各自都是一次真正的回退，已写进注释）；
+4. `CreateDataPropertyOrThrow`：species 目标拒绝写入时抛 TypeError；
+5. `ToIntegerOrInfinity` 走 `to_number_throwing`（`[1,2].at(Symbol())` 是 TypeError）；
+6. `[...a]` / `for-of` 的数组快路径同样改为 `[[Get]]`（此前读密集存储，
+   访问器不执行）。
+
+验收：`built-ins/Array` 2155 → **2186**（`concat` 32→16、`includes` 21→13、
+`slice` 16→12、`join` 10→8），`String` +1、`TypedArray` +3、`for-of` +1；
+全量 17195（+36），无逐套件回退；微基准（20k 元素 × 200 轮）1560ms → 1333ms。
+
 ### P3.5 — 带标签模板（2026-10-17 已完成）
 
 `` tag`a${x}b` `` 此前**整段缺失**：`lower_expression` 没有

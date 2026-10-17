@@ -285,6 +285,11 @@ impl VM {
             if let Some(result) = self.try_array_callback_method(&this, method, args, module)? {
                 return Ok(result);
             }
+            // 读族（`join` / `slice` / `includes` / `at` / `concat` / `reverse`）：
+            // 同样要在内建层之前截住，否则访问器元素读成空位、类数组接收者走不通。
+            if let Some(result) = self.try_array_read_method(&this, method, args, module)? {
+                return Ok(result);
+            }
             // TypedArray 的回调一族：上面那条对 TypedArray 接收者直接让出（那里
             // 产出的是 Array），由这里接手 —— `map` / `filter` 的结果必须是
             // **同类视图**，不是普通数组。
@@ -1752,4 +1757,283 @@ impl VM {
         }
     }
 
+    /// `Array.prototype` 的**读族**（`join` / `slice` / `includes` / `at` /
+    /// `concat` / `reverse`），走 `[[Get]]` 与 `LengthOfArrayLike`。
+    ///
+    /// 这一族原来直接在 `ArrayObject` 的密集存储上工作，于是三件事同时错了：
+    /// 访问器元素读出来是空位（`Object.defineProperty(a, 0, {get})` 之后
+    /// `a.join()` 得到 `",2"`）、类数组接收者（`{length: 2, 0: 'a'}`）走不通、
+    /// 原型链上的 `length` 访问器看不到。`map` / `filter` / `indexOf` 早就走
+    /// 了 VM 的通用路径（`try_array_callback_method`），读族一直没跟上。
+    ///
+    /// 只处理**对象**接收者：`"abc".slice(1)` / `"abc".includes(…)` / `"abc".at(…)`
+    /// 必须落到 `String.prototype` 的同名方法上，而它们在派发层只按名字区分。
+    /// `join` / `reverse` 没有字符串同名方法，所以基本类型也接（`Object(…)` 由
+    /// `array_like_entries` 负责）。
+    pub(crate) fn try_array_read_method(
+        &mut self,
+        receiver: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        const READ_METHODS: &[&str] = &["join", "slice", "includes", "at", "concat", "reverse"];
+        if !READ_METHODS.contains(&method) {
+            return Ok(None);
+        }
+        if matches!(receiver, Value::Undefined | Value::Null) {
+            return Err(RuntimeError::TypeError(format!(
+                "Array.prototype.{method} called on null or undefined"
+            )));
+        }
+        // 只有"像数组的东西"才走这条路：`Array`、普通对象、`arguments`、函数
+        // 与 `Proxy`。其余内建对象都有自己的一族同名方法（TypedArray 的 `slice`
+        // 返回同类视图、`ArrayBuffer.prototype.slice` 走 species），按名字截胡
+        // 会把它们全打坏 —— `class AB extends ArrayBuffer {}` 的 `ab.slice(0,1)`
+        // 曾经因此变成一个空数组。
+        if let Value::Object(o) = receiver
+            && !matches!(
+                o.borrow().kind(),
+                ObjectKind::Array
+                    | ObjectKind::Ordinary
+                    | ObjectKind::Arguments
+                    | ObjectKind::Function
+                    | ObjectKind::Proxy
+            )
+        {
+            return Ok(None);
+        }
+        // `slice` / `includes` / `at` / `concat` 在 `String.prototype` 上也有同名
+        // 方法，而派发层只按名字区分 —— 所以**字符串与字符串包装对象**都要让出去，
+        // 否则 `new String("abc").slice(1)` 会被当成类数组返回一个数组。
+        let string_like = matches!(method, "slice" | "includes" | "at" | "concat");
+        if string_like {
+            // 与内建层的 `string_prototype_receiver` 保持**同一口径**：String 包装
+            // 之外，Number / Boolean 包装也算 —— `new Object(42).concat(false,true)`
+            // 绑定的是 `String.prototype.concat`，结果是 "42falsetrue"，不是数组。
+            let is_string_receiver = match receiver {
+                Value::Object(o) => matches!(
+                    o.borrow().kind(),
+                    ObjectKind::String | ObjectKind::Number | ObjectKind::Boolean
+                ),
+                // 其余基本类型也走 String.prototype（`"abc".slice(…)`）。
+                _ => true,
+            };
+            if is_string_receiver {
+                return Ok(None);
+            }
+        }
+
+        let entries = self.array_like_entries(receiver, module)?;
+        let len = entries.len() as i64;
+
+        match method {
+            "join" => {
+                let sep = match args.first() {
+                    Some(sep) if !sep.is_undefined() => sep.to_js_string(),
+                    _ => ",".to_string(),
+                };
+                let mut out = String::new();
+                for (i, entry) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(&sep);
+                    }
+                    // Holes and `undefined`/`null` all render as the empty string
+                    // (ES 23.1.3.15 step 6.c).
+                    if let Some(v) = entry
+                        && !matches!(v, Value::Undefined | Value::Null)
+                    {
+                        out.push_str(&v.to_js_string());
+                    }
+                }
+                Ok(Some(Value::string(&out)))
+            }
+            "slice" => {
+                let start = Self::relative_index(args.first(), len, 0)?;
+                let end = Self::relative_index(args.get(1), len, len)?;
+                let count = (end - start).max(0) as usize;
+                let picked: Vec<Option<Value>> = (0..count)
+                    .map(|k| entries.get((start as usize) + k).cloned().flatten())
+                    .collect();
+                Ok(Some(self.array_result_preserving_holes(receiver, &picked, module)?))
+            }
+            "includes" => {
+                let search = args.first().cloned().unwrap_or(Value::Undefined);
+                let from = Self::relative_index(args.get(1), len, 0)?.max(0);
+                for i in from..len {
+                    if let Some(v) = &entries[i as usize]
+                        && Self::same_value_zero(v, &search)
+                    {
+                        return Ok(Some(Value::Bool(true)));
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "at" => {
+                let index = Self::relative_index(args.first(), len, 0)?;
+                let index = if index < 0 { len + index } else { index };
+                let value = if index < 0 || index >= len {
+                    Value::Undefined
+                } else {
+                    entries[index as usize].clone().unwrap_or(Value::Undefined)
+                };
+                Ok(Some(value))
+            }
+            "concat" => {
+                // ES 23.1.3.2: `IsConcatSpreadable(item)` decides between "spread
+                // its elements" and "append the item itself". The default is
+                // `Array.isArray(item)`, overridable through @@isConcatSpreadable.
+                let mut out: Vec<Option<Value>> = Vec::new();
+                let mut items = vec![receiver.clone()];
+                items.extend(args.iter().cloned());
+                for item in &items {
+                    let spreadable = self.is_concat_spreadable(item, module)?;
+                    if spreadable {
+                        let sub = self.array_like_entries(item, module)?;
+                        out.extend(sub);
+                    } else {
+                        out.push(Some(item.clone()));
+                    }
+                }
+                Ok(Some(self.array_result_preserving_holes(receiver, &out, module)?))
+            }
+            "reverse" => {
+                // In place, and holes matter: the spec *deletes* the property when
+                // the partner slot is a hole (23.1.3.23 step 5.c) instead of
+                // writing `undefined`.
+                let len = entries.len();
+                for lower in 0..len / 2 {
+                    let upper = len - 1 - lower;
+                    let lower_key = PropertyKey::from_str(&lower.to_string());
+                    let upper_key = PropertyKey::from_str(&upper.to_string());
+                    let (lower_v, upper_v) = (entries[lower].clone(), entries[upper].clone());
+                    match upper_v {
+                        Some(v) => {
+                            self.set_member(receiver, lower_key, v, module)?;
+                        }
+                        None => {
+                            self.delete_member(receiver, &lower_key, module)?;
+                        }
+                    }
+                    match lower_v {
+                        Some(v) => {
+                            self.set_member(receiver, upper_key, v, module)?;
+                        }
+                        None => {
+                            self.delete_member(receiver, &upper_key, module)?;
+                        }
+                    }
+                }
+                Ok(Some(receiver.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `ToIntegerOrInfinity(index)` clamped into `[0, len]`, with `missing` as the
+    /// value for an absent (or `undefined`) argument — the shared preamble of
+    /// `slice` / `includes` / `at`.
+    fn relative_index(
+        arg: Option<&Value>,
+        len: i64,
+        missing: i64,
+    ) -> Result<i64, RuntimeError> {
+        let Some(v) = arg else { return Ok(missing) };
+        // `ToIntegerOrInfinity` starts with `ToNumber`, which throws for a Symbol
+        // (`[1, 2].at(Symbol())` is a TypeError, not index 0).
+        let n = crate::builtins::to_number_throwing(v)?;
+        if n.is_nan() {
+            return Ok(0);
+        }
+        let n = if n == f64::INFINITY {
+            len
+        } else if n == f64::NEG_INFINITY {
+            0
+        } else {
+            let t = n.trunc();
+            if t < 0.0 { (len as f64 + t) as i64 } else { t as i64 }
+        };
+        Ok(n.clamp(0, len))
+    }
+
+    /// SameValueZero: like `===`, but `NaN` matches itself.
+    fn same_value_zero(a: &Value, b: &Value) -> bool {
+        if let (Value::Number(x), Value::Number(y)) = (a, b) {
+            if x.is_nan() && y.is_nan() {
+                return true;
+            }
+        }
+        a.strict_eq(b)
+    }
+
+    /// `IsConcatSpreadable` (ES 23.1.3.2.1): `@@isConcatSpreadable` when it is
+    /// defined, `Array.isArray` otherwise.
+    fn is_concat_spreadable(
+        &mut self,
+        item: &Value,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
+        if !item.is_object() && !matches!(item, Value::Function(_)) {
+            return Ok(false);
+        }
+        // Through `[[Get]]`, so an accessor `@@isConcatSpreadable` runs.
+        let key = crate::builtins::is_concat_spreadable_symbol_key();
+        let flag = self.get_member(item, &key, module)?;
+        if flag.is_undefined() {
+            return Ok(Self::is_array_value(item));
+        }
+        Ok(flag.to_boolean())
+    }
+
+    fn is_array_value(value: &Value) -> bool {
+        matches!(value, Value::Object(o) if o.borrow().kind() == ObjectKind::Array)
+    }
+
+    /// Build the result of a read-family method: `ArraySpeciesCreate` when the
+    /// receiver has a custom species, an ordinary array otherwise. Holes stay
+    /// holes either way (spec: `CreateDataPropertyOrThrow` only for present
+    /// indices).
+    fn array_result_preserving_holes(
+        &mut self,
+        receiver: &Value,
+        entries: &[Option<Value>],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        match self.array_species_create(receiver, entries.len(), module)? {
+            None => {
+                let mut arr = crate::vm::object::ArrayObject::new();
+                arr.set_prototype(Some(self.builtins.array_prototype));
+                for entry in entries {
+                    match entry {
+                        Some(v) => arr.push(v.clone()),
+                        None => {
+                            arr.push(Value::Undefined);
+                            let index = arr.len() - 1;
+                            arr.mark_hole(index);
+                        }
+                    }
+                }
+                Ok(Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(arr))))
+            }
+            Some(target) => {
+                // `CreateDataPropertyOrThrow`: a species target that refuses the
+                // write (non-extensible, frozen) has to raise, not silently drop
+                // the element (`result_writes_are_abrupt_when_the_target_blocks_them`).
+                for (i, entry) in entries.iter().enumerate() {
+                    if let Some(v) = entry
+                        && !Self::create_data_property(
+                            &target,
+                            &PropertyKey::from_str(&i.to_string()),
+                            v,
+                        )
+                    {
+                        return Err(RuntimeError::TypeError(format!(
+                            "Cannot define property {i} on the array-species result"
+                        )));
+                    }
+                }
+                Ok(target)
+            }
+        }
+    }
 }
