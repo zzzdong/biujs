@@ -806,6 +806,72 @@ impl VM {
         Ok(entries)
     }
 
+    /// `LengthOfArrayLike(O)`: `ToLength(? Get(O, "length"))`, capped so a bogus
+    /// `length` cannot materialise billions of slots.
+    ///
+    /// The iteration methods only need the length up front — their elements are
+    /// read one step at a time (`array_live_at`). Materialising the whole list
+    /// there would invoke every accessor element *twice* (once for the snapshot,
+    /// once per step) and allocate O(n) for nothing.
+    fn array_like_length(
+        &mut self,
+        receiver: &Value,
+        module: &Module,
+    ) -> Result<usize, RuntimeError> {
+        let boxed = match receiver {
+            Value::Object(_) | Value::Function(_) => None,
+            _ => Some(crate::builtins::to_object(&mut self.heap, receiver)?),
+        };
+        let target = boxed.as_ref().unwrap_or(receiver);
+        let len_value = self.get_member(target, &PropertyKey::from_str("length"), module)?;
+        // `ToLength(ToNumber(…))`: a Symbol length is a TypeError, not 0.
+        let len = crate::builtins::to_number_throwing(&len_value)?;
+        if !len.is_finite() || len <= 0.0 {
+            return Ok(0);
+        }
+        Ok((len.trunc() as u64).min(1u64 << 24) as usize)
+    }
+
+    /// One step of the array iteration protocol: `HasProperty(O, index)`
+    /// **re-checked every time**, then `[[Get]]`.
+    ///
+    /// The spec puts the presence check *inside* the loop (`Array.prototype.map`
+    /// step 6.a.ii, `forEach` step 5.a.ii, …), so a callback that deletes a later
+    /// element makes it skipped, and one that adds an element makes it visited.
+    /// A snapshot of the element list cannot express either (`values-are-not-
+    /// cached` / `callCnt` 那一族用例).
+    fn array_live_at(
+        &mut self,
+        target: &Value,
+        index: usize,
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Object(obj_ref) = target else {
+            return Ok(None);
+        };
+        // Fast path: a plain dense array (no holes, no accessor elements) answers
+        // `HasProperty` with "present" and the value is the dense slot. Without
+        // this every step pays two generic property walks — measured +15–20% on
+        // a 5k-element callback loop.
+        {
+            let borrowed = obj_ref.borrow();
+            if let Some(arr) = borrowed.as_array()
+                && arr.dense_elements().is_some()
+                && let Some(value) = arr.get(index)
+            {
+                return Ok(Some(value.clone()));
+            }
+        }
+        let key = PropertyKey::from_str(&index.to_string());
+        let present = crate::vm::prototype::internal_has_property(*obj_ref, &key)
+            .map_err(RuntimeError::TypeError)?;
+        if !present {
+            return Ok(None);
+        }
+        // Through `[[Get]]`, so an accessor element is invoked at *this* step.
+        self.get_member(target, &key, module).map(Some)
+    }
+
     /// The half of `Reflect` that runs user code: `get` / `set` run accessors,
     /// `apply` / `construct` call functions, and `defineProperty`'s attributes
     /// may be accessors. `Reflect.ownKeys` and the rest are pure data and live in

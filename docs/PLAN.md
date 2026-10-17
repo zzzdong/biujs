@@ -166,6 +166,31 @@ timeout 7 → 17，无新增坏测试）。见 `docs/REFACTOR-HEAP-GC.md` §5 R3
 > `CalleeKind`）也要提为 `pub(crate)`。bytecode.rs 的元测试直接读 VM 源码取证，范围
 > 从单文件变成 `vm/dispatch_sources()` 列表，漏掉一个文件覆盖断言立刻报出来。
 
+### P3.8 — Array 迭代族逐步 `HasProperty`/`[[Get]]`（2026-10-17 已完成，M7-P1 第二批）
+
+`map` / `filter` / `forEach` / `some` / `every` / `find*` / `reduce*` /
+`indexOf` / `lastIndexOf` 原来先把元素物化成一份清单（快照），再遍历。规范把
+`HasProperty(O, Pk)` 放在循环**内部**（`Array.prototype.map` step 6.a.ii），于是
+三件事看不见：回调删掉的元素仍被访问、新加的元素不被访问、访问器元素被调用**两次**
+（快照一次 + 使用一次）。
+
+交付：
+1. `VM::array_like_length`：只取 `LengthOfArrayLike`（`ToLength(Get(O,"length"))`，
+   上限 1<<24），不再为迭代物化清单；
+2. `VM::array_live_at`：每步 `HasProperty` + `[[Get]]`，**带稠密快速路径**
+   （无洞、无访问器时直接读密集槽位 —— 不加它 5k 元素回调循环慢 15–20%，
+   加了之后与基线持平：193ms vs 192ms）；
+3. `array_index_of_live`：`indexOf`/`lastIndexOf` 同步改成逐步读取；
+4. `sort` / `toReversed` / `toSorted` / `toSpliced` / `with` 仍用清单（返回新数组，
+   本来就该快照）；
+5. 顺带修掉一个既有 bug：回调必填的判定写成通配 `_`，把 `toSorted()` / `with()`
+   也当成了"缺回调"，`[3,1,2].toSorted()` 报 `callback is not a function`。
+
+验收：`built-ins/Array` 2186 → **2318**（reduceRight 62→25、lastIndexOf 53→36、
+reduce 33→25、filter 33→26、some 30→24、map 30→25、every 29→22、forEach 27→21），
+全量 **17328**（+132），无逐套件回退，墙钟 7m35s（与基线持平）。三级
+238 / 616（4 ignored）/ 7，新增 12 条逐步语义断言。
+
 ### P3.7 — 字符串索引按 UTF-16 码元（2026-10-17，部分完成）
 
 JS 字符串的位置单位是 **UTF-16 码元**，引擎内部存 Rust `String`（UTF-8、按码点

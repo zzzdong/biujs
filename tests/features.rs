@@ -9,6 +9,8 @@ pub mod helpers;
 mod arithmetic_comparison;
 #[path = "features/array_methods.rs"]
 mod array_methods;
+#[path = "features/array_live_iteration.rs"]
+mod array_live_iteration;
 #[path = "features/array_read_methods.rs"]
 mod array_read_methods;
 #[path = "features/array_species.rs"]

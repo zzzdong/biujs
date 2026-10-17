@@ -1308,8 +1308,10 @@ impl VM {
             return Ok(None);
         }
 
-        let entries = match self.array_like_entries(receiver, module) {
-            Ok(entries) => entries,
+        // 只取 length：元素在每一步重新 `HasProperty` + `[[Get]]`
+        // （`array_live_at`），物化整张清单会让访问器元素被调用两次。
+        let len = match self.array_like_length(receiver, module) {
+            Ok(len) => len,
             // Not array-like (e.g. `filter.call(undefined, …)`): let the caller
             // continue with the ordinary dispatch, which raises a TypeError.
             Err(RuntimeError::TypeError(_)) => return Ok(None),
@@ -1329,19 +1331,26 @@ impl VM {
             if !self.receiver_is_array_like(receiver) {
                 return Ok(None);
             }
-            return self.array_index_of(&entries, method, args).map(Some);
+            // `ToObject(receiver)`: `indexOf` 与迭代族用同一个接收者口径
+            // （基本类型先装箱，索引属性长在包装对象上）。
+            let target = match receiver {
+                Value::Object(_) | Value::Function(_) => receiver.clone(),
+                other => crate::builtins::to_object(&mut self.heap, other)
+                    .unwrap_or_else(|_| other.clone()),
+            };
+            return self
+                .array_index_of_live(&target, len, method, args, module)
+                .map(Some);
         }
 
         let callback = args.first().cloned().unwrap_or(Value::Undefined);
         // Second argument is `thisArg`: undefined means "call with undefined
         // `this`" (only relevant for non-strict callbacks, but observable).
         let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-        // 宿主侧入根：`entries` 是**本地快照**（`array_like_entries` 拷出来的一份
-        // `Vec<Value>`），`callback` / `this_arg` 也是本地量 —— 而下面每次调用
-        // 用户回调都会跑字节码、到达 GC 安全点。收集器看不见机器栈，不登记的话
-        // 这些槽会被回收再分配，快照里就留下悬垂/占位对象
-        // （GC stress 实测：`species_target_receives_the_elements` 输出一串 hole）。
-        let _roots = self.root_all(&entries.iter().flatten().cloned().collect::<Vec<_>>());
+        // 宿主侧入根：`callback` / `this_arg` / 接收者都是本地量，而下面每次
+        // 调用用户回调都会跑字节码、到达 GC 安全点。收集器看不见机器栈，不登记
+        // 的话这些槽会被回收再分配（GC stress 实测：
+        // `species_target_receives_the_elements` 输出一串 hole）。
         let _root_cb = self.root(&callback);
         let _root_this = self.root(&this_arg);
         let _root_recv = self.root(receiver);
@@ -1373,6 +1382,7 @@ impl VM {
 
         match method {
             "sort" => {
+                let entries = self.array_like_entries(receiver, module)?;
                 // Holes sort to the end; the dense store has no hole marker, so
                 // they are treated as `undefined` (the previous behaviour).
                 let mut items: Vec<Value> = entries
@@ -1417,14 +1427,38 @@ impl VM {
                 }
                 Ok(Some(receiver.clone()))
             }
-            _ if !callback.is_callable() => Err(RuntimeError::TypeError(format!(
-                "{method} callback is not a function"
-            ))),
+            // 只有"必须给回调"的方法才在这里拒；`toSorted` / `sort` 的比较器、
+            // `toReversed` / `with` / `indexOf` 等都不需要（此前写成通配 `_`，
+            // 于是 `[3,1,2].toSorted()` 报 "callback is not a function"）。
+            method
+                if matches!(
+                    method,
+                    "map"
+                        | "filter"
+                        | "forEach"
+                        | "some"
+                        | "every"
+                        | "reduce"
+                        | "reduceRight"
+                        | "find"
+                        | "findIndex"
+                        | "findLast"
+                        | "findLastIndex"
+                        | "flatMap"
+                ) && !callback.is_callable() =>
+            {
+                Err(RuntimeError::TypeError(format!(
+                    "{method} callback is not a function"
+                )))
+            }
             "forEach" => {
-                for (i, e) in entries.iter().enumerate() {
-                    if let Some(e) = e {
-                        call(self, &callback, e, i)?;
-                    }
+                // 逐步 `HasProperty` + `[[Get]]`（ES 23.1.3.13 step 6.a.ii）：
+                // 回调删掉后面的元素 ⇒ 跳过；新加进来的 ⇒ 会被访问。
+                for i in 0..len {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    call(self, &callback, &e, i)?;
                 }
                 Ok(Some(Value::Undefined))
             }
@@ -1434,8 +1468,8 @@ impl VM {
                 // its holes; with a species constructor only the present
                 // indices are written, and a blocked write is abrupt
                 // (CreateDataPropertyOrThrow).
-                let species = self.array_species_create(receiver, entries.len(), module)?;
-                let mut values: Vec<(usize, Value)> = Vec::with_capacity(entries.len());
+                let species = self.array_species_create(receiver, len, module)?;
+                let mut values: Vec<(usize, Value)> = Vec::with_capacity(len);
                 // 累加器是 Rust 局部量，而 `call` 每次都会跑用户代码 ⇒ 每产出一个
                 // 值就必须立刻入根，否则中途一次收集会把已产出的那部分收走。
                 // `species` 自身也跨整个循环存活，同样要入根。
@@ -1443,16 +1477,17 @@ impl VM {
                 if let Some(ref sp) = species {
                     acc.push(sp);
                 }
-                for (i, e) in entries.iter().enumerate() {
-                    if let Some(e) = e {
-                        let v = call(self, &callback, e, i)?;
-                        acc.push(&v);
-                        values.push((i, v));
-                    }
+                for i in 0..len {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    let v = call(self, &callback, &e, i)?;
+                    acc.push(&v);
+                    values.push((i, v));
                 }
                 Ok(Some(match species {
                     None => {
-                        let mut out: Vec<Value> = vec![Value::Undefined; entries.len()];
+                        let mut out: Vec<Value> = vec![Value::Undefined; len];
                         let mut holes: Vec<usize> = Vec::new();
                         let mut next = 0usize;
                         for (i, v) in values {
@@ -1462,7 +1497,7 @@ impl VM {
                             }
                             next = i + 1;
                         }
-                        for h in next..entries.len() {
+                        for h in next..len {
                             holes.push(h);
                         }
                         let result = crate::vm::object::new_array_object_from_vec(&mut self.heap, out);
@@ -1498,15 +1533,18 @@ impl VM {
                 // it — that is what makes the `MAX_MATERIALIZED_LEN` cap fire
                 // (e.g. `flatMap` over a 2**32-length array-like must be a
                 // `RangeError`, not a 16 GiB allocation).
-                let species = self.array_species_create(receiver, entries.len(), module)?;
+                let species = self.array_species_create(receiver, len, module)?;
                 let mut values: Vec<Value> = Vec::new();
                 let mut acc = self.roots();
                 if let Some(ref sp) = species {
                     acc.push(sp);
                 }
-                for (i, e) in entries.iter().enumerate() {
-                    if let Some(e) = e {
-                        let mapped = call(self, &callback, e, i)?;
+                for i in 0..len {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    {
+                        let mapped = call(self, &callback, &e, i)?;
                         let mut flattened = false;
                         if let Value::Object(obj_ref) = &mapped {
                             if obj_ref.borrow().kind() == ObjectKind::Array {
@@ -1549,18 +1587,19 @@ impl VM {
                 // that is what makes the `MAX_MATERIALIZED_LEN` cap fire (e.g.
                 // `filter` over a 2**32-length array-like must be a `RangeError`,
                 // not a 16 GiB allocation).
-                let species = self.array_species_create(receiver, entries.len(), module)?;
+                let species = self.array_species_create(receiver, len, module)?;
                 let mut out: Vec<Value> = Vec::new();
                 let mut acc = self.roots();
                 if let Some(ref sp) = species {
                     acc.push(sp);
                 }
-                for (i, e) in entries.iter().enumerate() {
-                    if let Some(e) = e {
-                        if call(self, &callback, e, i)?.to_boolean() {
-                            acc.push(e);
-                            out.push(e.clone());
-                        }
+                for i in 0..len {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    if call(self, &callback, &e, i)?.to_boolean() {
+                        acc.push(&e);
+                        out.push(e);
                     }
                 }
                 Ok(Some(match species {
@@ -1579,41 +1618,45 @@ impl VM {
                 }))
             }
             "some" => {
-                for (i, e) in entries.iter().enumerate() {
-                    if let Some(e) = e {
-                        if call(self, &callback, e, i)?.to_boolean() {
-                            return Ok(Some(Value::Bool(true)));
-                        }
+                for i in 0..len {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    if call(self, &callback, &e, i)?.to_boolean() {
+                        return Ok(Some(Value::Bool(true)));
                     }
                 }
                 Ok(Some(Value::Bool(false)))
             }
             "every" => {
-                for (i, e) in entries.iter().enumerate() {
-                    if let Some(e) = e {
-                        if !call(self, &callback, e, i)?.to_boolean() {
-                            return Ok(Some(Value::Bool(false)));
-                        }
+                for i in 0..len {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    if !call(self, &callback, &e, i)?.to_boolean() {
+                        return Ok(Some(Value::Bool(false)));
                     }
                 }
                 Ok(Some(Value::Bool(true)))
             }
             "find" => {
-                for (i, e) in entries.iter().enumerate() {
-                    if let Some(e) = e {
-                        if call(self, &callback, e, i)?.to_boolean() {
-                            return Ok(Some(e.clone()));
-                        }
+                for i in 0..len {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    if call(self, &callback, &e, i)?.to_boolean() {
+                        return Ok(Some(e));
                     }
                 }
                 Ok(Some(Value::Undefined))
             }
             "findIndex" => {
-                for (i, e) in entries.iter().enumerate() {
-                    if let Some(e) = e {
-                        if call(self, &callback, e, i)?.to_boolean() {
-                            return Ok(Some(Value::Number(i as f64)));
-                        }
+                for i in 0..len {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    if call(self, &callback, &e, i)?.to_boolean() {
+                        return Ok(Some(Value::Number(i as f64)));
                     }
                 }
                 Ok(Some(Value::Number(-1.0)))
@@ -1621,27 +1664,30 @@ impl VM {
             // ── ES2023 ──
             // `findLast` / `findLastIndex`：从**末尾**往前找第一个命中的。
             "findLast" => {
-                for (i, e) in entries.iter().enumerate().rev() {
-                    if let Some(e) = e {
-                        if call(self, &callback, e, i)?.to_boolean() {
-                            return Ok(Some(e.clone()));
-                        }
+                for i in (0..len).rev() {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    if call(self, &callback, &e, i)?.to_boolean() {
+                        return Ok(Some(e));
                     }
                 }
                 Ok(Some(Value::Undefined))
             }
             "findLastIndex" => {
-                for (i, e) in entries.iter().enumerate().rev() {
-                    if let Some(e) = e {
-                        if call(self, &callback, e, i)?.to_boolean() {
-                            return Ok(Some(Value::Number(i as f64)));
-                        }
+                for i in (0..len).rev() {
+                    let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
+                        continue;
+                    };
+                    if call(self, &callback, &e, i)?.to_boolean() {
+                        return Ok(Some(Value::Number(i as f64)));
                     }
                 }
                 Ok(Some(Value::Number(-1.0)))
             }
             // `toReversed()`：返回**新**数组，元素逆序（不改原数组）。
             "toReversed" => {
+                let entries = self.array_like_entries(receiver, module)?;
                 let mut vals = Self::dense_entries(&entries);
                 vals.reverse();
                 Ok(Some(self.array_result_from(receiver, &vals, module)?))
@@ -1649,6 +1695,7 @@ impl VM {
             // `toSorted(comparefn)`：返回**新**数组。注意 **Array 的默认比较是
             // 字符串序**（与 `TypedArray.prototype.toSorted` 的数值序不同）。
             "toSorted" => {
+                let entries = self.array_like_entries(receiver, module)?;
                 let cmp = args.first().cloned().unwrap_or(Value::Undefined);
                 let mut vals = Self::dense_entries(&entries);
                 if cmp.is_callable() {
@@ -1681,6 +1728,7 @@ impl VM {
             // `with(index, value)`：返回**新**数组，指定下标换成新值；下标越界
             // 是 RangeError（ES 23.1.3.31）。负下标从末尾算。
             "with" => {
+                let entries = self.array_like_entries(receiver, module)?;
                 let mut vals = Self::dense_entries(&entries);
                 let len = vals.len();
                 let raw = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
@@ -1697,6 +1745,7 @@ impl VM {
             // `toSpliced(start, deleteCount, ...items)`：返回**新**数组，等价于
             // 在副本上做一次 `splice`（不改原数组）。
             "toSpliced" => {
+                let entries = self.array_like_entries(receiver, module)?;
                 let vals = Self::dense_entries(&entries);
                 let len = vals.len();
                 let start = self.splice_start(args.first(), len);
@@ -1719,27 +1768,36 @@ impl VM {
                 Ok(Some(self.array_result_from(receiver, &out, module)?))
             }
             "reduce" | "reduceRight" => {
-                // Indices are visited in order (or reverse) and holes skipped;
-                // without an initial value the accumulator is the first
-                // *present* element.
-                let mut indices: Vec<usize> = (0..entries.len()).collect();
-                if method == "reduceRight" {
-                    indices.reverse();
-                }
-                let (mut acc, start) = match args.get(1) {
+                // Indices are visited in order (or reverse); presence and value
+                // are re-read at every step, so a callback that deletes a later
+                // element skips it (`reduce` 那一族 `callCnt` 用例）。
+                let indices: Vec<usize> = if method == "reduceRight" {
+                    (0..len).rev().collect()
+                } else {
+                    (0..len).collect()
+                };
+                // Without an initial value the accumulator is the first
+                // *present* element, and the loop resumes right after it.
+                let (mut acc, resume_at) = match args.get(1) {
                     Some(init) => (init.clone(), 0usize),
                     None => {
-                        let Some(&first) = indices.iter().find(|&&i| entries[i].is_some()) else {
+                        let mut found = None;
+                        for (pos, &i) in indices.iter().enumerate() {
+                            if let Some(v) = self.array_live_at(&callback_receiver, i, module)? {
+                                found = Some((v, pos + 1));
+                                break;
+                            }
+                        }
+                        let Some((value, resume)) = found else {
                             return Err(RuntimeError::TypeError(
                                 "Reduce of empty array with no initial value".to_string(),
                             ));
                         };
-                        let first_value = entries[first].clone().unwrap_or(Value::Undefined);
-                        (first_value, indices.iter().position(|&i| i == first).unwrap_or(0) + 1)
+                        (value, resume)
                     }
                 };
-                for &i in indices.iter().skip(start) {
-                    let Some(element) = entries[i].clone() else {
+                for &i in indices.iter().skip(resume_at) {
+                    let Some(element) = self.array_live_at(&callback_receiver, i, module)? else {
                         continue;
                     };
                     // `reduce` has no `thisArg` parameter: the callback runs
@@ -1755,6 +1813,71 @@ impl VM {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `indexOf` / `lastIndexOf` with the **live** element view: `HasProperty`
+    /// and `[[Get]]` are re-evaluated per index (ES 23.1.3.25 step 8.a).
+    ///
+    /// `len` is the length captured before the loop, as the spec does.
+    fn array_index_of_live(
+        &mut self,
+        target: &Value,
+        len: usize,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        fn same_value_zero(a: &Value, b: &Value) -> bool {
+            if let (Value::Number(x), Value::Number(y)) = (a, b)
+                && x.is_nan()
+                && y.is_nan()
+            {
+                return true;
+            }
+            a.strict_eq(b)
+        }
+
+        let search = args.first().cloned().unwrap_or(Value::Undefined);
+        let len_i = len as i64;
+        // `? ToIntegerOrInfinity(fromIndex)`: ToNumber(Symbol) is abrupt, while
+        // an absent argument reads as ToIntegerOf(undefined) = 0.
+        let from = match args.get(1) {
+            Some(v) if !v.is_undefined() => {
+                crate::builtins::to_integer_or_infinity_throwing(Some(v))?
+            }
+            _ => {
+                if method == "indexOf" {
+                    0
+                } else {
+                    len_i - 1
+                }
+            }
+        };
+
+        if method == "indexOf" {
+            let start = from.max(0);
+            if start >= len_i {
+                return Ok(Value::Number(-1.0));
+            }
+            for i in start..len_i {
+                if let Some(element) = self.array_live_at(target, i as usize, module)?
+                    && same_value_zero(&element, &search)
+                {
+                    return Ok(Value::Number(i as f64));
+                }
+            }
+        } else {
+            let mut i = if from < 0 { -1 } else { from.min(len_i - 1) };
+            while i >= 0 {
+                if let Some(element) = self.array_live_at(target, i as usize, module)?
+                    && same_value_zero(&element, &search)
+                {
+                    return Ok(Value::Number(i as f64));
+                }
+                i -= 1;
+            }
+        }
+        Ok(Value::Number(-1.0))
     }
 
     /// `Array.prototype` 的**读族**（`join` / `slice` / `includes` / `at` /
