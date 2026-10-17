@@ -353,6 +353,12 @@ pub enum Instruction {
     MakeObject {
         dst: Value,
     },
+    /// The cached template object of a tagged-template call site (ES
+    /// `GetTemplateObject`): `site` indexes `IrUnit::templates`.
+    MakeTemplate {
+        dst: Value,
+        site: u32,
+    },
 
     // Iteration Instructions
     /// `yield*`: record the delegate so an abrupt completion can close it.
@@ -708,6 +714,7 @@ impl Instruction {
             Instruction::ArrayPush { array, value } => (vec![], vec![*array, *value]),
             Instruction::ArrayPushSpread { array, src } => (vec![], vec![*array, *src]),
             Instruction::MakeObject { dst } => (vec![*dst], vec![]),
+            Instruction::MakeTemplate { dst, .. } => (vec![*dst], vec![]),
             Instruction::IndexGet { dst, object, index } => (vec![*dst], vec![*object, *index]),
             Instruction::IndexSet {
                 object,
@@ -981,6 +988,9 @@ impl std::fmt::Display for Instruction {
             }
             Instruction::ArrayPushSpread { array, src } => {
                 write!(f, "array_push_spread {array}, {src}")
+            }
+            Instruction::MakeTemplate { dst, site } => {
+                write!(f, "{dst} = make_template {site}")
             }
             Instruction::MakeObject { dst } => {
                 write!(f, "{dst} = make_object")

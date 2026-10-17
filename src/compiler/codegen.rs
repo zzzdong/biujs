@@ -239,6 +239,13 @@ impl Codegen {
                         self.codes
                             .push(Instr::ArrayPush { array: array, value: value });
                     }
+                    Instruction::MakeTemplate { dst, site } => {
+                        let dst = self.gen_operand(dst);
+                        self.codes.push(Instr::MakeTemplate {
+                            dst: dst,
+                            site: Operand::new_immd(site as isize),
+                        });
+                    }
                     Instruction::MakeObject { dst } => {
                         let dst = self.gen_operand(dst);
                         self.codes.push(Instr::MakeObject { dst: dst });

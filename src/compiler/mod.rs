@@ -181,6 +181,7 @@ impl Compiler {
             code_blocks,
             all_codes,
             eh_regions,
+            unit.templates,
         ))
     }
 }

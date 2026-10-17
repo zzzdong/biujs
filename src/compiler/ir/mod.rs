@@ -139,6 +139,8 @@ pub struct IrUnit {
     pub constants: Vec<Constant>,
     pub functions: Vec<IrFunction>,
     pub control_flow_graph: ControlFlowGraph,
+    /// 每个带标签模板站点的静态字符串（下标即 `Instruction::MakeTemplate` 的 `site`）。
+    pub templates: Vec<crate::bytecode::TemplateSite>,
 }
 
 impl IrUnit {
@@ -147,7 +149,16 @@ impl IrUnit {
             constants: Vec::new(),
             functions: Vec::new(),
             control_flow_graph: ControlFlowGraph::new(),
+            templates: Vec::new(),
         }
+    }
+
+    /// Register a tagged-template call site; the returned index is the runtime
+    /// cache key (`GetTemplateObject` is per site, not per evaluation).
+    pub fn declare_template(&mut self, site: crate::bytecode::TemplateSite) -> u32 {
+        let index = self.templates.len() as u32;
+        self.templates.push(site);
+        index
     }
 
     pub fn get_function(&self, id: FunctionId) -> Option<&IrFunction> {

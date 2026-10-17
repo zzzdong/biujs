@@ -391,6 +391,13 @@ pub trait InstBuilder {
         array
     }
 
+    /// The cached template object of `site` (see `IrUnit::declare_template`).
+    fn make_template(&mut self, site: u32) -> Value {
+        let dst = self.alloc();
+        self.emit(Instruction::MakeTemplate { dst, site });
+        dst
+    }
+
     fn make_object(&mut self) -> Value {
         let object = self.alloc();
         self.emit(Instruction::MakeObject { dst: object });

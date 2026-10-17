@@ -841,6 +841,11 @@ const SUITES: &[&str] = &[
     "language/expressions/strict-does-not-equals",
     "language/expressions/strict-equals",
     "language/expressions/subtraction",
+    // `tag`…`` and the plain template literal: the tagged form is a call through
+    // `GetTemplateObject`, so its suite is enrolled with the lowering that made
+    // it compile at all (it used to reach the catch-all and become `null`).
+    "language/expressions/tagged-template",
+    "language/expressions/template-literal",
     "language/expressions/this",
     "language/expressions/typeof",
     "language/expressions/unary-minus",

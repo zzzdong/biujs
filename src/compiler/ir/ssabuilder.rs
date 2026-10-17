@@ -878,6 +878,9 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_use(array, stacks);
                 SSABuilder::rename_use(src, stacks);
             }
+            Instruction::MakeTemplate { dst, .. } => {
+                SSABuilder::rename_definition(dst, new_versions);
+            }
             Instruction::MakeObject { dst } => {
                 SSABuilder::rename_definition(dst, new_versions);
             }

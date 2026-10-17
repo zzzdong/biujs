@@ -2237,6 +2237,7 @@ impl<'a> JSASTLower<'a> {
             Expression::FunctionExpression(func) => self.lower_function_expr(func),
             Expression::SequenceExpression(seq) => self.lower_sequence(seq),
             Expression::TemplateLiteral(tpl) => self.lower_template_literal(tpl),
+            Expression::TaggedTemplateExpression(tagged) => self.lower_tagged_template(tagged),
             Expression::RegExpLiteral(lit) => self.lower_regexp_literal(lit),
             Expression::ParenthesizedExpression(paren) => self.lower_expression(&paren.expression),
             Expression::ThisExpression(_) => {
@@ -3480,6 +3481,74 @@ impl<'a> JSASTLower<'a> {
         }
 
         result.unwrap_or(Value::Primitive(Primitive::Undefined))
+    }
+
+    /// ES 12.3.7 `TaggedTemplate`: `` tag`a${x}b` ``.
+    ///
+    /// Expands to `tag(strings, x, …)` where `strings` is the *template object*:
+    /// an array of the cooked quasis carrying a `raw` array of the raw ones
+    /// (`{ writable: false, enumerable: false, configurable: false }`, per
+    /// `GetTemplateObject`). The engine had no arm for this expression at all,
+    /// so it fell through the catch-all and compiled to `null` — which is why
+    /// `String.raw` existed as a built-in while `` String.raw`a\nb` `` answered
+    /// `null`.
+    ///
+    /// Order matters and is observable: the tag reference is evaluated first,
+    /// then the template object, then the substitutions left to right, then the
+    /// call (ES 12.3.7.1).
+    fn lower_tagged_template(&mut self, tagged: &TaggedTemplateExpression<'_>) -> Value {
+        // 1. The tag. A *member* tag keeps its base: `obj.m`…`` calls `m` with
+        //    `this === obj` (ES 12.3.7.1 `EvaluateCall`).
+        let mut tag_func: Option<Value> = None;
+        let mut receiver: Option<Value> = None;
+        let mut key: Option<MemberKey> = None;
+        match &tagged.tag {
+            Expression::StaticMemberExpression(member) => {
+                receiver = Some(self.lower_expression(&member.object));
+                key = Some(MemberKey::Static(member.property.name.to_string()));
+            }
+            Expression::ComputedMemberExpression(member) => {
+                receiver = Some(self.lower_expression(&member.object));
+                let computed = self.lower_expression(&member.expression);
+                key = Some(MemberKey::Dynamic(computed));
+            }
+            other => tag_func = Some(self.lower_expression(other)),
+        }
+
+        // 2. The template object. `GetTemplateObject` is **per call site** —
+        //    every evaluation of this site must see the *same* frozen object —
+        //    so the strings are registered as a module-level table entry and the
+        //    VM caches the object on first use.
+        let mut site = crate::bytecode::TemplateSite {
+            cooked: Vec::with_capacity(tagged.quasi.quasis.len()),
+            raw: Vec::with_capacity(tagged.quasi.quasis.len()),
+        };
+        for quasi in &tagged.quasi.quasis {
+            // `cooked` is `None` for an invalid escape sequence — ES 2018 made
+            // those legal in a tagged template, and the hole is the point.
+            site.cooked
+                .push(quasi.value.cooked.as_ref().map(|s| s.to_string()));
+            site.raw.push(quasi.value.raw.to_string());
+        }
+        let site = self.builder.module_mut().declare_template(site);
+        let strings = self.builder.make_template(site);
+
+        // 3. Substitutions, left to right, then the call.
+        let mut args = vec![strings];
+        for expr in &tagged.quasi.expressions {
+            args.push(self.lower_expression(expr));
+        }
+
+        if let (Some(object), Some(key)) = (receiver, key) {
+            return match key {
+                MemberKey::Static(name) => self.builder.call_property(object, &name, args),
+                MemberKey::Dynamic(computed) => {
+                    self.builder.call_property_dynamic(object, computed, args)
+                }
+            };
+        }
+        let func = tag_func.unwrap_or(Value::Primitive(Primitive::Undefined));
+        self.builder.make_call(func, args)
     }
 
     // ──────────────────────── Function Lowering ────────────────────────

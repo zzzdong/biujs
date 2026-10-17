@@ -60,6 +60,11 @@ pub struct CodeBlock {
 pub struct Module {
     pub name: Option<String>,
     pub constants: Vec<Constant>,
+    /// 每个带标签模板**调用点**的静态字符串表（下标即 `MakeTemplate` 的 `site`）。
+    ///
+    /// 模板对象是**每个站点一个、跨求值复用**的（ES `GetTemplateObject`），
+    /// 所以字符串不能编进指令流：静态表在这里，运行期缓存挂在 VM 上。
+    pub templates: Vec<TemplateSite>,
     /// 每个函数的描述，**下标就是函数 id**（编译期保证 0..n 连续）。
     ///
     /// 这是"按函数属性"的唯一来源：以前那六张表（入口 pc、名字/arity、
@@ -143,6 +148,7 @@ impl Module {
         code_blocks: Vec<CodeBlock>,
         instructions: Vec<Instr>,
         eh_regions: HashMap<u32, Vec<EhRegion>>,
+        templates: Vec<TemplateSite>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -150,6 +156,7 @@ impl Module {
             code_blocks,
             instructions,
             eh_regions,
+            templates,
             debug_instructions: BTreeMap::new(),
             eh_index: OnceCell::new(),
         }
@@ -346,6 +353,19 @@ impl fmt::Display for Module {
 /// 与"操作数角色"（P0b 的读写集）是两件事：`Kind` 说这条指令**会做什么**，
 /// 读写集说它**碰哪些操作数**。`Try` 有跳转目标却是 `Normal`（它登记处理点后照样往下走），
 /// `IterNext` 写一个布尔寄存器也是 `Normal`（分支由随后的 `BrIf` 完成）。
+/// 一个带标签模板站点的静态字符串：`cooked`（转义已处理）与 `raw`（原文）。
+///
+/// `cooked` 为 `None` 表示该段含非法转义 —— ES 2018 起这在**带标签**模板里合法，
+/// 对应的 cooked 元素是 `undefined`。
+///
+/// 表放在 `Module` 上而不是编进指令流：`GetTemplateObject` 的缓存是**每站点一个**
+/// 对象，运行期需要一个稳定的键，`site` 下标就是它。
+#[derive(Debug, Clone, Default)]
+pub struct TemplateSite {
+    pub cooked: Vec<Option<String>>,
+    pub raw: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// 顺序执行到 `pc + 1`。
@@ -813,6 +833,7 @@ define_instrs! {
     ;
 // ── arity 2 ──
         LoadConst { dst: w, index: n },
+        MakeTemplate { dst: w, site: n },
         InitLexical { name: n, value: r },
         SetFunctionName { func: r, name: r },
         LoadEnv { dst: w, name: n },
@@ -1019,6 +1040,9 @@ pub enum Opcode {
     ArrayPushSpread,
     /// make_object dst
     MakeObject,
+    /// make_template dst, site — the **cached** template object of a call site
+    /// (ES `GetTemplateObject`): one frozen array per site, with `raw`.
+    MakeTemplate,
     /// index_get dst, obj, idx
     IndexGet,
     /// index_set obj, idx, value
@@ -1170,6 +1194,7 @@ impl fmt::Display for Opcode {
             Opcode::ArrayPush => write!(f, "array_push"),
             Opcode::ArrayPushSpread => write!(f, "array_push_spread"),
             Opcode::MakeObject => write!(f, "make_object"),
+            Opcode::MakeTemplate => write!(f, "make_template"),
             Opcode::IndexGet => write!(f, "index_get"),
             Opcode::IndexSet => write!(f, "index_set"),
             Opcode::PropGet => write!(f, "prop_get"),
@@ -1769,6 +1794,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            Vec::new(),
         );
         assert_eq!(module.name, Some("test".to_string()));
         assert!(module.constants.is_empty());
@@ -1793,6 +1819,7 @@ mod tests {
             }],
             vec![Instr::Halt {}],
             HashMap::new(),
+            Vec::new(),
         );
         let display = format!("{}", module);
         assert!(display.contains("Module main"));
@@ -1811,8 +1838,9 @@ mod tests {
     /// 它同时也是"标记没被手滑删掉"的守卫 —— 删掉一个 `@Call`，这里立刻红。
     #[test]
     fn kind_markers_cover_the_table() {
-        // `MakeCell` 入表（闭包共享单元，见 `vm::EnvCell`）后是 91。
-        assert_eq!(Instr::ALL.len(), 91, "表里的指令条数");
+        // `MakeCell` 入表（闭包共享单元，见 `vm::EnvCell`）后是 91；
+        // `MakeTemplate`（带标签模板的站点缓存）再 +1。
+        assert_eq!(Instr::ALL.len(), 92, "表里的指令条数");
         assert_eq!(count_of(Kind::Call), 8, "Call* / New*");
         assert_eq!(count_of(Kind::Jump), 4, "Jump / BrIf / DelayedJump / ResumeExc");
         assert_eq!(count_of(Kind::Return), 2, "Ret / Halt");

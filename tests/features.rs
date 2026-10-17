@@ -71,6 +71,8 @@ mod reflect;
 mod set;
 #[path = "features/stack_overflow.rs"]
 mod stack_overflow;
+#[path = "features/tagged_templates.rs"]
+mod tagged_templates;
 #[path = "features/string_es6.rs"]
 mod string_es6;
 #[path = "features/symbol_test.rs"]

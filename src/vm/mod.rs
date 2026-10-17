@@ -213,6 +213,11 @@ pub struct VM {
     /// Live iterators created by `MakeIterator`, keyed by registry id. The
     /// user-facing `next()`/`return()` natives look iterators up here.
     iterator_registry: HashMap<u64, Value>,
+    /// `GetTemplateObject` 的缓存：下标是**调用点**的 site id。
+    ///
+    /// 规范要求同一个站点每次求值都得到**同一个**（已冻结的）模板对象，
+    /// 所以缓存活在 VM 上、按 `run` 重置（一个 module 一套 site id）。
+    template_objects: Vec<Option<Value>>,
     next_iterator_id: u64,
     /// Live generator objects, keyed by registry id. `gen.next()` is a native
     /// (`__gen_next__<id>`), so the resume path has to find the object here.
@@ -454,6 +459,7 @@ impl VM {
             state,
             builtins,
             iterator_registry: HashMap::new(),
+            template_objects: Vec::new(),
             next_iterator_id: 0,
             generator_registry: HashMap::new(),
             next_generator_id: 0,
@@ -523,6 +529,8 @@ impl VM {
         // runner was switched to reuse (15972 → 14002 passing).
         self.iterator_registry.clear();
         self.next_iterator_id = 0;
+        // Site ids belong to the module, so the cache is per `run` as well.
+        self.template_objects.clear();
         self.generator_registry.clear();
         self.next_generator_id = 0;
         self.generator_send = Value::Undefined;
@@ -3569,6 +3577,68 @@ impl VM {
     // jumping past the last instruction, exactly like a `Ret` to the sentinel
     // return address does.
 
+    /// The **cached** template object of a tagged-template call site.
+    ///
+    /// ES `GetTemplateObject`: one array per *site*, shared by every evaluation,
+    /// carrying a `raw` array of the un-escaped strings; both are frozen so the
+    /// elements and `length` are non-writable / non-configurable. A fresh object
+    /// per evaluation would fail `cache-same-site` (identity) and every
+    /// `verifyProperty` on the elements.
+    fn make_template_object(
+        &mut self,
+        site: usize,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(Some(cached)) = self.template_objects.get(site) {
+            return Ok(cached.clone());
+        }
+        let Some(desc) = module.templates.get(site) else {
+            // Only a hand-built module can get here: `codegen` and this table
+            // are written by the same lowering pass.
+            return Err(RuntimeError::InternalError(format!(
+                "unknown template site {site}"
+            )));
+        };
+        let cooked: Vec<Value> = desc
+            .cooked
+            .iter()
+            .map(|cooked| match cooked {
+                Some(text) => Value::string(text),
+                // Invalid escape: legal in a *tagged* template since ES 2018,
+                // and the cooked entry is `undefined`.
+                None => Value::Undefined,
+            })
+            .collect();
+        let cooked_val = crate::vm::object::new_array_object_from_vec(&mut self.heap, cooked);
+        let raw: Vec<Value> = desc.raw.iter().map(|text| Value::string(text)).collect();
+        let raw_val = crate::vm::object::new_array_object_from_vec(&mut self.heap, raw);
+
+        if let Value::Object(raw_ref) = &raw_val {
+            raw_ref.borrow_mut().freeze();
+        }
+        if let Value::Object(strings_ref) = &cooked_val {
+            let raw_desc = crate::vm::property::PropertyDescriptor {
+                value: raw_val,
+                writable: false,
+                enumerable: false,
+                configurable: false,
+                getter: None,
+                setter: None,
+            };
+            strings_ref
+                .borrow_mut()
+                .define_property(PropertyKey::from_str("raw"), raw_desc)
+                .map_err(RuntimeError::TypeError)?;
+            strings_ref.borrow_mut().freeze();
+        }
+
+        if self.template_objects.len() <= site {
+            self.template_objects.resize(site + 1, None);
+        }
+        self.template_objects[site] = Some(cooked_val.clone());
+        Ok(cooked_val)
+    }
+
     /// Build the generator object a call to `function*` produces.
     ///
     /// The body does not run yet: it starts on the first `next()`.
@@ -6385,6 +6455,7 @@ mod tests {
             Vec::new(),
             instructions,
             HashMap::new(),
+            Vec::new(),
         )
     }
 

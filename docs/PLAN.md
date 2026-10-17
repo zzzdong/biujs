@@ -166,6 +166,28 @@ timeout 7 → 17，无新增坏测试）。见 `docs/REFACTOR-HEAP-GC.md` §5 R3
 > `CalleeKind`）也要提为 `pub(crate)`。bytecode.rs 的元测试直接读 VM 源码取证，范围
 > 从单文件变成 `vm/dispatch_sources()` 列表，漏掉一个文件覆盖断言立刻报出来。
 
+### P3.5 — 带标签模板（2026-10-17 已完成）
+
+`` tag`a${x}b` `` 此前**整段缺失**：`lower_expression` 没有
+`TaggedTemplateExpression` 分支，于是掉进兜底 arm 编译成 `null`（release 下连日志
+都没有）。`String.raw` 作为内建存在，但 `` String.raw`a\nb` `` 返回 `null`。
+
+交付：
+1. `lower_tagged_template`：按规范顺序求值 tag 引用 → 模板对象 → 替换表达式 →
+   调用；成员 tag 保留接收者（`obj.m\`\`` 的 `this` 是 `obj`）；
+2. **站点缓存**（`GetTemplateObject`）：新指令 `MakeTemplate { dst, site }` +
+   `Module::templates` 静态表 + VM 上按 `site` 的缓存；同一站点跨求值复用同一个
+   **冻结**对象（元素不可写/不可配置、`raw` 三个属性都不可），缓存已入 GC 根集；
+3. 顺带修掉一个更深的语义缺口：`ToString`/`ToNumber` 指令把 `ToPrimitive` 的
+   abrupt completion **吞掉**了（回退成 "[object Object]" / `NaN`）——
+   现在用户 `toString`/`valueOf` 抛出会传播（ES 12.2.8.5 step 4）。
+
+入册：`language/expressions/tagged-template`（18 通过 / 8 跳过 / 1 失败 —— 失败是
+`noStrict` 用例，严格模式固有的偏差）与 `language/expressions/template-literal`
+（54 / 3 / 0）。验收：三级 233 / 581 / 7 全绿；全量 17159（+82），无逐套件回退，
+另外 7 个套件因 ToPrimitive 修复各 +1（`unary-plus`、四种 `++`/`--`、`new.target`、
+`String` +4）。
+
 ## 4. 两条待定的语义 bug（属于"修 bug"，不是重构）
 
 1. ✅ **闭包共享可变单元**（2026-10-16 已修）：被嵌套函数捕获的绑定现在住在

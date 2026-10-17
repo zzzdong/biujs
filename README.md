@@ -11,6 +11,7 @@ A JavaScript engine implemented in Rust. Targeted to support **strict mode ES6**
 - `this` binding (strict mode only)
 - Prototype chain and method inheritance
 - Closures: a captured binding is a **shared cell**, so `counter()` really counts
+- Tagged templates (`` tag`…` ``) with the per-site frozen template object (so `String.raw` works)
 - let variables, control flow, operators
 - Objects and Arrays with prototype methods
 - `JSON.parse` / `JSON.stringify` (includes `toJSON`, `replacer`, `space`, reviver)
@@ -33,7 +34,7 @@ test262 口径 / 批次表 / 快照纪律在
 
 ## Conformance
 
-**82.51%**（17077 / 执行 20698；2026-10-16 基线）。
+**82.61%**（17159 / 执行 20771；2026-10-17 基线）。
 
 一条命令跑齐三级验证并与基线逐套件对比：
 
@@ -45,8 +46,8 @@ test262 口径 / 批次表 / 快照纪律在
 快验三档：
 
 ```sh
-cargo test --release --lib            # 单元 232
-cargo test --release --test features  # feature 断言 569
+cargo test --release --lib            # 单元 233
+cargo test --release --test features  # feature 断言 581
 cargo test --release --test guards    # 护栏 7
 ```
 

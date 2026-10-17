@@ -100,6 +100,9 @@ impl Trace for VM {
         self.state.trace(out);
         self.builtins.trace(out);
         self.iterator_registry.trace(out);
+        // `GetTemplateObject` 的站点缓存：模板对象（及其 `raw`）只能从这里到达，
+        // 漏掉这一行，一次收集就会把缓存扫成悬垂句柄（INV-3）。
+        self.template_objects.trace(out);
         self.generator_registry.trace(out);
         self.generator_send.trace(out);
         self.generator_yielded.trace(out);
@@ -157,6 +160,15 @@ mod tests {
             .globals
             .borrow_mut()
             .insert("x".to_string(), Value::Object(g));
+        assert!(traced_contains(&vm, &g));
+    }
+
+    /// 带标签模板的站点缓存：模板对象只从这里可达，必须是根。
+    #[test]
+    fn vm_roots_include_the_template_object_cache() {
+        let mut vm = VM::new();
+        let g = vm.heap.alloc(Object::Ordinary(OrdinaryObject::new()));
+        vm.template_objects.push(Some(Value::Object(g)));
         assert!(traced_contains(&vm, &g));
     }
 

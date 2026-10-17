@@ -1539,7 +1539,7 @@ impl VM {
             Instr::CallSpread { .. } | Instr::CallSuperSpread { .. } | Instr::NewSpread { .. } => self.run_call_spread(inst, module)?,
             Instr::ToString { .. } | Instr::ToNumber { .. } => self.run_convert(inst, module)?,
             Instr::MakeArray { .. } | Instr::ArrayPushSpread { .. } | Instr::MarkHole { .. } |
-              Instr::ArrayPush { .. } => self.run_array(inst, module)?,
+              Instr::ArrayPush { .. } | Instr::MakeTemplate { .. } => self.run_array(inst, module)?,
             Instr::MakeObject { .. } | Instr::IndexGet { .. } | Instr::PropGet { .. } |
               Instr::IndexSet { .. } | Instr::PropSet { .. } | Instr::IndexDelete { .. } |
               Instr::PropDelete { .. } | Instr::Arguments { .. } | Instr::StoreEnv { .. } |
@@ -2396,20 +2396,20 @@ impl VM {
         match *inst {
             Instr::ToString { dst, src } => {
                 let src = self.get_value(src)?;
-                let s = match self.to_primitive(&src, "string", module) {
-                    Ok(v) => v.to_js_string(),
-                    Err(_) => src.to_js_string(),
-                };
-                self.set_value(dst, Value::string(&s))?;
+                // An abrupt completion from `ToPrimitive` **propagates**: the
+                // user's `toString`/`valueOf` threw, and `${obj}` / `String(obj)`
+                // must rethrow (ES 12.2.8.5 step 4 `ReturnIfAbrupt`). Falling
+                // back to `src.to_js_string()` here silently turned that into
+                // "[object Object]".
+                let prim = self.to_primitive(&src, "string", module)?;
+                self.set_value(dst, Value::string(&prim.to_js_string()))?;
             }
             Instr::ToNumber { dst, src } => {
                 // ES 7.1.4 ToNumber: objects convert through
-                // ToPrimitive(hint "number"), which may run user code.
+                // ToPrimitive(hint "number"), which may run user code — and its
+                // abrupt completion propagates for the same reason as above.
                 let src = self.get_value(src)?;
-                let prim = match self.to_primitive(&src, "number", module) {
-                    Ok(v) => v,
-                    Err(_) => src.clone(),
-                };
+                let prim = self.to_primitive(&src, "number", module)?;
                 self.set_value(dst, Value::Number(prim.to_number()))?;
             }
             _ => return Ok(false),
@@ -2427,6 +2427,11 @@ impl VM {
                 arr.set_prototype(Some(self.builtins.array_prototype));
                 let arr_val = Value::Object(self.heap.alloc(Object::Array(arr)));
                 self.set_value(dst, arr_val)?;
+            }
+            Instr::MakeTemplate { dst, site } => {
+                let site = site.as_immd() as usize;
+                let strings = self.make_template_object(site, module)?;
+                self.set_value(dst, strings)?;
             }
             Instr::ArrayPushSpread { array, src } => {
                 // `[...src]` / `f(...src)`: append every element of `src`. The
