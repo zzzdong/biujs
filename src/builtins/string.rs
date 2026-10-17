@@ -191,13 +191,14 @@ pub fn string_pad(obj: &Value, args: &[Value], at_start: bool) -> Result<Value, 
     } else {
         fill
     };
-    let len = s.chars().count();
+    let len = crate::vm::utf16::length(&s);
     if target <= len || target > 1 << 20 {
         return Ok(Value::string(&s));
     }
     let pad_len = target - len;
-    let fill_chars: Vec<char> = fill.chars().collect();
-    let padding: String = (0..pad_len).map(|i| fill_chars[i % fill_chars.len()]).collect();
+    let fill_units = crate::vm::utf16::units(&fill);
+    let padding: Vec<u16> = (0..pad_len).map(|i| fill_units[i % fill_units.len()]).collect();
+    let padding = crate::vm::utf16::from_units(&padding);
     Ok(Value::string(&if at_start {
         format!("{padding}{s}")
     } else {
@@ -212,19 +213,21 @@ pub fn string_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, Runtim
         Some(v) => super::to_string_throwing(v)?,
         None => "undefined".to_string(),
     };
-    let chars: Vec<char> = s.chars().collect();
-    let needle: Vec<char> = search.chars().collect();
+    let haystack = crate::vm::utf16::units(&s);
+    let needle = crate::vm::utf16::units(&search);
     // No `position` means +Infinity for `lastIndexOf` (clamped to the length),
     // unlike `indexOf` which starts at 0.
-    let start = string_position(args.get(1), chars.len(), chars.len() as i64)?;
+    let start = string_position(args.get(1), haystack.len(), haystack.len() as i64)?;
     if needle.is_empty() {
         return Ok(Value::Number(start as f64));
     }
-    let mut i = start as i64;
+    if needle.len() > haystack.len() {
+        return Ok(Value::Number(-1.0));
+    }
+    let mut i = start.min(haystack.len() - needle.len()) as i64;
     while i >= 0 {
         let at = i as usize;
-        let end = at + needle.len();
-        if end <= chars.len() && chars[at..end] == needle[..] {
+        if haystack[at..at + needle.len()] == needle[..] {
             return Ok(Value::Number(i as f64));
         }
         i -= 1;
@@ -263,21 +266,20 @@ pub fn string_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 pub fn string_char_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
     let idx = position_arg(args.first())?;
-    if let Some(c) = s.chars().nth(idx) {
-        Ok(Value::string(&c.to_string()))
-    } else {
-        Ok(Value::string(""))
-    }
+    // 按**码元**取：非 BMP 字符的第 0 位是半个代理对（存储模型只能给 U+FFFD）。
+    Ok(match s.encode_utf16().nth(idx) {
+        Some(unit) => Value::string(&crate::vm::utf16::from_units(&[unit])),
+        None => Value::string(""),
+    })
 }
 
 pub fn string_char_code_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
     let idx = position_arg(args.first())?;
-    if let Some(c) = s.chars().nth(idx) {
-        Ok(Value::Number(c as u32 as f64))
-    } else {
-        Ok(Value::Number(f64::NAN))
-    }
+    Ok(match crate::vm::utf16::char_code_at(&s, idx) {
+        Some(unit) => Value::Number(unit as f64),
+        None => Value::Number(f64::NAN),
+    })
 }
 
 pub fn string_concat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -311,16 +313,23 @@ pub fn string_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeErro
         Some(v) => super::to_string_throwing(v)?,
         None => "undefined".to_string(),
     };
-    let len = s.chars().count();
+    // 位置与返回值都以**码元**计（`"a😀b".indexOf("b")` 是 3）。
+    let haystack = crate::vm::utf16::units(&s);
+    let needle = crate::vm::utf16::units(&search);
+    let len = haystack.len();
     let start = string_position(args.get(1), len, 0)?;
-    if search.is_empty() {
+    if needle.is_empty() {
         return Ok(Value::Number(start as f64));
     }
-    let tail: String = s.chars().skip(start).collect();
-    match tail.find(&search) {
-        Some(offset) => Ok(Value::Number((start + tail[..offset].chars().count()) as f64)),
-        None => Ok(Value::Number(-1.0)),
+    if needle.len() > len {
+        return Ok(Value::Number(-1.0));
     }
+    for i in start..=(len - needle.len()) {
+        if haystack[i..i + needle.len()] == needle[..] {
+            return Ok(Value::Number(i as f64));
+        }
+    }
+    Ok(Value::Number(-1.0))
 }
 
 /// ToInteger-clamped start index shared by `indexOf` / `lastIndexOf`.
@@ -368,8 +377,9 @@ fn position_arg(arg: Option<&Value>) -> Result<usize, RuntimeError> {
 
 pub fn string_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
+    // 边界与结果都按**码元**（`"😀".slice(0, 1)` 是半个代理对）。
+    let units = crate::vm::utf16::units(&s);
+    let len = units.len();
     let start = slice_bound(args.first(), len)?;
     let end = if args.len() < 2 {
         len
@@ -380,8 +390,7 @@ pub fn string_slice(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
         return Ok(Value::string(""));
     }
     let end = end.min(len);
-    let result: String = chars[start..end].iter().collect();
-    Ok(Value::string(&result))
+    Ok(Value::string(&crate::vm::utf16::from_units(&units[start..end])))
 }
 
 /// `ToNumber(arg)` clamped to `[0, len]`, counting negatives from the end —
@@ -544,7 +553,10 @@ pub fn string_split(
     }
     let sep = super::to_string_throwing(&args[0])?;
     let parts: Vec<Value> = if sep.is_empty() {
-        s.chars().map(|c| Value::string(&c.to_string())).collect()
+        // 空分隔符按**码元**切（`"😀".split("").length` 是 2）。
+        s.encode_utf16()
+            .map(|unit| Value::string(&crate::vm::utf16::from_units(&[unit])))
+            .collect()
     } else {
         s.split(&sep).map(|part| Value::string(part)).collect()
     };
@@ -618,8 +630,8 @@ fn to_substring_bound(n: f64, len: usize) -> usize {
 
 pub fn string_substring(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
+    let units = crate::vm::utf16::units(&s);
+    let len = units.len();
     let start = if args.is_empty() {
         0
     } else {
@@ -634,6 +646,5 @@ pub fn string_substring(obj: &Value, args: &[Value]) -> Result<Value, RuntimeErr
     };
     let from = start.min(end);
     let to = start.max(end);
-    let result: String = chars[from..to].iter().collect();
-    Ok(Value::string(&result))
+    Ok(Value::string(&crate::vm::utf16::from_units(&units[from..to])))
 }

@@ -34,7 +34,7 @@ test262 口径 / 批次表 / 快照纪律在
 
 ## Conformance
 
-**82.78%**（17195 / 执行 20771；2026-10-17 基线）。
+**82.79%**（17196 / 执行 20771；2026-10-17 基线）。
 
 一条命令跑齐三级验证并与基线逐套件对比：
 
@@ -46,8 +46,8 @@ test262 口径 / 批次表 / 快照纪律在
 快验三档：
 
 ```sh
-cargo test --release --lib            # 单元 233
-cargo test --release --test features  # feature 断言 595
+cargo test --release --lib            # 单元 238
+cargo test --release --test features  # feature 断言 604
 cargo test --release --test guards    # 护栏 7
 ```
 

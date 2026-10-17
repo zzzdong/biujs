@@ -1846,9 +1846,10 @@ impl PrimitiveWrapperObject {
         }
     }
 
+    /// `String.prototype.length` 的口径：**UTF-16 码元**（不是码点）。
     fn string_len(&self) -> usize {
         match &self.primitive {
-            Value::String(s) => s.chars().count(),
+            Value::String(s) => crate::vm::utf16::length(s),
             _ => 0,
         }
     }
@@ -1871,7 +1872,7 @@ impl JSObject for PrimitiveWrapperObject {
             if let PropertyKey::Str(k) = key {
                 if k.as_str() == "length" {
                     return Some(PropertyDescriptor {
-                        value: Value::Number(s.chars().count() as f64),
+                        value: Value::Number(crate::vm::utf16::length(s) as f64),
                         writable: false,
                         enumerable: false,
                         configurable: false,
@@ -1880,8 +1881,9 @@ impl JSObject for PrimitiveWrapperObject {
                     });
                 }
                 if let Ok(idx) = k.parse::<usize>() {
-                    return s.chars().nth(idx).map(|c| PropertyDescriptor {
-                        value: Value::string(&c.to_string()),
+                    // 索引按码元：非 BMP 字符的第 0 位是半个代理对（U+FFFD）。
+                    return s.encode_utf16().nth(idx).map(|unit| PropertyDescriptor {
+                        value: Value::string(&crate::vm::utf16::from_units(&[unit])),
                         writable: false,
                         enumerable: true,
                         configurable: false,

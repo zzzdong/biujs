@@ -7,6 +7,7 @@ pub mod property;
 pub mod prototype;
 pub(crate) mod proxy;
 pub(crate) mod trace;
+pub(crate) mod utf16;
 pub mod value;
 
 pub use object::{
@@ -3156,7 +3157,8 @@ impl VM {
             Value::String(s) => {
                 // String prototype properties
                 match prop {
-                    "length" => Ok(Value::Number(s.len() as f64)),
+                    // UTF-16 码元数：`s.len()` 是字节数（"é" 会报 2）。
+                    "length" => Ok(Value::Number(crate::vm::utf16::length(s) as f64)),
                     _ => Ok(Value::Undefined),
                 }
             }
@@ -3232,13 +3234,14 @@ impl VM {
             Value::String(s) => {
                 let name = key.as_str().unwrap_or("");
                 if name == "length" {
-                    return Ok(Value::Number(s.chars().count() as f64));
+                    return Ok(Value::Number(crate::vm::utf16::length(s) as f64));
                 }
                 if let Ok(idx) = name.parse::<usize>() {
+                    // `s[i]` 取的是**码元**：非 BMP 字符会得到半个代理对。
                     return Ok(s
-                        .chars()
+                        .encode_utf16()
                         .nth(idx)
-                        .map(|c| Value::string(&c.to_string()))
+                        .map(|unit| Value::string(&crate::vm::utf16::from_units(&[unit])))
                         .unwrap_or(Value::Undefined));
                 }
                 let proto = self.primitive_prototype(obj);
@@ -3561,7 +3564,7 @@ impl VM {
             }
             Value::String(s) => {
                 if prop_name == "length" {
-                    Ok(Value::Number(s.len() as f64))
+                    Ok(Value::Number(crate::vm::utf16::length(s) as f64))
                 } else {
                     Ok(Value::Undefined)
                 }

@@ -166,6 +166,28 @@ timeout 7 → 17，无新增坏测试）。见 `docs/REFACTOR-HEAP-GC.md` §5 R3
 > `CalleeKind`）也要提为 `pub(crate)`。bytecode.rs 的元测试直接读 VM 源码取证，范围
 > 从单文件变成 `vm/dispatch_sources()` 列表，漏掉一个文件覆盖断言立刻报出来。
 
+### P3.7 — 字符串索引按 UTF-16 码元（2026-10-17，部分完成）
+
+JS 字符串的位置单位是 **UTF-16 码元**，引擎内部存 Rust `String`（UTF-8、按码点
+遍历），于是所有"按位置"的操作都差一层：`"\u{1F600}".length` 是 1（应为 2）、
+`charCodeAt(0)` 给出码点而不是高代理、`indexOf` 报码点偏移、`slice(0,1)` 把整个
+emoji 当一个单位、`split("")` 只切出 1 段。
+
+交付（`src/vm/utf16.rs` 换算层 + 调用点改造）：
+1. `length` 三处（`js_prop_get`、`get_member` 的字符串分支、`PrimitiveWrapperObject`）
+   —— 其中两处原来用 `s.len()`（**字节数**，"é" 会报 2）；
+2. `s[i]` / 字符串包装对象的索引；
+3. `charAt` / `charCodeAt` / `codePointAt` / `at` / `slice` / `substring` /
+   `indexOf` / `lastIndexOf` / `padStart` / `padEnd` / `split("")`；
+4. `String.prototype.length` 对**包装对象**同样按码元（`new String('\ud834\udf06').length === 2`）。
+
+**残留（存储模型）**：Rust `String` 装不下孤立代理，切在代理对中间/单独的
+`"\uD83D"` 只能给 U+FFFD。`returns-code-unit`、`return-single-code-unit` 那一族
+仍然失败；要修得把 `Value::String` 换成 UTF-16 或 WTF-8 表示（独立的大改）。
+
+验收：三级 238 / 604 / 7 全绿；全量 17196（`built-ins/String` 741 → 742，唯一
+可表示的那条 `String/length.js` 落地），无逐套件回退。
+
 ### P3.6 — Array 读族改走 `[[Get]]`（2026-10-17 已完成，M7-P1 第一批）
 
 `join` / `slice` / `includes` / `at` / `concat` / `reverse` 原来在 `ArrayObject`

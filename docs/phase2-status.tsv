@@ -54,7 +54,7 @@ built-ins/Boolean	28	5	18
 built-ins/Map	187	4	13
 built-ins/TypedArray	300	509	637
 built-ins/Object	2849	206	356
-built-ins/String	741	178	304
+built-ins/String	742	178	303
 language/expressions/generators	252	13	25
 language/expressions/assignment/destructuring	3	1	4
 language/expressions/addition	36	8	4

@@ -75,6 +75,8 @@ mod set;
 mod stack_overflow;
 #[path = "features/tagged_templates.rs"]
 mod tagged_templates;
+#[path = "features/string_utf16.rs"]
+mod string_utf16;
 #[path = "features/string_es6.rs"]
 mod string_es6;
 #[path = "features/symbol_test.rs"]
