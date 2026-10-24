@@ -1,11 +1,11 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
-# 最近更新：2026-10-17
+# 最近更新：2026-10-18
 language/statements/for-of	635	15	101
 language/statements/for-in	79	19	17
 built-ins/Array/prototype/Symbol.iterator	0	0	1
 language/expressions/bitwise-and	20	7	3
-language/expressions/call	59	19	14
+language/expressions/call	64	19	9
 language/expressions/complement	0	0	0
 language/expressions/does-not-equals	27	10	1
 language/expressions/greater-than	39	9	1
@@ -19,11 +19,11 @@ language/expressions/this	1	4	1
 language/expressions/unsigned-right-shift	25	7	13
 language/statements/break	18	2	0
 language/statements/do-while	27	9	0
-language/statements/function	349	74	28
+language/statements/function	351	74	26
 language/statements/switch	51	54	6
 language/statements/while	28	10	0
 language/literals/string	67	6	0
-built-ins/Array	2318	102	661
+built-ins/Array	2311	196	574
 built-ins/JSON	122	29	14
 built-ins/WeakSet	80	1	4
 built-ins/Number	196	40	104
@@ -52,8 +52,8 @@ language/literals/boolean	4	0	0
 language/computed-property-names	40	0	8
 built-ins/Boolean	28	5	18
 built-ins/Map	187	4	13
-built-ins/TypedArray	300	509	637
-built-ins/Object	2849	206	356
+built-ins/TypedArray	303	509	634
+built-ins/Object	2865	206	340
 built-ins/String	742	178	303
 language/expressions/generators	252	13	25
 language/expressions/assignment/destructuring	3	1	4
@@ -74,14 +74,14 @@ language/expressions/arrow-function	312	17	14
 language/statements/const	122	5	9
 language/statements/expression	1	2	0
 language/statements/let	132	5	8
-language/statements/try	153	22	26
+language/statements/try	166	22	13
 language/literals/null	2	1	0
 language/identifiers	202	66	0
 built-ins/Error	40	8	45
 built-ins/Set	348	3	32
 built-ins/Math	305	0	22
-built-ins/Promise	246	289	142
-built-ins/Symbol	57	22	19
+built-ins/Promise	247	289	141
+built-ins/Symbol	58	22	18
 language/expressions/yield	40	3	20
 language/rest-parameters	11	0	0
 language/expressions/assignment	407	18	60
@@ -104,7 +104,7 @@ language/statements/return	5	1	10
 language/statements/variable	143	21	14
 language/literals/numeric	93	64	0
 language/types	92	9	12
-built-ins/Function	197	174	138
+built-ins/Function	198	174	137
 built-ins/WeakMap	132	2	7
 built-ins/NativeErrors	74	6	14
 built-ins/Reflect	149	3	1

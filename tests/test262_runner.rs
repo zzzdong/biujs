@@ -377,6 +377,12 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 "async-iteration",
 "async-functions",
 "Atomics",
+// ES2024，在 ES6 目标之外。2026-10-18 显式登记：此前这些用例是**假绿**的 ——
+// `Array.fromAsync` 未实现，而 `obj.missing()` 当时静默返回 `undefined`，
+// `await undefined` 直接完成，asyncTest 因此"通过"。`obj.missing()` 修正为
+// 抛 TypeError 之后它们立刻现形，所以这里做一次明确的范围决策而不是留一堆
+// 必然失败的用例在池子里（§2.2：交付特性时同批解锁/锁定）。
+"Array.fromAsync",
 // ES2019 (`Array.prototype.flatMap`), unimplemented and outside the ES6
 // target. It is listed *explicitly* even though the loose matching below used
 // to hide it anyway — `feature.contains("Map")` matched

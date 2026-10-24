@@ -235,7 +235,16 @@ echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 # 8166 → 7843（B46）：`Reflect` 从 IN_SCOPE_PENDING 摘掉、`built-ins/Reflect` 入册。
 # 这次是 -323：test262 里带 `features: [Reflect]` 的用例远比 Reflect 套件本身多
 # （`Proxy` / `Math` / `Object` / `Promise` 里都有），它们此前被顺带跳过。
-EXPECTED_SKIPPED=7843
+# 8310 → 8404（2026-10-18，SEH 批）：`Array.fromAsync` 显式进 OUT_OF_SCOPE。
+# 它是 ES2024（ES6 目标之外），且此前那 8 条用例是**假绿**的 ——
+# `Array.fromAsync` 未实现，而 `obj.missing()` 当时静默返回 `undefined`，
+# `await undefined` 直接完成。`obj.missing()` 修正为抛 TypeError 之后必须做
+# 一次明确的范围决策（§2.2）。同批修掉的 SEH 问题让 language/statements/try
+# +13、built-ins/Object +16（__lookupGetter__/__lookupSetter__ 真正实现）。
+#
+# 顺带修正一处陈旧：本常量停在 B46 时的 7843，而基线快照自那之后已多次刷新
+# （上次快照 8310）—— 常量与快照不同步会让每一批都误报"跳过表被改动了"。
+EXPECTED_SKIPPED=8404
 if [ "$SKIPPED" != "$EXPECTED_SKIPPED" ]; then
   echo "  !! 跳过数从 $EXPECTED_SKIPPED 变为 $SKIPPED —— 跳过表被改动了。"
   echo "     请确认这是有意的（计划书 §2.2：交付特性时必须同批解锁），并更新本脚本的 EXPECTED_SKIPPED。"
