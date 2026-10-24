@@ -202,12 +202,19 @@ GUARD_SUMS="$(awk '/^[[:space:]]*guards:/{gsub(/,/, ""); for (i = 1; i <= NF; i+
                      else if ($i == "memory") m += $(i+1);
                    }} END{print t+0, s+0, m+0}' \
   $CHUNK_FILES)"
+GUARD_TIMEOUT="$(echo "$GUARD_SUMS" | awk '{print $1}')"
+GUARD_STEP="$(echo "$GUARD_SUMS" | awk '{print $2}')"
+GUARD_MEMORY="$(echo "$GUARD_SUMS" | awk '{print $3}')"
+# 护栏计数也是基线的一部分：同一份代码在 256MB / 384MB 下会得到不同的
+# head-line（已知：Array 的 5 条边界用例）。快照必须记录预算与计数，否则
+# 下一次比较会把护栏漂移误判成语义回退。
+GUARDS_LINE="# guards: timeout $GUARD_TIMEOUT step-limit $GUARD_STEP memory $GUARD_MEMORY (TEST262_TIMEOUT_MS=$TEST262_TIMEOUT_MS TEST262_STEP_LIMIT=${TEST262_STEP_LIMIT:-0} TEST262_MEMORY_MB=$TEST262_MEMORY_MB)"
 echo
 hr
 printf '  TOTAL                                              %s    %s    %s\n' "$PASSED" "$SKIPPED" "$FAILED"
 echo "  pass rate over executed tests: ${RATE}% (${PASSED} / ${EXECUTED})"
 printf '  guards: timeout %s, step-limit %s, memory %s   (TEST262_TIMEOUT_MS / TEST262_STEP_LIMIT / TEST262_MEMORY_MB, 0 = off)\n' \
-  $(echo "$GUARD_SUMS" | awk '{print $1}') $(echo "$GUARD_SUMS" | awk '{print $2}') $(echo "$GUARD_SUMS" | awk '{print $3}')
+  "$GUARD_TIMEOUT" "$GUARD_STEP" "$GUARD_MEMORY"
 echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 
 # ── 5. 头条数字 ────────────────────────────────────────────────────────────
@@ -252,6 +259,7 @@ if [ ! -f "$SNAP" ]; then
     echo "# 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成"
     echo "# 格式：suite<TAB>passed<TAB>skipped<TAB>failed"
     echo "# 最近更新：$(date +%Y-%m-%d)"
+    echo "$GUARDS_LINE"
     cat "$TMP/new.tsv"
   } > "$SNAP"
   echo "已写入 $SNAP。"
@@ -264,6 +272,32 @@ strip_comments "$SNAP" | sort > "$TMP/old.tsv"
 join -t$'\t' -j 1 "$TMP/old.tsv" <(sort "$TMP/new.tsv") > "$TMP/joined.tsv"
 
 REGRESSED=0
+# 护栏计数也是基线的一部分。旧快照没有这行时只提示；有则比较总数（预算不同
+# 时只提示，因为 256MB/384MB 会改变边界用例的归类与通过数）。
+if grep -q '^# guards:' "$SNAP"; then
+  read -r OLD_GUARD_TIMEOUT OLD_GUARD_STEP OLD_GUARD_MEMORY < <(awk '
+    /^# guards:/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "timeout") t = $(i+1);
+        else if ($i == "step-limit") s = $(i+1);
+        else if ($i == "memory") m = $(i+1);
+      }
+      print t+0, s+0, m+0; exit
+    }' "$SNAP")
+  OLD_MEM_BUDGET="$(grep -m1 '^# guards:' "$SNAP" | sed -n 's/.*TEST262_MEMORY_MB=\([0-9][0-9]*\).*/\1/p')"
+  OLD_GUARD_TOTAL=$((OLD_GUARD_TIMEOUT + OLD_GUARD_STEP + OLD_GUARD_MEMORY))
+  NEW_GUARD_TOTAL=$((GUARD_TIMEOUT + GUARD_STEP + GUARD_MEMORY))
+  if [ -n "$OLD_MEM_BUDGET" ] && [ "$OLD_MEM_BUDGET" != "$TEST262_MEMORY_MB" ]; then
+    echo "  护栏预算不同（基线 ${OLD_MEM_BUDGET}MB vs 本次 ${TEST262_MEMORY_MB}MB）；跳过护栏计数比较。"
+  elif [ "$NEW_GUARD_TOTAL" -gt "$OLD_GUARD_TOTAL" ]; then
+    echo "  护栏计数回退：基线 $OLD_GUARD_TOTAL -> 本次 $NEW_GUARD_TOTAL (t/s/m $GUARD_TIMEOUT/$GUARD_STEP/$GUARD_MEMORY)"
+    REGRESSED=1
+  elif [ "$NEW_GUARD_TOTAL" -lt "$OLD_GUARD_TOTAL" ]; then
+    echo "  护栏计数改善：$OLD_GUARD_TOTAL -> $NEW_GUARD_TOTAL"
+  fi
+else
+  echo "  基线未记录护栏计数（旧快照）；本次 t/s/m = $GUARD_TIMEOUT/$GUARD_STEP/$GUARD_MEMORY。"
+fi
 : > "$TMP/regress.txt"
 : > "$TMP/gain.txt"
 while IFS=$'\t' read -r suite old_p old_s old_f new_p new_s new_f; do
@@ -309,6 +343,7 @@ if [ "$UPDATE" = "1" ]; then
     echo "# 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成"
     echo "# 格式：suite<TAB>passed<TAB>skipped<TAB>failed"
     echo "# 最近更新：$(date +%Y-%m-%d)"
+    echo "$GUARDS_LINE"
     cat "$TMP/new.tsv"
   } > "$SNAP"
   echo
