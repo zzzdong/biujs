@@ -51,7 +51,7 @@ fn main() {
         };
 
         if std::env::var("BIUJS_DUMP").is_ok() {
-            eprintln!("{module}");
+            eprintln!("{}", module.dump_bytecode());
         }
 
         // A counted step budget does not bound *wall-clock* time: a single step

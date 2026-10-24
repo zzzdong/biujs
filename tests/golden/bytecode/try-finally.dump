@@ -1,0 +1,32 @@
+module name=Some("main")
+constants 2:
+  c0 = "side"
+  c1 = "f"
+functions 2:
+  fn 0: start=0 end=9 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 3
+    1: mov [rbp+0], sym_1
+    2: store_env 1, sym_1
+    3: load_env [rbp+1], 1
+    4: call_ex [rbp+1], 0
+    5: subc rsp, rsp, 0
+    6: mov [rbp+2], rv
+    7: mov rv, [rbp+2]
+    8: halt
+  fn 1: start=9 end=24 exit=23 name="f" arity=0 flags=-
+    eh start=14 exits=[] catch=Some(18) finally=Some(18)
+    9: addc rsp, rsp, 6
+    10: arguments [rbp+0]
+    11: mov [rbp+1], undefined
+    12: mov [rbp+2], sym_1
+    13: mov [rbp+3], undefined
+    14: try 4, 4
+    15: br 1
+    16: mov rv, 1
+    17: ret
+    18: load_const [rbp+4], 0
+    19: mov [rbp+5], 2
+    20: resume_exception 14
+    21: br 1
+    22: mov rv, undefined
+    23: ret

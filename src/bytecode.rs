@@ -1,6 +1,6 @@
 use std::{
     cell::OnceCell,
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fmt,
     sync::Arc,
 };
@@ -71,7 +71,6 @@ pub struct Module {
     /// 生成器 / async / 派生构造器三个 id 集合、尾 `Ret` 的 pc）都并进了这里。
     pub code_blocks: Vec<CodeBlock>,
     pub instructions: Vec<Instr>,
-    pub debug_instructions: BTreeMap<usize, crate::compiler::ir::Instruction>,
     /// 每个函数的 try 区域表，**由编译期（`codegen`）声明**，不再是扫指令流派生出来的。
     ///
     /// 为什么必须声明而不是派生：`EndTry` 与 `Try` **不是一一配对**（`try` 体以终结指令
@@ -157,7 +156,6 @@ impl Module {
             instructions,
             eh_regions,
             templates,
-            debug_instructions: BTreeMap::new(),
             eh_index: OnceCell::new(),
         }
     }
@@ -283,50 +281,113 @@ impl Module {
     }
 }
 
+impl Module {
+    /// Deterministic, bytecode-only dump for golden tests and `BIUJS_DUMP`.
+    ///
+    /// It deliberately does **not** include IR annotations: the dump is a
+    /// contract between compiler and tests, not a debugging view of the IR.
+    /// Constants, templates, functions and EH regions all have stable order;
+    /// registers and immediates are the only variable-looking parts.
+    pub fn dump_bytecode(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "module name={:?}", self.name);
+
+        let _ = writeln!(out, "constants {}:", self.constants.len());
+        for (i, constant) in self.constants.iter().enumerate() {
+            match constant {
+                Constant::String(s) => {
+                    let _ = writeln!(out, "  c{i} = {s:?}");
+                }
+            }
+        }
+
+        if !self.templates.is_empty() {
+            let _ = writeln!(out, "templates {}:", self.templates.len());
+            for (i, site) in self.templates.iter().enumerate() {
+                let cooked: Vec<String> = site
+                    .cooked
+                    .iter()
+                    .map(|c| match c {
+                        Some(s) => format!("{s:?}"),
+                        None => "<hole>".to_string(),
+                    })
+                    .collect();
+                let raw: Vec<String> = site.raw.iter().map(|s| format!("{s:?}")).collect();
+                let _ = writeln!(
+                    out,
+                    "  t{i} cooked=[{}] raw=[{}]",
+                    cooked.join(", "),
+                    raw.join(", ")
+                );
+            }
+        }
+
+        let _ = writeln!(out, "functions {}:", self.code_blocks.len());
+        for (id, body) in self.bodies() {
+            let block = self.code_blocks.get(id as usize);
+            let name = block.map(|b| b.name.as_str()).unwrap_or("");
+            let arity = block.map(|b| b.arity).unwrap_or(0);
+            let exit = block
+                .and_then(|b| b.exit_pc)
+                .map(|pc| pc.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let mut flags = Vec::new();
+            if let Some(block) = block {
+                if block.flags.generator {
+                    flags.push("generator");
+                }
+                if block.flags.r#async {
+                    flags.push("async");
+                }
+                if block.flags.derived_ctor {
+                    flags.push("derived-ctor");
+                }
+            }
+            let flags = if flags.is_empty() {
+                "-".to_string()
+            } else {
+                flags.join(",")
+            };
+            let _ = writeln!(
+                out,
+                "  fn {id}: start={} end={} exit={exit} name={name:?} arity={arity} flags={flags}",
+                body.start, body.end
+            );
+
+            let mut regions = self.eh_regions_of(id);
+            regions.sort_by_key(|region| region.start);
+            for region in regions {
+                let _ = writeln!(
+                    out,
+                    "    eh start={} exits={:?} catch={:?} finally={:?}",
+                    region.start, region.exits, region.catch, region.finally
+                );
+            }
+
+            for pc in body.start..body.end {
+                if let Some(instruction) = self.instructions.get(pc) {
+                    let _ = writeln!(out, "    {pc}: {instruction}");
+                }
+            }
+        }
+
+        // Hand-built modules (unit tests) may have instructions but no
+        // `code_blocks`; they still deserve a dump.
+        if self.code_blocks.is_empty() {
+            for (pc, instruction) in self.instructions.iter().enumerate() {
+                let _ = writeln!(out, "  {pc}: {instruction}");
+            }
+        }
+
+        out
+    }
+}
+
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Module")?;
-        if let Some(name) = &self.name {
-            write!(f, " {name}")?;
-        }
-        writeln!(f)?;
-
-        writeln!(f, "=== constants ===")?;
-        for (i, constant) in self.constants.iter().enumerate() {
-            writeln!(f, "{i}\t: {constant}")?;
-        }
-
-        writeln!(f, "=== code blocks ===")?;
-        for (function_id, block) in self.code_blocks.iter().enumerate() {
-            write!(f, "{function_id}: start {} .. {:?}", block.start, block.exit_pc)?;
-            if !block.name.is_empty() {
-                write!(f, " name {:?}", block.name)?;
-            }
-            if block.arity != 0 {
-                write!(f, " arity {}", block.arity)?;
-            }
-            if block.flags.generator {
-                write!(f, " [generator]")?;
-            }
-            if block.flags.r#async {
-                write!(f, " [async]")?;
-            }
-            if block.flags.derived_ctor {
-                write!(f, " [derived-ctor]")?;
-            }
-            writeln!(f)?;
-        }
-
-        writeln!(f, "=== instructions ===")?;
-        for (i, instruction) in self.instructions.iter().enumerate() {
-            write!(f, "{i}\t: {instruction}")?;
-            if let Some(debug_instruction) = self.debug_instructions.get(&i) {
-                writeln!(f, "\t;{debug_instruction:<16}")?;
-            } else {
-                writeln!(f)?;
-            }
-        }
-        Ok(())
+        f.write_str(&self.dump_bytecode())
     }
 }
 
@@ -1838,9 +1899,10 @@ mod tests {
             Vec::new(),
         );
         let display = format!("{}", module);
-        assert!(display.contains("Module main"));
-        assert!(display.contains("\"hello\""));
-        assert!(display.contains("halt"));
+        assert!(display.contains("module name=Some(\"main\")"));
+        assert!(display.contains("c0 = \"hello\""));
+        assert!(display.contains("flags=generator"));
+        assert!(display.contains("0: halt"));
     }
 
     // ──────────────────────── Kind（P0b 的控制流分类）────────────────────────

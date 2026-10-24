@@ -32,6 +32,7 @@ BIUJS_DUMP=1 ./target/release/biujs f.js # 打印字节码
 cargo test --release --lib               # 单元
 cargo test --release --test features     # feature 断言
 cargo test --release --test guards       # 护栏
+cargo test --release --test bytecode_dump  # 字节码 golden（UPDATE_GOLDEN=1 重生成）
 
 # 全量 + 与基线逐套件对比（推荐，约 7–8 分钟）
 ./scripts/phase2-status.sh

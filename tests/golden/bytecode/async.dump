@@ -1,0 +1,20 @@
+module name=Some("main")
+constants 1:
+  c0 = "value"
+functions 2:
+  fn 0: start=0 end=9 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 3
+    1: mov [rbp+0], sym_1
+    2: store_env 0, sym_1
+    3: load_env [rbp+1], 0
+    4: call_ex [rbp+1], 0
+    5: subc rsp, rsp, 0
+    6: mov [rbp+2], rv
+    7: mov rv, [rbp+2]
+    8: halt
+  fn 1: start=9 end=14 exit=13 name="value" arity=0 flags=async
+    9: addc rsp, rsp, 2
+    10: arguments [rbp+0]
+    11: mov [rbp+1], sym_1
+    12: mov rv, 1
+    13: ret

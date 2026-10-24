@@ -1,0 +1,59 @@
+module name=Some("main")
+constants 3:
+  c0 = "x"
+  c1 = "add"
+  c2 = "outer"
+functions 4:
+  fn 0: start=0 end=23 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 8
+    1: mov [rbp+0], sym_1
+    2: store_env 1, sym_1
+    3: mov [rbp+1], sym_2
+    4: store_env 2, sym_2
+    5: load_env [rbp+2], 1
+    6: push 2
+    7: push 1
+    8: call_ex [rbp+2], 2
+    9: subc rsp, rsp, 2
+    10: mov [rbp+3], rv
+    11: load_env [rbp+4], 2
+    12: push 3
+    13: call_ex [rbp+4], 1
+    14: subc rsp, rsp, 1
+    15: mov [rbp+5], rv
+    16: push 4
+    17: call_ex [rbp+5], 1
+    18: subc rsp, rsp, 1
+    19: mov [rbp+6], rv
+    20: addx [rbp+7], [rbp+3], [rbp+6]
+    21: mov rv, [rbp+7]
+    22: halt
+  fn 1: start=23 end=31 exit=30 name="add" arity=2 flags=-
+    23: addc rsp, rsp, 5
+    24: mov [rbp+0], [rbp-1]
+    25: mov [rbp+1], [rbp-2]
+    26: arguments [rbp+2]
+    27: mov [rbp+3], sym_1
+    28: addx [rbp+4], [rbp+0], [rbp+1]
+    29: mov rv, [rbp+4]
+    30: ret
+  fn 2: start=31 end=41 exit=40 name="outer" arity=1 flags=-
+    31: addc rsp, rsp, 5
+    32: make_cell 0
+    33: mov [rbp+0], [rbp-1]
+    34: init_lexical 0, [rbp+0]
+    35: arguments [rbp+1]
+    36: mov [rbp+2], sym_2
+    37: closure_var 0, [rbp+3], 0
+    38: make_func_obj [rbp+4], sym_3
+    39: mov rv, [rbp+4]
+    40: ret
+  fn 3: start=41 end=49 exit=48 name="inner" arity=1 flags=-
+    41: addc rsp, rsp, 5
+    42: mov [rbp+0], [rbp-1]
+    43: arguments [rbp+1]
+    44: mov [rbp+2], sym_3
+    45: load_env [rbp+3], 0
+    46: addx [rbp+4], [rbp+3], [rbp+0]
+    47: mov rv, [rbp+4]
+    48: ret

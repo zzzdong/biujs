@@ -1,0 +1,51 @@
+module name=Some("main")
+constants 3:
+  c0 = "n"
+  c1 = "c"
+  c2 = "counter"
+functions 3:
+  fn 0: start=0 end=22 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 10
+    1: mov [rbp+0], undefined
+    2: store_env 1, undefined
+    3: mov [rbp+1], sym_1
+    4: store_env 2, sym_1
+    5: load_const [rbp+2], 1
+    6: load_env [rbp+3], 2
+    7: call_ex [rbp+3], 0
+    8: subc rsp, rsp, 0
+    9: mov [rbp+4], rv
+    10: mov [rbp+5], [rbp+4]
+    11: store_env 1, [rbp+4]
+    12: load_env [rbp+6], 1
+    13: call_ex [rbp+6], 0
+    14: subc rsp, rsp, 0
+    15: mov [rbp+7], rv
+    16: load_env [rbp+8], 1
+    17: call_ex [rbp+8], 0
+    18: subc rsp, rsp, 0
+    19: mov [rbp+9], rv
+    20: mov rv, [rbp+9]
+    21: halt
+  fn 1: start=22 end=33 exit=32 name="counter" arity=0 flags=-
+    22: addc rsp, rsp, 5
+    23: make_cell 0
+    24: arguments [rbp+0]
+    25: mov [rbp+1], undefined
+    26: mov [rbp+2], sym_1
+    27: load_const [rbp+3], 0
+    28: init_lexical 0, 0
+    29: closure_var 0, [rbp+1], 0
+    30: make_func_obj [rbp+4], sym_2
+    31: mov rv, [rbp+4]
+    32: ret
+  fn 2: start=33 end=42 exit=41 name="" arity=0 flags=-
+    33: addc rsp, rsp, 5
+    34: arguments [rbp+0]
+    35: load_const [rbp+1], 0
+    36: load_env [rbp+2], 0
+    37: addx [rbp+3], [rbp+2], 1
+    38: store_env 0, [rbp+3]
+    39: load_env [rbp+4], 0
+    40: mov rv, [rbp+4]
+    41: ret

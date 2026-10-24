@@ -1,0 +1,36 @@
+module name=Some("main")
+constants 2:
+  c0 = "a"
+  c1 = "b"
+functions 1:
+  fn 0: start=0 end=30 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 19
+    1: mov [rbp+1], undefined
+    2: store_env 0, undefined
+    3: mov [rbp+2], undefined
+    4: store_env 1, undefined
+    5: load_const [rbp+3], 0
+    6: mulx [rbp+4], 2, 3
+    7: addx [rbp+5], 1, [rbp+4]
+    8: mov [rbp+6], [rbp+5]
+    9: store_env 0, [rbp+5]
+    10: load_const [rbp+7], 1
+    11: load_env [rbp+8], 0
+    12: subx [rbp+9], [rbp+8], 4
+    13: divx [rbp+10], [rbp+9], 2
+    14: mov [rbp+11], [rbp+10]
+    15: store_env 1, [rbp+10]
+    16: load_env [rbp+12], 0
+    17: load_env [rbp+13], 1
+    18: gt [rbp+14], [rbp+12], [rbp+13]
+    19: br_if [rbp+14], 7, 3
+    20: mov rv, [rbp+0]
+    21: halt
+    22: load_env [rbp+15], 1
+    23: mov [rbp+16], [rbp+15]
+    24: mov [rbp+0], [rbp+16]
+    25: br -5
+    26: load_env [rbp+17], 0
+    27: mov [rbp+18], [rbp+17]
+    28: mov [rbp+0], [rbp+18]
+    29: br -9

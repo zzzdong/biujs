@@ -1,0 +1,42 @@
+module name=Some("main")
+constants 3:
+  c0 = "it"
+  c1 = "gen"
+  c2 = "next"
+functions 2:
+  fn 0: start=0 end=23 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 10
+    1: mov [rbp+0], undefined
+    2: store_env 0, undefined
+    3: mov [rbp+1], sym_1
+    4: store_env 1, sym_1
+    5: load_const [rbp+2], 0
+    6: load_env [rbp+3], 1
+    7: push 1
+    8: call_ex [rbp+3], 1
+    9: subc rsp, rsp, 1
+    10: mov [rbp+4], rv
+    11: mov [rbp+5], [rbp+4]
+    12: store_env 0, [rbp+4]
+    13: load_env [rbp+6], 0
+    14: call_method [rbp+6], 2, 0
+    15: subc rsp, rsp, 0
+    16: mov [rbp+7], rv
+    17: load_env [rbp+8], 0
+    18: call_method [rbp+8], 2, 0
+    19: subc rsp, rsp, 0
+    20: mov [rbp+9], rv
+    21: mov rv, [rbp+9]
+    22: halt
+  fn 1: start=23 end=34 exit=33 name="gen" arity=1 flags=generator
+    23: addc rsp, rsp, 7
+    24: mov [rbp+0], [rbp-1]
+    25: arguments [rbp+1]
+    26: prologue_end
+    27: mov [rbp+2], sym_1
+    28: yield [rbp+3], [rbp+0]
+    29: addx [rbp+4], [rbp+0], 1
+    30: yield [rbp+5], [rbp+4]
+    31: addx [rbp+6], [rbp+0], 2
+    32: mov rv, [rbp+6]
+    33: ret

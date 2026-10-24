@@ -1,0 +1,76 @@
+module name=Some("main")
+constants 13:
+  c0 = "array"
+  c1 = "object"
+  c2 = "x"
+  c3 = "Object"
+  c4 = "getPrototypeOf"
+  c5 = "m"
+  c6 = "value"
+  c7 = "writable"
+  c8 = "enumerable"
+  c9 = "configurable"
+  c10 = "__superProto__"
+  c11 = "defineProperty"
+  c12 = "length"
+functions 2:
+  fn 0: start=0 end=52 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 23
+    1: mov [rbp+0], undefined
+    2: store_env 0, undefined
+    3: mov [rbp+1], undefined
+    4: store_env 1, undefined
+    5: load_const [rbp+2], 0
+    6: make_array [rbp+3]
+    7: array_push [rbp+3], 1
+    8: array_push [rbp+3], undefined
+    9: mark_hole [rbp+3]
+    10: array_push [rbp+3], 3
+    11: mov [rbp+4], [rbp+3]
+    12: store_env 0, [rbp+3]
+    13: load_const [rbp+5], 1
+    14: make_object [rbp+6]
+    15: load_const [rbp+7], 2
+    16: prop_set [rbp+6], 2, 1
+    17: load_env [rbp+8], 3
+    18: push [rbp+6]
+    19: call_method [rbp+8], 4, 1
+    20: subc rsp, rsp, 1
+    21: mov [rbp+9], rv
+    22: load_const [rbp+10], 5
+    23: make_func_obj [rbp+11], sym_1
+    24: set_function_name [rbp+11], [rbp+10]
+    25: make_object [rbp+12]
+    26: prop_set [rbp+12], 6, [rbp+9]
+    27: prop_set [rbp+12], 7, true
+    28: prop_set [rbp+12], 8, false
+    29: prop_set [rbp+12], 9, true
+    30: load_const [rbp+13], 10
+    31: load_env [rbp+14], 3
+    32: push [rbp+12]
+    33: push [rbp+13]
+    34: push [rbp+11]
+    35: call_method [rbp+14], 11, 3
+    36: subc rsp, rsp, 3
+    37: mov [rbp+15], rv
+    38: prop_set [rbp+6], 5, [rbp+11]
+    39: mov [rbp+16], [rbp+6]
+    40: store_env 1, [rbp+6]
+    41: load_env [rbp+17], 0
+    42: index_set [rbp+17], 1, 2
+    43: load_env [rbp+18], 1
+    44: call_method [rbp+18], 5, 0
+    45: subc rsp, rsp, 0
+    46: mov [rbp+19], rv
+    47: load_env [rbp+20], 0
+    48: prop_get [rbp+21], [rbp+20], 12
+    49: addx [rbp+22], [rbp+19], [rbp+21]
+    50: mov rv, [rbp+22]
+    51: halt
+  fn 1: start=52 end=58 exit=57 name="" arity=0 flags=-
+    52: addc rsp, rsp, 3
+    53: arguments [rbp+0]
+    54: load_this [rbp+1]
+    55: prop_get [rbp+2], [rbp+1], 2
+    56: mov rv, [rbp+2]
+    57: ret

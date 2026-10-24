@@ -1,0 +1,35 @@
+module name=Some("main")
+constants 2:
+  c0 = "sum"
+  c1 = "value"
+functions 1:
+  fn 0: start=0 end=29 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 14
+    1: mov [rbp+0], undefined
+    2: store_env 0, undefined
+    3: mov [rbp+1], undefined
+    4: store_env 1, undefined
+    5: load_const [rbp+2], 0
+    6: mov [rbp+3], 0
+    7: store_env 0, 0
+    8: make_array [rbp+4]
+    9: array_push [rbp+4], 1
+    10: array_push [rbp+4], 2
+    11: array_push [rbp+4], 3
+    12: make_iter [rbp+5], [rbp+4]
+    13: br 1
+    14: iter_next [rbp+6], [rbp+7], [rbp+5]
+    15: br_if [rbp+7], 6, 1
+    16: iter_close [rbp+5]
+    17: br 1
+    18: load_env [rbp+8], 0
+    19: mov rv, [rbp+8]
+    20: halt
+    21: mov [rbp+9], [rbp+6]
+    22: store_env 1, [rbp+6]
+    23: load_const [rbp+10], 0
+    24: load_env [rbp+11], 0
+    25: load_env [rbp+12], 1
+    26: addx [rbp+13], [rbp+11], [rbp+12]
+    27: store_env 0, [rbp+13]
+    28: br -14

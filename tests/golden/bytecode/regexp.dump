@@ -1,0 +1,24 @@
+module name=Some("main")
+constants 5:
+  c0 = "re"
+  c1 = "ab+c"
+  c2 = "gi"
+  c3 = "abbc"
+  c4 = "test"
+functions 1:
+  fn 0: start=0 end=15 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 7
+    1: mov [rbp+0], undefined
+    2: store_env 0, undefined
+    3: load_const [rbp+1], 0
+    4: make_regexp [rbp+2], 1, 2
+    5: mov [rbp+3], [rbp+2]
+    6: store_env 0, [rbp+2]
+    7: load_const [rbp+4], 3
+    8: load_env [rbp+5], 0
+    9: push [rbp+4]
+    10: call_method [rbp+5], 4, 1
+    11: subc rsp, rsp, 1
+    12: mov [rbp+6], rv
+    13: mov rv, [rbp+6]
+    14: halt

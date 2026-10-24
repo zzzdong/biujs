@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use log::{debug, trace};
 
@@ -31,7 +31,6 @@ pub struct Codegen {
     codes: Vec<Instr>,
     block_map: HashMap<isize, isize>,
     inst_index: usize,
-    insts: BTreeMap<usize, Instruction>,
     throw_to_handlers: HashMap<BlockId, Vec<BlockId>>,
     /// Keep every variable in a fixed stack slot, using registers only as
     /// per-instruction temporaries.
@@ -61,7 +60,6 @@ impl Codegen {
             codes: Vec::new(),
             block_map: HashMap::new(),
             inst_index: 0,
-            insts: BTreeMap::new(),
             throw_to_handlers,
             // Memory-resident by default; opt into the register path explicitly.
             memory_resident_vars: std::env::var("BIUJS_REG_VARS").is_err(),
@@ -133,8 +131,6 @@ impl Codegen {
 
                 debug!("inst[{}]: {inst:?}", self.inst_index);
                 debug!("register: {}", self.reg_alloc.reg_set);
-
-                self.insts.insert(self.codes.len(), inst.clone());
 
                 match inst.clone() {
                     // Function Call Instructions
@@ -1067,7 +1063,4 @@ impl Codegen {
         self.codes.push(code);
     }
 
-    pub fn debug_insts(&self) -> &BTreeMap<usize, Instruction> {
-        &self.insts
-    }
 }

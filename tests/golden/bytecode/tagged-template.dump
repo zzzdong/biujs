@@ -1,0 +1,40 @@
+module name=Some("main")
+constants 3:
+  c0 = "name"
+  c1 = "tag"
+  c2 = "world"
+templates 1:
+  t0 cooked=["hello ", "!"] raw=["hello ", "!"]
+functions 2:
+  fn 0: start=0 end=19 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 9
+    1: mov [rbp+0], undefined
+    2: store_env 0, undefined
+    3: mov [rbp+1], sym_1
+    4: store_env 1, sym_1
+    5: load_const [rbp+2], 0
+    6: load_const [rbp+3], 2
+    7: mov [rbp+4], [rbp+3]
+    8: store_env 0, [rbp+3]
+    9: load_env [rbp+5], 1
+    10: make_template [rbp+6], 0
+    11: load_env [rbp+7], 0
+    12: push [rbp+7]
+    13: push [rbp+6]
+    14: call_ex [rbp+5], 2
+    15: subc rsp, rsp, 2
+    16: mov [rbp+8], rv
+    17: mov rv, [rbp+8]
+    18: halt
+  fn 1: start=19 end=30 exit=29 name="tag" arity=2 flags=-
+    19: addc rsp, rsp, 8
+    20: mov [rbp+0], [rbp-1]
+    21: mov [rbp+1], [rbp-2]
+    22: arguments [rbp+2]
+    23: mov [rbp+3], sym_1
+    24: index_get [rbp+4], [rbp+0], 0
+    25: addx [rbp+5], [rbp+4], [rbp+1]
+    26: index_get [rbp+6], [rbp+0], 1
+    27: addx [rbp+7], [rbp+5], [rbp+6]
+    28: mov rv, [rbp+7]
+    29: ret

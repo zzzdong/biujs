@@ -1,0 +1,45 @@
+module name=Some("main")
+constants 4:
+  c0 = "length"
+  c1 = "a"
+  c2 = "b"
+  c3 = "count"
+functions 2:
+  fn 0: start=0 end=29 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 14
+    1: mov [rbp+0], undefined
+    2: store_env 1, undefined
+    3: mov [rbp+1], undefined
+    4: store_env 2, undefined
+    5: mov [rbp+2], sym_1
+    6: store_env 3, sym_1
+    7: load_const [rbp+3], 1
+    8: make_array [rbp+4]
+    9: array_push [rbp+4], 1
+    10: array_push [rbp+4], 2
+    11: mov [rbp+5], [rbp+4]
+    12: store_env 1, [rbp+4]
+    13: load_const [rbp+6], 2
+    14: make_array [rbp+7]
+    15: array_push [rbp+7], 0
+    16: load_env [rbp+8], 1
+    17: array_push_spread [rbp+7], [rbp+8]
+    18: array_push [rbp+7], 3
+    19: mov [rbp+9], [rbp+7]
+    20: store_env 2, [rbp+7]
+    21: make_array [rbp+10]
+    22: load_env [rbp+11], 2
+    23: array_push_spread [rbp+10], [rbp+11]
+    24: load_env [rbp+12], 3
+    25: call_spread [rbp+12], undefined, [rbp+10]
+    26: mov [rbp+13], rv
+    27: mov rv, [rbp+13]
+    28: halt
+  fn 1: start=29 end=36 exit=35 name="count" arity=0 flags=-
+    29: addc rsp, rsp, 4
+    30: make_rest [rbp+0], 0
+    31: arguments [rbp+1]
+    32: mov [rbp+2], sym_1
+    33: prop_get [rbp+3], [rbp+0], 0
+    34: mov rv, [rbp+3]
+    35: ret

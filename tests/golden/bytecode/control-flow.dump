@@ -1,0 +1,49 @@
+module name=Some("main")
+constants 2:
+  c0 = "total"
+  c1 = "i"
+functions 1:
+  fn 0: start=0 end=43 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 23
+    1: mov [rbp+0], undefined
+    2: store_env 0, undefined
+    3: mov [rbp+1], undefined
+    4: store_env 1, undefined
+    5: load_const [rbp+2], 0
+    6: mov [rbp+3], 0
+    7: store_env 0, 0
+    8: load_const [rbp+4], 1
+    9: mov [rbp+5], 0
+    10: store_env 1, 0
+    11: br 1
+    12: load_env [rbp+6], 1
+    13: lt [rbp+7], [rbp+6], 3
+    14: br_if [rbp+7], 13, 1
+    15: br 1
+    16: load_env [rbp+8], 0
+    17: gt [rbp+9], [rbp+8], 2
+    18: br_if [rbp+9], 4, 1
+    19: load_env [rbp+10], 0
+    20: mov rv, [rbp+10]
+    21: halt
+    22: load_const [rbp+11], 0
+    23: load_env [rbp+12], 0
+    24: subx [rbp+13], [rbp+12], 1
+    25: store_env 0, [rbp+13]
+    26: br -10
+    27: load_env [rbp+14], 1
+    28: seq [rbp+15], [rbp+14], 1
+    29: br_if [rbp+15], 8, 1
+    30: load_const [rbp+16], 0
+    31: load_env [rbp+17], 0
+    32: load_env [rbp+18], 1
+    33: addx [rbp+19], [rbp+17], [rbp+18]
+    34: store_env 0, [rbp+19]
+    35: br 1
+    36: br 2
+    37: br 1
+    38: load_const [rbp+20], 1
+    39: load_env [rbp+21], 1
+    40: addx [rbp+22], [rbp+21], 1
+    41: store_env 1, [rbp+22]
+    42: br -30

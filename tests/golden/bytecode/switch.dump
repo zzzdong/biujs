@@ -1,0 +1,42 @@
+module name=Some("main")
+constants 4:
+  c0 = "zero"
+  c1 = "small"
+  c2 = "other"
+  c3 = "classify"
+functions 2:
+  fn 0: start=0 end=10 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 3
+    1: mov [rbp+0], sym_1
+    2: store_env 3, sym_1
+    3: load_env [rbp+1], 3
+    4: push 2
+    5: call_ex [rbp+1], 1
+    6: subc rsp, rsp, 1
+    7: mov [rbp+2], rv
+    8: mov rv, [rbp+2]
+    9: halt
+  fn 1: start=10 end=33 exit=32 name="classify" arity=1 flags=-
+    10: addc rsp, rsp, 9
+    11: mov [rbp+0], [rbp-1]
+    12: arguments [rbp+1]
+    13: mov [rbp+2], sym_1
+    14: br 1
+    15: seq [rbp+3], [rbp+0], 0
+    16: br_if [rbp+3], 12, 1
+    17: seq [rbp+4], [rbp+0], 1
+    18: br_if [rbp+4], 9, 4
+    19: load_const [rbp+5], 1
+    20: mov rv, [rbp+5]
+    21: ret
+    22: seq [rbp+6], [rbp+0], 2
+    23: br_if [rbp+6], -4, 1
+    24: load_const [rbp+7], 2
+    25: mov rv, [rbp+7]
+    26: ret
+    27: br -8
+    28: load_const [rbp+8], 0
+    29: mov rv, [rbp+8]
+    30: ret
+    31: mov rv, undefined
+    32: ret
