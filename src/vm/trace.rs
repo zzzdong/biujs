@@ -16,8 +16,10 @@ use super::{BoundFunction, Frame, PromiseAggregation, PromiseJob, SehRecord, Sta
 
 impl Trace for SehRecord {
     fn trace(&self, out: &mut Worklist) {
-        // 只有 `pending_exception` 持有值；其余字段都是 pc / 水位 / 布尔。
+        // 只有 `pending_exception` 与 `delayed_return_value` 持有值；
+        // 其余字段都是 pc / 水位 / 布尔 / 区域身份。
         self.pending_exception.trace(out);
+        self.delayed_return_value.trace(out);
     }
 }
 

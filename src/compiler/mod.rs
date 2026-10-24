@@ -9,7 +9,7 @@ pub mod symbol;
 
 use std::collections::HashMap;
 
-use crate::bytecode::{CodeBlock, EhRegion, FnFlags, FunctionId, Module, Register};
+use crate::bytecode::{CodeBlock, EhRegion, FnFlags, FunctionId, Instr, Module, Register};
 use crate::compiler::error::CompileError;
 use crate::compiler::ir::{FuncSignature, FunctionBuilder, IrFunction, IrUnit, SSABuilder};
 use crate::compiler::lowering::JSASTLower;
@@ -172,6 +172,24 @@ impl Compiler {
                 exit_pc,
             });
             all_codes.extend(func_codes);
+            // 绝对 pc 操作数平移：`DelayedJump` 的跳转目标与 `ResumeExc` 的区域
+            // 身份都是**函数局部**坐标（codegen 的 `block_map` / `eh_decls` 都从 0
+            // 起算），而这个函数在模块坐标系里坐在 `offset` 上。漏掉这一步的表现：
+            // 非首个函数里 break/continue 穿过 try-finally 时跳进别人的指令流 ——
+            // 实测静默跑偏（后续语句消失），或 `SubC rsp` 下溢 panic
+            // （release `panic = "abort"` 下直接没进程）。
+            // EH 区域表在下面平移，指令操作数在这里平移 —— 两处必须同步。
+            for inst in &mut all_codes[offset..] {
+                match inst {
+                    Instr::DelayedJump { target, .. } => {
+                        target.set(target.as_immd() + offset as isize)
+                    }
+                    Instr::ResumeExc { region } => {
+                        region.set(region.as_immd() + offset as isize)
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // 6. Build module with all functions

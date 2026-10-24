@@ -464,7 +464,7 @@ impl<'a> SSABuilder<'a> {
                             args.extend(arg_values.iter().copied());
                         }
                     }
-                    Instruction::ResumeException { args } => {
+                    Instruction::ResumeException { args, .. } => {
                         // Same reasoning as `throw`: a finally block re-throwing
                         // propagates to every enclosing handler edge.
                         if is_successor && args.is_empty() {

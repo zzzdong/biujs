@@ -151,8 +151,21 @@ impl VM {
                 // outer `finally` while the inner record was still on top — the
                 // epilogue then did nothing, fell into the implicit `Mov rv,
                 // undefined`, and the return value was lost.
+                //
+                // **只扫本帧的记录**（`frame.seh_depth` 以下的不归这个 return 管）：
+                // 调用方的 finally 不能替被调用方的 return 跑。漏掉这条界限的实测
+                // 症状是 `try { return inner(); } finally {…}` ——  finally 在
+                // `inner()` 里就跑了，且返回值丢失。
+                let frame_seh_depth = self.state.frames.last().map_or(0, |f| f.seh_depth);
                 let mut finally_to_execute = None;
-                for (idx, record) in self.state.seh_stack.iter().enumerate().rev() {
+                for (idx, record) in self
+                    .state
+                    .seh_stack
+                    .iter()
+                    .enumerate()
+                    .skip(frame_seh_depth)
+                    .rev()
+                {
                     if record.finally_pc != 0 && !record.in_finally {
                         finally_to_execute = Some(idx);
                         break;
@@ -161,9 +174,17 @@ impl VM {
 
                 if let Some(idx) = finally_to_execute {
                     // Mark the record as in_finally and set delayed return flag
+                    // 返回值先取出来再寄存：finally 体里的调用会覆写 `Rv`
+                    // （见 `SehRecord::delayed_return_value`）。
+                    let return_value = self.state.get_register(Register::Rv)?;
                     if let Some(record) = self.state.seh_stack.get_mut(idx) {
                         record.in_finally = true;
                         record.delayed_return = true;
+                        // try 体已正常完成（这个 return 就是完成方式）⇒ catch 的
+                        // 机会用掉了。finally 体里再抛异常必须向外传播，而不是
+                        // 被送进 catch。
+                        record.catch_closed = true;
+                        record.delayed_return_value = Some(return_value);
                     }
                     let finally_pc = self.state.seh_stack[idx].finally_pc;
                     self.state.jump(finally_pc);
@@ -1765,7 +1786,10 @@ impl VM {
                 // Check if we need to execute any finally blocks
                 let mut finally_to_execute = None;
                 let stack_len = self.state.seh_stack.len();
-                let start_idx = stack_len.saturating_sub(seh_depth);
+                // 扫描范围同样限定在**本帧**的记录里（调用方的区域不归这个
+                // break/continue 管），与 `Ret` 的尾声同一条界限。
+                let frame_seh_depth = self.state.frames.last().map_or(0, |f| f.seh_depth);
+                let start_idx = stack_len.saturating_sub(seh_depth).max(frame_seh_depth);
 
                 // Innermost first, for the same reason as `Opcode::Ret`: the
                 // epilogue can only finish the record on top of the stack.
@@ -1783,6 +1807,9 @@ impl VM {
                     if let Some(record) = self.state.seh_stack.get_mut(idx) {
                         record.in_finally = true;
                         record.delayed_jump_target = Some(offset);
+                        // break/continue 也是受保护体的一种正常完成 ⇒ catch 的
+                        // 机会用掉了（同上：finally 体里抛出的异常向外传播）。
+                        record.catch_closed = true;
                     }
                     self.state.jump(finally_pc);
                     return Ok(true);
@@ -2918,12 +2945,13 @@ impl VM {
                 // Look up user-defined method on the object's prototype chain
                 let method_val = self.lookup_property_on_object(&obj_val, &method_name, module)?;
 
-                // 方法没找到：`obj.missing()` 不抛，`Rv = undefined`（保持原样；
-                // 原来这条是靠落到分派循环尾部的 `jump_offset(1)` 推进 pc）。
+                // 方法没找到（或找到的是 `undefined`）：`obj.missing()` 必须抛
+                // TypeError（ES 的 CallMethod：`IsCallable(func)` 为假即抛）。
+                // 旧行为是静默 `Rv = undefined` —— 已登记为已知 bug #3。
                 if matches!(method_val, Value::Undefined) {
-                    self.state.set_register(Register::Rv, Value::Undefined)?;
-                    self.state.jump_offset(1);
-                    return Ok(true);
+                    return Err(RuntimeError::TypeError(format!(
+                        "{method_name} is not a function"
+                    )));
                 }
                 // 其余全部交给统一入口（P1-2c）：原生原型方法 / 生成器方法 /
                 // async 方法 / 两种 callee 形状的开帧。`this` 是接收者；参数是
@@ -3019,11 +3047,15 @@ impl VM {
                     saved_rbp: self.state.rbp,
                     in_finally: false,
                     pending_exception: None,
-                    catch_executed: false,
+                    catch_closed: false,
                     delayed_jump_target: None,
                     delayed_return: false,
+                    delayed_return_value: None,
                     saved_closure_depth: self.state.closure_var_stack.len(),
                     saved_frame_depth: self.state.frames.len(),
+                    // 区域身份 = 这条 `Try` 自己的 pc。`EndTry` / `ResumeExc`
+                    // 按它认领记录（见 `SehRecord::region`）。
+                    region: self.state.pc(),
                 };
                 self.state.seh_stack.push(record);
             }
@@ -3035,17 +3067,54 @@ impl VM {
                 // M1.1 之后配对是结构化的（`PopSeh { region }` → 区域表的 `exits`），
                 // 所以每条 `EndTry` 的 pc 必然登记在某个区域上。留着它当守卫：
                 // 它一响就说明发射端与表之间又出现了新的分叉。
+                let region = module.eh_region_ending_at(self.state.pc());
                 debug_assert!(
-                    module.eh_region_ending_at(self.state.pc()).is_some(),
+                    region.is_some(),
                     "EndTry(pc={}) 不是任何区域的退出点 —— 发射端与 EH 表分叉了",
                     self.state.pc()
                 );
-                self.state.seh_stack.pop();
+                match region {
+                    Some(r) => {
+                        // 按身份找最靠上的那条记录（结构化配对说它就是栈顶；
+                        // 按身份找而不是直接 pop，是为了让"认领"这个动作可验证）。
+                        let idx = self
+                            .state
+                            .seh_stack
+                            .iter()
+                            .rposition(|rec| rec.region == r.start);
+                        match (idx, r.finally) {
+                            (Some(idx), Some(_)) => {
+                                // 受保护体**正常结束**，finally 即将运行。记录
+                                // **保持存活**：标记 in_finally / catch_closed，
+                                // 由 finally 末尾的 `ResumeExc` 收尾弹出 ——
+                                // 一次 push 对一次 pop。直接在这里 pop 会把记录
+                                // 的寿命砍短，finally 体里的 throw/break 就再也
+                                // 找不到它（实测：finally 跑两遍、外层 handler
+                                // 被吃、内层 finally 正常完成时跳过外层 finally
+                                // 的剩余代码）。
+                                let rec = &mut self.state.seh_stack[idx];
+                                rec.in_finally = true;
+                                rec.catch_closed = true;
+                            }
+                            (Some(idx), None) => {
+                                // 没有 finally：区域到这里就结束，弹掉。
+                                self.state.seh_stack.remove(idx);
+                            }
+                            (None, _) => {
+                                debug_assert!(false, "EndTry 认不到自己的区域记录");
+                                self.state.seh_stack.pop();
+                            }
+                        }
+                    }
+                    None => {
+                        self.state.seh_stack.pop();
+                    }
+                }
             }
             Instr::ThrowExc { value } => {
                 let exc_val = match value {
                     Operand::Immd(id) => {
-                        let constant = &module.constants[id as usize];
+                        let constant = constant_at(module, id, "ThrowExc value")?;
                         VM::from_constant(constant)
                     }
                     _ => self.get_value(value)?,
@@ -3460,100 +3529,81 @@ impl VM {
                 // These are handled in run(), not here
                 unreachable!("Halt/Ret should be handled in run()")
             }
-            Instr::ResumeExc {  } => {
-                let action = if let Some(record) = self.state.seh_stack.last() {
-                    if record.in_finally {
-                        if record.pending_exception.is_some() {
-                            Some((
-                                record.handler_pc,
-                                record.finally_pc,
-                                record.pending_exception.clone(),
-                                record.catch_executed,
-                                record.delayed_jump_target,
-                                record.delayed_return,
-                            ))
-                        } else if record.delayed_jump_target.is_some() {
-                            Some((
-                                record.handler_pc,
-                                record.finally_pc,
-                                None,
-                                record.catch_executed,
-                                record.delayed_jump_target,
-                                record.delayed_return,
-                            ))
-                        } else if record.delayed_return {
-                            Some((
-                                record.handler_pc,
-                                record.finally_pc,
-                                None,
-                                record.catch_executed,
-                                record.delayed_jump_target,
-                                record.delayed_return,
-                            ))
-                        } else {
-                            None
+            Instr::ResumeExc { region } => {
+                // finally 末尾的收尾。四种出口（重抛 / 延迟跳转 / 延迟返回 / 正常
+                // 完成）都按**区域身份**认领 `seh_stack` 上的记录 —— `Try` 指令自身
+                // 的 pc 就是身份（全局坐标，跨函数唯一）。为什么不能看"栈顶"：
+                // 递归调用下同一条 `try` 同时有多条记录；而正常完成路径上本 finally
+                // 的记录**一定**还在栈上（`EndTry` 保留它），所以身份是唯一可靠的
+                // 判据。找不到记录 ⇒ 这是一次普通控制流的延续，安静落到下一条。
+                let region = region.as_immd() as usize;
+                let outcome = self
+                    .state
+                    .seh_stack
+                    .iter()
+                    .rposition(|rec| rec.region == region)
+                    .and_then(|idx| {
+                        let rec = &self.state.seh_stack[idx];
+                        if !rec.in_finally {
+                            return None;
                         }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if let Some((
-                    handler_pc,
-                    finally_pc,
-                    pending_exc,
-                    catch_executed,
-                    delayed_jump,
-                    delayed_return,
-                )) = action
-                {
-                    if let Some(exc) = pending_exc {
-                        let has_real_catch = handler_pc != 0 && handler_pc != finally_pc;
-                        if has_real_catch && !catch_executed {
-                            if let Some(record) = self.state.seh_stack.last_mut() {
-                                record.in_finally = false;
-                                record.pending_exception = None;
-                                record.catch_executed = true;
-                            }
-                            self.state.set_register(Register::Rv, exc)?;
-                            self.state.jump(handler_pc);
-                            return Ok(true);
+                        if rec.pending_exception.is_some() {
+                            Some((idx, FinallyOutcome::Rethrow))
+                        } else if rec.delayed_jump_target.is_some() {
+                            Some((idx, FinallyOutcome::DelayedJump))
+                        } else if rec.delayed_return {
+                            Some((idx, FinallyOutcome::DelayedReturn))
                         } else {
-                            self.state.seh_stack.pop();
+                            Some((idx, FinallyOutcome::Normal))
+                        }
+                    });
+                if let Some((idx, outcome)) = outcome {
+                    match outcome {
+                        FinallyOutcome::Rethrow => {
+                            // catch 已关闭或没有真 catch：异常继续向外传播。
+                            // （旧实现在这里还有一条"分派进 catch"的分支 ——
+                            // `handle_throw` 改成 catch 优先后它不可达。）
+                            let exc = self.state.seh_stack[idx]
+                                .pending_exception
+                                .take()
+                                .expect("Rethrow 出口必有 pending_exception");
+                            self.state.seh_stack.remove(idx);
                             return self.handle_throw(exc).map(|_| true);
                         }
-                    } else if let Some(target_pc) = delayed_jump {
-                        // Delayed jump after finally execution. `target_pc` is an
-                        // absolute address (see Codegen for DelayedJump).
-                        self.state.seh_stack.pop();
-                        self.state.jump(target_pc.max(0) as usize);
-                        return Ok(true);
-                    } else if delayed_return {
-                        // Delayed return after finally execution: jump back to
-                        // the function's trailing `Ret` (the return value is
-                        // already in `Rv`).
-                        //
-                        // Falling through is wrong: the instruction after
-                        // `ResumeExc` is the *normal* completion's continuation
-                        // (`Br` to the code following the `try`), so a `return`
-                        // inside `try`/`finally` would run the statements it was
-                        // skipping and then hit the exit block's implicit
-                        // `Mov rv, undefined`, losing the value — which is what
-                        // broke `return_in_try_finally` and friends.
-                        self.state.seh_stack.pop();
-                        if let Some(pc) = self
-                            .current_function_id()
-                            .and_then(|id| module.func_exit_pc(id))
-                        {
-                            self.state.jump(pc);
+                        FinallyOutcome::DelayedJump => {
+                            // break/continue 的延迟跳转。`target_pc` 是绝对地址
+                            // （见 codegen 对 DelayedJump 的回填）。
+                            let target = self.state.seh_stack[idx]
+                                .delayed_jump_target
+                                .take()
+                                .expect("DelayedJump 出口必有目标");
+                            self.state.seh_stack.remove(idx);
+                            self.state.jump(target.max(0) as usize);
+                            return Ok(true);
                         }
-                        return Ok(true);
-                    }
-                } else if let Some(record) = self.state.seh_stack.last_mut() {
-                    if record.in_finally {
-                        record.in_finally = false;
+                        FinallyOutcome::DelayedReturn => {
+                            // return 的延迟返回：恢复被 finally 体的调用覆写掉的
+                            // 返回值，再落到本函数的尾 `Ret`。不能落到下一条指令
+                            // —— 那是正常完成的延续，会把 return 跳过的语句又跑
+                            // 一遍（`return_in_try_finally`）。
+                            let value = self.state.seh_stack[idx]
+                                .delayed_return_value
+                                .take()
+                                .expect("DelayedReturn 出口必有寄存的返回值");
+                            self.state.seh_stack.remove(idx);
+                            self.state.set_register(Register::Rv, value)?;
+                            if let Some(pc) = self
+                                .current_function_id()
+                                .and_then(|id| module.func_exit_pc(id))
+                            {
+                                self.state.jump(pc);
+                            }
+                            return Ok(true);
+                        }
+                        FinallyOutcome::Normal => {
+                            // 正常完成：finally 只是普通控制流的延续，记录在这里收尾。
+                            self.state.seh_stack.remove(idx);
+                        }
                     }
                 }
             }

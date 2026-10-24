@@ -702,7 +702,7 @@ impl Codegen {
                         self.codes
                             .push(Instr::LoadException { dst: reg });
                     }
-                    Instruction::ResumeException { args } => {
+                    Instruction::ResumeException { args, region } => {
                         let handlers: Vec<BlockId> = self
                             .throw_to_handlers
                             .get(&block.id())
@@ -720,7 +720,31 @@ impl Codegen {
                                 self.store_jump_args(params, &args);
                             }
                         }
-                        self.codes.push(Instr::ResumeExc {});
+                        // 区域身份先写块 id，回填时解析成该区域的 `Try` 指令 pc
+                        // （`eh_decls` 按 body 块 id 登记，`try_pc` 即身份）。
+                        // 与 DelayedJump 同一手法：操作数里暂存块 id，patch 时换成 pc。
+                        let region_blk = region.as_usize() as isize;
+                        let pos = self.codes.len();
+                        patchs.push(Box::new(move |this: &mut Self| {
+                            let blk = match &this.codes[pos] {
+                                Instr::ResumeExc { region } => region.as_immd(),
+                                other => unreachable!("resume-exc patch site holds {other}"),
+                            };
+                            let try_pc = this
+                                .eh_decls
+                                .iter()
+                                .find(|d| d.body == blk)
+                                .map(|d| d.try_pc)
+                                .unwrap_or_else(|| {
+                                    panic!("ResumeExc 的区域 {blk} 没有对应的 Try 声明")
+                                });
+                            if let Instr::ResumeExc { region } = &mut this.codes[pos] {
+                                region.set(try_pc);
+                            }
+                        }));
+                        self.codes.push(Instr::ResumeExc {
+                            region: AbsPc::immediate(region_blk),
+                        });
                     }
                     Instruction::DelayedJump { target, seh_depth } => {
                         let target_op = Operand::new_immd(target.as_usize() as isize);

@@ -1,11 +1,16 @@
 //! 已确认、但**尚未修**的语义 bug —— 每条都记着 node 的行为与我们的实际行为。
 //!
-//! 这些用例断言的是**正确**的（node 的）行为，因此现在全部 `#[ignore]`：
-//! 套件保持绿，同时把"正确语义是什么"钉死。修掉一条就把那条上的 `ignore` 去掉，
+//! 这些用例断言的是**正确**的（node 的）行为。修掉一条就把那条上的 `ignore` 去掉，
 //! 它就会变成一条普通的回归测试。
 //!
+//! **2026-10-18 更新**：#1–#4 全部修掉或不再复现，`ignore` 已全部解除：
+//! #3（`obj.missing()` 抛 TypeError）与 #4（嵌套 catch）本轮修复；
+//! #1 的测试本身有语法笔误（对象字面量里多了个 `;`，整个测试编译失败），
+//! 笔误修掉后它直接通过 —— 真正的修复来自更早的"闭包共享可变单元"（捕获单元
+//! 而非创建时快照）；#2 同样不再复现。四条留档作为回归测试。
+//!
 //! 为什么先钉测试再动结构：见 `docs/architecture-redesign.md` §7/§8。重写一旦开始，
-//! 连"它原来是什么行为"都会失去参照 —— 这三条就是那三个参照。
+//! 连"它原来是什么行为"都会失去参照 —— 这几条就是那几个参照。
 //!
 //! 每条都标注了：现象 / node / 我们 / 已知的分析位置。
 
@@ -18,16 +23,12 @@ use crate::helpers::{eval_bool, eval_string};
 /// mk()().next().value
 /// ```
 /// - node：`7`
-/// - 我们：`function() { [native code] }`（`it` 本身是对的，只是 `value` 拿到了错槽位里的东西）
+/// - 我们（修复前）：`function() { [native code] }`
 ///
-///   注意读出来的是**原生函数**（不是随便一个函数）—— 这条线索限定了根因的范围：
-///   闭包槽位读到的是某个装着原生函数的槽，而不是"某个随机的值"。
-///
-/// 注意它**不经过任何方法调用** —— 最早以为是 `CallMethod` 的生成器分支传
-/// `Vec::new()` 丢了闭包变量，那是读代码得出的错判（`interpreter-refactor.md` §3.3.6
-/// 已订正）。真根因在闭包槽位本身：`create_generator` 之后（或生成器恢复时）的作用域装配。
+/// **修复**：来自"闭包共享可变单元"（捕获的是单元而不是创建时的快照）。
+/// 注意本用例原来的变体 3 有语法笔误（`{ *h() { yield y; }; }` 里多余的 `;`），
+/// 整个测试编译失败 ——  bug 是否还在，那条笔误一直挡着。已修。
 #[test]
-#[ignore = "已知 bug #1：生成器闭包槽位错位（architecture-redesign.md §8）"]
 fn generator_sees_the_variables_it_closes_over() {
     // 变体 1：生成器函数 + 外层变量（不经任何方法调用）
     assert_eq!(
@@ -48,7 +49,7 @@ fn generator_sees_the_variables_it_closes_over() {
     // 变体 3：先取出再调用（走另一条 opcode 路径）
     assert_eq!(
         eval_string(
-            "function outer2() { var y = 7; return { *h() { yield y; }; }; }
+            "function outer2() { var y = 7; return { *h() { yield y; } }; }
              var g = outer2().h;
              String(g().next().value)"
         ),
@@ -68,15 +69,13 @@ fn generator_sees_the_variables_it_closes_over() {
 /// o.m()
 /// ```
 /// - node：`outer`（`this` 在 `new` 之后仍然是调用方的）
-/// - 我们：`inner`（调用方的 `this` 被新对象覆盖了）
+/// - 我们（修复前）：`inner`（调用方的 `this` 被新对象覆盖了）
 ///
-/// 根因：`New` 的开帧顺序与其它调用路径**相反** —— 它先
-/// `this_val = new_obj; function_val = new_target`，**再** `enter_frame`；而
-/// `enter_frame` 会把 `self.this_val.clone()` 快照进 `this_stack`，于是这一帧的快照是
-/// 新对象而不是调用方，`Ret` 的收尾（`vm/mod.rs` 里 `this_stack.pop()`）恢复出来的
-/// `this` 就错了。登记见 `interpreter-refactor.md` §3.3.3。
+/// 历史根因：`New` 的开帧顺序与其它调用路径**相反**（先
+/// `this_val = new_obj` 再 `enter_frame`，于是这一帧的快照是新对象）。
+/// 现已不再复现（帧自带 `this` / `this_state` 之后该顺序不再能冲掉调用方），
+/// 留档回归。
 #[test]
-#[ignore = "已知 bug #2：new 之后调用方的 this 被冲掉（interpreter-refactor.md §3.3.3）"]
 fn this_survives_a_new_expression_inside_a_method() {
     assert_eq!(
         eval_string(
@@ -110,9 +109,13 @@ fn this_survives_a_new_expression_inside_a_method() {
 /// q.missing()
 /// ```
 /// - node：抛 `TypeError`
-/// - 我们：返回 `undefined`（`CallMethod` 里 `Value::Undefined` 分支只写 `Rv`）
+/// - 我们（修复前）：返回 `undefined`（`CallMethod` 里 `Value::Undefined` 分支只写 `Rv`）
+///
+/// **修复（2026-10-18）**：`CallMethod` 的 `Value::Undefined` 分支改为抛
+/// `TypeError("{method} is not a function")` —— 与 ES 的 CallMethod
+/// （`IsCallable(func)` 为假即抛）一致，消息格式沿用本引擎原有的
+/// "not a function" 写法。
 #[test]
-#[ignore = "已知 bug #3：obj.missing() 应抛 TypeError（CallMethod 的 Undefined 分支）"]
 fn calling_a_missing_method_throws_type_error() {
     assert_eq!(
         eval_string("var q = {}; try { q.missing(); 'no throw' } catch (e) { e.name }"),
@@ -145,13 +148,15 @@ fn calling_a_missing_method_throws_type_error() {
 ///
 /// 与 `lower_try` 里"catch 处不 pop SEH 记录"的注释直接矛盾 —— 那条注释描述的才是设计意图：
 /// 记录应当活过整个 catch，由 catch 末尾的 `EndTry` 收尾（一次 push 对一次 pop）。
-/// `SehRecord.catch_executed` 这个字段在当前行为下也几乎不会置位。
 ///
-/// **归属**：这是运行期 `seh_stack` 记账的缺陷，`architecture-redesign.md` §4.6 的
-/// M2（`Frame.try_stack` + completion 传递）按构造消除它（没有"什么时候 pop"这个问题，
-/// 因为 handler 查找不再依赖一条栈）。在此之前它是已知偏差。
+/// **修复（2026-10-18）**：`handle_throw` 改成 **catch 优先**分派（先 catch 再 finally，
+/// 与规范顺序一致），分派进 catch 时把记录**push 回去**，由 catch 末尾的 `EndTry` 收尾；
+/// 同时 `EndTry` 在有 finally 时改为"标记并保留"记录、由 finally 末尾按**区域身份**
+/// （`ResumeExc` 的操作数）认领的 `ResumeExc` 弹出。同一轮修复还消除了附带发现的
+/// finally 双重执行（`try{throw}catch{}finally{}` 的 finally 跑两遍）与
+/// `DelayedJump` 绝对 pc 缺模块坐标系平移（非首函数里 break/continue 穿 try-finally
+/// 静默跑偏）。
 #[test]
-#[ignore = "已知 bug #4：内层 catch 执行后外层 handler 丢失（handle_throw 在 catch 路径多弹一次）"]
 fn an_executed_inner_catch_does_not_swallow_the_outer_handler() {
     // 最小复现：内层真的捕获过一次之后，外层 catch 必须还能接住后续的 throw。
     assert_eq!(
@@ -166,7 +171,9 @@ fn an_executed_inner_catch_does_not_swallow_the_outer_handler() {
         ),
         "caught:2"
     );
-    // 同一件事在有 finally 的形状下（内层 catch + finally，外层 catch）：
+    // 同一件事在有 finally 的形状下（内层 catch + finally，外层 catch）。
+    // （尾表达式用 `return` 带回：函数完成值是另一个已知缺口，与 SEH 无关 ——
+    // 普通函数尾表达式语句同样丢值，见 P2 的完成值语义任务。）
     assert_eq!(
         eval_string(
             "function g() {
@@ -175,7 +182,7 @@ fn an_executed_inner_catch_does_not_swallow_the_outer_handler() {
                  try { throw 'a'; } catch (e) { log.push('c'); }
                  throw 'b';
                } catch (e2) { log.push('outer'); }
-               log.join(',')
+               return log.join(',');
              }
              g()"
         ),

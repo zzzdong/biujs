@@ -3128,15 +3128,27 @@ impl VM {
                 let finally_pc = record.finally_pc;
                 let handler_pc = record.handler_pc;
 
-                if finally_pc != 0 && !record.in_finally {
+                // **catch 优先**：先跑 catch，catch 的正常出口（`EndTry` + `Jump`）
+                // 再进 finally —— 与规范的顺序一致，也保证 finally 只跑一次
+                // （旧顺序是 finally 先行，catch 出口又跳进 finally，实测
+                // `try{throw}catch{}finally{}` 的 finally 跑两遍）。
+                //
+                // 记录在这期间**保持存活**（push 回去）：catch 体仍在同一条区域的
+                // 运行时保护之内（`lower_try` 的注释即此意图），由 catch 末尾的
+                // `EndTry` 收尾。旧实现在这里不 push，于是那条 `EndTry` 多弹一层，
+                // 把**外层**的记录吃掉 —— 已知 bug #4（嵌套 try 内层 catch 真执行过
+                // 之后外层 handler 丢失）。
+                if handler_pc != 0 && handler_pc != finally_pc && !record.catch_closed {
+                    record.catch_closed = true;
+                    self.state.seh_stack.push(record);
+                    self.state.set_register(Register::Rv, exc_val)?;
+                    self.state.jump(handler_pc);
+                    Ok(())
+                } else if finally_pc != 0 && !record.in_finally {
                     record.in_finally = true;
                     record.pending_exception = Some(exc_val);
                     self.state.seh_stack.push(record);
                     self.state.jump(finally_pc);
-                    Ok(())
-                } else if handler_pc != 0 {
-                    self.state.set_register(Register::Rv, exc_val)?;
-                    self.state.jump(handler_pc);
                     Ok(())
                 } else {
                     self.handle_throw(exc_val)
@@ -4544,8 +4556,12 @@ impl VM {
         }
         // The body's live exception handlers come back with the frame; a
         // `finally` that had not run yet must still run.
-        self.state.seh_stack.extend(frame.seh.iter().cloned());
+        // 帧的 `seh_depth` 记的是**这些记录之前**的水位 —— 与 `open_frame` 的约定
+        // 一致（帧出生时、自己的任何记录入栈之前）。记在 extend 之后会让这些记录
+        // 落在帧界之外：`Ret` 尾声按帧界扫描时找不到它们（`gen.return()` 的
+        // finally 不跑），退帧时也漏弹它们。
         let seh_depth = self.state.seh_stack.len();
+        self.state.seh_stack.extend(frame.seh.iter().cloned());
                         self.state.note_frame(FrameBirth {
             pc: module.instructions.len(),
             func: callee_func,
@@ -6039,12 +6055,26 @@ struct SehRecord {
     in_finally: bool,
     /// pending exception value when entering finally from throw
     pending_exception: Option<Value>,
-    /// whether catch handler has already been executed for this SEH scope
-    catch_executed: bool,
+    /// whether the catch handler can no longer be dispatched to.
+    ///
+    /// 三种关闭方式，语义相同（"catch 的机会用掉了"）：`handle_throw` 分派进
+    /// catch 之后；受保护体**正常结束**（`EndTry` 标记，含 try 体与 catch 体的
+    /// 正常出口）；`return` / `break` / `continue` 延迟穿过本区域
+    /// （`Ret` / `DelayedJump` 标记）。最后一种若不标记，finally 体里抛出的
+    /// 异常会被错误地送进 catch —— 而那时 try 体早已正常完成。
+    catch_closed: bool,
     /// delayed jump target (for break/continue inside try-finally)
     delayed_jump_target: Option<isize>,
     /// delayed return flag (for return inside try-finally)
     delayed_return: bool,
+    /// the return value being carried across a `finally` (for return inside
+    /// try-finally).
+    ///
+    /// **为什么必须单独存**：返回值住在 `Rv` 寄存器里，而 finally 体里的任何
+    /// 调用（`console.log`、方法调用……）都会覆写 `Rv`。旧实现假设" finally 跑完
+    /// `Rv` 还是返回值"，实测 `try { return x } finally { f() }` 返回
+    /// `undefined`。延迟期间把它寄存在记录里，`ResumeExc` 的延迟返回出口恢复。
+    delayed_return_value: Option<Value>,
     /// saved closure var stack depth when return was deferred by finally
     saved_closure_depth: usize,
     ///
@@ -6062,6 +6092,13 @@ struct SehRecord {
     /// 还是抛出者那一帧（`pc` 就在抛出点上），会接着跑错的地方。
     /// 切片 1b 之前这里记的是控制栈深度 —— 那是同一个事实的另一种编码。
     saved_frame_depth: usize,
+    /// 区域身份 = 该 try 的 `Try` 指令自身的 pc（**全局坐标**，跨函数唯一）。
+    ///
+    /// `ResumeExc`（finally 末尾）与 `EndTry` 靠它在 `seh_stack` 上**按身份**
+    /// 认领记录，而不是假设"栈顶就是我的"：递归调用下同一条 `try` 会同时存在
+    /// 多条记录（每条属于一个栈帧），而正常完成路径上本 finally 的记录**一定**
+    /// 还在栈上（`EndTry` 保留它）—— 两条事实合起来，身份才是唯一可靠的判据。
+    region: usize,
 }
 
 /// Per-frame constructor states, stored in [`Frame::this_state`].

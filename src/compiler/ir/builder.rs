@@ -594,8 +594,11 @@ pub trait InstBuilder {
         dst
     }
 
-    fn resume_exception(&mut self) {
-        self.emit(Instruction::ResumeException { args: vec![] });
+    fn resume_exception(&mut self, region: BlockId) {
+        self.emit(Instruction::ResumeException {
+            args: vec![],
+            region,
+        });
     }
 
     fn delayed_jump(&mut self, target: BlockId, seh_depth: usize) {

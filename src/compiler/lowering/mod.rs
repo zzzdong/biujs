@@ -58,7 +58,15 @@ struct SehFrameInfo {
     /// reachable: without an edge, codegen prunes the trampoline as dead and the
     /// branch lands past the last instruction, which silently dropped everything
     /// left in the program (`for (x of y) { try { break; } catch (e) {} }`).
+    ///
+    /// **源点在登记时决定，不在消费时替换**：出口若发生在**自己的 finally 体里**，
+    /// finally 已经在跑了，延迟跳转直接从出口块进 trampoline；否则要等 finally
+    /// 跑完，源才是 `finally_blk`。运行期记录在 finally 体期间依然存活
+    /// （`EndTry` 保留它，见 `lower_try`），所以 lowering 的作用域记账也必须
+    /// 覆盖到 finally 之后 —— 两个簿记说的是同一件事。
     exit_edges: Vec<(BlockId, BlockId)>,
+    /// 正在降低本区域的 `finally` 体（出口边因此不再绕道 `finally_blk`）。
+    in_finally_body: bool,
 }
 
 /// Context for break/continue inside loops.
@@ -1957,7 +1965,15 @@ impl<'a> JSASTLower<'a> {
             let first = self.seh_frames.len().saturating_sub(seh_depth_to_pop);
             for frame in self.seh_frames.iter_mut().skip(first) {
                 frame.pending_exits.push(trampoline);
-                frame.exit_edges.push((source, trampoline));
+                // 出口在**自己的 finally 体里** ⇒ finally 已在运行，延迟跳转直接
+                // 从出口块进 trampoline；否则要等 finally 跑完，源才是 finally 块
+                // （无 finally 的 try/catch 则本来就是出口块）。
+                let edge_source = if frame.in_finally_body {
+                    source
+                } else {
+                    frame.finally_blk.unwrap_or(source)
+                };
+                frame.exit_edges.push((edge_source, trampoline));
             }
             self.builder.delayed_jump(trampoline, seh_depth_to_pop);
             self.builder.switch_to_block(trampoline);
@@ -2108,6 +2124,7 @@ impl<'a> JSASTLower<'a> {
             finally_blk: if has_finally { Some(finally_blk) } else { None },
             pending_exits: Vec::new(),
             exit_edges: Vec::new(),
+            in_finally_body: false,
         });
 
         // `try_body` 既是受保护区域的入口，也是这条区域的身份：它随 `PushSeh` 一起进 IR，
@@ -2129,24 +2146,6 @@ impl<'a> JSASTLower<'a> {
         self.builder.switch_to_block(try_body);
         if let Some(v) = self.lower_block_like_with_result(&try_stmt.block.body) {
             self.builder.assign(result_var, v);
-        }
-        // Decrement SEH depth after try body
-        self.seh_depth -= 1;
-        // Model the data flow a delayed break/continue creates: the trampoline
-        // is entered once this try's `finally` has finished, so the finally
-        // block is its real predecessor.
-        if let Some(frame) = self.seh_frames.pop() {
-            // With a `finally` the trampoline is entered once it has run; without
-            // one, straight from the block that executed the jump. Either way the
-            // edge has to exist — a trampoline with no predecessor is dead code
-            // and gets pruned, leaving the branch to fall off the end of the
-            // program (which silently swallowed everything after the loop).
-            for (from, target) in frame.exit_edges {
-                let source = frame.finally_blk.unwrap_or(from);
-                self.builder
-                    .control_flow_graph_mut()
-                    .add_edge(source, target);
-            }
         }
         if !self.current_block_is_terminated() {
             // Emit into whatever block the body *ended* in. Switching back to
@@ -2198,12 +2197,31 @@ impl<'a> JSASTLower<'a> {
 
         // Finally handler (if present)
         if has_finally {
+            // 运行期：`EndTry`（有 finally 时）**保留** SEH 记录，由 finally 末尾的
+            // `ResumeExc` 收尾弹出 —— 记录覆盖 try 体、catch 体**与 finally 体**。
+            // lowering 的作用域记账必须说同一件事，否则 finally 体里的
+            // break/continue 会少弹一条记录，把它漏在 `seh_stack` 上。
+            if let Some(frame) = self.seh_frames.last_mut() {
+                frame.in_finally_body = true;
+            }
             self.builder.switch_to_block(finally_blk);
             self.lower_block_like(&try_stmt.finalizer.as_ref().unwrap().body);
             if !self.current_block_is_terminated() {
                 // After finally, check if there's a pending exception to re-throw
-                self.builder.resume_exception();
+                self.builder.resume_exception(try_body);
                 self.builder.jump(after_finally);
+            }
+        }
+
+        // 区域到此关闭：记账（`seh_depth` / `seh_frames`）覆盖到 finally 之后，
+        // 与运行期记录的存活范围一致。出口边在**登记时**就已定好源点
+        // （`lower_loop_exit`），这里只补 CFG 边。
+        self.seh_depth -= 1;
+        if let Some(frame) = self.seh_frames.pop() {
+            for (source, target) in frame.exit_edges {
+                self.builder
+                    .control_flow_graph_mut()
+                    .add_edge(source, target);
             }
         }
 

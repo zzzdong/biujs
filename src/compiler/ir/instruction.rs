@@ -494,6 +494,13 @@ pub enum Instruction {
     },
     ResumeException {
         args: Vec<Value>,
+        /// 这条 finally 属于哪条区域（`PushSeh.body`，即 `try` 体入口块）。
+        ///
+        /// 运行期 `ResumeExc` 靠它在 `seh_stack` 上**按身份**认领记录：
+        /// 递归调用下同一条 `try` 会同时存在多条记录（每条一个栈帧），
+        /// 而正常完成路径上这条finally自己的记录还**一定**在栈上（`EndTry`
+        /// 保留它），所以"栈顶就是我的"这个推断在嵌套/递归下不成立。
+        region: BlockId,
     },
     /// Delayed jump for break/continue inside try-finally.
     /// Pops SEH records and executes finally blocks before jumping to target.
@@ -746,7 +753,9 @@ impl Instruction {
             // `resume_exception` hands its arguments over to the outer handler's
             // phi parameters, exactly like `throw` does; codegen reads those
             // values when emitting the moves, so they must count as uses.
-            Instruction::ResumeException { args } => (vec![], args.iter().cloned().collect()),
+            Instruction::ResumeException { args, .. } => {
+                (vec![], args.iter().cloned().collect())
+            }
             Instruction::DelayedJump { .. } => (vec![], vec![]),
             Instruction::TypeOf { dst, src } => (vec![*dst], vec![*src]),
             Instruction::TypeOfEnv { dst, .. } => (vec![*dst], vec![]),
@@ -1059,8 +1068,8 @@ impl std::fmt::Display for Instruction {
             Instruction::LoadException { dst } => {
                 write!(f, "{dst} = load_exception")
             }
-            Instruction::ResumeException { .. } => {
-                write!(f, "resume_exception")
+            Instruction::ResumeException { region, .. } => {
+                write!(f, "resume_exception {region}")
             }
             Instruction::DelayedJump { target, seh_depth } => {
                 write!(f, "delayed_jump {target} (seh_depth={seh_depth})")

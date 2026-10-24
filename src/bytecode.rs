@@ -808,11 +808,15 @@ define_instrs! {
         Halt {} @Return,
         Ret {} @Return,
         EndTry {},
-        ResumeExc {} @Jump,
         PrologueEnd {} @Suspend
     ;
 // ── arity 1 ──
         DeclareLexical { name: n },
+        // `ResumeExc` 的 `region` 是**区域身份**（该 try 的 `Try` 指令自身的 pc，
+        // 全局坐标）：finally 末尾按它认领 `seh_stack` 上的记录，不靠"栈顶就是我
+        // 的"推断 —— 递归调用下同一条 `try` 会同时有多条记录，而正常完成路径上
+        // 这条 finally 自己的记录还**一定**在栈上（`EndTry` 保留它）。
+        ResumeExc { region: ja } @Jump,
         Push { src: r },
         Pop { dst: w },
         Jump { offset: jr } @Jump,
@@ -1067,7 +1071,9 @@ pub enum Opcode {
     ThrowExc,
     /// load_exception dst (SEH: load caught exception)
     LoadException,
-    /// resume_exception (SEH: re-throw pending exception after finally)
+    /// resume_exception region (SEH: finish a finally — re-throw pending exception,
+    /// run a delayed jump/return, or continue normally; `region` identifies the
+    /// `Try` whose record on the SEH stack this finally belongs to)
     ResumeExc,
     /// delayed_jump target, seh_depth (execute finally blocks then jump)
     DelayedJump,
@@ -2533,8 +2539,9 @@ mod tests {
     /// 于是"相对偏移喂给绝对字段"是编译错误（`expected RelPc, found AbsPc`），
     /// 不再是靠人记住 `Jump` 与 `DelayedJump` 的区别。
     ///
-    /// 这里是数量断言：相对 5 个（`Jump` 1 + `BrIf` 2 + `Try` 2）、绝对 1 个
-    /// （`DelayedJump`）。改表时这个数会变，逼你确认是有意的。
+    /// 这里是数量断言：相对 5 个（`Jump` 1 + `BrIf` 2 + `Try` 2）、绝对 2 个
+    /// （`DelayedJump` 的跳转目标 + `ResumeExc` 的区域身份）。改表时这个数会变，
+    /// 逼你确认是有意的。
     #[test]
     fn pc_fields_are_typed_by_role() {
         let (mut rel, mut abs) = (0, 0);
@@ -2547,7 +2554,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!((rel, abs), (5, 1), "相对 5（Jump/BrIf×2/Try×2）、绝对 1（DelayedJump）");
+        assert_eq!(
+            (rel, abs),
+            (5, 2),
+            "相对 5（Jump/BrIf×2/Try×2）、绝对 2（DelayedJump/ResumeExc）"
+        );
 
         // 两个类型各自的读取/回填写法（也顺便钉住"读不改变调用点"这一点）。
         let mut j = Instr::Jump { offset: RelPc::immediate(3) };
