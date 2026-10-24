@@ -159,6 +159,98 @@ fn collect_var_names(stmts: &[Statement<'_>], out: &mut Vec<String>) {
     }
 }
 
+/// Every name the script **declares anywhere**: `var` / `let` / `const` /
+/// `class` / function declarations, at any statement depth.
+///
+/// `StoreEnv` needs it for the strict rule: writing to a name the script never
+/// declares (and that is not already a global property) is an unresolvable
+/// reference and must throw (ES 8.1.1.4 / 13.15), while writing to a *declared*
+/// binding is an ordinary assignment — even before the declaration statement
+/// has run, and even though this engine still keeps block-scoped bindings in
+/// the globals map rather than in a real declarative record (§3.5).
+pub(crate) fn collect_declared_names(stmts: &[Statement<'_>]) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_declared_names_in(stmts, &mut out);
+    out
+}
+
+fn collect_declared_names_in(stmts: &[Statement<'_>], out: &mut Vec<String>) {
+    for stmt in stmts {
+        match stmt {
+            Statement::VariableDeclaration(decl) => {
+                for declarator in &decl.declarations {
+                    collect_binding_names(&declarator.id, out);
+                }
+            }
+            Statement::FunctionDeclaration(func) => {
+                if let Some(id) = &func.id {
+                    out.push(id.name.to_string());
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    out.push(id.name.to_string());
+                }
+            }
+            Statement::BlockStatement(block) => collect_declared_names_in(&block.body, out),
+            Statement::IfStatement(if_stmt) => {
+                collect_declared_names_in(std::slice::from_ref(&if_stmt.consequent), out);
+                if let Some(alternate) = &if_stmt.alternate {
+                    collect_declared_names_in(std::slice::from_ref(&*alternate), out);
+                }
+            }
+            Statement::WhileStatement(while_stmt) => {
+                collect_declared_names_in(std::slice::from_ref(&while_stmt.body), out)
+            }
+            Statement::DoWhileStatement(do_stmt) => {
+                collect_declared_names_in(std::slice::from_ref(&do_stmt.body), out)
+            }
+            Statement::ForStatement(for_stmt) => {
+                if let Some(ForStatementInit::VariableDeclaration(decl)) = &for_stmt.init {
+                    for declarator in &decl.declarations {
+                        collect_binding_names(&declarator.id, out);
+                    }
+                }
+                collect_declared_names_in(std::slice::from_ref(&for_stmt.body), out);
+            }
+            Statement::ForInStatement(for_in) => {
+                if let ForStatementLeft::VariableDeclaration(decl) = &for_in.left {
+                    for declarator in &decl.declarations {
+                        collect_binding_names(&declarator.id, out);
+                    }
+                }
+                collect_declared_names_in(std::slice::from_ref(&for_in.body), out);
+            }
+            Statement::ForOfStatement(for_of) => {
+                if let ForStatementLeft::VariableDeclaration(decl) = &for_of.left {
+                    for declarator in &decl.declarations {
+                        collect_binding_names(&declarator.id, out);
+                    }
+                }
+                collect_declared_names_in(std::slice::from_ref(&for_of.body), out);
+            }
+            Statement::SwitchStatement(switch) => {
+                for case in &switch.cases {
+                    collect_declared_names_in(&case.consequent, out);
+                }
+            }
+            Statement::TryStatement(try_stmt) => {
+                collect_declared_names_in(&try_stmt.block.body, out);
+                if let Some(handler) = &try_stmt.handler {
+                    collect_declared_names_in(&handler.body.body, out);
+                }
+                if let Some(finalizer) = &try_stmt.finalizer {
+                    collect_declared_names_in(&finalizer.body, out);
+                }
+            }
+            Statement::LabeledStatement(labeled) => {
+                collect_declared_names_in(std::slice::from_ref(&labeled.body), out)
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_var_names_from_declaration(decl: &VariableDeclaration<'_>, out: &mut Vec<String>) {
     if decl.kind != VariableDeclarationKind::Var {
         return;

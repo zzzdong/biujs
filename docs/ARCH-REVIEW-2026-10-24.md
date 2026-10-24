@@ -10,17 +10,19 @@
 > 0.1 护栏计数写入基线、0.5 常量/立即数的运行时检查、
 > 0.6 字节码 dumper + 16 组 golden（`tests/golden/bytecode/`）并删除
 > `Module::debug_instructions` 的 IR 克隆、0.7 scope 表收口（`noStrict`/`raw` 跳过、
-> 删掉过宽的源码子串门控、所有用例统一前置 `"use strict"`）已落地。
-> 默认内存预算调回 384MB；scope 收口后全量为
-> **17,206 / 20,504（83.92%）**，跳过 8,577、失败 3,298。
+> 删掉过宽的源码子串门控、所有用例统一前置 `"use strict"`）、
+> 0.8 strict 运行时收口（`with` 编译期拒绝、隐式全局赋 `ReferenceError`、
+> 顶层 `this = globalThis`、全局对象接 `Object.prototype`）已落地。
+> 默认内存预算调回 384MB；0.8 之后全量为
+> **17,271 / 20,504（84.23%）**，相对 0.7 基线 +65 条，无逐套件回退。
 
 ---
 
 ## 0. 结论摘要
 
-1. **当前通过率 83.92%**（17,206 / 20,504，跳过 8,577，失败 3,298；scope 收口后
-   2026-10-25 基线）。收口前为 83.97%（17,363 / 20,677）。语言层 `language/*`
-   与内建层 `built-ins/*` 的差距仍是主要矛盾 —— **差距在内建，不在语法**。
+1. **当前通过率 84.23%**（17,271 / 20,504，跳过 8,577，失败 3,233；0.8 之后
+   2026-10-25 基线）。语言层 `language/*` 与内建层 `built-ins/*` 的差距仍是主要矛盾
+   —— **差距在内建，不在语法**。
 2. 384MB 下与 2026-10-18 基线（17,363 / 3,314）逐套件一致。此前 256MB 预算下少 5 条，
    是 `built-ins/Array` 的**内存护栏误伤**：`TEST262_MEMORY_MB=0` 时 Array 回到 2311
    通过。**工作区没有语义回退**；2026-10-24 已把默认预算调回 384MB。
@@ -34,11 +36,14 @@
    `class-fields-public`（2,054 条）、`object-rest`、`resizable-arraybuffer` 等后 ES6 特性
    **没有**被 gate，直接进入分母；`built-ins/Date` 等 ES6 套件仍未入册。
    **83.92% 仍是“当前支持面”的通过率，不是 ES6 一致率。**
-5. **strict 只做了一半**：`"use strict"` 下的早期错误（重复参数、`with`、八进制、
-   `eval`/`arguments` 赋值）会报；但**运行时严格语义没有**：
-   `"use strict"; x = 1` 仍会创建全局；sloppy 的 `with ({x:2}) { … }` 能编译且行为错误
-   （读 `x` 得 `undefined`）；脚本顶层 `this` 是 `undefined`；`globalThis` 的原型是 `null`
-   （没有 `Object.prototype`，`globalThis.hasOwnProperty` 不存在）。
+5. **strict 运行时语义（0.8 已修）**：此前 `"use strict"` 只有 oxc 的早期错误
+   （重复参数、`with`、八进制、`eval`/`arguments` 赋值），而
+   `"use strict"; x = 1` 仍会创建全局、sloppy 的 `with ({x:2}) { … }` 能编译且行为错误、
+   脚本顶层 `this` 是 `undefined`、`globalThis` 的原型是 `null`。
+   现在：`with` 一律编译期拒绝、严格模式下写不可解析的名字抛 `ReferenceError`、
+   顶层 `this === globalThis`、全局对象接上 `Object.prototype`。
+   **仍未建模**：逐函数级严格性（`function f() { "use strict"; }`），
+   以及"块级 `let` 的绑定应住在声明式记录里"——它现在还是全局属性（Phase 1B 的事）。
 6. **架构判断**：VM/GC/字节码的方向是对的（真 SSA + 块参数、EH 侧表、精确根、
    `Gc` 瘦句柄），但有三处结构性错配：
    - **无 JIT 却保留完整 IR/SSA/regalloc**（约 10.5k 行）。默认变量全部内存驻留
@@ -70,7 +75,7 @@
 | 构建警告 | 77（`cargo build --release`） |
 | `cargo clippy --release --lib` | **442 warnings**（主要是 `collapsible_if` 88、冗余字段名 79、`Value` 上多余的 `clone` 61、冗余闭包 36、未用 import 30+） |
 | 源码规模 | 46,013 行：compiler 11,980 / vm 20,949 / builtins 9,885 |
-| 全量 test262（384MB，scope 收口后） | **20,504 执行 = 17,206 通过 + 3,298 失败；8,577 跳过；83.92%** |
+| 全量 test262（384MB，scope 收口 + strict 收口后） | **20,504 执行 = 17,271 通过 + 3,233 失败；8,577 跳过；84.23%** |
 | 护栏 | timeout 0 / step-limit 0 / memory 14 |
 | 全量墙钟 | 约 7–9 分钟（4 片串行；不含首次全量构建） |
 
@@ -228,18 +233,37 @@ Object.getPrototypeOf(globalThis) // null（应为 Object.prototype）
 typeof globalThis.hasOwnProperty   // "undefined"（应继承自 Object.prototype）
 ```
 
-这意味着：
-- **严格模式的运行时语义没有实现**，只有 oxc 的早期错误；
-- **全局对象不是真正的对象**：它是 `State::globals: HashMap` 的一个视图
-  （`src/vm/object.rs:2437`），没有原型链、没有 `Object.prototype` 方法；
-- **`with` 没被禁止**，而且 lowering 后的行为是错的（源码模式门控把它藏起来了）。
+**0.8 之后的状态**：
+
+```js
+with ({x: 2}) { x }                  // 编译期拒绝（之前能编译，读到 undefined）
+"use strict"; x = 1                  // ReferenceError（之前创建全局）
+this === globalThis                  // true（之前 undefined）
+Object.getPrototypeOf(globalThis) === Object.prototype   // true（之前 null）
+typeof globalThis.hasOwnProperty     // "function"（之前 "undefined"）
+({}) instanceof globalThis           // TypeError（顺带修掉一个真 bug，见下）
+```
+
+`this` 从 `undefined` 变成全局对象，立刻暴露了 `instanceof` 的一个存量 bug：
+ES 12.10.4 第 4 步规定 RHS 是**不可调用对象时抛 TypeError**，而实现直接走了原型链
+遍历（`src/vm/exec.rs` 的 `Instr::InstanceOf`）。之前 `this` 是 `undefined`，
+"不是对象"这一条先抛了 TypeError，把 bug 遮住了。已修，`instanceof` 套件回到基线。
+
+仍存在的缺口：
+- **逐函数级严格性**没有建模 —— 现在只有脚本首部的指令会被识别，
+  `Module::strict` 是全模块一个布尔；
+- **块级 `let`/`const` 的绑定**仍然落在全局属性上（`store_env` → globals），
+  而不是声明式记录；Phase 1B 的 `EnvRecord` 会一次性解决；
+- 全局对象仍是 `State::globals: HashMap` 的视图（`src/vm/object.rs` 的
+  `GlobalObject`），只是现在有了 `[[Prototype]]`；真 `GlobalObject`（属性描述符、
+  `var` 的非可配置语义）也属于 1B。
 
 ### 2.5 “离目标还有多远”的三种口径
 
 | 口径 | 当前 | 说明 |
 |---|---|---|
-| **A. 当前支持面**（已入册 107 套件，scope 收口后） | **83.92%**（17,206 / 20,504） | 现有数字；混入后 ES6 特性 |
-| **B. ES6 核心 + 已实现扩展**（再加入 Date/AB/DV/TAConstructors） | ≈ **81.1%**（17,941 / 22,126） | 建议采用；明确列出排除项 |
+| **A. 当前支持面**（已入册 107 套件，scope 收口后） | **84.23%**（17,271 / 20,504） | 现有数字；混入后 ES6 特性 |
+| **B. ES6 核心 + 已实现扩展**（再加入 Date/AB/DV/TAConstructors） | ≈ **81.4%**（18,006 / 22,126） | 建议采用；明确列出排除项 |
 | **C. ES6 全家桶**（再加 modules / RegExp） | 未知，预计 < 70% | modules 完全没做；RegExp 无完整引擎 |
 
 建议采用 **B**，并把它写成机器可读的 scope 表：
@@ -482,7 +506,7 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 | 0.5 | `Operand::as_immediate() -> Option`；环境/调用指令的 `-1` 哨兵改 `Option`；`constants.get()` 替代索引 | `src/vm` 无 `as_immd` panic 路径；坏模块返回 `InternalError` |
 | 0.6 | 字节码 dumper + 20–30 个脚本的 golden 测试；`Module` 去掉 `debug_instructions` 克隆（或改为可选 feature） | 同一源码字节码逐字节稳定；Module 内存下降 |
 | ~~0.7~~ **已完成** | scope 表收口：删 `"Date"`/`"RegExp"`/`"label:"`/`print(`/`$ERROR` 等过宽 pattern；`noStrict`/`raw` 跳过；所有用例统一前置 `"use strict"`；`is_unsupported` 加了陷阱用例 | 全量 17,206 / 20,504（83.92%）；Object +166、String +49、Array +28；基线已刷新并写入 guard 行 |
-| 0.8 | strict 运行时收口：`with` 永远 SyntaxError；隐式全局赋值 ReferenceError；顶层 `this = globalThis`；`globalThis` 临时挂 `Object.prototype` | 四条探针通过；相关 test262 不退化 |
+| ~~0.8~~ **已完成** | strict 运行时收口：`with` 永远编译报错；严格模式隐式全局赋 `ReferenceError`（用"脚本声明过名字"集合区分）；顶层 `this = globalThis`；全局对象接 `Object.prototype` | 四条探针通过；`instanceof` 套件回到基线（顺带修掉一个真 bug：ES 12.10.4 第 4 步"RHS 不可调用应抛 TypeError"） |
 | 0.9 | CI：build + unit + features + guards + clippy baseline；周度全量 | PR 不再把回归留到人工发现 |
 | 0.10 | 文档去重：README/PROJECT/PLAN/tsv 的数字由脚本生成，不再手写 | 一处数据源 |
 
@@ -581,15 +605,13 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 
 已完成：1（boundary RAII）、2（pending_captured 入根）、3（guard 配置+预算 384MB）、
 4（debug 几何断言）、5（运行时立即数/常量检查）、7（scope 表收口 + 基线刷新）、
-9（字节码 dumper + 16 组 golden，删除 IR 克隆）。
+8（strict 运行时收口）、9（字节码 dumper + 16 组 golden，删除 IR 克隆）。
 
 剩余（按顺序）：
 
 6. 删 `BIUJS_REG_VARS` 与变量寄存器分配（先固定内存驻留语义）。
-8. strict 运行时收口：`with` 永远报错、隐式全局报错、顶层 `this = globalThis`、
-   全局对象接上 `Object.prototype` —— 这是 0.8，也是语言层最大的单项缺口。
-10. 文档数字脚本化（0.10），再进入架构阶段：
-    1A（Atom/PropertyKey）→ 1B（ObjectHeader/Shape/全局对象/Realm）→
+10. 文档数字脚本化（0.10）与 CI（0.9），再进入架构阶段：
+    1A（Atom/PropertyKey）→ 1B（ObjectHeader/Shape/全局对象/Realm/EnvRecord）→
     1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→
     Phase 2（帧几何/GC/字节码 v2）→ Phase 3（编译器简化）。
 

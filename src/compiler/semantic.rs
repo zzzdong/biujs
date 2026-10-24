@@ -2,6 +2,7 @@
 //!
 //! Performs semantic checks before lowering to IR:
 //! - const variable reassignment detection
+//! - `with` rejection (out of scope, and oxc only rejects it under strict)
 //! - (future) undefined variable detection
 //! - (future) duplicate declaration detection
 
@@ -213,6 +214,17 @@ impl SemanticAnalyzer {
             }
             Statement::ExpressionStatement(expr) => {
                 self.visit_expression(&expr.expression);
+            }
+            // `with` is out of scope for this engine (§1: 明确不做). Rejecting it
+            // here — before lowering — is what stops sloppy `with ({x: 2}) { x }`
+            // from compiling into something that quietly reads the wrong scope
+            // (measured: the body compiled and `x` resolved to `undefined`).
+            // oxc only rejects it under strict, so the sloppy shape needs this.
+            Statement::WithStatement(with) => {
+                self.add_error(
+                    "SyntaxError: 'with' statements are not supported",
+                    with.span,
+                );
             }
             _ => {}
         }

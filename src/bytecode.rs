@@ -1,6 +1,6 @@
 use std::{
     cell::OnceCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::Arc,
 };
@@ -80,6 +80,17 @@ pub struct Module {
     /// 配对的权威来源是 IR 的 `PopSeh { region }`（`region` = 区域身份块 id），
     /// `codegen` 解析成 pc 后放在这里。
     pub eh_regions: HashMap<u32, Vec<EhRegion>>,
+    /// 这个程序是不是**严格模式**（脚本首部的 `"use strict"` 指令）。
+    ///
+    /// 运行期只有一处需要它：`StoreEnv` 写到一个**不可解析**的名字时，严格模式下要
+    /// 抛 `ReferenceError`，而不是创建全局属性（ES 8.1.1.4 / 13.15）。
+    /// 逐函数级严格性仍未建模 —— 那是 Phase 3“strictness 是编译模式”的事。
+    pub strict: bool,
+    /// 脚本**声明过**的名字（`var` / `let` / `const` / `class` / 函数声明）。
+    ///
+    /// `StoreEnv` 用它区分"写到一个已声明的绑定"与"写到一个不可解析的名字"：
+    /// 严格模式下后者要抛 `ReferenceError`，前者即便声明语句还没跑也是普通赋值。
+    pub declared_names: HashSet<String>,
     /// try 区域的**惰性索引**（按起点与"退出点"两端都能查）：`Module` 编译后不可变，
     /// 所以缓存不会失效。存在的理由：查表要能在热路径上用，不能每次扫一遍表。
     eh_index: OnceCell<EhIndex>,
@@ -148,6 +159,8 @@ impl Module {
         instructions: Vec<Instr>,
         eh_regions: HashMap<u32, Vec<EhRegion>>,
         templates: Vec<TemplateSite>,
+        strict: bool,
+        declared_names: HashSet<String>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -156,6 +169,8 @@ impl Module {
             instructions,
             eh_regions,
             templates,
+            strict,
+            declared_names,
             eh_index: OnceCell::new(),
         }
     }
@@ -1872,8 +1887,11 @@ mod tests {
             vec![],
             HashMap::new(),
             Vec::new(),
+            false,
+            HashSet::new(),
         );
         assert_eq!(module.name, Some("test".to_string()));
+        assert!(!module.strict);
         assert!(module.constants.is_empty());
         assert!(module.code_blocks.is_empty());
         assert!(module.instructions.is_empty());
@@ -1897,6 +1915,8 @@ mod tests {
             vec![Instr::Halt {}],
             HashMap::new(),
             Vec::new(),
+            false,
+            HashSet::new(),
         );
         let display = format!("{}", module);
         assert!(display.contains("module name=Some(\"main\")"));

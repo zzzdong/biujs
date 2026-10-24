@@ -93,3 +93,5 @@ mod well_known_symbols;
 mod typedarray_methods;
 #[path = "features/known_bugs.rs"]
 mod known_bugs;
+#[path = "features/strict_mode.rs"]
+mod strict_mode;

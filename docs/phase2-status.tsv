@@ -2,7 +2,7 @@
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
 # 最近更新：2026-10-25
 # guards: timeout 0 step-limit 0 memory 14 (TEST262_TIMEOUT_MS=15000 TEST262_STEP_LIMIT=0 TEST262_MEMORY_MB=384)
-language/statements/for-of	601	52	98
+language/statements/for-of	605	52	94
 language/statements/for-in	72	28	15
 built-ins/Array/prototype/Symbol.iterator	0	0	1
 language/expressions/bitwise-and	19	8	3
@@ -10,13 +10,13 @@ language/expressions/call	61	22	9
 language/expressions/complement	0	0	0
 language/expressions/does-not-equals	26	11	1
 language/expressions/greater-than	38	10	1
-language/expressions/instanceof	21	12	10
+language/expressions/instanceof	22	12	9
 language/expressions/logical-and	15	3	0
 language/expressions/modulus	31	8	1
 language/expressions/object	676	434	60
-language/expressions/prefix-increment	21	8	4
+language/expressions/prefix-increment	22	8	3
 language/expressions/strict-equals	19	11	0
-language/expressions/this	1	4	1
+language/expressions/this	2	4	0
 language/expressions/unsigned-right-shift	24	8	13
 language/statements/break	18	2	0
 language/statements/do-while	26	10	0
@@ -24,7 +24,7 @@ language/statements/function	318	115	18
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	55	18	0
-built-ins/Array	2339	187	555
+built-ins/Array	2342	187	552
 built-ins/JSON	122	29	14
 built-ins/WeakSet	80	1	4
 built-ins/Number	196	38	106
@@ -40,12 +40,12 @@ language/expressions/greater-than-or-equal	27	8	8
 language/expressions/left-shift	34	8	3
 language/expressions/logical-not	15	4	0
 language/expressions/multiplication	32	7	1
-language/expressions/postfix-decrement	25	8	4
+language/expressions/postfix-decrement	26	8	3
 language/expressions/property-accessors	13	2	6
 language/expressions/subtraction	30	7	1
-language/expressions/typeof	11	3	2
+language/expressions/typeof	12	3	1
 language/expressions/void	8	1	0
-language/statements/class	1413	2811	143
+language/statements/class	1414	2811	142
 language/statements/empty	1	1	0
 language/statements/if	47	22	0
 language/statements/throw	13	1	0
@@ -54,8 +54,8 @@ language/computed-property-names	40	0	8
 built-ins/Boolean	28	3	20
 built-ins/Map	186	5	13
 built-ins/TypedArray	303	513	630
-built-ins/Object	3031	32	348
-built-ins/String	791	72	360
+built-ins/Object	3067	32	312
+built-ins/String	792	72	359
 language/expressions/generators	241	30	19
 language/expressions/assignment/destructuring	3	1	4
 language/expressions/addition	35	8	5
@@ -67,11 +67,11 @@ language/expressions/grouping	6	3	0
 language/expressions/less-than	34	10	1
 language/expressions/logical-or	15	3	0
 language/expressions/new	48	3	8
-language/expressions/postfix-increment	26	8	4
+language/expressions/postfix-increment	27	8	3
 language/expressions/right-shift	26	8	3
 language/expressions/tagged-template	17	10	0
 language/expressions/unary-minus	10	3	1
-language/expressions/arrow-function	298	31	14
+language/expressions/arrow-function	299	31	13
 language/statements/const	123	4	9
 language/statements/expression	1	2	0
 language/statements/let	133	5	7
@@ -85,7 +85,7 @@ built-ins/Promise	244	292	141
 built-ins/Symbol	58	21	19
 language/expressions/yield	42	2	19
 language/rest-parameters	11	0	0
-language/expressions/assignment	341	88	56
+language/expressions/assignment	343	88	54
 language/expressions/bitwise-xor	19	8	3
 language/expressions/comma	4	2	0
 language/expressions/division	35	9	1
@@ -94,7 +94,7 @@ language/expressions/in	14	22	0
 language/expressions/less-than-or-equal	31	8	8
 language/expressions/member	0	0	0
 language/expressions/new.target	13	1	0
-language/expressions/prefix-decrement	22	8	4
+language/expressions/prefix-decrement	23	8	3
 language/expressions/strict-does-not-equals	19	11	0
 language/expressions/template-literal	54	3	0
 language/expressions/unary-plus	13	3	1
@@ -102,10 +102,10 @@ language/statements/block	13	6	2
 language/statements/continue	21	3	0
 language/statements/for	350	21	14
 language/statements/return	5	1	10
-language/statements/variable	140	25	13
+language/statements/variable	142	25	11
 language/literals/numeric	91	66	0
-language/types	88	16	9
-built-ins/Function	139	240	130
+language/types	95	16	2
+built-ins/Function	140	240	129
 built-ins/WeakMap	132	2	7
 built-ins/NativeErrors	74	6	14
 built-ins/Reflect	151	1	1

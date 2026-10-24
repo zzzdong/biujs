@@ -7,7 +7,7 @@ pub mod regalloc;
 pub mod semantic;
 pub mod symbol;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{CodeBlock, EhRegion, FnFlags, FunctionId, Instr, Module, Register};
 use crate::compiler::error::CompileError;
@@ -54,6 +54,22 @@ impl Compiler {
         if !semantic_errors.is_empty() {
             return Err(semantic_errors.into_iter().next().unwrap());
         }
+
+        // 2b. Strict mode. The runtime only needs it for one rule: writing to an
+        // unresolvable name is a `ReferenceError` in strict code instead of
+        // creating a global (see `Module::strict` and `Instr::StoreEnv`).
+        //
+        // Per-function strictness (`function f() { "use strict"; }`) is *not*
+        // modelled yet — that is part of "strictness is a compile mode" (§4).
+        let strict = program
+            .directives
+            .iter()
+            .any(|directive| directive.expression.value.as_str() == "use strict");
+        // The strict rule needs the set of names the script declares anywhere;
+        // see `Module::declared_names`.
+        let declared_names = crate::compiler::lowering::collect_declared_names(&program.body)
+            .into_iter()
+            .collect::<HashSet<_>>();
 
         // 3. Create IR unit and main function
         let mut unit = IrUnit::new();
@@ -200,6 +216,8 @@ impl Compiler {
             all_codes,
             eh_regions,
             unit.templates,
+            strict,
+            declared_names,
         ))
     }
 }

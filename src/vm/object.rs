@@ -2436,13 +2436,30 @@ impl JSObject for PromiseObject {
 #[derive(Debug)]
 pub struct GlobalObject {
     store: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+    /// `[[Prototype]]`. It is `Object.prototype`, which is what makes
+    /// `globalThis.hasOwnProperty` and `Object.getPrototypeOf(globalThis)`
+    /// behave — the globals map alone only answers *own* properties.
+    prototype: Option<Gc<Object>>,
 }
 
 impl GlobalObject {
     pub fn new(
         store: Rc<RefCell<std::collections::HashMap<String, Value>>>,
     ) -> Self {
-        Self { store }
+        Self {
+            store,
+            prototype: None,
+        }
+    }
+
+    pub fn with_prototype(
+        store: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+        prototype: Gc<Object>,
+    ) -> Self {
+        Self {
+            store,
+            prototype: Some(prototype),
+        }
     }
 
     fn key_name(key: &PropertyKey) -> Option<String> {
@@ -2522,9 +2539,11 @@ impl JSObject for GlobalObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        None
+        self.prototype
     }
-    fn set_prototype(&mut self, _proto: Option<Gc<Object>>) {}
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
+        self.prototype = proto;
+    }
     fn is_extensible(&self) -> bool {
         true
     }

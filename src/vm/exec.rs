@@ -2251,6 +2251,16 @@ impl VM {
                     Some(found) => found,
                     None => match ctor {
                         Value::Object(ctor_ref) => {
+                            // ES 12.10.4 step 4: an object that is not callable
+                            // throws, it does not fall back to the prototype
+                            // walk. (`({}) instanceof this` at the top level is
+                            // how this surfaced: `this` used to be `undefined`,
+                            // which threw for the "not an object" reason.)
+                            if !ctor.is_callable() {
+                                return Err(RuntimeError::TypeError(
+                                    "Right-hand side of 'instanceof' is not callable".to_string(),
+                                ));
+                            }
                             let ctor_proto = ctor_ref
                                 .borrow()
                                 .property_get(&PropertyKey::from("prototype"));
@@ -2700,6 +2710,19 @@ impl VM {
                             )))
                         }
                         None => {
+                            // ES `SetMutableBinding` on an **unresolvable** reference:
+                            // strict code throws instead of creating a global
+                            // property (ES 8.1.1.4 / 13.15). Sloppy code still
+                            // creates one, which is what REPL-style sources
+                            // without a directive expect today.
+                            if module.strict
+                                && !module.declared_names.contains(&name)
+                                && !self.state.globals.borrow().contains_key(&name)
+                            {
+                                return Err(RuntimeError::ReferenceError(format!(
+                                    "assignment to undeclared variable {name}"
+                                )));
+                            }
                             self.state.globals.borrow_mut().insert(name, value);
                         }
                     }

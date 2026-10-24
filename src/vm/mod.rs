@@ -473,6 +473,9 @@ impl VM {
             .globals
             .borrow_mut()
             .insert("globalThis".to_string(), state.global_object.clone());
+        // The global object is an ordinary object with `Object.prototype` as its
+        // prototype, not a bare property bag.
+        state.set_global_prototype(builtins.object_prototype);
         Self {
             state,
             builtins,
@@ -574,6 +577,7 @@ impl VM {
             .globals
             .borrow_mut()
             .insert("globalThis".to_string(), self.state.global_object.clone());
+        self.state.set_global_prototype(self.builtins.object_prototype);
 
         // **顶层脚本也是一个帧**（`architecture-redesign.md` §4.3 陷阱 5）。
         // 这条不是锦上添花：`pc` 现在住在 `Frame` 里，如果脚本没有帧，`pc` 就没有
@@ -5643,7 +5647,11 @@ impl State {
         self.note_frame(FrameBirth {
             pc: 0,
             func: Value::Undefined,
-            this: Value::Undefined,
+            // ES: the top-level `this` of a script is the global object, in
+            // strict mode included. It used to be `undefined`, which made
+            // `this` at the top level unusable (and `Object.defineProperty(this, …)`
+            // a TypeError).
+            this: self.global_object.clone(),
             this_state: THIS_NONE,
             argc: 0,
             construct: false,
@@ -5929,6 +5937,19 @@ impl State {
 
     fn get_global(&self, name: &str) -> Option<Value> {
         self.globals.borrow().get(name).cloned()
+    }
+
+    /// Attach the global object's `[[Prototype]]` (`Object.prototype`).
+    ///
+    /// `State` is built before `Builtins` (the global object only wraps the
+    /// globals map), so the prototype has to be attached afterwards — and again
+    /// on every `run`, because a run installs a fresh `State`. Without it
+    /// `globalThis` has no `Object.prototype` methods at all: `hasOwnProperty`,
+    /// `toString`, and `Object.getPrototypeOf(globalThis)` all failed.
+    pub(crate) fn set_global_prototype(&mut self, proto: Gc<Object>) {
+        if let Value::Object(object) = self.global_object {
+            object.borrow_mut().set_prototype(Some(proto));
+        }
     }
 }
 
@@ -6707,6 +6728,8 @@ mod tests {
             instructions,
             HashMap::new(),
             Vec::new(),
+            false,
+            std::collections::HashSet::new(),
         )
     }
 
