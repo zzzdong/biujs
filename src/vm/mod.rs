@@ -309,6 +309,23 @@ impl VM {
         self.invoke_boundaries.last().copied()
     }
 
+    /// Run `f` with one `invoke_boundaries` entry and pop it on the way out.
+    ///
+    /// The entry is the GC safe point's "a Rust-driven JS call is in flight"
+    /// signal and the exception dispatcher's frame boundary. It used to be
+    /// pushed/popped by hand around fallible setup (`state.push` / `open_frame`);
+    /// any early `?` there left the entry behind, which disabled collection for
+    /// the rest of the run and made `handle_throw` use a stale boundary.
+    ///
+    /// The pop runs for both `Ok` and `Err`. A panic still aborts in release
+    /// (`panic = "abort"`), so it cannot leak a half-collected heap.
+    fn with_invoke_boundary<R>(&mut self, boundary: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invoke_boundaries.push(boundary);
+        let result = f(self);
+        self.invoke_boundaries.pop();
+        result
+    }
+
     /// 把一个 `Value` 登记为**宿主侧根**，返回 RAII 守卫。
     ///
     /// 收集器看不见机器栈，所以原生内建握在 Rust 局部变量里的 `Value`
@@ -4296,13 +4313,10 @@ impl VM {
         let Some(exc) = self.as_js_exception(&err) else {
             return Err(err);
         };
-        self.invoke_boundaries.push(boundary);
-        let dispatched = self.handle_throw(exc);
-        self.invoke_boundaries.pop();
-        dispatched
+        self.with_invoke_boundary(boundary, |vm| vm.handle_throw(exc))
     }
 
-        /// Drive the generator frame that is currently installed until it yields or
+    /// Drive the generator frame that is currently installed until it yields or
     /// returns, then take the frame down and restore the resumer's context.
     ///
     /// On `Err` the caller's context has already been restored.
@@ -4318,28 +4332,28 @@ impl VM {
         // bottom must come back as `Err(Thrown(_))` so the *resumer* dispatches
         // it. Letting it jump straight to a handler outside the frame would
         // unwind control-stack entries the nested loop still has to pop.
-        self.invoke_boundaries.push(saved.frame_depth);
-        self.generator_yielded = None;
-        // 出口改成"回到 resumer 那一帧"：生成器**返回**时 `Ret` 把它收掉；
-        // 而 `yield` / `PrologueEnd` 泊车时帧**还在**，靠 `step` 返回 `false`
-        // （它们把**自己那帧**的 pc 停在哨兵上）退出循环 —— 帧留着是刻意的，
-        // 挂起态就是那个没被收掉的帧。
-        //
-        // 边界取 `saved.frame_depth`（`save_execution_state` 在**装帧之前**取的），
-        // 而不是 `frames.len() - 1`：后者等于"假设生成器帧一定装好了"。
-        let boundary = saved.frame_depth;
-        let outcome = (|| -> Result<(), RuntimeError> {
-            loop {
-                if self.state.frames.len() <= boundary {
-                    break;
+        let outcome = self.with_invoke_boundary(saved.frame_depth, |vm| {
+            vm.generator_yielded = None;
+            // 出口改成"回到 resumer 那一帧"：生成器**返回**时 `Ret` 把它收掉；
+            // 而 `yield` / `PrologueEnd` 泊车时帧**还在**，靠 `step` 返回 `false`
+            // （它们把**自己那帧**的 pc 停在哨兵上）退出循环 —— 帧留着是刻意的，
+            // 挂起态就是那个没被收掉的帧。
+            //
+            // 边界取 `saved.frame_depth`（`save_execution_state` 在**装帧之前**取的），
+            // 而不是 `frames.len() - 1`：后者等于"假设生成器帧一定装好了"。
+            let boundary = saved.frame_depth;
+            (|| -> Result<(), RuntimeError> {
+                loop {
+                    if vm.state.frames.len() <= boundary {
+                        break;
+                    }
+                    if !vm.step(module)? {
+                        break;
+                    }
                 }
-                if !self.step(module)? {
-                    break;
-                }
-            }
-            Ok(())
-        })();
-        self.invoke_boundaries.pop();
+                Ok(())
+            })()
+        });
 
         // A `yield` left the frame on the value stack: lift it out before the
         // resumer's context is restored (which would rewind `rsp` below it).
@@ -6264,6 +6278,81 @@ mod tests {
         let mut state = State::new(&mut heap);
         let result = state.pop();
         assert!(matches!(result, Err(RuntimeError::RangeError(_))));
+    }
+
+    #[test]
+    fn state_trace_roots_pending_captured_cells() {
+        // `ClosureVar` parks cells in `pending_captured` until the following
+        // `Make*FuncObj` consumes them. The instruction boundary between the two
+        // is a GC safe point, so a cell that is not traced here can be swept
+        // before it is captured.
+        let mut heap = Heap::new();
+        let mut state = State::new(&mut heap);
+        let obj = heap.alloc(crate::vm::gc::Object::Ordinary(
+            crate::vm::object::OrdinaryObject::new(),
+        ));
+        let cell: EnvCell = Rc::new(RefCell::new(Some(Value::Object(obj))));
+        state.pending_captured.push(("captured".to_string(), cell));
+
+        let mut roots = crate::vm::gc::Worklist::new();
+        crate::vm::gc::Trace::trace(&state, &mut roots);
+        assert!(
+            roots
+                .iter()
+                .any(|root| crate::vm::gc::Gc::ptr_eq(root, &obj)),
+            "pending_captured must be a GC root"
+        );
+    }
+
+    #[test]
+    fn invoke_boundary_is_popped_when_the_body_fails() {
+        // A leaked entry disables collection for the rest of the run and makes
+        // `handle_throw` use a stale frame boundary.
+        let mut vm = VM::new();
+        let result: Result<(), RuntimeError> = vm.with_invoke_boundary(0, |_| {
+            Err(RuntimeError::RangeError("setup failed".to_string()))
+        });
+        assert!(result.is_err());
+        assert!(
+            vm.invoke_boundaries.is_empty(),
+            "invoke boundary leaked: {:?}",
+            vm.invoke_boundaries
+        );
+    }
+
+    #[test]
+    fn invoke_boundary_is_popped_when_open_frame_fails() {
+        // The innermost `map` callback is opened by `drive_bytecode_frame` at the
+        // call-depth limit: `state.push` succeeds, `open_frame` fails. Before the
+        // fix that early `?` leaked the boundary and disabled GC for the rest of
+        // the run.
+        let mut compiler = crate::Compiler::new();
+        let module = compiler
+            .compile(
+                r#"
+                function f(n) {
+                    if (n === 0) {
+                        return [1].map(function () {
+                            return [1].map(function () { return 1; });
+                        });
+                    }
+                    return f(n - 1);
+                }
+                f(510);
+                "#,
+            )
+            .expect("compilation failed");
+        let mut vm = VM::new();
+        let err = vm.run(&module).expect_err("must hit the call-depth guard");
+        assert!(
+            matches!(err, RuntimeError::RangeError(_) | RuntimeError::Thrown(_)),
+            "expected a stack-overflow error, got {err:?}"
+        );
+        assert!(
+            vm.invoke_boundaries.is_empty(),
+            "invoke boundary leaked: {:?}",
+            vm.invoke_boundaries
+        );
     }
 
     /// 单元测试用：压一个"顶层脚本帧"。

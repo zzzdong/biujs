@@ -91,6 +91,12 @@ impl Trace for State {
         self.aggregations.trace(out);
         self.finally_handlers.trace(out);
         self.closure_var_stack.trace(out);
+        // `ClosureVar` pushes cells here for the `Make*FuncObj` that follows.
+        // The window is short, but an instruction boundary is a GC safe point,
+        // so these are roots too.
+        for (_, cell) in &self.pending_captured {
+            cell.trace(out);
+        }
         self.frames.trace(out);
     }
 }

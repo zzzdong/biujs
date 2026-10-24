@@ -41,13 +41,35 @@ impl VM {
         // 调用在飞行中（`Array.prototype.map` 的回调、Map/Set 构造器的迭代协议、
         // `JSON.parse` 的 reviver…），那些原生把 `Value` 握在 **Rust 局部变量**里，
         // 而收集器看不见机器栈 —— 收一次就会把它们收走（GC stress 实测 6 条失败：
-        // "Map constructor: 'set' is not callable"）。宿主侧入根（`Scope`）是正解，
-        // 但在那之前，这是不让收集器踩空的闸门。
-        if self.heap.should_collect() {
+        // "Map constructor: 'set' is not callable"）。
+        //
+        // 2026-10-18：这个闸门**曾经从代码里丢失**，只剩注释（`should_collect()`
+        // 一查就收，没有问 `invoke_boundaries`）。`Scope` / `Roots` 那套宿主侧
+        // 入根已经接了约 20 处，但原生回调握在 Rust 局部变量里的值还没有全部
+        // 接入 —— 所以闸门不是"过渡措施"，它就是当前的安全契约。后续若要把重入
+        // 期间的收集打开，前置工作是把这些局部值接入 `Roots`，而不是先删闸门。
+        //
+        // 跳过是有界的：`drive_bytecode_frame` / `run_generator_frame` 都在
+        // 步数/时钟护栏之内，边界弹出后下一个安全点照常收集。
+        if self.invoke_boundaries.is_empty() && self.heap.should_collect() {
             let mut roots = crate::vm::gc::Worklist::new();
             crate::vm::gc::Trace::trace(self, &mut roots);
             self.heap.collect(roots);
         }
+        // Cheap geometry guard. The stronger `rbp == frames.last().base` is the
+        // goal, but it does not hold on the generator suspension paths yet
+        // (`handle_throw` / `restore_execution_state` deliberately restore the
+        // pre-suspension snapshot; see `docs/ARCH-REVIEW-2026-10-24.md` §3.6).
+        // This one catches accidental downward rewinds without encoding that
+        // known exception.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.state.rbp <= self.state.rsp,
+            "frame geometry: rbp {} > rsp {} at pc {}",
+            self.state.rbp,
+            self.state.rsp,
+            self.state.pc()
+        );
         // Borrowed, not cloned: `module` and `self` are distinct, so the
         // instruction can be matched in place — no 48-byte copy per step.
         let inst = match module.instructions.get(self.state.pc()) {
@@ -840,67 +862,84 @@ impl VM {
         // 而它们必须保持一致 —— 那就是"两条知识"的来源。
         let boundary = self.state.frames.len();
         self.invoke_boundaries.push(boundary);
-        // `PushC`/`PopC` 的保存项也需要一个水位：异常逃出被调帧时，它自己那几条
-        // 没来得及 `PopC` 的项必须丢掉 —— 否则外层之后会 `PopC` 到过期的 `rsp`/`rbp`。
+        // Setup is fallible (`push` can hit the stack cap, `open_frame` the call
+        // depth cap). Running it in a closure means the `?`s below cannot skip
+        // the `invoke_boundaries.pop()` and leave GC disabled for the rest of
+        // the run. The loop itself already captures its error in `outcome`.
+        let setup = (|| -> Result<(), RuntimeError> {
+            // `PushC`/`PopC` 的保存项也需要一个水位：异常逃出被调帧时，它自己那几条
+            // 没来得及 `PopC` 的项必须丢掉 —— 否则外层之后会 `PopC` 到过期的 `rsp`/`rbp`。
 
-        // Push the arguments and open the callee's frame at the new stack top,
-        // using the same convention as the `Call`/`CallEx` opcodes (arg0 ends up
-        // at `[rbp-1]`).
-        for arg in args.iter().rev() {
-            self.state.push(arg.clone())?;
-        }
-        // 不再在这里切 `rbp`：下面 `open_frame` 会在开帧时设定（唯一的写入时机）。
+            // Push the arguments and open the callee's frame at the new stack top,
+            // using the same convention as the `Call`/`CallEx` opcodes (arg0 ends up
+            // at `[rbp-1]`).
+            for arg in args.iter().rev() {
+                self.state.push(arg.clone())?;
+            }
+            // 不再在这里切 `rbp`：下面 `open_frame` 会在开帧时设定（唯一的写入时机）。
 
-        // Sentinel return address one past the last instruction: when the callee
-        // returns, `Ret` lands here and the nested loop stops.
-        // 哨兵返回地址 = **整个模块的下一位**，而不是被调函数自己的出口。
-        //
-        // 嵌套 `step` 循环的终止条件是 `module.instructions.get(pc) == None`，即
-        // **pc 越界**；它不是"pc == 某个返回值"。所以哨兵必须是一个**不存在的 pc**。
-        // （试过用 `module.body_of(func_id).end` 当哨兵 —— 那是个合法的 pc，于是
-        // `Ret` 之后循环接着跑下一段函数的代码，array / async / promise 一片红。
-        // 要改成 per-function 哨兵，得先让循环在"pc == 本帧哨兵"时停止 —— 那是
-        // 深改第 4 步（帧模型重写）的事，见 `docs/archive/architecture-redesign.md`。）
+            // Sentinel return address one past the last instruction: when the callee
+            // returns, `Ret` lands here and the nested loop stops.
+            // 哨兵返回地址 = **整个模块的下一位**，而不是被调函数自己的出口。
+            //
+            // 嵌套 `step` 循环的终止条件是 `module.instructions.get(pc) == None`，即
+            // **pc 越界**；它不是"pc == 某个返回值"。所以哨兵必须是一个**不存在的 pc**。
+            // （试过用 `module.body_of(func_id).end` 当哨兵 —— 那是个合法的 pc，于是
+            // `Ret` 之后循环接着跑下一段函数的代码，array / async / promise 一片红。
+            // 要改成 per-function 哨兵，得先让循环在"pc == 本帧哨兵"时停止 —— 那是
+            // 深改第 4 步（帧模型重写）的事，见 `docs/archive/architecture-redesign.md`。）
 
-        // 模式差异在一处算清；开帧那 15 行在 `open_frame` 里，与各 opcode 内联开帧共用。
-        let (this_val, function_val, new_target_val, is_construct) = match mode {
-            FrameMode::Call {
+            // 模式差异在一处算清；开帧那 15 行在 `open_frame` 里，与各 opcode 内联开帧共用。
+            let (this_val, function_val, new_target_val, is_construct) = match mode {
+                FrameMode::Call {
+                    this_val,
+                    captured_new_target,
+                    new_target_override,
+                } => (
+                    this_val,
+                    match callee {
+                        Value::Function(id) => self.materialize_function(*id),
+                        other => other.clone(),
+                    },
+                    new_target_override
+                        .or(captured_new_target)
+                        .unwrap_or(Value::Undefined),
+                    false,
+                ),
+                // 构造帧的 `this` 是刚建好的实例，`function_val` 与 `new.target` 都是
+                // `new_target`（`Reflect.construct` 会把它换成第三个参数）。
+                FrameMode::Construct {
+                    new_obj,
+                    new_target,
+                } => (new_obj, new_target.clone(), new_target, true),
+            };
+            if is_construct {
+                // 构造器不显式返回对象时，结果就是 `this` —— 先把 `Rv` 清成
+                // `undefined`，让"看 `Rv` 是不是对象"这一步能成立。
+                self.state.set_register(Register::Rv, Value::Undefined)?;
+            }
+            self.open_frame(
+                func_id,
+                args.len(),
                 this_val,
-                captured_new_target,
-                new_target_override,
-            } => (
-                this_val,
-                match callee {
-                    Value::Function(id) => self.materialize_function(*id),
-                    other => other.clone(),
-                },
-                new_target_override
-                    .or(captured_new_target)
-                    .unwrap_or(Value::Undefined),
-                false,
-            ),
-            // 构造帧的 `this` 是刚建好的实例，`function_val` 与 `new.target` 都是
-            // `new_target`（`Reflect.construct` 会把它换成第三个参数）。
-            FrameMode::Construct {
-                new_obj,
-                new_target,
-            } => (new_obj, new_target.clone(), new_target, true),
-        };
-        if is_construct {
-            // 构造器不显式返回对象时，结果就是 `this` —— 先把 `Rv` 清成
-            // `undefined`，让"看 `Rv` 是不是对象"这一步能成立。
-            self.state.set_register(Register::Rv, Value::Undefined)?;
+                function_val,
+                captured_vars,
+                is_construct,
+                new_target_val,
+                module,
+            )?;
+            Ok(())
+        })();
+        // A failed setup still has to restore the caller's geometry: `open_frame`
+        // may have pushed a partial frame before returning `Err`.
+        if let Err(err) = setup {
+            self.invoke_boundaries.pop();
+            self.unwind_frames_to(boundary, saved_closure, saved_seh);
+            self.state.pending_captured.truncate(saved_pending);
+            self.state.rsp = saved_rsp;
+            self.state.rbp = self.state.frame_base();
+            return Err(err);
         }
-        self.open_frame(
-            func_id,
-            args.len(),
-            this_val,
-            function_val,
-            captured_vars,
-            is_construct,
-            new_target_val,
-            module,
-        )?;
 
         // Drive the nested frame. On error the caller's context is restored
         // first, so an enclosing `try` still sees the exception: unwinding has
