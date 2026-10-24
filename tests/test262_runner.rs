@@ -343,16 +343,17 @@ fn build_source(test: &Test) -> String {
     parts.push(&test.source);
     let source = parts.join("\n");
 
-    // test262's `onlyStrict` tests carry no `"use strict"` of their own — the
-    // runner supplies it, and it has to be the *first* statement of the
-    // assembled program or it is an ordinary expression statement and the whole
-    // program stays sloppy. Without this, a test whose entire point is a strict
-    // early error (`for ({ eval } of [])`, `function f(a, a) {}`, …) was parsed
-    // as sloppy code and the engine was asked to accept it.
-    if test.desc.flags.contains(&Flag::OnlyStrict) {
-        return format!("\"use strict\";\n{source}");
-    }
-    source
+    // The engine is **strict-only** (§1), so every test it runs is a strict
+    // program: the runner supplies the directive, and it has to be the *first*
+    // statement of the assembled program or it is an ordinary expression
+    // statement and the program stays sloppy.
+    //
+    // This used to apply only to `onlyStrict`; tests without a flag were run
+    // sloppy, which let the engine pass for the wrong reason (an unimplemented
+    // sloppy behaviour and an unimplemented strict behaviour are different
+    // gaps, and only the strict one is in scope). `noStrict` / `raw` tests are
+    // skipped in `should_skip` — they are sloppy by definition.
+    format!("\"use strict\";\n{source}")
 }
 
 // ─────────────────────────────────────────────────────────
@@ -469,34 +470,44 @@ fn is_unsupported(feature: &str) -> bool {
         .any(|f| feature.starts_with(f) || feature.contains(f))
 }
 
-/// Source patterns biujs cannot handle at all.
+/// Guard for the scope table itself.
+///
+/// The match is deliberately loose (`starts_with` **or** `contains`), which
+/// cuts both ways: an entry for a *short* name also skips unrelated longer
+/// tags. `Array.prototype.flatMap` containing `"Map"` is the recorded accident
+/// (§6.1), and it is only correct because the tag is listed explicitly.
+#[test]
+fn scope_table_does_not_accidentally_skip() {
+    assert!(!is_unsupported("Map"));
+    assert!(!is_unsupported("Set"));
+    assert!(is_unsupported("BigInt"));
+    assert!(is_unsupported("class-fields-private"));
+    assert!(is_unsupported("Array.prototype.flatMap"));
+}
+
+/// Source patterns biujs cannot handle at all — **syntax the engine
+/// deliberately does not have**, nothing else.
+///
+/// Substring matching is a blunt instrument, so this list must stay minimal:
+/// every entry formerly here that named something *unimplemented at the time*
+/// (`JSON`, `Date`, `RegExp`, `yield`, `async`, `function*`, `label:`) had to
+/// go once the feature existed, and until it did it silently hid tests that
+/// would have measured the gap (§1.2: `Date` was implemented while every test
+/// mentioning the word was skipped).
 const UNSUPPORTED_PATTERNS: &[&str] = &[
+    // `eval` and the `Function` constructor (§1 明确不做).
     "eval(",
-    // `JSON` used to be listed here while it was unimplemented; it is now a
-    // real built-in, so tests that exercise it must run.
-    "Date",
-    "RegExp",
-    // `$DONOTEVALUATE` is *not* unsupported: these are ordinary negative tests.
-    // The harness makes `$DONOTEVALUATE` throw, so the call is only reached if
-    // the engine wrongly accepted the syntax it was supposed to reject — and the
-    // runner already handles `negative:` metadata (§2.1y).
     "new Function(",
     "Function(\"",
     "Function('",
-    "$ERROR",
-    "print(",
-    // `yield ` and `async `/`await ` used to be listed here while generators and
-    // async functions were unimplemented; both are implemented now, so sources
-    // exercising them must run.
+    // Modules are out of scope for now (§1).
     "import(",
     "import ",
     "export ",
+    // `with` is out of scope; the engine rejects it with a compile error, and
+    // a test whose point is `with` cannot pass.
     "with (",
     "with(",
-    "label:",
-    // `function*` used to be listed here while generators were unimplemented;
-    // the M4-G1 subset handles them, so generator sources must run.
-    "=>*",
 ];
 
 fn should_skip(test: &Test) -> Option<String> {
@@ -518,6 +529,14 @@ fn should_skip(test: &Test) -> Option<String> {
             // ~5k tests (463 of the 556 generator tests alone) — see §2.1y.
             Flag::Module => {
                 return Some(format!("flag {flag:?}"));
+            }
+            // The engine targets **strict mode only** (§1): a test whose point
+            // is sloppy semantics (`noStrict`) or that must run as-is without a
+            // strict directive (`raw`) cannot pass, and keeping them in the pool
+            // only inflates the failure count. Everything else runs under the
+            // directive the runner prepends (see `build_source`).
+            Flag::NoStrict | Flag::Raw => {
+                return Some(format!("flag {flag:?} (strict-only target)"));
             }
             _ => {}
         }

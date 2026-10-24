@@ -7,29 +7,33 @@
 >
 > **进展（2026-10-24/25）**：0.2 `invoke_boundaries` 作用域化 + 2 条回归测试、
 > 0.3 `pending_captured` 入根 + 单测、0.4 `rbp <= rsp` debug 断言、
-> 0.1 护栏计数写入基线（旧快照仅提示）、0.5 常量/立即数的运行时检查、
+> 0.1 护栏计数写入基线、0.5 常量/立即数的运行时检查、
 > 0.6 字节码 dumper + 16 组 golden（`tests/golden/bytecode/`）并删除
-> `Module::debug_instructions` 的 IR 克隆已落地。默认内存预算调回 384MB：
-> 全量回到 **17,363 / 20,677（83.97%）**，与 2026-10-18 基线逐套件一致，无回退。
+> `Module::debug_instructions` 的 IR 克隆、0.7 scope 表收口（`noStrict`/`raw` 跳过、
+> 删掉过宽的源码子串门控、所有用例统一前置 `"use strict"`）已落地。
+> 默认内存预算调回 384MB；scope 收口后全量为
+> **17,206 / 20,504（83.92%）**，跳过 8,577、失败 3,298。
 
 ---
 
 ## 0. 结论摘要
 
-1. **当前通过率 83.97%**（17,363 / 20,677，跳过 8,404，失败 3,314）。语言层
-   `language/*` 91.20%，内建层 `built-ins/*` 77.71% —— **差距主要在内建，不在语法**。
-2. 与 2026-10-18 基线（17,363 / 3,314）逐套件一致。此前 256MB 预算下少 5 条，
+1. **当前通过率 83.92%**（17,206 / 20,504，跳过 8,577，失败 3,298；scope 收口后
+   2026-10-25 基线）。收口前为 83.97%（17,363 / 20,677）。语言层 `language/*`
+   与内建层 `built-ins/*` 的差距仍是主要矛盾 —— **差距在内建，不在语法**。
+2. 384MB 下与 2026-10-18 基线（17,363 / 3,314）逐套件一致。此前 256MB 预算下少 5 条，
    是 `built-ins/Array` 的**内存护栏误伤**：`TEST262_MEMORY_MB=0` 时 Array 回到 2311
    通过。**工作区没有语义回退**；2026-10-24 已把默认预算调回 384MB。
 3. **未入册的四个 ES6 套件实测只有 45.31%**（735 / 1,622）：
    Date 45.5%、ArrayBuffer 23.5%、DataView 44.1%、TypedArrayConstructors 58.4%。
    全部入册后总盘约为 **18,093 / 22,299 = 81.14%**，还剩 **4,206 条失败**。
    这还没有算 modules 与 RegExp —— 它们目前被整体排除在分母外。
-4. **目标口径不干净**：8,404 条跳过里 3,732 条是 ES2022 的 class 私有/静态私有，
-   1,820 条 async-iteration，658 条 BigInt；但同时 `class-fields-public`（2,054 条）、
-   `object-rest`、`resizable-arraybuffer` 等后 ES6 特性**没有**被 gate，直接进入分母。
-   `Date` 已实现，却被源码子串 `"Date"` 整族跳过；`noStrict` 的 832 条也在跑，
-   而引擎目标是 strict-only。**83.95% 是“当前支持面”的通过率，不是 ES6 一致率。**
+4. **目标口径（已部分收口）**：`noStrict` / `raw` 用例现在跳过（strict-only 目标），
+   `Date` / `RegExp` / `label:` / `print(` / `$ERROR` / `=>` 等过宽的**源码子串门控**已删除
+   （Object +166、String +49、Array +28）。仍未收口的是：
+   `class-fields-public`（2,054 条）、`object-rest`、`resizable-arraybuffer` 等后 ES6 特性
+   **没有**被 gate，直接进入分母；`built-ins/Date` 等 ES6 套件仍未入册。
+   **83.92% 仍是“当前支持面”的通过率，不是 ES6 一致率。**
 5. **strict 只做了一半**：`"use strict"` 下的早期错误（重复参数、`with`、八进制、
    `eval`/`arguments` 赋值）会报；但**运行时严格语义没有**：
    `"use strict"; x = 1` 仍会创建全局；sloppy 的 `with ({x:2}) { … }` 能编译且行为错误
@@ -66,7 +70,7 @@
 | 构建警告 | 77（`cargo build --release`） |
 | `cargo clippy --release --lib` | **442 warnings**（主要是 `collapsible_if` 88、冗余字段名 79、`Value` 上多余的 `clone` 61、冗余闭包 36、未用 import 30+） |
 | 源码规模 | 46,013 行：compiler 11,980 / vm 20,949 / builtins 9,885 |
-| 全量 test262（384MB） | **20,677 执行 = 17,363 通过 + 3,314 失败；8,404 跳过；83.97%** |
+| 全量 test262（384MB，scope 收口后） | **20,504 执行 = 17,206 通过 + 3,298 失败；8,577 跳过；83.92%** |
 | 护栏 | timeout 0 / step-limit 0 / memory 14 |
 | 全量墙钟 | 约 7–9 分钟（4 片串行；不含首次全量构建） |
 
@@ -79,15 +83,22 @@ awk -F'\t' '!/^#/{p+=$2;s+=$3;f+=$4} END{printf "passed %d skipped %d failed %d 
 
 ### 1.2 基线漂移与“假回退”
 
-- `docs/phase2-status.tsv`（2026-10-18）是唯一自洽快照：17,363 / 3,314 / 8,404。
+- `docs/phase2-status.tsv`（2026-10-18）曾是唯一自洽快照：17,363 / 3,314 / 8,404。
 - 256MB 下实测 17,358 / 3,319，唯一逐套件差异是 `built-ins/Array` 2311 → 2306；
   关掉内存护栏后 Array 回到 **2311** 通过，5 条失败均为 `memory budget exceeded`。
 - 也就是说：**5 条不是语义回退，是 256MB 预算的边界用例**。2026-10-24 默认预算已
   调回 **384MB**：全量回到 **17,363 / 3,314 / 8,404**，无逐套件回退。
+- 2026-10-25 做完 0.7 scope 收口后刷新基线：**17,206 / 3,298 / 8,577（83.92%）**。
+  逐套件“回退”全部来自 `noStrict` 不再计入分母（失败数同时下降），净收益是
+  Object +166、String +49、Array +28；唯一失败数上升的 `expressions/addition`
+  （4 → 5）来自此前被 `"Date"` / `print(` 门控挡住的用例（Date 加法、`f + 1`、
+  Symbol → Number 抛错、求值顺序），是**暴露出来的真缺口**。
 - 基线快照必须把 `TEST262_TIMEOUT_MS / TEST262_STEP_LIMIT / TEST262_MEMORY_MB`
-  一起记录，否则每次比较都会把护栏漂移当成代码回退。
+  一起记录，否则每次比较都会把护栏漂移当成代码回退。脚本已支持写入与比较，
+  新快照头部形如
+  `# guards: timeout 0 step-limit 0 memory 14 (TEST262_TIMEOUT_MS=15000 …)`。
 - 文档里的数字已经互相矛盾：README 83.42%（10-17）、PROJECT 标 10-11 实为 10-17、
-  PLAN 84.06%（更早）、tsv 83.97%（10-18）。本次审查以 tsv + 实测为准。
+  PLAN 84.06%（更早）。本次审查以 tsv + 实测为准；0.10 会把这些数字改成脚本生成。
 
 ### 1.3 未入册套件实测（临时 runner，已删除）
 
@@ -163,9 +174,9 @@ class / Promise / Function / Number 这 8 个桶打掉，就能覆盖约 80% 的
 > 逐条原因。要把估算变成实测，跑一次
 > `TEST262_FAILURES=99999` 并用 `scripts/kpi-noise.py` 归类。
 
-### 2.3 目标口径的三个问题
+### 2.3 目标口径的问题（0.7 已处理 c 与 d，a/b 仍开放）
 
-**(a) 跳过的 8,404 条不是同一类东西。** 实测跳过原因 Top：
+**(a) 跳过的 8,577 条不是同一类东西。** 实测跳过原因 Top（0.7 之前的口径）：
 
 | 原因 | 条数 | 性质 |
 |---|---|---|
@@ -192,19 +203,18 @@ class / Promise / Function / Number 这 8 个桶打掉，就能覆盖约 80% 的
 其中 class fields / object rest 实际已实现，跑它们不是错；但它们不属于 ES6，
 **混进同一个通过率就无法回答“ES6 还差多少”**。
 
-**(c) 源码子串门控在隐藏已实现的功能。**
-`tests/test262_runner.rs:473-500` 的 `UNSUPPORTED_PATTERNS` 里有 `"Date"`、`"RegExp"`、
-`"label:"`、`"print("`、`"$ERROR"` 等。**Date 已有实现**（B31，实测 45.5%），但任何源码含 `"Date"`
-的用例都被跳过，`built-ins/Date` 也从未入册。`label:` 会跳过所有带标签语句的用例，
-而标签是 ES3 语法。`Date`/`RegExp` 还会匹配注释里的词。**这类门控必须改为按
-feature/flag 判定，而不是源码子串。**
+**(c) 源码子串门控在隐藏已实现的功能 —— 已修。**
+`UNSUPPORTED_PATTERNS` 里原有 `"Date"`、`"RegExp"`、`"label:"`、`"print("`、`"$ERROR"`、
+`"=>` 等。**Date 已有实现**（B31，实测 45.5%），但任何源码含 `"Date"` 的用例都被跳过；
+`label:` 跳过所有带标签语句的用例，而标签是 ES3 语法且引擎已支持（实测 `outer: for`
+正常）。0.7 把它们全部删掉，只保留"语法上明确不做"的四类（`eval` / `Function` 构造器 /
+`with` / modules）。收益：Object +166、String +49、Array +28。
 
-**(d) strict-only 目标与 `noStrict` 混跑。** 832 条 `noStrict` 用例在跑，而引擎的
-目标是严格模式；同时未加 `"use strict"` 的普通用例也是按 sloppy 跑的。当前
-strictness 是“指令驱动”，不是“引擎模式”，所以同一份代码在不同测试里语义不同。
-
-> 建议：runner 改成 **skip `noStrict`，对其余所有用例统一前置 `"use strict"`**；
-> 这是让“strict-only”目标可测的前提。会改变分母，必须作为一次显式的基线变更记录。
+**(d) strict-only 目标与 `noStrict` 混跑 —— 已修（测量侧）。** 0.7 起
+`noStrict` / `raw` 用例跳过，其余所有用例统一前置 `"use strict"`（此前只有
+`onlyStrict` 会前置，普通用例按 sloppy 跑）。跳过 +173、执行 20,677 → 20,504。
+注意这只解决了**测量**：引擎的 strictness 仍然是“指令驱动”（见 §2.4）——
+运行时严格语义与全局对象仍是缺口，那是 0.8 的事。
 
 ### 2.4 语言层的实际缺口（不只是内建）
 
@@ -228,8 +238,8 @@ typeof globalThis.hasOwnProperty   // "undefined"（应继承自 Object.prototyp
 
 | 口径 | 当前 | 说明 |
 |---|---|---|
-| **A. 当前支持面**（已入册 107 套件） | **83.95%**（17,358 / 20,677） | 现有 README 的数字；混入后 ES6 特性 |
-| **B. ES6 核心 + 已实现扩展**（加入 Date/AB/DV/TAConstructors） | **81.14%**（18,093 / 22,299） | 建议采用；明确列出排除项 |
+| **A. 当前支持面**（已入册 107 套件，scope 收口后） | **83.92%**（17,206 / 20,504） | 现有数字；混入后 ES6 特性 |
+| **B. ES6 核心 + 已实现扩展**（再加入 Date/AB/DV/TAConstructors） | ≈ **81.1%**（17,941 / 22,126） | 建议采用；明确列出排除项 |
 | **C. ES6 全家桶**（再加 modules / RegExp） | 未知，预计 < 70% | modules 完全没做；RegExp 无完整引擎 |
 
 建议采用 **B**，并把它写成机器可读的 scope 表：
@@ -471,7 +481,7 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 | 0.4 | `step` 里加 debug 断言：`rbp == frames.last().base`、`rsp` 边界、frame 深度 | 全量 debug 构建零命中 |
 | 0.5 | `Operand::as_immediate() -> Option`；环境/调用指令的 `-1` 哨兵改 `Option`；`constants.get()` 替代索引 | `src/vm` 无 `as_immd` panic 路径；坏模块返回 `InternalError` |
 | 0.6 | 字节码 dumper + 20–30 个脚本的 golden 测试；`Module` 去掉 `debug_instructions` 克隆（或改为可选 feature） | 同一源码字节码逐字节稳定；Module 内存下降 |
-| 0.7 | scope 表：把 `OUT_OF_SCOPE_FEATURES`/`IN_SCOPE_PENDING` 改成数据驱动；删 `"Date"`/`"RegExp"`/`"label:"` 等过宽 pattern；`noStrict` 统一 skip；所有非 noStrict 用例前置 `"use strict"` | 生成双轨报告（es6-core / extended）；`built-ins/Date` 可测 |
+| ~~0.7~~ **已完成** | scope 表收口：删 `"Date"`/`"RegExp"`/`"label:"`/`print(`/`$ERROR` 等过宽 pattern；`noStrict`/`raw` 跳过；所有用例统一前置 `"use strict"`；`is_unsupported` 加了陷阱用例 | 全量 17,206 / 20,504（83.92%）；Object +166、String +49、Array +28；基线已刷新并写入 guard 行 |
 | 0.8 | strict 运行时收口：`with` 永远 SyntaxError；隐式全局赋值 ReferenceError；顶层 `this = globalThis`；`globalThis` 临时挂 `Object.prototype` | 四条探针通过；相关 test262 不退化 |
 | 0.9 | CI：build + unit + features + guards + clippy baseline；周度全量 | PR 不再把回归留到人工发现 |
 | 0.10 | 文档去重：README/PROJECT/PLAN/tsv 的数字由脚本生成，不再手写 | 一处数据源 |
@@ -569,19 +579,19 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 
 ## 6. 接下来 10 个具体动作（按顺序）
 
-1. 修 `invoke_boundaries` 泄漏（RAII），加回归用例。
-2. `State::trace` 补 `pending_captured`；跑 `BIUJS_GC_STRESS=1` feature。
-3. 基线记录 guard 配置；确认 5 条 Array 是 memory budget 误伤（已复现）。
-4. `step` 加 `rbp/rsp` debug 断言；打开被注释掉的互校。
-5. `Operand::as_immediate() -> Option`；清 `-1` 哨兵与 `constants[]` 索引。
+已完成：1（boundary RAII）、2（pending_captured 入根）、3（guard 配置+预算 384MB）、
+4（debug 几何断言）、5（运行时立即数/常量检查）、7（scope 表收口 + 基线刷新）、
+9（字节码 dumper + 16 组 golden，删除 IR 克隆）。
+
+剩余（按顺序）：
+
 6. 删 `BIUJS_REG_VARS` 与变量寄存器分配（先固定内存驻留语义）。
-7. scope 表数据化：删 `"Date"`/`"RegExp"`/`"label:"` 门控；skip `noStrict`；
-   统一 strict 前置；`built-ins/Date` 加入 SUITES 并记录新基线。
 8. strict 运行时收口：`with` 永远报错、隐式全局报错、顶层 `this = globalThis`、
-   `globalThis` 挂 `Object.prototype`。
-9. 字节码 dumper + golden 测试；`Module` 去掉 `debug_instructions` 克隆。
-10. 启动 1A（Atom/PropertyKey）与 1D（Array 的 NativeId）两条并行小批；
-    每批单独跑全量。
+   全局对象接上 `Object.prototype` —— 这是 0.8，也是语言层最大的单项缺口。
+10. 文档数字脚本化（0.10），再进入架构阶段：
+    1A（Atom/PropertyKey）→ 1B（ObjectHeader/Shape/全局对象/Realm）→
+    1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→
+    Phase 2（帧几何/GC/字节码 v2）→ Phase 3（编译器简化）。
 
 ---
 

@@ -244,7 +244,12 @@ echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 #
 # 顺带修正一处陈旧：本常量停在 B46 时的 7843，而基线快照自那之后已多次刷新
 # （上次快照 8310）—— 常量与快照不同步会让每一批都误报"跳过表被改动了"。
-EXPECTED_SKIPPED=8404
+# 8404 → 8577（2026-10-25，scope 批）：`noStrict` / `raw` 用例不再进入分母
+# （引擎是 strict-only，sloppy 语义的用例不能通过，留在池子里只会虚增失败数）；
+# 同时删掉 `Date` / `RegExp` / `label:` / `print(` / `$ERROR` / `=>*` 这些**过宽的源码
+# 子串门控** —— 它们把一大批已经能跑的用例挡在池外（Object +166、String +49、
+# Array +28）。净效果：跳过 +173，执行 20,677 → 20,504，通过率 83.97% → 83.92%。
+EXPECTED_SKIPPED=8577
 if [ "$SKIPPED" != "$EXPECTED_SKIPPED" ]; then
   echo "  !! 跳过数从 $EXPECTED_SKIPPED 变为 $SKIPPED —— 跳过表被改动了。"
   echo "     请确认这是有意的（计划书 §2.2：交付特性时必须同批解锁），并更新本脚本的 EXPECTED_SKIPPED。"
