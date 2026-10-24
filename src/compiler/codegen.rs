@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use log::{debug, trace};
+use log::debug;
 
 use super::ir::{BlockId, ControlFlowGraph, Instruction, Value, Variable};
 use crate::bytecode::{AbsPc, EhRegion, Instr, Operand, Register, RelPc};
 
-use super::regalloc::{Action, RegAlloc};
+use super::frame_slots::FrameSlots;
 
 type PatchFn = Box<dyn Fn(&mut Codegen)>;
 
@@ -27,23 +27,12 @@ struct EhDecl {
 }
 
 pub struct Codegen {
-    reg_alloc: RegAlloc,
+    /// 帧槽分配（内存驻留语义：每个变量一个固定栈槽）。
+    slots: FrameSlots,
     codes: Vec<Instr>,
     block_map: HashMap<isize, isize>,
     inst_index: usize,
     throw_to_handlers: HashMap<BlockId, Vec<BlockId>>,
-    /// Keep every variable in a fixed stack slot, using registers only as
-    /// per-instruction temporaries.
-    ///
-    /// Default. A single-pass, layout-ordered code generator cannot know which
-    /// predecessor ran, so a value that this pass believes is in a register may
-    /// never have been written on the path that is actually taken. Addressing
-    /// variables through memory removes that entire class of bug. It is also
-    /// faster in practice: no registers have to be saved around a call.
-    /// `BIUJS_REG_VARS` opts into the register path (see `begin_block` /
-    /// `spill_live_out`), which keeps values in registers inside a block and
-    /// only routes them through memory at block boundaries.
-    memory_resident_vars: bool,
     /// EH 区域声明（顺序即 `Try` 的发射顺序）。
     eh_decls: Vec<EhDecl>,
     /// `(区域身份块 id, 该 `EndTry` 的 pc)`。**一条区域可以有 0/1/2 个**：
@@ -54,15 +43,13 @@ pub struct Codegen {
 }
 
 impl Codegen {
-    pub fn new(registers: &[Register], throw_to_handlers: HashMap<BlockId, Vec<BlockId>>) -> Self {
+    pub fn new(throw_to_handlers: HashMap<BlockId, Vec<BlockId>>) -> Self {
         Self {
-            reg_alloc: RegAlloc::new(registers),
+            slots: FrameSlots::new(),
             codes: Vec::new(),
             block_map: HashMap::new(),
             inst_index: 0,
             throw_to_handlers,
-            // Memory-resident by default; opt into the register path explicitly.
-            memory_resident_vars: std::env::var("BIUJS_REG_VARS").is_err(),
             eh_decls: Vec::new(),
             eh_exits: Vec::new(),
             eh_regions: Vec::new(),
@@ -81,31 +68,15 @@ impl Codegen {
         log::debug!("=== end IR ===");
         let block_layout = cfg.loop_root_reverse_postorder_layout2();
 
-        // A value can escape to an exception handler from the middle of a block,
-        // which the per-terminator hand-off of the register path cannot cover.
-        // Functions with a handler therefore always keep variables in memory,
-        // so any handler can reload them whichever instruction threw.
-        let uses_exception_handlers = cfg.blocks().iter().any(|block| {
-            block
-                .instructions()
-                .iter()
-                .any(|inst| matches!(inst, Instruction::PushSeh { .. }))
-        });
-        if uses_exception_handlers {
-            self.memory_resident_vars = true;
-        }
-
-        self.reg_alloc.arrange(&cfg, &block_layout);
-
         let mut patchs: Vec<PatchFn> = Vec::new();
 
         // alloc stack frame, need rewrite with actual stack size
         // rsp = rsp + stack_size
         let pos = self.codes.len();
         patchs.push(Box::new(move |this: &mut Self| {
-            // 帧大小要等寄存器分配跑完才知道，所以先发射占位再回填。
+            // 帧大小要等所有变量都拿到槽位才知道，所以先发射占位再回填。
             if let Instr::AddC { value, .. } = &mut this.codes[pos] {
-                *value = Operand::new_immd(this.reg_alloc.stack_size() as isize);
+                *value = Operand::new_immd(this.slots.stack_size() as isize);
             }
         }));
         // placeholder
@@ -115,22 +86,8 @@ impl Codegen {
             self.block_map
                 .insert(block.id().as_usize() as isize, self.codes.len() as isize);
 
-            // No register state survives a block boundary; each block reloads
-            // what it needs from memory (see `RegAlloc::begin_block`).
-            self.reg_alloc.begin_block();
-
             for inst in block.instructions() {
-                // Hand the values a successor still needs over through memory
-                // before control leaves the block.
-                if inst.is_terminator() {
-                    for (register, stack) in self.reg_alloc.spill_live_out(block.id()) {
-                        trace!("block-end spill [rbp+{stack}] <- {register}");
-                        self.codes.push(Instr::Mov { dst: Operand::Stack(stack as isize), src: register.into() });
-                    }
-                }
-
                 debug!("inst[{}]: {inst:?}", self.inst_index);
-                debug!("register: {}", self.reg_alloc.reg_set);
 
                 match inst.clone() {
                     // Function Call Instructions
@@ -159,7 +116,7 @@ impl Codegen {
                     // Load and Move Instructions
                     Instruction::LoadArg { dst, index } => {
                         let dst = self.gen_operand(dst);
-                        let stack = self.reg_alloc.load_arg(index);
+                        let stack = self.slots.load_arg(index);
                         self.codes.push(Instr::Mov { dst: dst, src: Operand::new_stack(stack) });
                     }
                     Instruction::LoadConst { dst, const_id } => {
@@ -391,15 +348,8 @@ impl Codegen {
                         // The callee runs in a nested frame and freely reuses
                         // registers, so live values must be saved across it —
                         // same contract as `gen_call`.
-                        let in_use_registers = self.call_saved_registers();
-                        for reg in in_use_registers.iter().copied() {
-                            self.codes.push(Instr::Push { src: reg.into() });
-                        }
                         self.codes
                             .push(Instr::CallSpread { callee: callee, this: this, args: args });
-                        for reg in in_use_registers.iter().rev().copied() {
-                            self.codes.push(Instr::Pop { dst: reg.into() });
-                        }
                         // The result travels in Rv (same as CallMethod).
                         let result = self.gen_operand(result);
                         self.codes.push(Instr::Mov { dst: result, src: Operand::new_register(Register::Rv) });
@@ -415,14 +365,7 @@ impl Codegen {
                         let args = self.gen_operand(args);
                         // Same register contract as `CallSpread`: the callee runs
                         // in a nested frame and reuses registers.
-                        let in_use_registers = self.call_saved_registers();
-                        for reg in in_use_registers.iter().copied() {
-                            self.codes.push(Instr::Push { src: reg.into() });
-                        }
                         self.codes.push(Instr::CallSuperSpread { callee: callee, this: this, args: args });
-                        for reg in in_use_registers.iter().rev().copied() {
-                            self.codes.push(Instr::Pop { dst: reg.into() });
-                        }
                         let result = self.gen_operand(result);
                         self.codes.push(Instr::Mov { dst: result, src: Operand::new_register(Register::Rv) });
                     }
@@ -433,15 +376,8 @@ impl Codegen {
                     } => {                        let dst = self.gen_operand(dst);
                         let ctor = self.gen_operand(constructor);
                         let args = self.gen_operand(args);
-                        let in_use_registers = self.call_saved_registers();
-                        for reg in in_use_registers.iter().copied() {
-                            self.codes.push(Instr::Push { src: reg.into() });
-                        }
                         self.codes
                             .push(Instr::NewSpread { dst: dst, ctor: ctor, args: args });
-                        for reg in in_use_registers.iter().rev().copied() {
-                            self.codes.push(Instr::Pop { dst: reg.into() });
-                        }
                     }
                     Instruction::IterateNext {
                         iter,
@@ -817,10 +753,6 @@ impl Codegen {
 
     fn gen_call(&mut self, func: Value, args: &[Value], result: Value) {
         // 1. Backup used registers
-        let in_use_registers = self.call_saved_registers();
-        for reg in in_use_registers.iter().copied() {
-            self.codes.push(Instr::Push { src: reg.into() });
-        }
 
         // 2. Push arguments onto the stack
         self.store_args(args, self.inst_index);
@@ -836,9 +768,6 @@ impl Codegen {
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });
 
         // 8. Restore backed-up registers
-        for reg in in_use_registers.iter().rev().copied() {
-            self.codes.push(Instr::Pop { dst: reg.into() });
-        }
 
         // 9. Move return value to destination register
         let result_reg = self.gen_operand(result);
@@ -849,10 +778,6 @@ impl Codegen {
         let callable = self.gen_operand(func);
 
         // 1. Backup used registers
-        let in_use_registers = self.call_saved_registers();
-        for reg in in_use_registers.iter().copied() {
-            self.codes.push(Instr::Push { src: reg.into() });
-        }
 
         // 2. Push arguments onto the stack
         self.store_args(args, self.inst_index);
@@ -869,9 +794,6 @@ impl Codegen {
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });
 
         // 8. Restore backed-up registers
-        for reg in in_use_registers.iter().rev().copied() {
-            self.codes.push(Instr::Pop { dst: reg.into() });
-        }
 
         // 9. Move return value to destination register
         let result_reg = self.gen_operand(result);
@@ -902,10 +824,6 @@ impl Codegen {
         let callable = self.gen_operand(object);
 
         // 1. Backup used registers
-        let in_use_registers = self.call_saved_registers();
-        for reg in in_use_registers.iter().copied() {
-            self.codes.push(Instr::Push { src: reg.into() });
-        }
 
         // 2. Push arguments onto the stack
         self.store_args(args, self.inst_index);
@@ -921,9 +839,6 @@ impl Codegen {
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });
 
         // 7. Restore backed-up registers
-        for reg in in_use_registers.iter().rev().copied() {
-            self.codes.push(Instr::Pop { dst: reg.into() });
-        }
 
         // 8. Move return value to destination register
         let result_reg = self.gen_operand(result);
@@ -934,10 +849,6 @@ impl Codegen {
         let callable = self.gen_operand(constructor);
 
         // 1. Backup used registers
-        let in_use_registers = self.call_saved_registers();
-        for reg in in_use_registers.iter().copied() {
-            self.codes.push(Instr::Push { src: reg.into() });
-        }
 
         // 2. Push arguments onto the stack
         self.store_args(args, self.inst_index);
@@ -952,26 +863,12 @@ impl Codegen {
         self.codes.push(Instr::SubC { dst: Operand::Register(Register::Rsp), src: Operand::Register(Register::Rsp), value: Operand::new_immd(args.len() as isize) });
 
         // 8. Restore backed-up registers
-        for reg in in_use_registers.iter().rev().copied() {
-            self.codes.push(Instr::Pop { dst: reg.into() });
-        }
 
         // 9. Move return value to destination register
         let result_reg = self.gen_operand(result);
         self.codes.push(Instr::Mov { dst: result_reg, src: Operand::new_register(Register::Rv) });
     }
 
-    /// Registers that have to survive a nested call.
-    ///
-    /// With variables resident in memory nothing is held in a register across a
-    /// call, so the callee cannot clobber a value the caller still needs.
-    fn call_saved_registers(&self) -> Vec<Register> {
-        if self.memory_resident_vars {
-            Vec::new()
-        } else {
-            self.reg_alloc.call_saved_registers()
-        }
-    }
 
     /// Hand a block's parameters over at a jump.
     ///
@@ -987,53 +884,15 @@ impl Codegen {
     fn store_jump_args(&mut self, params: &[Variable], args: &[Value]) {
         for (param, arg) in params.iter().zip(args.iter()) {
             let arg_op = self.gen_operand(*arg);
-            let stack = self.reg_alloc.ensure_stack_slot(*param);
+            let stack = self.slots.ensure_slot(*param);
             self.codes.push(Instr::Mov { dst: Operand::Stack(stack as isize), src: arg_op });
-            // The slot now holds the incoming value; any register copy is stale,
-            // so the block entry must reload from memory.
-            self.reg_alloc.mark_stack_written(*param);
-            self.reg_alloc.forget_register(param);
         }
     }
 
-    fn store_args(&mut self, args: &[Value], index: usize) {
+    fn store_args(&mut self, args: &[Value], _index: usize) {
         for arg in args.iter().rev() {
             let op = self.gen_operand(*arg);
             self.codes.push(Instr::Push { src: op });
-            if let Value::Variable(arg) = arg
-                && let Some(action) = self.reg_alloc.release(*arg, index)
-            {
-                match action {
-                    Action::Spill { stack, register } => {
-                        trace!("spilling({arg}) {register} -> [rbp+{stack}]");
-                        self.codes.push(Instr::Mov { dst: Operand::Stack(stack as isize), src: register.into() });
-                    }
-                    _ => unreachable!("action must be spill"),
-                }
-            }
-        }
-    }
-
-    /// Emit the bookkeeping that comes with a register allocation.
-    ///
-    /// `alloc` may report that a victim was spilled (`Action::Spill`) and/or
-    /// that the value itself must be reloaded from its stack slot
-    /// (`Action::Restore`). The actions are emitted in the order given: a spill
-    /// must reach memory before the register is overwritten by a restore.
-    /// Callers that only take the register silently drop that work and lose
-    /// values.
-    fn apply_alloc_actions(&mut self, actions: Vec<Action>) {
-        for action in actions {
-            match action {
-                Action::Spill { register, stack } => {
-                    trace!("spilling [rbp+{stack}] <- {register}");
-                    self.codes.push(Instr::Mov { dst: Operand::Stack(stack as isize), src: register.into() });
-                }
-                Action::Restore { register, stack } => {
-                    trace!("unspilling [rbp+{stack}] -> {register}");
-                    self.codes.push(Instr::Mov { dst: register.into(), src: Operand::Stack(stack as isize) });
-                }
-            }
         }
     }
 
@@ -1043,18 +902,10 @@ impl Codegen {
             Value::Constant(id) => Operand::new_immd(id.as_usize() as isize),
             Value::Function(id) => Operand::new_symbol(id.as_usize() as u32),
             Value::Block(id) => Operand::new_immd(id.as_usize() as isize),
-            Value::Variable(var) if self.memory_resident_vars => {
-                // Memory-resident mode: every variable lives in a fixed stack
-                // slot, so no value can be lost by register reuse.
-                let stack = self.reg_alloc.ensure_stack_slot(var);
-                Operand::Stack(stack as isize)
-            }
-            Value::Variable(var) => {
-                let (register, actions) = self.reg_alloc.alloc(var, self.inst_index);
-                trace!("allocating {value} -> {register}, actions = {actions:?}");
-                self.apply_alloc_actions(actions);
-                Operand::new_register(register)
-            }
+            // Memory-resident: every variable lives in a fixed stack slot, so a
+            // value can never be lost by register reuse. Registers are only
+            // per-instruction temporaries (and `Rv` / `Rsp`, which the VM owns).
+            Value::Variable(var) => Operand::Stack(self.slots.ensure_slot(var) as isize),
         }
     }
 

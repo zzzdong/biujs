@@ -3,13 +3,13 @@ pub mod error;
 pub mod ir;
 pub mod lowering;
 pub mod parser;
-pub mod regalloc;
+pub mod frame_slots;
 pub mod semantic;
 pub mod symbol;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::bytecode::{CodeBlock, EhRegion, FnFlags, FunctionId, Instr, Module, Register};
+use crate::bytecode::{CodeBlock, EhRegion, FnFlags, FunctionId, Instr, Module};
 use crate::compiler::error::CompileError;
 use crate::compiler::ir::{FuncSignature, FunctionBuilder, IrFunction, IrUnit, SSABuilder};
 use crate::compiler::lowering::JSASTLower;
@@ -90,7 +90,6 @@ impl Compiler {
         unit.define_function(main_id, main_func);
 
         // 6. Run SSA + Codegen for ALL functions in the unit
-        let registers = Register::general();
         let mut all_codes: Vec<crate::bytecode::Instr> = Vec::new();
 
         let function_count = unit.functions.len();
@@ -138,7 +137,7 @@ impl Compiler {
             };
 
             // Run codegen -> bytecode
-            let mut codegen = Codegen::new(&registers, throw_to_handlers);
+            let mut codegen = Codegen::new(throw_to_handlers);
             let func_codes = codegen.generate_code(cfg).to_vec();
             // 区域表是**块 id 解析成 pc** 之后的产物（pc 从 0 开始，属于本函数），
             // 所以要在下面按 `offset` 平移到整个模块的坐标系里。

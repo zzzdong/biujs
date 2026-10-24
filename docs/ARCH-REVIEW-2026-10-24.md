@@ -12,7 +12,9 @@
 > `Module::debug_instructions` 的 IR 克隆、0.7 scope 表收口（`noStrict`/`raw` 跳过、
 > 删掉过宽的源码子串门控、所有用例统一前置 `"use strict"`）、
 > 0.8 strict 运行时收口（`with` 编译期拒绝、隐式全局赋 `ReferenceError`、
-> 顶层 `this = globalThis`、全局对象接 `Object.prototype`）已落地。
+> 顶层 `this = globalThis`、全局对象接 `Object.prototype`）、
+> 3A 删 `BIUJS_REG_VARS` 与变量寄存器分配（`regalloc.rs` 1063 行 → `frame_slots.rs`
+> 87 行）已落地。
 > 默认内存预算调回 384MB；0.8 之后全量为
 > **17,271 / 20,504（84.23%）**，相对 0.7 基线 +65 条，无逐套件回退。
 
@@ -46,9 +48,10 @@
    以及"块级 `let` 的绑定应住在声明式记录里"——它现在还是全局属性（Phase 1B 的事）。
 6. **架构判断**：VM/GC/字节码的方向是对的（真 SSA + 块参数、EH 侧表、精确根、
    `Gc` 瘦句柄），但有三处结构性错配：
-   - **无 JIT 却保留完整 IR/SSA/regalloc**（约 10.5k 行）。默认变量全部内存驻留
-     （`codegen.rs:67`），寄存器路径只在 `BIUJS_REG_VARS` 下启用；`codegen`/`ssa`/`cfg`
-     几乎没有测试。这是当前最大的“复杂度没有消费者”。
+   - ~~**无 JIT 却保留完整 IR/SSA/regalloc**~~（约 10.5k 行，**已削掉 ~1k 行**：
+     `BIUJS_REG_VARS` 与整套寄存器分配于 2026-10-25 删除，`regalloc.rs` 收缩为
+     `frame_slots.rs` 的槽位分配）。剩余问题不变：`codegen`/`ssa`/`cfg`
+     几乎没有测试，加一条 IR 指令仍要改 4–5 处 —— 这是“复杂度没有消费者”的主体。
    - **对象模型缺 atom/shape**：每次属性访问都 `Rc::new(String)`（`property.rs:11`），
      每次 get 克隆 56B 的 `PropertyDescriptor`；数组元素散在 `elements`/`properties`/
      `holes` 三处；20 个 `Object` 变体各抄一份 header。
@@ -74,7 +77,7 @@
 | `cargo test --release --test guards` | 7 passed |
 | 构建警告 | 77（`cargo build --release`） |
 | `cargo clippy --release --lib` | **442 warnings**（主要是 `collapsible_if` 88、冗余字段名 79、`Value` 上多余的 `clone` 61、冗余闭包 36、未用 import 30+） |
-| 源码规模 | 46,013 行：compiler 11,980 / vm 20,949 / builtins 9,885 |
+| 源码规模 | 45,322 行：compiler 10,969 / vm 21,170 / builtins 9,885（删寄存器分配后 -691） |
 | 全量 test262（384MB，scope 收口 + strict 收口后） | **20,504 执行 = 17,271 通过 + 3,233 失败；8,577 跳过；84.23%** |
 | 护栏 | timeout 0 / step-limit 0 / memory 14 |
 | 全量墙钟 | 约 7–9 分钟（4 片串行；不含首次全量构建） |
@@ -297,8 +300,8 @@ ES 12.10.4 第 4 步规定 RHS 是**不可调用对象时抛 TypeError**，而�
 
 | 证据 | 说明 |
 |---|---|
-| `src/compiler/codegen.rs:67` | `memory_resident_vars = env::var("BIUJS_REG_VARS").is_err()` —— **默认所有变量在栈上**，寄存器路径是环境变量开关 |
-| `codegen.rs:1044-1061` | `gen_operand` 对 `Value::Variable` 直接 `ensure_stack_slot`，只有开了 `BIUJS_REG_VARS` 才 `alloc()` |
+| `src/compiler/codegen.rs:67` | ~~`memory_resident_vars = env::var("BIUJS_REG_VARS").is_err()`~~ **已删除（2026-10-25）**：固定内存驻留，`BIUJS_REG_VARS` 与整套寄存器分配（约 900 行）一并移除 |
+| `codegen.rs:1044-1061` | ~~`gen_operand` 对 `Value::Variable` 直接 `ensure_stack_slot`，只有开了 `BIUJS_REG_VARS` 才 `alloc()`~~ **已删除**：`Value::Variable` 一律走 `FrameSlots::ensure_slot` |
 | `codegen.rs:96-98` | 任何含 `try` 的函数强制内存驻留 |
 | `regalloc.rs`（1,060 行） | 区间分组着色；但默认路径只用来给临时值分配寄存器 |
 | `compiler/mod.rs:35-204` | 一个函数干完 parse/semantic/lower/SSA/codegen/link；`DelayedJump`/`ResumeExc` 手工加模块偏移 |
@@ -553,7 +556,9 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 
 ### Phase 3 — 编译器（30–50 人日，先 spike）
 
-- **3A** 删 `BIUJS_REG_VARS` 与变量寄存器分配；固定内存驻留语义（低风险，1–2 人日）。
+- **~~3A~~ 已完成**：删 `BIUJS_REG_VARS` 与变量寄存器分配；固定内存驻留语义。
+  `regalloc.rs`（1063 行）→ `frame_slots.rs`（约 100 行，含 2 个单测）；
+  字节码 golden 中 2/16 个文件变化，逐条核对为**纯槽位重编号**（指令序列与帧大小不变）。
 - **3B** `ScopeTree` 统一 semantic/symbol/自由变量走查；捕获环境变 `(depth,index)`。
 - **3C** 直出 spike：表达式 + 语句 + 调用 + 简单函数，产出 `FunctionCode`；
   对比 LOC / 编译时间 / test262 通过数。**只有在同等通过数下才继续。**
@@ -605,11 +610,11 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 
 已完成：1（boundary RAII）、2（pending_captured 入根）、3（guard 配置+预算 384MB）、
 4（debug 几何断言）、5（运行时立即数/常量检查）、7（scope 表收口 + 基线刷新）、
-8（strict 运行时收口）、9（字节码 dumper + 16 组 golden，删除 IR 克隆）。
+8（strict 运行时收口）、9（字节码 dumper + 16 组 golden，删除 IR 克隆）、
+6（删 `BIUJS_REG_VARS` 与变量寄存器分配，固定内存驻留语义）。
 
 剩余（按顺序）：
 
-6. 删 `BIUJS_REG_VARS` 与变量寄存器分配（先固定内存驻留语义）。
 10. 文档数字脚本化（0.10）与 CI（0.9），再进入架构阶段：
     1A（Atom/PropertyKey）→ 1B（ObjectHeader/Shape/全局对象/Realm/EnvRecord）→
     1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→

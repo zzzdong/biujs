@@ -13,7 +13,7 @@ AST ── 符号表 ───────────────────�
   │  lowering（JSASTLower）               src/compiler/lowering/
   ▼
 IR（SSA 形态 + CFG）───────────────────── src/compiler/ir/{builder,ssabuilder,cfg,instruction}.rs
-  │  寄存器分配                            src/compiler/regalloc.rs
+  │  帧槽分配（内存驻留）                  src/compiler/frame_slots.rs
   │  指令选择 / 布局 / patch 回填           src/compiler/codegen.rs
   ▼
 字节码：Module { Vec<CodeBlock>, … }      src/bytecode.rs
