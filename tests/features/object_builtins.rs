@@ -573,3 +573,75 @@ fn array_length_errors_are_range_errors() {
     )
     .unwrap();
 }
+
+// ── ES B.2.2.1 / B.2.2.2：`__lookupGetter__` / `__lookupSetter__` ──────────
+//
+// 2026-10-18 实现。此前这两个方法根本不存在，而 `obj.missing()` 静默返回
+// `undefined` 的 bug 让"查找不到 ⇒ undefined"那一半用例假绿；`obj.missing()`
+// 修正为抛 TypeError 之后必须真正实现它们。
+
+#[test]
+fn lookup_accessor_walks_the_prototype_chain() {
+    // 数据属性（无论在链上哪一层）⇒ undefined；accessor ⇒ 所要的那一半。
+    assert_eq!(
+        eval_string(
+            "var root = Object.defineProperty({}, 'g', { get: function () { return 1; }, configurable: true });
+             var mid = Object.create(root);
+             var leaf = Object.create(mid);
+             var getter = leaf.__lookupGetter__('g');
+             String(typeof getter === 'function' && getter() === 1 &&
+                    leaf.__lookupSetter__('g') === undefined)"
+        ),
+        "true"
+    );
+    // 自有数据属性遮住链上的 accessor ⇒ undefined。
+    assert_eq!(
+        eval_string(
+            "var root = Object.defineProperty({}, 'g', { get: function () {}, configurable: true });
+             var leaf = Object.create(root, { g: { value: 1, configurable: true } });
+             String(leaf.__lookupGetter__('g'))"
+        ),
+        "undefined"
+    );
+    // 只有 setter 的 accessor：getter 半边是 undefined，setter 半边是函数。
+    assert_eq!(
+        eval_string(
+            "var o = Object.defineProperty({}, 's', { set: function () {}, configurable: true });
+             String(o.__lookupGetter__('s')) + '|' + String(typeof o.__lookupSetter__('s'))"
+        ),
+        "undefined|function"
+    );
+    // 一路到链尾都没有 ⇒ undefined。
+    assert_eq!(
+        eval_string("String({}.__lookupGetter__('nope'))"),
+        "undefined"
+    );
+}
+
+#[test]
+fn lookup_accessor_metadata_and_to_object() {
+    // 函数元数据：length 1、name 与注册名一致、是 Object.prototype 的自有属性。
+    assert_eq!(
+        eval_string(
+            "String(Object.prototype.__lookupGetter__.length) + '|' +
+             Object.prototype.__lookupGetter__.name + '|' +
+             Object.prototype.__lookupSetter__.name + '|' +
+             String(Object.prototype.hasOwnProperty('__lookupGetter__'))"
+        ),
+        "1|__lookupGetter__|__lookupSetter__|true"
+    );
+    // `ToObject(this)`：原语接收者被装箱（字符串暴露索引键），null/undefined 抛。
+    assert_eq!(
+        eval_string(
+            "try { Object.prototype.__lookupGetter__.call(null, 'x'); 'no throw' } catch (e) { e.name }"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        eval_string(
+            "var s = Object.defineProperty({}, '0', { get: function () {}, configurable: true });
+             String('ab'.__lookupGetter__('0') === undefined)"
+        ),
+        "true"
+    );
+}

@@ -900,6 +900,45 @@ pub fn object_property_is_enumerable(
     }
 }
 
+/// ES B.2.2.1 `Object.prototype.__lookupGetter__` /
+/// ES B.2.2.2 `Object.prototype.__lookupSetter__`。
+///
+/// 沿原型链找**第一个**与 `key` 同名的描述符：是 accessor 就返回所要的那一半
+/// （没有那一半 ⇒ `undefined`），是数据属性 ⇒ `undefined`，一路到链尾都没找到
+/// ⇒ `undefined`。`want_getter` 区分两个方向。
+pub fn object_lookup_accessor(
+    heap: &mut super::Heap,
+    obj: &Value,
+    args: &[Value],
+    want_getter: bool,
+) -> Result<Value, RuntimeError> {
+    // `ToObject(this)` first：`__lookupGetter__.call(null, "x")` 是 TypeError，
+    // 不是 `undefined`。
+    super::require_object_coercible(obj)?;
+    let key = match args.first() {
+        Some(Value::String(s)) => PropertyKey::from_str(s),
+        Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),
+        Some(other) => PropertyKey::from_str(&other.to_js_string()),
+        None => return Ok(Value::Undefined),
+    };
+    // 原语接收者装箱：字符串暴露出索引键与 `length`（`"ab".__lookupGetter__("0")`）。
+    let target = match obj {
+        Value::Object(_) => obj.clone(),
+        other => super::to_object(heap, other)?,
+    };
+    let Value::Object(obj_ref) = target else {
+        return Ok(Value::Undefined);
+    };
+    // `find_descriptor` 是纯描述符 walk，不调用 getter —— 正是这里要的。
+    match crate::vm::prototype::find_descriptor(obj_ref, &key).map_err(RuntimeError::TypeError)? {
+        Some((_, desc)) if desc.is_accessor_descriptor() => {
+            let half = if want_getter { &desc.getter } else { &desc.setter };
+            Ok(half.clone().unwrap_or(Value::Undefined))
+        }
+        _ => Ok(Value::Undefined),
+    }
+}
+
 /// Name of the `Object.prototype.toString` native.
 ///
 /// It needs a dedicated name because `Object.prototype.toString.call(x)` must
@@ -928,6 +967,13 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
     set_prototype_method(proto, heap, "propertyIsEnumerable", |this, args| {
         object_property_is_enumerable(this, args)
     });
+    // ES B.2.2.1 / B.2.2.2（web 兼容遗留）：沿原型链找 accessor 的一半。
+    // 找不到 ⇒ `undefined`；数据属性 ⇒ `undefined`。实现之前这两条路是靠
+    // "方法不存在时静默返回 undefined" 的 bug 顺带跑过的（测试因此假绿），
+    // `obj.missing()` 修正为抛 TypeError 之后必须真正实现它们。
+    // 实现要 heap（原语接收者需装箱），住在 `call_prototype_method` 的分派里。
+    super::mark_prototype_method(proto, heap, "__lookupGetter__");
+    super::mark_prototype_method(proto, heap, "__lookupSetter__");
     set_prototype_method(proto, heap, "toLocaleString", |this, args| {
         object_prototype_to_string(this, args)
     });

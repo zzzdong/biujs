@@ -1480,6 +1480,9 @@ pub fn call_prototype_method(
         "hasOwnProperty" => object::object_has_own_property(obj, args),
         "isPrototypeOf" => object::object_is_prototype_of(obj, args),
         "propertyIsEnumerable" => object::object_property_is_enumerable(obj, args),
+        // ES B.2.2.1 / B.2.2.2：需要装箱原语接收者，故带 heap。
+        "__lookupGetter__" => object::object_lookup_accessor(heap, obj, args, true),
+        "__lookupSetter__" => object::object_lookup_accessor(heap, obj, args, false),
         // Number prototype
         "toFixed" => number::number_to_fixed(obj, args),
         "toExponential" => number::number_to_exponential(obj, args),
@@ -2033,6 +2036,8 @@ pub fn builtin_arity(registered_name: &str) -> usize {
         "parseFloat" | "isNaN" | "isFinite" => 1,
         // ── Object ──
         "hasOwnProperty" | "isPrototypeOf" | "propertyIsEnumerable" => 1,
+        // ES B.2.2.1 / B.2.2.2：`__lookupGetter__(key)` 收一个键。
+        "__lookupGetter__" | "__lookupSetter__" => 1,
         "Object.keys" | "Object.values" | "Object.entries" | "Object.getPrototypeOf"
         | "Object.getOwnPropertyNames" | "Object.getOwnPropertySymbols"
         | "Object.isExtensible" | "Object.isFrozen" | "Object.isSealed"
