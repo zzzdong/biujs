@@ -35,7 +35,7 @@
 //! |-------|---------|---------|---------|
 //! | steps | `TEST262_STEP_LIMIT` (0 = off) | `DEFAULT_STEP_LIMIT` | hot infinite loops |
 //! | clock | `TEST262_TIMEOUT_MS` (0 = off) | `10000` | slow loops, native stalls |
-//! | heap | `TEST262_MEMORY_MB` (0 = off) | `256` MiB **per test** | runaway allocation |
+//! | heap | `TEST262_MEMORY_MB` (0 = off) | `384` MiB **per test** | runaway allocation |
 //!
 //! The heap budget is a per-test *delta* (armed against the live heap when the
 //! test starts), because the harness itself holds hundreds of megabytes of
@@ -113,7 +113,7 @@ fn live_bytes() -> usize {
 // ─────────────────────────────────────────────────────────
 
 /// Heap a *single test* may allocate on top of what the harness already holds,
-/// from `TEST262_MEMORY_MB` (default 256 MiB, `0` = off).
+/// from `TEST262_MEMORY_MB` (default 384 MiB, `0` = off).
 ///
 /// The budget is deliberately a per-test *delta*, not an absolute process cap:
 /// the harness keeps every parsed test around, so an absolute cap fails whichever
@@ -128,7 +128,7 @@ fn memory_allowance() -> usize {
         let mb: usize = std::env::var("TEST262_MEMORY_MB")
             .ok()
             .and_then(|raw| raw.parse().ok())
-            .unwrap_or(256);
+            .unwrap_or(384);
         if mb == 0 {
             usize::MAX
         } else {

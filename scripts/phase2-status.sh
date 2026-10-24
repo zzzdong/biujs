@@ -38,14 +38,11 @@ SNAP="docs/phase2-status.tsv"
 #   TEST262_MEMORY_MB   单条用例的增量上限（0 = 关）
 : "${TEST262_TIMEOUT_MS:=15000}"   # 实测第 10 慢的用例 2.2s（更慢的 9 条基线里本已失败）
 : "${TEST262_STEP_LIMIT:=0}"        # 0 交给 runner 用 DEFAULT_STEP_LIMIT
-: "${TEST262_MEMORY_MB:=256}"        # 256 → 384（2026-10-12，P1 之后）：堆归 VM、单次 run 内不回收，
-                                     # 临时垃圾峰值从"边跑边释放"变成"留到 run 结束" ⇒ 256MB 丢 5 条。
-                                     # 阶段 C 的 mark-sweep 落地后：384MB 与基线逐项相同（16567）。
-                                     # 阶段 E 宿主侧入根完成后，`invoke_boundaries` 闸门撤掉、收集可在
-                                     # 原生回调期间进行 ⇒ 256MB 也回到 16567（内存守卫 22→12），那 5 条
-                                     # 回收。故默认值降回 256（见 docs/REFACTOR-HEAP-GC.md §5 R3 / §E）。
-                                     # 代价：守卫从 memory 22 挪到 timeout 17（同一批 ~29 条问题用例，
-                                     # 只是触发了不同守卫，无新增坏测试；这是已知的小幅 wall-clock 成本）。
+: "${TEST262_MEMORY_MB:=384}"        # 384MB（2026-10-24 调回）：256MB 会误伤 Array 的 5 条边界
+                                     # 用例（内存守卫），而它们不是语义回退；384MB 与 2026-10-18
+                                     # 基线逐套件一致。代价是同一批问题用例在内存守卫上更宽松，
+                                     # 部分会落到 timeout 分类（随机器负载略漂）。见
+                                     # docs/ARCH-REVIEW-2026-10-24.md §1.2。
 # 整轮再套一层硬超时：护栏本身出问题时，至少不让脚本无限等下去。
 : "${TEST262_HARD_TIMEOUT:=1200}"
 export TEST262_TIMEOUT_MS TEST262_STEP_LIMIT TEST262_MEMORY_MB

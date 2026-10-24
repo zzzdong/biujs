@@ -27,7 +27,7 @@
 | test262 执行 / 通过 / 跳过 / 失败 | 20771 / **17328** / 8310 / 3443 |
 | 通过率 | **83.42%** |
 | 单元 / feature / 护栏 | 238 / 616（4 ignored）/ 7 |
-| 护栏计数 | timeout 7、step-limit 0、memory 22（`TEST262_MEMORY_MB=384`，见 §5.7；**2026-10-13 更新**：预算已降回 256，守卫现为 timeout 17 / memory 12 —— 同一批 ~29 条问题用例从 memory 守卫挪到了 timeout 守卫，总数不变，见 `docs/REFACTOR-HEAP-GC.md` 阶段 E） |
+| 护栏计数 | timeout 7、step-limit 0、memory 22（`TEST262_MEMORY_MB=384`，见 §5.7；**2026-10-24 更新**：默认预算维持 384MB —— 256MB 会误伤 `built-ins/Array` 的 5 条边界用例，不是语义回退） |
 | 全量墙钟 | 约 450s（串行 4 分片，单片 `ulimit -v` 4 GB） |
 | 源码规模 | 50 个 `.rs`，约 44k 行 |
 

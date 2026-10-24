@@ -142,7 +142,7 @@ docs/                  项目文档与基线快照
 | `TEST262_CHUNKS` / `TEST262_CHUNK_INDEX` | 分片（每片独立进程；默认 4 片串行） |
 | `TEST262_TIMEOUT_MS` | 单条用例墙钟预算；`phase2-status.sh` 默认 15000（runner 自身默认 10000），0 = 关 |
 | `TEST262_STEP_LIMIT` | 单条用例指令预算，0 = 用 `DEFAULT_STEP_LIMIT` |
-| `TEST262_MEMORY_MB` | 单条用例增量内存上限，默认 256，0 = 关 |
+| `TEST262_MEMORY_MB` | 单条用例增量内存上限，默认 384，0 = 关 |
 | `TEST262_JOBS` | 并行度（默认 1；实测并行更慢且护栏分类会漂，别当优化） |
 | `BIUJS_DUMP` | CLI 打印编译后的字节码 |
 | `BIUJS_TIMEOUT_MS` | CLI/REPL 的墙钟预算，0 = 关 |
