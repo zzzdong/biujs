@@ -1264,11 +1264,21 @@ impl Operand {
         Self::Symbol(id)
     }
 
-    pub fn as_immd(&self) -> isize {
+    /// The immediate value, or `None` for a register/primitive operand.
+    ///
+    /// Runtime code uses this instead of `as_immd`: malformed bytecode is an
+    /// internal error, not a reason to abort the process (`panic = "abort"`).
+    pub fn try_immd(&self) -> Option<isize> {
         match self {
-            Operand::Immd(immd) => *immd,
-            _ => panic!("{self:?} not an immediate"),
+            Operand::Immd(immd) => Some(*immd),
+            _ => None,
         }
+    }
+
+    /// Compile-time accessor for operands that are immediate by construction.
+    pub fn as_immd(&self) -> isize {
+        self.try_immd()
+            .unwrap_or_else(|| panic!("{self:?} not an immediate"))
     }
 }
 
@@ -2546,6 +2556,13 @@ mod tests {
             offset.set(9);
         }
         assert!(format!("{j}").contains('9'), "回填后 Display 应反映新偏移：{j}");
+    }
+
+    #[test]
+    fn try_immd_rejects_non_immediates() {
+        // Runtime paths must not abort on malformed bytecode; they ask first.
+        assert_eq!(Operand::new_immd(7).try_immd(), Some(7));
+        assert_eq!(Operand::Register(Register::Rv).try_immd(), None);
     }
 
     /// 跳转类指令的偏移**相对还是绝对**：`Jump` / `BrIf` 是相对（`jump_offset`），

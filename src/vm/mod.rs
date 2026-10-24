@@ -3010,7 +3010,7 @@ impl VM {
         module: &Module,
     ) -> Result<PropertyKey, RuntimeError> {
         match operand {
-            Operand::Immd(id) => match &module.constants[id as usize] {
+            Operand::Immd(id) => match constant_at(module, id, "property key")? {
                 Constant::String(s) => Ok(PropertyKey::from_str(s.as_str())),
             },
             _ => {
@@ -5934,6 +5934,36 @@ pub fn to_int32(n: f64) -> i32 {
 /// ES `ToUint32` (ECMAScript 7.1.7).
 pub fn to_uint32(n: f64) -> u32 {
     to_int32(n) as u32
+}
+
+/// Read an operand that must be an immediate, without panicking on malformed
+/// bytecode. The interpreter used to call `Operand::as_immd()`, which is a
+/// process abort in release (`panic = "abort"`).
+pub(crate) fn immd(operand: &Operand, what: &str) -> Result<isize, RuntimeError> {
+    operand.try_immd().ok_or_else(|| {
+        RuntimeError::InternalError(format!(
+            "malformed bytecode: {what} must be an immediate, got {operand:?}"
+        ))
+    })
+}
+
+/// Bounds-checked constant-pool access for the interpreter.
+pub(crate) fn constant_at<'a>(
+    module: &'a Module,
+    index: isize,
+    what: &str,
+) -> Result<&'a Constant, RuntimeError> {
+    let index = usize::try_from(index).map_err(|_| {
+        RuntimeError::InternalError(format!(
+            "malformed bytecode: {what} constant index {index} is negative"
+        ))
+    })?;
+    module.constants.get(index).ok_or_else(|| {
+        RuntimeError::InternalError(format!(
+            "malformed bytecode: {what} constant index {index} out of range ({} constants)",
+            module.constants.len()
+        ))
+    })
 }
 
 /// The shape `GetSetRecord` validates for the `set-methods` operators

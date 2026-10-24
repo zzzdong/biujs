@@ -18,9 +18,25 @@ use crate::vm::{
     ArrayObject, BOUND_PREFIX, BoundFunction, CallArgs, CalleeKind, Control, FrameBirth,
     FrameMode, GUARD_CHECK_INTERVAL, GuardFired,
     ObjectKind, PropertyKey, RuntimeError, SehRecord, THIS_DERIVED_BOUND,
-    THIS_DERIVED_UNBOUND, THIS_NONE, Value, VM, finalize_json, is_addressable,
-    memory_pressure, to_int32, to_uint32, vm_trace_steps,
+    THIS_DERIVED_UNBOUND, THIS_NONE, Value, VM, constant_at, finalize_json, immd,
+    is_addressable, memory_pressure, to_int32, to_uint32, vm_trace_steps,
 };
+
+/// `ResumeExc`（finally 末尾）按区域身份认领到记录之后的四种收尾。
+///
+/// 与旧的"看栈顶 + 现场拆六个字段"相比，这里先把决策收成一个枚举：
+/// 每种出口拿什么、弹不弹记录，一目了然。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinallyOutcome {
+    /// 有待重抛的异常（catch 已关闭，或本来就没有 catch）。
+    Rethrow,
+    /// `break` / `continue` 的延迟跳转目标。
+    DelayedJump,
+    /// `return` 的延迟返回（落到本函数的尾 `Ret`）。
+    DelayedReturn,
+    /// 正常完成：finally 只是普通控制流的延续。
+    Normal,
+}
 
 impl VM {
     /// Execute a single bytecode instruction. Returns `Ok(false)` when execution
@@ -1652,9 +1668,9 @@ impl VM {
         match *inst {
             // ===== Control Flow =====
             Instr::Call { func, argc } => {
-                let func_id = func.as_immd();
+                let func_id = immd(&func, "Call func")?;
                 // The argument count is its own operand (see `CodeGen::gen_call`).
-                let arg_count = argc.as_immd() as usize;
+                let arg_count = immd(&argc, "Call argc")? as usize;
                 // An `async` function answers a promise. Route it through
                 // `invoke`, which drives the body and wraps its outcome, instead
                 // of entering the frame directly.
@@ -1704,7 +1720,7 @@ impl VM {
                 }
             }
             Instr::CallEx { callee, argc } => {
-                let arg_count = argc.as_immd() as usize;
+                let arg_count = immd(&argc, "CallEx argc")? as usize;
                 // Operands are read with the *caller's* frame pointer still in
                 // place: a stack-slot operand would otherwise resolve inside the
                 // callee's frame. The frame switch happens once they are read.
@@ -1822,7 +1838,7 @@ impl VM {
             }
             Instr::AddC { dst, src, value } => match (dst, src) {
                 (Operand::Register(Register::Rsp), Operand::Register(Register::Rsp)) => {
-                    self.state.rsp += value.as_immd() as usize;
+                    self.state.rsp += immd(&value, "AddC value")? as usize;
                 }
                 _ => {
                     return Err(RuntimeError::TypeError(format!(
@@ -1832,7 +1848,7 @@ impl VM {
             },
             Instr::SubC { dst, src, value } => match (dst, src) {
                 (Operand::Register(Register::Rsp), Operand::Register(Register::Rsp)) => {
-                    self.state.rsp -= value.as_immd() as usize;
+                    self.state.rsp -= immd(&value, "SubC value")? as usize;
                 }
                 _ => {
                     return Err(RuntimeError::TypeError(format!(
@@ -1851,15 +1867,15 @@ impl VM {
         match *inst {
             // ===== Load Instructions =====
             Instr::LoadConst { dst, index } => {
-                let const_index = index.as_immd();
-                let value = Self::from_constant(&module.constants[const_index as usize]);
+                let const_index = immd(&index, "LoadConst index")?;
+                let value = Self::from_constant(constant_at(module, const_index, "LoadConst index")?);
                 self.set_value(dst, value)?;
             }
             Instr::MakeRegExp { dst, source, flags } => {
-                let source = match &module.constants[source.as_immd() as usize] {
+                let source = match constant_at(module, immd(&source, "MakeRegExp source")?, "MakeRegExp source")? {
                     Constant::String(v) => v.to_string(),
                 };
-                let flags = match &module.constants[flags.as_immd() as usize] {
+                let flags = match constant_at(module, immd(&flags, "MakeRegExp flags")?, "MakeRegExp flags")? {
                     Constant::String(v) => v.to_string(),
                 };
                 let proto = Some(Value::Object(self.builtins.regexp_prototype));
@@ -1871,8 +1887,8 @@ impl VM {
                 self.set_value(dst, value)?;
             }
             Instr::DeclareLexical { name } => {
-                let name_index = name.as_immd();
-                let name = match &module.constants[name_index as usize] {
+                let name_index = immd(&name, "DeclareLexical name")?;
+                let name = match constant_at(module, name_index, "DeclareLexical name")? {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 // Idempotent, and never overwrites a value: the declaration that
@@ -1880,8 +1896,8 @@ impl VM {
                 self.state.script_env.entry(name).or_insert(None);
             }
             Instr::InitLexical { name, value } => {
-                let name_index = name.as_immd();
-                let name = match &module.constants[name_index as usize] {
+                let name_index = immd(&name, "InitLexical name")?;
+                let name = match constant_at(module, name_index, "InitLexical name")? {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 let value = self.get_value(value)?;
@@ -1906,8 +1922,8 @@ impl VM {
                 }
             }
             Instr::LoadEnv { dst, name } => {
-                let name_index = name.as_immd();
-                let name = &module.constants[name_index as usize];
+                let name_index = immd(&name, "LoadEnv name")?;
+                let name = constant_at(module, name_index, "LoadEnv name")?;
                 match name {
                     Constant::String(name) => {
                         match self.state.resolve_env_name(name.as_str())? {
@@ -2162,8 +2178,8 @@ impl VM {
             Instr::TypeOfEnv { dst, name } => {
                 // `typeof unresolvableName` is "undefined" — never a
                 // ReferenceError. The name is a constant-pool index.
-                let name_index = name.as_immd();
-                let name = match &module.constants[name_index as usize] {
+                let name_index = immd(&name, "TypeOfEnv name")?;
+                let name = match constant_at(module, name_index, "TypeOfEnv name")? {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 // A dead-zone read *does* throw here — unlike an unresolvable
@@ -2310,7 +2326,7 @@ impl VM {
             Instr::MakeRest { dst, from } => {
                 // Collect the tail of the incoming arguments into a fresh
                 // array: args[from..] where arg i lives at [rbp - (i + 1)].
-                let from = from.as_immd().max(0) as usize;
+                let from = immd(&from, "MakeRest from")?.max(0) as usize;
                 let argc = self.current_argc();
                 let rbp = self.state.rbp as isize;
                 let mut arr = ArrayObject::new();
@@ -2468,7 +2484,7 @@ impl VM {
                 self.set_value(dst, arr_val)?;
             }
             Instr::MakeTemplate { dst, site } => {
-                let site = site.as_immd() as usize;
+                let site = immd(&site, "MakeTemplate site")? as usize;
                 let strings = self.make_template_object(site, module)?;
                 self.set_value(dst, strings)?;
             }
@@ -2626,8 +2642,8 @@ impl VM {
                 self.set_value(dst, obj)?;
             }
             Instr::StoreEnv { name, value } => {
-                let name_index = name.as_immd();
-                let name = match &module.constants[name_index as usize] {
+                let name_index = immd(&name, "StoreEnv name")?;
+                let name = match constant_at(module, name_index, "StoreEnv name")? {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 let value = self.get_value(value)?;
@@ -2672,10 +2688,10 @@ impl VM {
                 {
                     self.set_value(callee, obj_val.clone())?;
                 }
-                let arg_count = argc.as_immd() as usize;
+                let arg_count = immd(&argc, "CallMethod argc")? as usize;
 
                 let method_name = match property {
-                    Operand::Immd(id) => match &module.constants[id as usize] {
+                    Operand::Immd(id) => match constant_at(module, id, "CallMethod property")? {
                         Constant::String(s) => s.as_str().to_string(),
                     },
                     _ => {
@@ -3051,12 +3067,12 @@ impl VM {
         match *inst {
             // ===== Function/Closure =====
             Instr::CreateClosure { dst, func } => {
-                let func_id = func.as_immd();
+                let func_id = immd(&func, "CreateClosure func")?;
                 self.set_value(dst, Value::Function(func_id as u32))?;
             }
             Instr::New { callee, argc } => {
                 let constructor_val = self.get_value(callee)?;
-                let arg_count = argc.as_immd() as usize;
+                let arg_count = immd(&argc, "New argc")? as usize;
                 // **这里不再切 `rbp`**（§22 记录的那处"中途换参照系"就此消失）：
                 //
                 // 以前切换放在最前面，于是下面 `set_value(callee, func_obj)` 那次写
@@ -3342,8 +3358,8 @@ impl VM {
                 self.set_value(dst, obj_val)?;
             }
             Instr::MakeCell { name } => {
-                let name_index = name.as_immd() as usize;
-                let name = match &module.constants[name_index] {
+                let name_index = immd(&name, "MakeCell name")?;
+                let name = match constant_at(module, name_index, "MakeCell name")? {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 // A captured function-local gets its cell **at frame entry**:
@@ -3365,12 +3381,12 @@ impl VM {
                 value,
                 fallback,
             } => {
-                let name_index = name.as_immd() as usize;
-                let name = match &module.constants[name_index] {
+                let name_index = immd(&name, "ClosureVar name")?;
+                let name = match constant_at(module, name_index, "ClosureVar name")? {
                     Constant::String(s) => s.as_str().to_string(),
                 };
                 let value = self.get_value(value)?;
-                let copy_fallback = fallback.as_immd() != 0;
+                let copy_fallback = immd(&fallback, "ClosureVar fallback")? != 0;
                 // Capture the **cell**, not the value. The cell is looked up by
                 // name in the current frame's environment, so a name captured
                 // from an enclosing frame resolves to that very cell (the chain
@@ -3393,7 +3409,7 @@ impl VM {
             }
             Instr::CallNative { callee, argc } => {
                 let callable = self.get_value(callee)?;
-                let arg_count = argc.as_immd() as usize;
+                let arg_count = immd(&argc, "CallNative argc")? as usize;
                 // 不再切 `rbp`：实参是 `rsp` 相对读的，而这条路径**永远不开帧**
                 // （`CallNative` 只分派内建）—— 切换只会造出一个不属于任何帧的基址。
 
