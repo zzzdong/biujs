@@ -36,7 +36,10 @@ pub fn object_constructor(heap: &mut super::Heap, args: &[Value]) -> Result<Valu
 ///
 /// Shared by `Object.keys` / `values` / `entries`: a string primitive exposes
 /// its index keys, other primitives have none, and null/undefined throw.
-fn to_object_string_keys(value: &Value) -> Result<Vec<PropertyKey>, RuntimeError> {
+fn to_object_string_keys(
+    heap: &mut super::Heap,
+    value: &Value,
+) -> Result<Vec<PropertyKey>, RuntimeError> {
     match value {
         Value::Object(obj_ref) => Ok(obj_ref
             .borrow()
@@ -53,7 +56,7 @@ fn to_object_string_keys(value: &Value) -> Result<Vec<PropertyKey>, RuntimeError
             })
             .collect()),
         Value::String(s) => Ok((0..s.chars().count())
-            .map(|i| PropertyKey::element(i as u64))
+            .map(|i| PropertyKey::element(heap, i as u64))
             .collect()),
         Value::Number(_) | Value::Bool(_) | Value::Symbol(_) => Ok(Vec::new()),
         Value::Undefined | Value::Null => Err(RuntimeError::TypeError(
@@ -87,11 +90,11 @@ pub fn object_keys(heap: &mut super::Heap, args: &[Value]) -> Result<Value, Runt
             "Object.keys requires at least 1 argument".to_string(),
         ));
     }
-    let keys = to_object_string_keys(&args[0])?;
+    let keys = to_object_string_keys(heap, &args[0])?;
     let str_keys: Vec<Value> = keys
         .iter()
         .filter_map(|k| match k {
-            PropertyKey::Str(s) => Some(Value::string(s)),
+            PropertyKey::Str(atom) => Some(Value::string(heap.resolve(*atom))),
             PropertyKey::Index(index) => Some(Value::string(&index.to_string())),
             PropertyKey::Symbol(_) => None,
         })
@@ -105,7 +108,7 @@ pub fn object_values(heap: &mut super::Heap, args: &[Value]) -> Result<Value, Ru
             "Object.values requires at least 1 argument".to_string(),
         ));
     }
-    let keys = to_object_string_keys(&args[0])?;
+    let keys = to_object_string_keys(heap, &args[0])?;
     let values: Vec<Value> = keys.iter().map(|k| to_object_get(&args[0], k)).collect();
     Ok(new_array_object_from_vec(heap, values))
 }
@@ -116,12 +119,12 @@ pub fn object_entries(heap: &mut super::Heap, args: &[Value]) -> Result<Value, R
             "Object.entries requires at least 1 argument".to_string(),
         ));
     }
-    let keys = to_object_string_keys(&args[0])?;
+    let keys = to_object_string_keys(heap, &args[0])?;
     let entries: Vec<Value> = keys
         .iter()
         .map(|k| {
             new_array_object_from_vec(heap, vec![
-                Value::string(&k.display()),
+                Value::string(&k.display(heap)),
                 to_object_get(&args[0], k),
             ])
         })
@@ -144,10 +147,10 @@ pub fn object_from_entries(heap: &mut super::Heap, args: &[Value]) -> Result<Val
             ))
         }
     };
-    let keys = to_object_string_keys(iterable)?;
+    let keys = to_object_string_keys(heap, iterable)?;
     let mut result = OrdinaryObject::new();
-    let zero = PropertyKey::from_str("0");
-    let one = PropertyKey::from_str("1");
+    let zero = PropertyKey::from_index(0);
+    let one = PropertyKey::from_index(1);
     for k in &keys {
         let entry = to_object_get(iterable, k);
         if !matches!(entry, Value::Object(_)) {
@@ -158,7 +161,7 @@ pub fn object_from_entries(heap: &mut super::Heap, args: &[Value]) -> Result<Val
         let key = to_object_get(&entry, &zero);
         let value = to_object_get(&entry, &one);
         let _ = result.define_property(
-            PropertyKey::from_str(&key.to_js_string()),
+            PropertyKey::intern(heap, &key.to_js_string()),
             PropertyDescriptor {
                 value,
                 writable: true,
@@ -172,7 +175,10 @@ pub fn object_from_entries(heap: &mut super::Heap, args: &[Value]) -> Result<Val
     Ok(Value::Object(heap.alloc(Object::Ordinary(result))))
 }
 
-pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_define_property(
+    heap: &mut super::Heap,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     if args.len() < 3 {
         return Err(RuntimeError::TypeError(
             "Object.defineProperty requires at least 3 arguments".to_string(),
@@ -189,9 +195,9 @@ pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
     // `ToPropertyKey`: strings pass through, symbols stay symbols, anything
     // else is stringified. Computed class members routinely use symbols.
     let key = match &args[1] {
-        Value::String(s) => PropertyKey::from_str(s),
+        Value::String(s) => PropertyKey::intern(heap, s),
         Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
-        other => PropertyKey::from_str(&other.to_js_string()),
+        other => PropertyKey::intern(heap, &other.to_js_string()),
     };
     let desc = &args[2];
 
@@ -205,7 +211,7 @@ pub fn object_define_property(args: &[Value]) -> Result<Value, RuntimeError> {
         // constructor is a `FunctionObject`, and `static get x()` is defined
         // through exactly this path.
         let mut obj_mut = obj.borrow_mut();
-        apply_property_descriptor(&mut *obj_mut, &key, &desc_val)?;
+        apply_property_descriptor(heap, &mut *obj_mut, &key, &desc_val)?;
     } else {
         return Err(RuntimeError::TypeError(
             "Property description must be an object".to_string(),
@@ -233,9 +239,9 @@ pub fn object_get_own_property_descriptor(
         ));
     };
     let key = match &args[1] {
-        Value::String(s) => PropertyKey::from_str(s),
+        Value::String(s) => PropertyKey::intern(heap, s),
         Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
-        other => PropertyKey::from_str(&other.to_js_string()),
+        other => PropertyKey::intern(heap, &other.to_js_string()),
     };
 
     let borrowed = obj.borrow();
@@ -259,36 +265,36 @@ pub fn descriptor_to_value(
             let undefined = Value::Undefined;
             desc_obj
                 .property_set(
-                    PropertyKey::from_str("get"),
+                    PropertyKey::well_known("get").expect("well-known name"),
                     desc.getter.clone().unwrap_or(undefined.clone()),
                 )
                 .ok();
             desc_obj
                 .property_set(
-                    PropertyKey::from_str("set"),
+                    PropertyKey::well_known("set").expect("well-known name"),
                     desc.setter.clone().unwrap_or(undefined),
                 )
                 .ok();
         } else {
             desc_obj
-                .property_set(PropertyKey::from_str("value"), desc.value.clone())
+                .property_set(PropertyKey::well_known("value").expect("well-known name"), desc.value.clone())
                 .ok();
             desc_obj
                 .property_set(
-                    PropertyKey::from_str("writable"),
+                    PropertyKey::well_known("writable").expect("well-known name"),
                     Value::Bool(desc.writable),
                 )
                 .ok();
         }
         desc_obj
             .property_set(
-                PropertyKey::from_str("enumerable"),
+                PropertyKey::well_known("enumerable").expect("well-known name"),
                 Value::Bool(desc.enumerable),
             )
             .ok();
         desc_obj
             .property_set(
-                PropertyKey::from_str("configurable"),
+                PropertyKey::well_known("configurable").expect("well-known name"),
                 Value::Bool(desc.configurable),
             )
             .ok();
@@ -318,7 +324,7 @@ pub fn object_get_own_property_names(
         .own_keys()
         .into_iter()
         .filter_map(|k| match k {
-            PropertyKey::Str(s) => Some(Value::string(&s)),
+            PropertyKey::Str(atom) => Some(Value::string(heap.resolve(atom))),
             PropertyKey::Index(index) => Some(Value::string(&index.to_string())),
             PropertyKey::Symbol(_) => None,
         })
@@ -482,7 +488,7 @@ pub fn object_create(heap: &mut super::Heap, args: &[Value]) -> Result<Value, Ru
                     .property_get(&key)
                     .map(|d| d.value)
                     .unwrap_or(Value::Undefined);
-                apply_property_descriptor(&mut new_obj, &key, &desc)?;
+                apply_property_descriptor(heap, &mut new_obj, &key, &desc)?;
             }
         }
     }
@@ -498,6 +504,7 @@ pub fn object_create(heap: &mut super::Heap, args: &[Value]) -> Result<Value, Ru
 /// `false` for a brand-new property — the ES `[[DefineOwnProperty]]` rule for
 /// a partial descriptor.
 pub fn apply_property_descriptor(
+    heap: &mut super::Heap,
     obj: &mut Object,
     key: &PropertyKey,
     desc: &Value,
@@ -510,16 +517,16 @@ pub fn apply_property_descriptor(
             ));
         }
     };
-    let read = |name: &str| -> Option<Value> {
+    let read = |heap: &mut super::Heap, name: &str| -> Option<Value> {
         desc_ref
             .borrow()
-            .property_get(&PropertyKey::from_str(name))
+            .property_get(&PropertyKey::intern(heap, name))
             .map(|d| d.value)
     };
-    let has = |name: &str| -> bool {
+    let has = |heap: &mut super::Heap, name: &str| -> bool {
         desc_ref
             .borrow()
-            .property_get(&PropertyKey::from_str(name))
+            .property_get(&PropertyKey::intern(heap, name))
             .is_some()
     };
 
@@ -531,8 +538,8 @@ pub fn apply_property_descriptor(
         existing.as_ref().is_some_and(pick)
     };
 
-    let getter = read("get");
-    let setter = read("set");
+    let getter = read(heap, "get");
+    let setter = read(heap, "set");
     for (field, value) in [("get", &getter), ("set", &setter)] {
         if let Some(v) = value {
             // ES 6.2.4.6 (ToPropertyDescriptor): the field may only hold a
@@ -547,10 +554,10 @@ pub fn apply_property_descriptor(
         }
     }
 
-    let mentions_data = has("value") || has("writable");
+    let mentions_data = has(heap, "value") || has(heap, "writable");
     // ES 6.2.4.6 step 10: mixing accessor fields with `value`/`writable` is an
     // invalid descriptor regardless of the target object.
-    if (has("get") || has("set")) && mentions_data {
+    if (has(heap, "get") || has(heap, "set")) && mentions_data {
         return Err(RuntimeError::TypeError(
             "Invalid property descriptor: cannot both specify accessors and a value or writable attribute"
                 .to_string(),
@@ -564,11 +571,11 @@ pub fn apply_property_descriptor(
     let existing_is_accessor = existing
         .as_ref()
         .is_some_and(|d| d.getter.is_some() || d.setter.is_some());
-    let mentions_nothing = !(has("get")
-        || has("set")
+    let mentions_nothing = !(has(heap, "get")
+        || has(heap, "set")
         || mentions_data
-        || has("enumerable")
-        || has("configurable"));
+        || has(heap, "enumerable")
+        || has(heap, "configurable"));
     if mentions_nothing && existing.is_some() {
         return Ok(true);
     }
@@ -597,10 +604,10 @@ pub fn apply_property_descriptor(
         }
 
         let mut descriptor = PropertyDescriptor::accessor_descriptor(current_get, current_set);
-        descriptor.enumerable = read("enumerable")
+        descriptor.enumerable = read(heap, "enumerable")
             .map(|v| v.to_boolean())
             .unwrap_or_else(|| current(|d| d.enumerable));
-        descriptor.configurable = read("configurable")
+        descriptor.configurable = read(heap, "configurable")
             .map(|v| v.to_boolean())
             .unwrap_or_else(|| current(|d| d.configurable));
         return obj
@@ -608,18 +615,18 @@ pub fn apply_property_descriptor(
             .map_err(RuntimeError::from_property_error);
     }
 
-    let value = match read("value") {
+    let value = match read(heap, "value") {
         Some(v) => v,
         None => existing.as_ref().map(|d| d.value.clone()).unwrap_or(Value::Undefined),
     };
     let mut descriptor = PropertyDescriptor::data_descriptor(value);
-    descriptor.writable = read("writable")
+    descriptor.writable = read(heap, "writable")
         .map(|v| v.to_boolean())
         .unwrap_or_else(|| current(|d| d.writable));
-    descriptor.enumerable = read("enumerable")
+    descriptor.enumerable = read(heap, "enumerable")
         .map(|v| v.to_boolean())
         .unwrap_or_else(|| current(|d| d.enumerable));
-    descriptor.configurable = read("configurable")
+    descriptor.configurable = read(heap, "configurable")
         .map(|v| v.to_boolean())
         .unwrap_or_else(|| current(|d| d.configurable));
     obj.define_property(key.clone(), descriptor)
@@ -637,9 +644,9 @@ pub fn object_has_own(heap: &mut super::Heap, args: &[Value]) -> Result<Value, R
     match &target {
         Value::Object(obj_ref) => {
             let key = match &args[1] {
-                Value::String(s) => PropertyKey::from_str(s),
+                Value::String(s) => PropertyKey::intern(heap, s),
                 Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
-                _ => PropertyKey::from_str(&args[1].to_js_string()),
+                _ => PropertyKey::intern(heap, &args[1].to_js_string()),
             };
             let borrowed = obj_ref.borrow();
             // Check if property exists directly on this object (not in prototype chain)
@@ -773,7 +780,10 @@ pub fn object_assign(heap: &mut super::Heap, args: &[Value]) -> Result<Value, Ru
 }
 
 /// `Object.defineProperties(obj, props)`
-pub fn object_define_properties(args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_define_properties(
+    heap: &mut super::Heap,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let (Some(target), Some(props)) = (args.first(), args.get(1)) else {
         return Err(RuntimeError::TypeError(
             "Object.defineProperties requires 2 arguments".to_string(),
@@ -804,11 +814,11 @@ pub fn object_define_properties(args: &[Value]) -> Result<Value, RuntimeError> {
     };
     for (key, descriptor) in descriptors {
         let key_value = match &key {
-            PropertyKey::Str(s) => Value::string(s),
+            PropertyKey::Str(atom) => Value::string(heap.resolve(*atom)),
             PropertyKey::Index(index) => Value::string(&index.to_string()),
             PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(*id),
         };
-        object_define_property(&[target.clone(), key_value, descriptor])?;
+        object_define_property(heap, &[target.clone(), key_value, descriptor])?;
     }
     Ok(target.clone())
 }
@@ -829,21 +839,25 @@ pub fn object_prototype_to_string(obj: &Value, _args: &[Value]) -> Result<Value,
 }
 
 /// `Object.prototype.hasOwnProperty(V)`
-pub fn object_has_own_property(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn object_has_own_property(
+    heap: &mut super::Heap,
+    obj: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     // ES 20.1.3.3: `ToObject(this)` first, so `hasOwnProperty.call(null, "x")`
     // is a TypeError rather than `false`.
     super::require_object_coercible(obj)?;
     let key = match args.first() {
-        Some(Value::String(s)) => PropertyKey::from_str(s),
+        Some(Value::String(s)) => PropertyKey::intern(heap, s),
         Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),
-        Some(other) => PropertyKey::from_str(&other.to_js_string()),
+        Some(other) => PropertyKey::intern(heap, &other.to_js_string()),
         None => return Ok(Value::Bool(false)),
     };
     match obj {
         Value::Object(obj_ref) => Ok(Value::Bool(obj_ref.borrow().has_property(&key))),
         Value::String(s) => {
             // String wrappers expose an own `length` and their index keys.
-            let own = match key.as_str() {
+            let own = match key.resolve(heap) {
                 Some("length") => true,
                 // 索引键走统一的 `array_index()`（`"01"` 之类不是索引）。
                 _ => key
@@ -887,15 +901,16 @@ pub fn object_is_prototype_of(obj: &Value, args: &[Value]) -> Result<Value, Runt
 
 /// `Object.prototype.propertyIsEnumerable(V)`.
 pub fn object_property_is_enumerable(
+    heap: &mut super::Heap,
     obj: &Value,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
     // ES 20.1.3.4: `ToObject(this)` first.
     super::require_object_coercible(obj)?;
     let key = match args.first() {
-        Some(Value::String(s)) => PropertyKey::from_str(s),
+        Some(Value::String(s)) => PropertyKey::intern(heap, s),
         Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),
-        Some(other) => PropertyKey::from_str(&other.to_js_string()),
+        Some(other) => PropertyKey::intern(heap, &other.to_js_string()),
         None => return Ok(Value::Bool(false)),
     };
     match obj {
@@ -925,9 +940,9 @@ pub fn object_lookup_accessor(
     // 不是 `undefined`。
     super::require_object_coercible(obj)?;
     let key = match args.first() {
-        Some(Value::String(s)) => PropertyKey::from_str(s),
+        Some(Value::String(s)) => PropertyKey::intern(heap, s),
         Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),
-        Some(other) => PropertyKey::from_str(&other.to_js_string()),
+        Some(other) => PropertyKey::intern(heap, &other.to_js_string()),
         None => return Ok(Value::Undefined),
     };
     // 原语接收者装箱：字符串暴露出索引键与 `length`（`"ab".__lookupGetter__("0")`）。
@@ -961,20 +976,26 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
 
     // Dedicated native so that `.call(receiver)` keeps Array/Number semantics.
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("toString"),
+        PropertyKey::well_known("toString").expect("well-known name"),
         super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
             crate::vm::object::NativeFunctionObject::new(OBJECT_TO_STRING_NATIVE),
         )))),
     );
     set_prototype_method(proto, heap, "valueOf", |this, _args| Ok(this.clone()));
-    set_prototype_method(proto, heap, "hasOwnProperty", |this, args| {
-        object_has_own_property(this, args)
+    // 闭包从不被调用（`set_prototype_method` 忽略它，真正走
+    // `call_prototype_method` 的按名分派）；实现需要 heap，住在分派里。
+    set_prototype_method(proto, heap, "hasOwnProperty", |_, _| {
+        Err(RuntimeError::NotImplemented(
+            "method implemented by the VM".to_string(),
+        ))
     });
     set_prototype_method(proto, heap, "isPrototypeOf", |this, args| {
         object_is_prototype_of(this, args)
     });
-    set_prototype_method(proto, heap, "propertyIsEnumerable", |this, args| {
-        object_property_is_enumerable(this, args)
+    set_prototype_method(proto, heap, "propertyIsEnumerable", |_, _| {
+        Err(RuntimeError::NotImplemented(
+            "method implemented by the VM".to_string(),
+        ))
     });
     // ES B.2.2.1 / B.2.2.2（web 兼容遗留）：沿原型链找 accessor 的一半。
     // 找不到 ⇒ `undefined`；数据属性 ⇒ `undefined`。实现之前这两条路是靠
@@ -989,7 +1010,7 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
     let _ = proto
         .borrow_mut()
         .define_property(
-            PropertyKey::from_str("constructor"),
+            PropertyKey::well_known("constructor").expect("well-known name"),
             super::method_descriptor(object_fn.clone()),
         );
 }
@@ -1002,11 +1023,17 @@ pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins, h
     set_static_method(object_fn, "values", heap, |_args| Ok(Value::Undefined));
     set_static_method(object_fn, "entries", heap, |_args| Ok(Value::Undefined));
     set_static_method(object_fn, "assign", heap, |_args| Ok(Value::Undefined));
-    set_static_method(object_fn, "defineProperty", heap, |args| {
-        object_define_property(args)
+    // 闭包从不被调用（`set_static_method` 按名注册，真正走 `call_static_method`
+    // 的按名分派）；实现需要 heap，住在分派表里。
+    set_static_method(object_fn, "defineProperty", heap, |_args| {
+        Err(RuntimeError::NotImplemented(
+            "method implemented by the VM".to_string(),
+        ))
     });
-    set_static_method(object_fn, "defineProperties", heap, |args| {
-        object_define_properties(args)
+    set_static_method(object_fn, "defineProperties", heap, |_args| {
+        Err(RuntimeError::NotImplemented(
+            "method implemented by the VM".to_string(),
+        ))
     });
     set_static_method(object_fn, "getOwnPropertyDescriptor", heap, |_args| {
         Ok(Value::Undefined)

@@ -114,7 +114,7 @@ pub fn register_number_statics(number_fn: &Value, _proto: &Gc<Object>, heap: &mu
         // Numeric constants are read-only, non-enumerable, non-configurable.
         for (name, value) in constants {
             let _ = obj_ref.borrow_mut().define_property(
-                crate::vm::PropertyKey::from_str(name),
+                crate::vm::PropertyKey::intern(heap, name),
                 super::constant_descriptor(Value::Number(value)),
             );
         }

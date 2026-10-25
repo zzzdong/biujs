@@ -36,9 +36,9 @@ pub fn register_json(heap: &mut Heap) -> Value {
     let stringify = Value::Object(heap.alloc(Object::NativeFunction(
         crate::vm::object::NativeFunctionObject::new("JSON.stringify"),
     )));
-    let _ = json.define_property(PropertyKey::from_str("parse"), super::method_descriptor(parse));
+    let _ = json.define_property(PropertyKey::well_known("parse").expect("well-known name"), super::method_descriptor(parse));
     let _ = json.define_property(
-        PropertyKey::from_str("stringify"),
+        PropertyKey::well_known("stringify").expect("well-known name"),
         super::method_descriptor(stringify),
     );
     let _ = json.define_property(
@@ -203,7 +203,7 @@ impl<'a> JsonParser<'a> {
             // CreateDataProperty: a later duplicate key wins, and a `__proto__`
             // key becomes an ordinary own property.
             let _ = obj.define_property(
-                PropertyKey::from_str(&key),
+                PropertyKey::intern(self.heap, &key),
                 PropertyDescriptor::data_descriptor(value),
             );
             self.skip_whitespace();
@@ -359,10 +359,14 @@ impl<'a> JsonParser<'a> {
 /// depending on where the value sits.
 pub fn json_stringify(heap: &mut Heap, value: &Value) -> Result<Option<String>, RuntimeError> {
     let mut stack = Vec::new();
-    serialize(value, &mut stack)
+    serialize(heap, value, &mut stack)
 }
 
-fn serialize(value: &Value, stack: &mut Vec<Value>) -> Result<Option<String>, RuntimeError> {
+fn serialize(
+    heap: &mut Heap,
+    value: &Value,
+    stack: &mut Vec<Value>,
+) -> Result<Option<String>, RuntimeError> {
     match value {
         Value::Undefined | Value::Function(_) | Value::Symbol(_) => Ok(None),
         Value::Null => Ok(Some("null".to_string())),
@@ -402,9 +406,9 @@ fn serialize(value: &Value, stack: &mut Vec<Value>) -> Result<Option<String>, Ru
                     }
                     stack.push(value.clone());
                     let result = if kind == ObjectKind::Array {
-                        serialize_array(value, stack)
+                        serialize_array(heap, value, stack)
                     } else {
-                        serialize_object(value, stack)
+                        serialize_object(heap, value, stack)
                     };
                     stack.pop();
                     result
@@ -416,7 +420,10 @@ fn serialize(value: &Value, stack: &mut Vec<Value>) -> Result<Option<String>, Ru
 
 /// `EnumerableOwnPropertyNames(value, key)`, in ordinary order (integer indices
 /// ascending, then the remaining strings in insertion order).
-pub fn own_enumerable_string_keys(value: &Value) -> Vec<String> {
+pub fn own_enumerable_string_keys(
+    heap: &mut Heap,
+    value: &Value,
+) -> Vec<(PropertyKey, String)> {
     let Value::Object(obj_ref) = value else {
         return Vec::new();
     };
@@ -426,13 +433,14 @@ pub fn own_enumerable_string_keys(value: &Value) -> Vec<String> {
         .into_iter()
         .filter_map(|key| {
             let name = match &key {
-                PropertyKey::Str(s) => s.to_string(),
+                PropertyKey::Str(atom) => heap.resolve(*atom).to_string(),
                 // 索引键（`Index`）也要输出 —— 它们是普通（非 Symbol）键。
                 PropertyKey::Index(index) => index.to_string(),
                 PropertyKey::Symbol(_) => return None,
             };
             if borrowed.property_get(&key).is_some_and(|d| d.enumerable) {
-                Some(name)
+                // 键本身一起带出去：调用方直接用它查值，不必把名字重新驻留一遍。
+                Some((key, name))
             } else {
                 None
             }
@@ -440,11 +448,15 @@ pub fn own_enumerable_string_keys(value: &Value) -> Vec<String> {
         .collect()
 }
 
-fn serialize_array(value: &Value, stack: &mut Vec<Value>) -> Result<Option<String>, RuntimeError> {
+fn serialize_array(
+    heap: &mut Heap,
+    value: &Value,
+    stack: &mut Vec<Value>,
+) -> Result<Option<String>, RuntimeError> {
     let len = match value {
         Value::Object(obj_ref) => obj_ref
             .borrow()
-            .property_get(&PropertyKey::from_str("length"))
+            .property_get(&PropertyKey::well_known("length").expect("well-known name"))
             .map(|d| d.value.to_number())
             .unwrap_or(0.0),
         _ => 0.0,
@@ -454,30 +466,34 @@ fn serialize_array(value: &Value, stack: &mut Vec<Value>) -> Result<Option<Strin
         let element = match value {
             Value::Object(obj_ref) => obj_ref
                 .borrow()
-                .property_get(&PropertyKey::element(index))
+                .property_get(&PropertyKey::element(heap, index))
                 .map(|d| d.value)
                 .unwrap_or(Value::Undefined),
             _ => Value::Undefined,
         };
-        partial.push(serialize(&element, stack)?.unwrap_or_else(|| "null".to_string()));
+        partial.push(serialize(heap, &element, stack)?.unwrap_or_else(|| "null".to_string()));
     }
     Ok(Some(format!("[{}]", partial.join(","))))
 }
 
-fn serialize_object(value: &Value, stack: &mut Vec<Value>) -> Result<Option<String>, RuntimeError> {
+fn serialize_object(
+    heap: &mut Heap,
+    value: &Value,
+    stack: &mut Vec<Value>,
+) -> Result<Option<String>, RuntimeError> {
     let mut partial = Vec::new();
-    for key in own_enumerable_string_keys(value) {
+    for (key, name) in own_enumerable_string_keys(heap, value) {
         let entry = match value {
             Value::Object(obj_ref) => obj_ref
                 .borrow()
-                .property_get(&PropertyKey::from_str(&key))
+                .property_get(&key)
                 .map(|d| d.value)
                 .unwrap_or(Value::Undefined),
             _ => Value::Undefined,
         };
-        if let Some(serialized) = serialize(&entry, stack)? {
+        if let Some(serialized) = serialize(heap, &entry, stack)? {
             let mut quoted = String::new();
-            quote_json_string(&key, &mut quoted);
+            quote_json_string(&name, &mut quoted);
             partial.push(format!("{quoted}:{serialized}"));
         }
     }

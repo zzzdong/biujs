@@ -870,19 +870,17 @@ impl JSObject for ArrayObject {
 
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        if let PropertyKey::Str(s) = key {
-            if s.as_str() == "length" {
-                // Array `length`: writable (until frozen so), non-enumerable,
-                // non-configurable (ES 10.4.2.1).
-                return Some(PropertyDescriptor {
-                    value: Value::Number(self.elements.len() as f64),
-                    writable: self.length_writable,
-                    enumerable: false,
-                    configurable: false,
-                    getter: None,
-                    setter: None,
-                });
-            }
+        if key.is("length") {
+            // Array `length`: writable (until frozen so), non-enumerable,
+            // non-configurable (ES 10.4.2.1).
+            return Some(PropertyDescriptor {
+                value: Value::Number(self.elements.len() as f64),
+                writable: self.length_writable,
+                enumerable: false,
+                configurable: false,
+                getter: None,
+                setter: None,
+            });
         }
         // 索引键（`Index` 或规范形式的字符串键）—— 判定只有 `array_index()` 一处。
         if let Some(index) = key.array_index() {
@@ -911,26 +909,24 @@ impl JSObject for ArrayObject {
             return Err("Cannot set property on frozen array".to_string());
         }
 
-        if let PropertyKey::Str(s) = &key {
-            if s.as_str() == "length" {
-                if !self.length_writable {
-                    return Err("Cannot assign to read-only property 'length'".to_string());
-                }
-                // Adjust array length (with the usual ArrayLength validation).
-                // `ArraySetLength` throws a *RangeError*; the `String` channel
-                // would flatten it into a TypeError, so it travels prefixed.
-                let n = value.to_number();
-                let new_len = crate::builtins::validate_array_length(n)
-                    .map_err(crate::vm::RuntimeError::into_property_error)?;
-                if !self.resize_length(new_len) {
-                    return Err(
-                        "Cannot assign to 'length': an index beyond it cannot be deleted"
-                            .to_string(),
-                    );
-                }
-                return Ok(true);
+        if key.is("length") {
+            if !self.length_writable {
+                return Err("Cannot assign to read-only property 'length'".to_string());
             }
-        }
+            // Adjust array length (with the usual ArrayLength validation).
+            // `ArraySetLength` throws a *RangeError*; the `String` channel
+            // would flatten it into a TypeError, so it travels prefixed.
+            let n = value.to_number();
+            let new_len = crate::builtins::validate_array_length(n)
+                .map_err(crate::vm::RuntimeError::into_property_error)?;
+            if !self.resize_length(new_len) {
+                return Err(
+                    "Cannot assign to 'length': an index beyond it cannot be deleted"
+                        .to_string(),
+                );
+            }
+            return Ok(true);
+    }
 
         if let Some(index) = key.array_index() {
             let idx = index as usize;
@@ -1002,40 +998,38 @@ impl JSObject for ArrayObject {
         if self.frozen {
             return Err("Cannot define property on frozen array".to_string());
         }
-        if let PropertyKey::Str(s) = &key {
-            if s.as_str() == "length" {
-                if desc.is_accessor_descriptor() {
-                    return Err("Cannot redefine property: length".to_string());
-                }
-                if desc.configurable {
-                    return Err("Cannot redefine property: length is non-configurable".to_string());
-                }
-                let n = desc.value.to_number();
-                // `validate_array_length` already builds the right error
-                // (`RangeError`); the `String` channel of `define_property`
-                // would flatten it into a TypeError, so it travels prefixed and
-                // `RuntimeError::from_property_error` unpacks it.
-                let new_len = crate::builtins::validate_array_length(n)
-                    .map_err(crate::vm::RuntimeError::into_property_error)?;
-                if !self.length_writable && new_len != self.elements.len() {
-                    return Err("Cannot redefine property: length is non-writable".to_string());
-                }
-                // The *whole* descriptor takes effect even when the shrink fails
-                // partway (ES 10.4.2.4 step 12.c): `Object.defineProperty(a,
-                // "length", {value: 0, writable: false})` over a
-                // non-configurable index leaves `length` clamped and read-only,
-                // and then reports failure, which `[[DefineOwnProperty]]`
-                // raises as a TypeError.
-                self.length_writable = desc.writable;
-                if !self.resize_length(new_len) {
-                    return Err(
-                        "Cannot redefine property: length is beyond a non-configurable index"
-                            .to_string(),
-                    );
-                }
-                return Ok(true);
+        if key.is("length") {
+            if desc.is_accessor_descriptor() {
+                return Err("Cannot redefine property: length".to_string());
             }
-        }
+            if desc.configurable {
+                return Err("Cannot redefine property: length is non-configurable".to_string());
+            }
+            let n = desc.value.to_number();
+            // `validate_array_length` already builds the right error
+            // (`RangeError`); the `String` channel of `define_property`
+            // would flatten it into a TypeError, so it travels prefixed and
+            // `RuntimeError::from_property_error` unpacks it.
+            let new_len = crate::builtins::validate_array_length(n)
+                .map_err(crate::vm::RuntimeError::into_property_error)?;
+            if !self.length_writable && new_len != self.elements.len() {
+                return Err("Cannot redefine property: length is non-writable".to_string());
+            }
+            // The *whole* descriptor takes effect even when the shrink fails
+            // partway (ES 10.4.2.4 step 12.c): `Object.defineProperty(a,
+            // "length", {value: 0, writable: false})` over a
+            // non-configurable index leaves `length` clamped and read-only,
+            // and then reports failure, which `[[DefineOwnProperty]]`
+            // raises as a TypeError.
+            self.length_writable = desc.writable;
+            if !self.resize_length(new_len) {
+                return Err(
+                    "Cannot redefine property: length is beyond a non-configurable index"
+                        .to_string(),
+                );
+            }
+            return Ok(true);
+    }
 
         if let Some(index) = key.array_index() {
             let idx = index as usize;
@@ -1101,10 +1095,8 @@ impl JSObject for ArrayObject {
         if self.frozen || self.sealed {
             return false;
         }
-        if let PropertyKey::Str(s) = key {
-            if s.as_str() == "length" {
-                return false;
-            }
+        if key.is("length") {
+            return false;
         }
         if let Some(index) = key.array_index() {
             let idx = index as usize;
@@ -1131,10 +1123,8 @@ impl JSObject for ArrayObject {
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        if let PropertyKey::Str(s) = key {
-            if s.as_str() == "length" {
-                return true;
-            }
+        if key.is("length") {
+            return true;
         }
         if let Some(index) = key.array_index() {
             if self.properties.contains_key(key) {
@@ -1159,7 +1149,7 @@ impl JSObject for ArrayObject {
             })
             .map(|(i, _)| Self::index_key(i))
             .collect();
-        keys.push(PropertyKey::from_str("length"));
+        keys.push(PropertyKey::well_known("length").expect("well-known name"));
         keys.extend(self.properties.keys());
         keys
     }
@@ -1475,12 +1465,12 @@ pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usi
     }
 
     obj_ref.borrow_mut().define_property(
-        crate::vm::property::PropertyKey::from_str("length"),
+        crate::vm::property::PropertyKey::well_known("length").expect("well-known name"),
         fn_meta(Value::Number(arity as f64)),
     )
     .ok();
     obj_ref.borrow_mut().define_property(
-        crate::vm::property::PropertyKey::from_str("name"),
+        crate::vm::property::PropertyKey::well_known("name").expect("well-known name"),
         fn_meta(Value::string(name)),
     )
     .ok();
@@ -1494,7 +1484,7 @@ pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usi
     if let Value::Object(ref proto_ref) = proto_obj {
         // `F.prototype.constructor` — writable, non-enumerable, configurable.
         proto_ref.borrow_mut().define_property(
-            crate::vm::property::PropertyKey::from_str("constructor"),
+            crate::vm::property::PropertyKey::well_known("constructor").expect("well-known name"),
             PropertyDescriptor {
                 value: Value::Function(func_id),
                 writable: true,
@@ -1510,7 +1500,8 @@ pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usi
         obj_ref
             .borrow_mut()
             .define_property(
-                crate::vm::property::PropertyKey::from("prototype"),
+                crate::vm::property::PropertyKey::well_known("prototype")
+                    .expect("well-known name"),
                 PropertyDescriptor {
                     value: proto_obj.clone(),
                     writable: true,
@@ -1547,13 +1538,13 @@ pub fn new_arrow_function_object(
     let mut borrowed = obj_ref.borrow_mut();
     borrowed
         .define_property(
-            PropertyKey::from_str("length"),
+            PropertyKey::well_known("length").expect("well-known name"),
             function_metadata_descriptor(Value::Number(arity as f64)),
         )
         .ok();
     borrowed
         .define_property(
-            PropertyKey::from_str("name"),
+            PropertyKey::well_known("name").expect("well-known name"),
             function_metadata_descriptor(Value::string(name)),
         )
         .ok();
@@ -1654,7 +1645,7 @@ impl NativeFunctionObject {
         };
         self.set_length(crate::builtins::builtin_arity(&self.name));
         self.properties.insert(
-            PropertyKey::from_str("name"),
+            PropertyKey::well_known("name").expect("well-known name"),
             function_metadata_descriptor(Value::string(&display)),
         );
     }
@@ -1663,7 +1654,7 @@ impl NativeFunctionObject {
     /// tell two same-named built-ins apart).
     pub fn set_length(&mut self, length: usize) {
         self.properties.insert(
-            PropertyKey::from_str("length"),
+            PropertyKey::well_known("length").expect("well-known name"),
             function_metadata_descriptor(Value::Number(length as f64)),
         );
     }
@@ -1830,17 +1821,15 @@ impl JSObject for PrimitiveWrapperObject {
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         if let Value::String(s) = &self.primitive {
-            if let PropertyKey::Str(k) = key {
-                if k.as_str() == "length" {
-                    return Some(PropertyDescriptor {
-                        value: Value::Number(crate::vm::utf16::length(s) as f64),
-                        writable: false,
-                        enumerable: false,
-                        configurable: false,
-                        getter: None,
-                        setter: None,
-                    });
-                }
+            if key.is("length") {
+                return Some(PropertyDescriptor {
+                    value: Value::Number(crate::vm::utf16::length(s) as f64),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    getter: None,
+                    setter: None,
+                });
             }
             if let Some(idx) = key.array_index() {
                 // 索引按码元：非 BMP 字符的第 0 位是半个代理对（U+FFFD）。
@@ -1859,13 +1848,13 @@ impl JSObject for PrimitiveWrapperObject {
 
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
         if matches!(self.primitive, Value::String(_)) {
-            if let PropertyKey::Str(s) = &key {
+            {
                 // String wrapper index keys and `length` are read-only.
-                if s.as_str() == "length" {
-                    return Err(
-                        "Cannot assign to read-only property of a String wrapper".to_string()
-                    );
-                }
+                if key.is("length") {
+                return Err(
+                    "Cannot assign to read-only property of a String wrapper".to_string()
+                );
+            }
             }
             if key.array_index().is_some() {
                 return Err(
@@ -1902,11 +1891,9 @@ impl JSObject for PrimitiveWrapperObject {
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
         if matches!(self.primitive, Value::String(_)) {
-            if let PropertyKey::Str(s) = key {
-                if s.as_str() == "length" {
-                    return false;
-                }
-            }
+            if key.is("length") {
+            return false;
+        }
             if key.array_index().is_some() {
                 return false;
             }
@@ -1916,11 +1903,9 @@ impl JSObject for PrimitiveWrapperObject {
 
     fn has_property(&self, key: &PropertyKey) -> bool {
         if matches!(self.primitive, Value::String(_)) {
-            if let PropertyKey::Str(s) = key {
-                if s.as_str() == "length" {
-                    return true;
-                }
-            }
+            if key.is("length") {
+            return true;
+        }
             if let Some(idx) = key.array_index() {
                 return (idx as usize) < self.string_len();
             }
@@ -1939,14 +1924,14 @@ impl JSObject for PrimitiveWrapperObject {
             // so it precedes every property added afterwards — putting it last
             // made `Reflect.ownKeys(new String(""))` answer `["a","b","length"]`
             // after `str.a = 1; str.b = 2`.
-            keys.push(PropertyKey::from_str("length"));
+            keys.push(PropertyKey::well_known("length").expect("well-known name"));
         }
         let wraps_string = matches!(self.primitive, Value::String(_));
         keys.extend(
             self.properties
                 .keys()
                 .into_iter()
-                .filter(|key| !wraps_string || key.as_str() != Some("length")),
+                .filter(|key| !wraps_string || !key.is("length")),
         );
         keys
     }
@@ -2197,19 +2182,29 @@ impl JSObject for RegExpObject {
         // object's own state, not properties: `lastIndex` in particular has to
         // be writable *through* to the matcher, which a property copy of it
         // would not be.
-        if let PropertyKey::Str(k) = key {
-            let slot = match k.as_str() {
-                "lastIndex" => Some((Value::Number(self.last_index), true)),
-                "source" => Some((Value::string(&self.source), false)),
-                "flags" => Some((Value::string(&self.flags), false)),
-                "global" => Some((Value::Bool(self.is_global()), false)),
-                "sticky" => Some((Value::Bool(self.is_sticky()), false)),
-                "ignoreCase" => Some((Value::Bool(self.flags.contains('i')), false)),
-                "multiline" => Some((Value::Bool(self.flags.contains('m')), false)),
-                "dotAll" => Some((Value::Bool(self.flags.contains('s')), false)),
-                "unicode" => Some((Value::Bool(self.flags.contains('u')), false)),
-                "hasIndices" => Some((Value::Bool(self.flags.contains('d')), false)),
-                _ => None,
+        {
+            let slot = if key.is("lastIndex") {
+                Some((Value::Number(self.last_index), true))
+            } else if key.is("source") {
+                Some((Value::string(&self.source), false))
+            } else if key.is("flags") {
+                Some((Value::string(&self.flags), false))
+            } else if key.is("global") {
+                Some((Value::Bool(self.is_global()), false))
+            } else if key.is("sticky") {
+                Some((Value::Bool(self.is_sticky()), false))
+            } else if key.is("ignoreCase") {
+                Some((Value::Bool(self.flags.contains('i')), false))
+            } else if key.is("multiline") {
+                Some((Value::Bool(self.flags.contains('m')), false))
+            } else if key.is("dotAll") {
+                Some((Value::Bool(self.flags.contains('s')), false))
+            } else if key.is("unicode") {
+                Some((Value::Bool(self.flags.contains('u')), false))
+            } else if key.is("hasIndices") {
+                Some((Value::Bool(self.flags.contains('d')), false))
+            } else {
+                None
             };
             if let Some((value, writable)) = slot {
                 return Some(PropertyDescriptor {
@@ -2227,18 +2222,15 @@ impl JSObject for RegExpObject {
         self.base.property_get(key)
     }
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        if let PropertyKey::Str(k) = &key {
-            if k.as_str() == "lastIndex" {
-                self.last_index = value.to_number();
-                return Ok(true);
-            }
-            if matches!(
-                k.as_str(),
-                "source" | "flags" | "global" | "sticky" | "ignoreCase" | "multiline"
-                    | "dotAll" | "unicode" | "hasIndices"
-            ) {
-                return Err("Cannot assign to read only property".to_string());
-            }
+        if key.is("lastIndex") {
+            self.last_index = value.to_number();
+            return Ok(true);
+        }
+        if ["source", "flags", "global", "sticky", "ignoreCase", "multiline", "dotAll", "unicode", "hasIndices"]
+            .iter()
+            .any(|name| key.is(name))
+        {
+            return Err("Cannot assign to read only property".to_string());
         }
         self.base.property_set(key, value)
     }
@@ -2405,7 +2397,7 @@ impl JSObject for PromiseObject {
 /// `globalThis.x` stays `undefined` for `let x`, per B21.)
 #[derive(Debug)]
 pub struct GlobalObject {
-    store: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+    store: Rc<RefCell<std::collections::HashMap<PropertyKey, Value>>>,
     /// `[[Prototype]]`. It is `Object.prototype`, which is what makes
     /// `globalThis.hasOwnProperty` and `Object.getPrototypeOf(globalThis)`
     /// behave — the globals map alone only answers *own* properties.
@@ -2414,7 +2406,7 @@ pub struct GlobalObject {
 
 impl GlobalObject {
     pub fn new(
-        store: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+        store: Rc<RefCell<std::collections::HashMap<PropertyKey, Value>>>,
     ) -> Self {
         Self {
             store,
@@ -2423,7 +2415,7 @@ impl GlobalObject {
     }
 
     pub fn with_prototype(
-        store: Rc<RefCell<std::collections::HashMap<String, Value>>>,
+        store: Rc<RefCell<std::collections::HashMap<PropertyKey, Value>>>,
         prototype: Gc<Object>,
     ) -> Self {
         Self {
@@ -2432,11 +2424,12 @@ impl GlobalObject {
         }
     }
 
-    fn key_name(key: &PropertyKey) -> Option<String> {
+    /// 键在 `store` 里的查找键：字符串键用它的 `Atom`（存储按 `Atom` 建键，
+    /// 所以这里**不需要**把 `Atom` 解析回字符串）；索引键退回十进制名字。
+    fn key_name(key: &PropertyKey) -> Option<PropertyKey> {
         match key {
-            PropertyKey::Str(s) => Some(s.as_str().to_string()),
-            // 索引键的名字就是它的十进制写法（`arr[1]` 与 `arr["1"]` 同一个键）。
-            PropertyKey::Index(index) => Some(index.to_string()),
+            PropertyKey::Str(_) => Some(*key),
+            PropertyKey::Index(_) => Some(*key),
             _ => None,
         }
     }
@@ -2503,11 +2496,7 @@ impl JSObject for GlobalObject {
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.store
-            .borrow()
-            .keys()
-            .map(|k| PropertyKey::from_str(k))
-            .collect()
+        self.store.borrow().keys().copied().collect()
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
@@ -2907,7 +2896,7 @@ impl JSObject for TypedArrayObject {
     /// Uint8Array(2))` is `["0", "1"]`.
     fn own_keys(&self) -> Vec<PropertyKey> {
         let mut keys: Vec<PropertyKey> = (0..self.length)
-            .map(|i| PropertyKey::element(i as u64))
+            .map(|i| PropertyKey::from_index(i as u32))
             .collect();
         keys.extend(self.base.own_keys());
         keys
@@ -3987,11 +3976,14 @@ impl JSObject for GeneratorObject {
         if *key == crate::vm::iterator::iterator_symbol_key() {
             return Some(PropertyDescriptor::data_descriptor(self.iterator_fn.clone()));
         }
-        match key.as_str() {
-            Some("next") => Some(PropertyDescriptor::data_descriptor(self.next_fn.clone())),
-            Some("return") => Some(PropertyDescriptor::data_descriptor(self.return_fn.clone())),
-            Some("throw") => Some(PropertyDescriptor::data_descriptor(self.throw_fn.clone())),
-            _ => None,
+        if key.is("next") {
+            Some(PropertyDescriptor::data_descriptor(self.next_fn.clone()))
+        } else if key.is("return") {
+            Some(PropertyDescriptor::data_descriptor(self.return_fn.clone()))
+        } else if key.is("throw") {
+            Some(PropertyDescriptor::data_descriptor(self.throw_fn.clone()))
+        } else {
+            None
         }
     }
 
@@ -4013,14 +4005,14 @@ impl JSObject for GeneratorObject {
 
     fn has_property(&self, key: &PropertyKey) -> bool {
         *key == crate::vm::iterator::iterator_symbol_key()
-            || matches!(key.as_str(), Some("next") | Some("return") | Some("throw"))
+            || key.is("next") || key.is("return") || key.is("throw")
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
         vec![
-            PropertyKey::from_str("next"),
-            PropertyKey::from_str("return"),
-            PropertyKey::from_str("throw"),
+            PropertyKey::well_known("next").expect("well-known name"),
+            PropertyKey::well_known("return").expect("well-known name"),
+            PropertyKey::well_known("throw").expect("well-known name"),
         ]
     }
 

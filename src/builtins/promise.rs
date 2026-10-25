@@ -44,7 +44,7 @@ pub fn register_promise_statics(ctor: &Value, heap: &mut Heap) {
     };
     for name in ["resolve", "reject", "all", "race", "allSettled", "any"] {
         let _ = obj_ref.borrow_mut().define_property(
-            crate::vm::property::PropertyKey::from_str(name),
+            crate::vm::property::PropertyKey::intern(heap, name),
             crate::vm::property::PropertyDescriptor {
                 value: Value::Object(heap.alloc(Object::NativeFunction(
                     crate::vm::object::NativeFunctionObject::new(&format!("Promise.{name}")),

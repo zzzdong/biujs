@@ -47,7 +47,7 @@ fn options_cause(options: Option<&Value>) -> Option<crate::vm::property::Propert
     };
     obj_ref
         .borrow()
-        .property_get(&PropertyKey::from_str("cause"))
+        .property_get(&PropertyKey::well_known("cause").expect("well-known name"))
         .map(|d| error_message_descriptor(d.value))
 }
 
@@ -82,7 +82,7 @@ pub fn create_error_object(
     obj.set_prototype(Some(prototype));
     if let Some(msg) = message {
         obj.define_property(
-            PropertyKey::from_str("message"),
+            PropertyKey::well_known("message").expect("well-known name"),
             error_message_descriptor(Value::string(&msg)),
         )
         .ok();
@@ -110,7 +110,7 @@ pub fn error_constructor(heap: &mut Heap, error_type: ErrorType, args: &[Value])
     }
     if let Some(msg) = message {
         obj.define_property(
-            PropertyKey::from_str("message"),
+            PropertyKey::well_known("message").expect("well-known name"),
             error_message_descriptor(Value::string(&msg)),
         )
         .ok();
@@ -118,7 +118,7 @@ pub fn error_constructor(heap: &mut Heap, error_type: ErrorType, args: &[Value])
     // `new Error(message, { cause })` installs an own, non-enumerable `cause`
     // (ES 20.5.1.1 step 3).
     if let Some(cause) = options_cause(args.get(1)) {
-        obj.define_property(PropertyKey::from_str("cause"), cause).ok();
+        obj.define_property(PropertyKey::well_known("cause").expect("well-known name"), cause).ok();
     }
 
     Ok(Value::Object(heap.alloc(Object::Ordinary(obj))))
@@ -185,7 +185,10 @@ pub fn runtime_error_to_js_error(
 ///
 /// `name` and `message` are read with `[[Get]]`, i.e. through the prototype
 /// chain, and an `undefined` value falls back to `"Error"` / `""`.
-pub fn error_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> {
+pub fn error_prototype_to_string(
+    heap: &mut Heap,
+    obj: &Value,
+) -> Result<Value, RuntimeError> {
     let Value::Object(obj_ref) = obj else {
         // "If the this value is not an object, throw a TypeError."
         return Err(RuntimeError::TypeError(
@@ -193,8 +196,11 @@ pub fn error_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> {
         ));
     };
 
+    // `name` / `message` 都是常用名：静态表命中，不需要堆（也就不会和 `heap`
+    // 的可变借用打架）。
     let get = |prop: &str| -> Option<Value> {
-        crate::vm::prototype::find_descriptor(*obj_ref, &PropertyKey::from_str(prop))
+        let key = PropertyKey::well_known(prop)?;
+        crate::vm::prototype::find_descriptor(*obj_ref, &key)
             .ok()
             .flatten()
             .map(|(_, desc)| desc.value)
@@ -245,14 +251,18 @@ pub fn setup_error_prototype(
     };
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::from_str("name"), writable_string(Value::string("Error")));
+        .define_property(PropertyKey::well_known("name").expect("well-known name"), writable_string(Value::string("Error")));
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::from_str("message"), writable_string(Value::string("")));
+        .define_property(PropertyKey::well_known("message").expect("well-known name"), writable_string(Value::string("")));
 
     // Error.prototype.toString
-    set_prototype_method(proto, heap, "toString", |this, _args| {
-        error_prototype_to_string(this)
+    // 闭包从不被调用（`set_prototype_method` 忽略它）；实现需要 heap，住在
+    // `call_prototype_method` 的按名分派里。
+    set_prototype_method(proto, heap, "toString", |_, _| {
+        Err(RuntimeError::NotImplemented(
+            "method implemented by the VM".to_string(),
+        ))
     });
 }
 
@@ -274,8 +284,8 @@ pub fn setup_native_error_prototype(proto: &Gc<Object>, name: &str) {
     };
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::from_str("name"), writable(Value::string(name)));
+        .define_property(PropertyKey::well_known("name").expect("well-known name"), writable(Value::string(name)));
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::from_str("message"), writable(Value::string("")));
+        .define_property(PropertyKey::well_known("message").expect("well-known name"), writable(Value::string("")));
 }

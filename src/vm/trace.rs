@@ -167,7 +167,7 @@ mod tests {
         vm.state
             .globals
             .borrow_mut()
-            .insert("x".to_string(), Value::Object(g));
+            .insert(crate::vm::property::PropertyKey::well_known("x").unwrap_or(crate::vm::property::PropertyKey::from_index(0)), Value::Object(g));
         assert!(traced_contains(&vm, &g));
     }
 

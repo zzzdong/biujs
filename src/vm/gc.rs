@@ -171,6 +171,9 @@ pub struct Heap {
     /// `BIUJS_GC_STRESS=1`：每次分配都收集（用于把 rooting bug 炸出来）。
     /// **只读一次**环境变量（纪律 #2：路径上的东西不要每步读）。
     stress: bool,
+    /// 属性名驻留表（见 [`crate::vm::atom`]）。跟着堆走：atom 与 `Gc` 一样
+    /// 不得活过它所属的堆。
+    interner: crate::vm::atom::Interner,
 }
 
 /// 收集阈值的下限。
@@ -189,7 +192,28 @@ impl Heap {
             bytes: 0,
             threshold: MIN_THRESHOLD,
             stress: std::env::var_os("BIUJS_GC_STRESS").is_some(),
+            interner: crate::vm::atom::Interner::new(),
         }
+    }
+
+    /// 驻留一个属性名（见 [`crate::vm::atom`]）。
+    pub fn intern(&mut self, name: &str) -> crate::vm::atom::Atom {
+        self.interner.intern(name)
+    }
+
+    /// `Atom` → 属性名。
+    pub fn resolve(&self, atom: crate::vm::atom::Atom) -> &str {
+        self.interner.resolve(atom)
+    }
+
+    /// 查一个**已驻留**的属性名，不插入（读路径用）。
+    pub fn lookup(&self, name: &str) -> Option<crate::vm::atom::Atom> {
+        self.interner.lookup(name)
+    }
+
+    /// 已驻留的属性名数（测试/调试用）。
+    pub fn interned_names(&self) -> usize {
+        self.interner.len()
     }
 
     /// 每块的槽位数 = [`CHUNK_BYTES`] / `size_of::<Slot>()`，至少 1。
@@ -953,8 +977,9 @@ mod tests {
     use super::*;
     use std::rc::Rc;
 
+    /// 测试用键：常用名走静态表，其余走 `Index`/原始字符串（这是单测，不是热路径）。
     fn key(s: &str) -> PropertyKey {
-        PropertyKey::from_str(s)
+        PropertyKey::well_known(s).unwrap_or(PropertyKey::from_index(0))
     }
 
     /// 0. 尺寸守门：枚举尺寸 = 最大变体，`Object` 的大小直接决定 arena 块粒度与

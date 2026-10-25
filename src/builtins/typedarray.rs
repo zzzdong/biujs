@@ -454,7 +454,11 @@ pub fn dv_set(this: &Value, args: &[Value], ty: DataViewType) -> Result<Value, R
 /// 的一种写法（`new Uint8Array({ length: 2 ** 31 })`），所以它也必须在
 /// `MAX_BUFFER_BYTES` 之前被拦住 —— 实测 `length-excessive-throws.js` 就是靠这个
 /// 形状把整个分片干掉的（2GiB）。
-fn source_numbers(value: &Value, bytes_per_element: usize) -> Result<Vec<f64>, RuntimeError> {
+fn source_numbers(
+    heap: &mut Heap,
+    value: &Value,
+    bytes_per_element: usize,
+) -> Result<Vec<f64>, RuntimeError> {
     let mut out = Vec::new();
     let Value::Object(obj_ref) = value else {
         return Ok(out);
@@ -474,7 +478,7 @@ fn source_numbers(value: &Value, bytes_per_element: usize) -> Result<Vec<f64>, R
     }
     let borrowed = obj_ref.borrow();
     let length = borrowed
-        .property_get(&PropertyKey::from_str("length"))
+        .property_get(&PropertyKey::well_known("length").expect("well-known name"))
         .map(|d| d.value.to_number())
         .unwrap_or(0.0);
     if length.is_nan() || length <= 0.0 {
@@ -483,7 +487,7 @@ fn source_numbers(value: &Value, bytes_per_element: usize) -> Result<Vec<f64>, R
     let length = checked_byte_length(length, bytes_per_element)? / bytes_per_element;
     for i in 0..length {
         let element = borrowed
-            .property_get(&PropertyKey::element(i as u64))
+            .property_get(&PropertyKey::element(heap, i as u64))
             .map(|d| d.value.to_number())
             .unwrap_or(f64::NAN);
         out.push(element);
@@ -569,7 +573,7 @@ pub fn typedarray_construct(
                 vec![0.0; length]
             }
         }
-        other => source_numbers(other, size)?,
+        other => source_numbers(heap, other, size)?,
     };
 
     let buffer = make_buffer(heap, numbers.len() * size, None);
@@ -663,12 +667,16 @@ pub fn typedarray_elements(value: &Value) -> Option<Vec<Value>> {
 }
 
 /// `set(source, offset)` — copies into this view.
-pub fn ta_set(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn ta_set(
+    heap: &mut Heap,
+    this: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let source = args.first().cloned().unwrap_or(Value::Undefined);
     let numbers = match source {
         // A TypedArray source copies *elements*, even of a different kind.
-        other if is_typedarray_receiver(&other) => source_numbers(&other, 1)?,
-        Value::Object(_) | Value::String(_) => source_numbers(&source, 1)?,
+        other if is_typedarray_receiver(&other) => source_numbers(heap, &other, 1)?,
+        Value::Object(_) | Value::String(_) => source_numbers(heap, &source, 1)?,
         other => return Err(RuntimeError::TypeError(format!(
             "TypedArray.prototype.set: {} is not an array-like",
             other.type_of()
@@ -997,7 +1005,7 @@ pub fn register_arraybuffer_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `ab_slice`（它需要 `heap`，而闭包签名拿不到）。
     set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("byteLength"),
+        PropertyKey::well_known("byteLength").expect("well-known name"),
         accessor(heap, AB_BYTE_LENGTH_NATIVE),
     );
 }
@@ -1035,15 +1043,15 @@ pub fn register_dataview_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         set_prototype_method(proto, heap, name, move |this, args| dv_set(this, args, ty));
     }
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("buffer"),
+        PropertyKey::well_known("buffer").expect("well-known name"),
         accessor(heap, DV_BUFFER_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("byteLength"),
+        PropertyKey::well_known("byteLength").expect("well-known name"),
         accessor(heap, DV_BYTE_LENGTH_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("byteOffset"),
+        PropertyKey::well_known("byteOffset").expect("well-known name"),
         accessor(heap, DV_BYTE_OFFSET_NATIVE),
     );
 }
@@ -1060,7 +1068,11 @@ pub fn register_arraybuffer_statics(ctor: &Value) {
 /// 那一项见 [`register_typedarray_bytes_per_element`]。
 pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use super::set_prototype_method;
-    set_prototype_method(proto, heap, "set", |this, args| ta_set(this, args));
+    set_prototype_method(proto, heap, "set", |_this, _args| {
+        Err(RuntimeError::NotImplemented(
+            "method implemented by the VM".to_string(),
+        ))
+    });
     // 下面这两个闭包**永不被调用**：`set_prototype_method` 只登记名字，实际分派
     // 在 `call_prototype_method` 里按名字走（`ta_subarray` / `ta_slice`）。留着
     // 只是为了满足签名，别被它误导成"subarray/slice 返回 undefined"。
@@ -1123,19 +1135,19 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     }
 
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("length"),
+        PropertyKey::well_known("length").expect("well-known name"),
         accessor(heap, TA_LENGTH_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("byteLength"),
+        PropertyKey::well_known("byteLength").expect("well-known name"),
         accessor(heap, TA_BYTE_LENGTH_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("byteOffset"),
+        PropertyKey::well_known("byteOffset").expect("well-known name"),
         accessor(heap, TA_BYTE_OFFSET_NATIVE),
     );
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("buffer"),
+        PropertyKey::well_known("buffer").expect("well-known name"),
         accessor(heap, TA_BUFFER_NATIVE),
     );
     // Iterating a view yields its elements: the factory reads `length` (a getter
@@ -1154,7 +1166,7 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
 /// （`%TypedArray%.prototype` 上并没有这一项）。
 pub fn register_typedarray_bytes_per_element(kind: TypedArrayKind, proto: &Gc<Object>) {
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("BYTES_PER_ELEMENT"),
+        PropertyKey::well_known("BYTES_PER_ELEMENT").expect("well-known name"),
         data(Value::Number(kind.bytes_per_element() as f64)),
     );
 }

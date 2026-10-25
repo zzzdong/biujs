@@ -143,7 +143,7 @@ pub fn register_map_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         MAP_SIZE_NATIVE,
     ))));
     let _ = proto.borrow_mut().define_property(
-        PropertyKey::from_str("size"),
+        PropertyKey::well_known("size").expect("well-known name"),
         PropertyDescriptor {
             value: Value::Undefined,
             writable: false,

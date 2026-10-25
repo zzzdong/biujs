@@ -290,20 +290,20 @@ var globalThis = { "$DONE": $DONE };
 const ASYNC_RECORDER: &str = "__test262_async";
 
 /// The recorded outcome of an async test, read off the recorder global.
-fn async_outcome(value: &Value) -> Result<(), String> {
+fn async_outcome(vm: &mut biujs::vm::VM, value: &Value) -> Result<(), String> {
     let Value::Object(obj) = value else {
         return Err("$DONE was never called".to_string());
     };
     let borrowed = obj.borrow();
     let called = borrowed
-        .property_get(&biujs::vm::PropertyKey::from_str("called"))
+        .property_get(&vm.property_key("called"))
         .map(|d| d.value.to_boolean())
         .unwrap_or(false);
     if !called {
         return Err("$DONE was never called (async test did not finish)".to_string());
     }
     match borrowed
-        .property_get(&biujs::vm::PropertyKey::from_str("error"))
+        .property_get(&vm.property_key("error"))
         .map(|d| d.value)
     {
         None | Some(Value::Undefined) => Ok(()),
@@ -569,11 +569,11 @@ fn should_skip(test: &Test) -> Option<String> {
 ///
 /// `name` lives on the error *prototype* for the standard error types, so the
 /// whole prototype chain has to be walked.
-fn thrown_error_name(val: &Value) -> Option<String> {
+fn thrown_error_name(vm: &mut biujs::vm::VM, val: &Value) -> Option<String> {
     let mut current = val.as_object();
     let mut depth = 0;
     while let Some(obj) = current {
-        if let Some(desc) = obj.borrow().property_get(&biujs::vm::PropertyKey::from_str("name")) {
+        if let Some(desc) = obj.borrow().property_get(&vm.property_key("name")) {
             if let Value::String(s) = desc.value {
                 return Some(s.to_string());
             }
@@ -614,7 +614,7 @@ fn run_test(test: &Test) -> Result<(), String> {
                 vm.run(&module).map_err(|e| e.to_string())?;
                 if test.desc.flags.contains(&Flag::Async) {
                     match vm.global(ASYNC_RECORDER) {
-                        Some(recorder) => async_outcome(&recorder),
+                        Some(recorder) => async_outcome(&mut vm, &recorder),
                         None => Err("$DONE was never called".to_string()),
                     }
                 } else {
@@ -666,7 +666,7 @@ fn run_test(test: &Test) -> Result<(), String> {
                                     RuntimeError::RangeError(_) => Some("RangeError".to_string()),
                                     RuntimeError::SyntaxError(_) => Some("SyntaxError".to_string()),
                                     RuntimeError::Thrown(val) => {
-                                        Some(thrown_error_name(val).unwrap_or_else(|| "Error".to_string()))
+                                        Some(thrown_error_name(&mut vm, val).unwrap_or_else(|| "Error".to_string()))
                                     }
                                     _ => None,
                                 };

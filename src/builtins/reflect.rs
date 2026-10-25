@@ -50,17 +50,17 @@ pub fn target_of(args: &[Value], method: &str) -> Result<Gc<Object>, RuntimeErro
 }
 
 /// `ToPropertyKey`: a symbol stays a symbol, everything else becomes a string.
-pub fn to_key(value: &Value) -> PropertyKey {
+pub fn to_key(heap: &mut Heap, value: &Value) -> PropertyKey {
     match value {
         Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
-        other => PropertyKey::from_str(&other.to_js_string()),
+        other => PropertyKey::intern(heap, &other.to_js_string()),
     }
 }
 
 /// `Reflect.has(target, key)` (ES 28.1.10) — the `in` operator.
-pub fn reflect_has(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_has(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "has")?;
-    let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
+    let key = to_key(heap, args.get(1).unwrap_or(&Value::Undefined));
     let has = crate::vm::prototype::internal_has_property(target, &key)
         .map_err(RuntimeError::TypeError)?;
     Ok(Value::Bool(has))
@@ -68,9 +68,9 @@ pub fn reflect_has(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeErr
 
 /// `Reflect.deleteProperty(target, key)` (ES 28.1.3) — `delete`, but it answers
 /// `false` instead of throwing in strict mode.
-pub fn reflect_delete_property(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn reflect_delete_property(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "deleteProperty")?;
-    let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
+    let key = to_key(heap, args.get(1).unwrap_or(&Value::Undefined));
     // `[[Delete]]` answers `true` for an absent property — the rule lives in
     // `internal_delete`, shared with the `delete` operator, which had answered
     // `false` there too.
@@ -95,7 +95,7 @@ pub fn reflect_own_keys(heap: &mut Heap, args: &[Value]) -> Result<Value, Runtim
                 symbols.push(Value::Symbol(Rc::new(SymbolData::new(None, id))));
             }
             PropertyKey::Index(index) => strings.push(Value::string(&index.to_string())),
-            PropertyKey::Str(text) => strings.push(Value::string(&text)),
+            PropertyKey::Str(atom) => strings.push(Value::string(heap.resolve(atom))),
         }
     }
     strings.extend(symbols);
@@ -108,7 +108,7 @@ pub fn reflect_own_keys(heap: &mut Heap, args: &[Value]) -> Result<Value, Runtim
 /// as `Object.getOwnPropertyDescriptor`, without the `ToObject` on the target.
 pub fn reflect_get_own_property_descriptor(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     let target = target_of(args, "getOwnPropertyDescriptor")?;
-    let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
+    let key = to_key(heap, args.get(1).unwrap_or(&Value::Undefined));
     let descriptor = target.borrow().property_get(&key);
     Ok(super::object::descriptor_to_value(heap, descriptor))
 }
@@ -202,7 +202,7 @@ pub fn create_reflect_object(heap: &mut Heap) -> Value {
         .collect();
     for name in names {
         let _ = obj.define_property(
-            PropertyKey::from_str(name),
+            PropertyKey::intern(heap, name),
             super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(&format!("Reflect.{name}")),
             )))),

@@ -2,6 +2,7 @@ pub mod iterator;
 pub(crate) mod builtins_dispatch;
 pub(crate) mod exec;
 pub(crate) mod gc;
+pub mod atom;
 pub mod object;
 pub mod property;
 pub mod prototype;
@@ -372,7 +373,7 @@ impl VM {
         match target {
             Value::Object(obj_ref) => crate::vm::prototype::internal_has_property(
                 *obj_ref,
-                &PropertyKey::from_str("length"),
+                &PropertyKey::well_known("length").expect("well-known name"),
             )
             .unwrap_or(false),
             _ => false,
@@ -472,7 +473,7 @@ impl VM {
         state
             .globals
             .borrow_mut()
-            .insert("globalThis".to_string(), state.global_object.clone());
+            .insert(PropertyKey::intern(&mut heap, "globalThis"), state.global_object.clone());
         // The global object is an ordinary object with `Object.prototype` as its
         // prototype, not a bare property bag.
         state.set_global_prototype(builtins.object_prototype);
@@ -576,7 +577,10 @@ impl VM {
         self.state
             .globals
             .borrow_mut()
-            .insert("globalThis".to_string(), self.state.global_object.clone());
+            .insert(
+                PropertyKey::intern(&mut self.heap, "globalThis"),
+                self.state.global_object.clone(),
+            );
         self.state.set_global_prototype(self.builtins.object_prototype);
 
         // **顶层脚本也是一个帧**（`architecture-redesign.md` §4.3 陷阱 5）。
@@ -606,8 +610,22 @@ impl VM {
     /// program that just finished — including mutations the drained microtask
     /// queue performed. That is how a host observes an async outcome: the test
     /// records it in a global, then the host reads that global.
+    /// 把一个属性名驻留成 [`PropertyKey`]。
+    ///
+    /// 宿主嵌入时读对象属性需要它（`PropertyKey` 是驻留 id，不能凭空构造）；
+    /// 常用名（`length` / `next` / …）走静态表，不需要这个调用。
+    pub fn property_key(&mut self, name: &str) -> PropertyKey {
+        PropertyKey::intern(&mut self.heap, name)
+    }
+
     pub fn global(&self, name: &str) -> Option<Value> {
-        self.state.globals.borrow().get(name).cloned()
+        // 只读查找：名字没驻留过就不在表里，顺带避免把宿主的任意查询灌进驻留表。
+        let atom = self.heap.lookup(name)?;
+        self.state
+            .globals
+            .borrow()
+            .get(&PropertyKey::Str(atom))
+            .cloned()
     }
 
     /// Box a bare `Value::Function(id)` into a stable `FunctionObject`.
@@ -694,7 +712,7 @@ impl VM {
             }
             borrowed
                 .define_property(
-                    crate::vm::property::PropertyKey::from_str("name"),
+                    crate::vm::property::PropertyKey::well_known("name").expect("well-known name"),
                     crate::vm::property::PropertyDescriptor {
                         value: Value::string(name),
                         writable: false,
@@ -739,7 +757,7 @@ impl VM {
                 // `Array.prototype.every.call({length:2, 0:'a', 1:'b'}, …)` and
                 // friends rely on this; it is the spec's ListFromLength path.
                 let borrowed = obj_ref.borrow();
-                let len_desc = borrowed.property_get(&PropertyKey::from_str("length"))?;
+                let len_desc = borrowed.property_get(&PropertyKey::well_known("length").expect("well-known name"))?;
                 let len = len_desc.value.to_number();
                 if !len.is_finite() || len < 0.0 {
                     return None;
@@ -748,8 +766,9 @@ impl VM {
                 Some(
                     (0..len)
                         .map(|i| {
+                            // 下标受 2^24 上限约束 ⇒ 一定落在 `Index` 范围，不需要堆。
                             borrowed
-                                .property_get(&PropertyKey::element(i as u64))
+                                .property_get(&PropertyKey::from_index(i as u32))
                                 .map(|d| d.value)
                                 .unwrap_or(Value::Undefined)
                         })
@@ -803,7 +822,7 @@ impl VM {
         // constructor's prototype defines `get length()`). Reading it with
         // `internal_get` skipped the accessor, so those receivers looked
         // zero-length and every element was skipped.
-        let len_value = self.get_member(target, &PropertyKey::from_str("length"), module)?;
+        let len_value = self.get_member(target, &PropertyKey::well_known("length").expect("well-known name"), module)?;
         // ToLength: clamp negatives to 0 and cap the allocation, which keeps a
         // bogus `length` from trying to materialize billions of slots.
         let len = len_value.to_number();
@@ -814,7 +833,7 @@ impl VM {
 
         let mut entries: Vec<Option<Value>> = Vec::with_capacity(len);
         for i in 0..len {
-            let key = PropertyKey::element(i as u64);
+            let key = PropertyKey::element(&mut self.heap, i as u64);
             let present = crate::vm::prototype::internal_has_property(obj, &key)
                 .map_err(RuntimeError::TypeError)?;
             if present {
@@ -844,7 +863,7 @@ impl VM {
             _ => Some(crate::builtins::to_object(&mut self.heap, receiver)?),
         };
         let target = boxed.as_ref().unwrap_or(receiver);
-        let len_value = self.get_member(target, &PropertyKey::from_str("length"), module)?;
+        let len_value = self.get_member(target, &PropertyKey::well_known("length").expect("well-known name"), module)?;
         // `ToLength(ToNumber(…))`: a Symbol length is a TypeError, not 0.
         let len = crate::builtins::to_number_throwing(&len_value)?;
         if !len.is_finite() || len <= 0.0 {
@@ -883,7 +902,7 @@ impl VM {
                 return Ok(Some(value.clone()));
             }
         }
-        let key = PropertyKey::element(index as u64);
+        let key = PropertyKey::element(&mut self.heap, index as u64);
         let present = crate::vm::prototype::internal_has_property(*obj_ref, &key)
             .map_err(RuntimeError::TypeError)?;
         if !present {
@@ -909,12 +928,12 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Option<Value>, RuntimeError> {
-        use crate::builtins::reflect::{target_of, to_key};
+        use crate::builtins::reflect::{target_of};
         match name {
             "Reflect.get" => {
                 target_of(args, "get")?;
                 let target = args[0].clone();
-                let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
+                let key = crate::builtins::reflect::to_key(&mut self.heap, args.get(1).unwrap_or(&Value::Undefined));
                 // The third argument is the *receiver*: the `this` an accessor
                 // is invoked with (ES 28.1.9 / 10.1.8). Absent, it is the target.
                 let receiver = if args.len() > 2 {
@@ -929,7 +948,7 @@ impl VM {
             "Reflect.set" => {
                 target_of(args, "set")?;
                 let target = args[0].clone();
-                let key = to_key(args.get(1).unwrap_or(&Value::Undefined));
+                let key = crate::builtins::reflect::to_key(&mut self.heap, args.get(1).unwrap_or(&Value::Undefined));
                 let value = args.get(2).cloned().unwrap_or(Value::Undefined);
                 // Same receiver rule, and `[[Set]]` *answers* instead of
                 // throwing: a non-writable property, a setter-less accessor or
@@ -1066,17 +1085,12 @@ impl VM {
             // `CreateListFromArrayLike` insists on an object — unlike
             // `Function.prototype.apply`, `Reflect.apply(f, null, null)` throws.
             Value::Object(_) => {
-                let length = self.get_member(value, &PropertyKey::from_str("length"), module)?;
+                let length = self.get_member(value, &PropertyKey::well_known("length").expect("well-known name"), module)?;
                 let len = crate::builtins::to_length_throwing(&length)?;
                 let mut items = Vec::with_capacity(len as usize);
                 for index in 0..len {
-                    items.push(
-                        self.get_member(
-                            value,
-                            &PropertyKey::element(index as u64),
-                            module,
-                        )?,
-                    );
+                    let key = PropertyKey::element(&mut self.heap, index as u64);
+                    items.push(self.get_member(value, &key, module)?);
                 }
                 Ok(items)
             }
@@ -1126,7 +1140,7 @@ impl VM {
 
         // Step 5: `? Get(O, "constructor")` — abrupt completions propagate.
         let mut species =
-            self.get_member(receiver, &PropertyKey::from_str("constructor"), module)?;
+            self.get_member(receiver, &PropertyKey::well_known("constructor").expect("well-known name"), module)?;
         // Step 7: only an *object* `constructor` is asked for `@@species`, and
         // a nullish result falls back to an ordinary array.
         if species.is_object() {
@@ -1393,7 +1407,7 @@ impl VM {
         if !matches!(iterable, Value::Undefined | Value::Null) {
             let iter = self.make_iterator(iterable, module)?;
             // Step 8.a: the adder is fetched once, through `[[Get]]`.
-            let adder = match self.get_member(&set_val, &PropertyKey::from_str("add"), module) {
+            let adder = match self.get_member(&set_val, &PropertyKey::well_known("add").expect("well-known name"), module) {
                 Ok(adder) => adder,
                 Err(err) => {
                     self.iterator_close(iter, None, true, module)?;
@@ -1792,7 +1806,7 @@ impl VM {
         if !matches!(iterable, Value::Undefined | Value::Null) {
             let iter = self.make_iterator(iterable, module)?;
             // `adder = Get(map, "set")` — a patched `set` is honoured.
-            let adder = match self.get_member(&map_val, &PropertyKey::from_str("set"), module) {
+            let adder = match self.get_member(&map_val, &PropertyKey::well_known("set").expect("well-known name"), module) {
                 Ok(adder) => adder,
                 Err(err) => {
                     self.iterator_close(iter, None, true, module)?;
@@ -1823,14 +1837,14 @@ impl VM {
                         "WeakMap constructor: iterator value is not an entry object".to_string(),
                     ));
                 }
-                let key = match self.get_member(&item, &PropertyKey::from_str("0"), module) {
+                let key = match self.get_member(&item, &PropertyKey::from_index(0), module) {
                     Ok(key) => key,
                     Err(err) => {
                         self.iterator_close(iter, None, true, module)?;
                         return Err(err);
                     }
                 };
-                let value = match self.get_member(&item, &PropertyKey::from_str("1"), module) {
+                let value = match self.get_member(&item, &PropertyKey::from_index(1), module) {
                     Ok(value) => value,
                     Err(err) => {
                         self.iterator_close(iter, None, true, module)?;
@@ -1865,7 +1879,7 @@ impl VM {
         let iterable = args.first().cloned().unwrap_or(Value::Undefined);
         if !matches!(iterable, Value::Undefined | Value::Null) {
             let iter = self.make_iterator(iterable, module)?;
-            let adder = match self.get_member(&set_val, &PropertyKey::from_str("add"), module) {
+            let adder = match self.get_member(&set_val, &PropertyKey::well_known("add").expect("well-known name"), module) {
                 Ok(adder) => adder,
                 Err(err) => {
                     self.iterator_close(iter, None, true, module)?;
@@ -1912,7 +1926,7 @@ impl VM {
                 "Set.prototype.{method}: the argument must be an object"
             )));
         }
-        let raw_size = self.get_member(value, &PropertyKey::from_str("size"), module)?;
+        let raw_size = self.get_member(value, &PropertyKey::well_known("size").expect("well-known name"), module)?;
         // `ToNumber(rawSize)` runs user code when `size` is an object
         // (`{ valueOf() { … } }`), which is observable — the tests count those
         // coercions — so it cannot be a plain `Value::to_number()`.
@@ -1936,13 +1950,13 @@ impl VM {
         } else {
             usize::MAX
         };
-        let has = self.get_member(value, &PropertyKey::from_str("has"), module)?;
+        let has = self.get_member(value, &PropertyKey::well_known("has").expect("well-known name"), module)?;
         if !has.is_callable() {
             return Err(RuntimeError::TypeError(format!(
                 "Set.prototype.{method}: has must be callable"
             )));
         }
-        let keys = self.get_member(value, &PropertyKey::from_str("keys"), module)?;
+        let keys = self.get_member(value, &PropertyKey::well_known("keys").expect("well-known name"), module)?;
         if !keys.is_callable() {
             return Err(RuntimeError::TypeError(format!(
                 "Set.prototype.{method}: keys must be callable"
@@ -2286,7 +2300,7 @@ impl VM {
             // Step 9.a: the adder is looked up *once*, through `[[Get]]`, and
             // it is a subclass's `set` when there is one
             // (`iterable-calls-set.js`, `get-set-method-failure.js`).
-            let adder = match self.get_member(&map_val, &PropertyKey::from_str("set"), module) {
+            let adder = match self.get_member(&map_val, &PropertyKey::well_known("set").expect("well-known name"), module) {
                 Ok(adder) => adder,
                 Err(err) => {
                     self.iterator_close(iter, None, true, module)?;
@@ -2325,14 +2339,14 @@ impl VM {
                 }
                 // 9.g–k: `Get(item, "0")` / `Get(item, "1")` run accessors, and
                 // the adder is called with the new map as `this`.
-                let key = match self.get_member(&item, &PropertyKey::from_str("0"), module) {
+                let key = match self.get_member(&item, &PropertyKey::from_index(0), module) {
                     Ok(key) => key,
                     Err(err) => {
                         self.iterator_close(iter, None, true, module)?;
                         return Err(err);
                     }
                 };
-                let value = match self.get_member(&item, &PropertyKey::from_str("1"), module) {
+                let value = match self.get_member(&item, &PropertyKey::from_index(1), module) {
                     Ok(value) => value,
                     Err(err) => {
                         self.iterator_close(iter, None, true, module)?;
@@ -2494,7 +2508,7 @@ impl VM {
         // `ResolvePromise` step 8: an object (or function) with a callable
         // `then` is adopted through a job that calls `thenable.then(...)`.
         if matches!(value, Value::Object(_) | Value::Function(_)) {
-            if let Ok(then) = self.get_member(&value, &PropertyKey::from_str("then"), module) {
+            if let Ok(then) = self.get_member(&value, &PropertyKey::well_known("then").expect("well-known name"), module) {
                 if then.is_callable() || matches!(then, Value::Function(_)) {
                     let then = self.as_object_value(&then);
                     let _ = then;
@@ -2631,7 +2645,7 @@ impl VM {
         if let Value::Object(obj) = &mut value {
             obj.borrow_mut()
                 .define_property(
-                    PropertyKey::from_str("name"),
+                    PropertyKey::well_known("name").expect("well-known name"),
                     crate::vm::property::PropertyDescriptor::data_descriptor(Value::string(
                         "AggregateError",
                     )),
@@ -2639,7 +2653,7 @@ impl VM {
                 .ok();
             obj.borrow_mut()
                 .define_property(
-                    PropertyKey::from_str("errors"),
+                    PropertyKey::well_known("errors").expect("well-known name"),
                     crate::vm::property::PropertyDescriptor::data_descriptor(array),
                 )
                 .ok();
@@ -2724,12 +2738,12 @@ impl VM {
                     let key = if fulfilled { "value" } else { "reason" };
                     let mut obj = crate::vm::object::OrdinaryObject::new();
                     obj.define_property(
-                        PropertyKey::from_str("status"),
+                        PropertyKey::well_known("status").expect("well-known name"),
                         crate::vm::property::PropertyDescriptor::data_descriptor(status),
                     )
                     .ok();
                     obj.define_property(
-                        PropertyKey::from_str(key),
+                        PropertyKey::intern(&mut self.heap, key),
                         crate::vm::property::PropertyDescriptor::data_descriptor(argument),
                     )
                     .ok();
@@ -2886,7 +2900,7 @@ impl VM {
                         Self::native_fn(&mut self.heap, &format!("__promise_reject__{id}"));
                     let then = match self.get_member(
                         &thenable,
-                        &PropertyKey::from_str("then"),
+                        &PropertyKey::well_known("then").expect("well-known name"),
                         module,
                     ) {
                         Ok(then) => then,
@@ -3015,13 +3029,13 @@ impl VM {
     ) -> Result<PropertyKey, RuntimeError> {
         match operand {
             Operand::Immd(id) => match constant_at(module, id, "property key")? {
-                Constant::String(s) => Ok(PropertyKey::from_str(s.as_str())),
+                Constant::String(s) => Ok(PropertyKey::intern(&mut self.heap, s.as_str())),
             },
             _ => {
                 let prop_val = self.get_value(operand)?;
                 match &prop_val {
                     Value::Symbol(sym) => return Ok(PropertyKey::Symbol(sym.id)),
-                    Value::String(s) => return Ok(PropertyKey::from_str(s.as_str())),
+                    Value::String(s) => return Ok(PropertyKey::intern(&mut self.heap, s.as_str())),
                     _ => {}
                 }
                 // ES `ToPropertyKey` = ToPrimitive(string) then ToString, so a
@@ -3030,7 +3044,7 @@ impl VM {
                 let primitive = self.to_primitive(&prop_val, "string", module)?;
                 Ok(match &primitive {
                     Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
-                    other => PropertyKey::from_str(&other.to_js_string()),
+                    other => PropertyKey::intern(&mut self.heap, &other.to_js_string()),
                 })
             }
         }
@@ -3251,7 +3265,7 @@ impl VM {
         Ok(x.abstract_eq(y))
     }
 
-    fn js_prop_get(obj: &Value, prop: &str) -> Result<Value, RuntimeError> {
+    fn js_prop_get(heap: &mut Heap, obj: &Value, prop: &str) -> Result<Value, RuntimeError> {
         match obj {
             Value::String(s) => {
                 // String prototype properties
@@ -3262,7 +3276,7 @@ impl VM {
                 }
             }
             Value::Object(obj_ref) => {
-                let key = PropertyKey::from_str(prop);
+                let key = PropertyKey::intern(heap, prop);
                 crate::vm::prototype::internal_get(obj_ref.clone(), &key, None)
                     .map_err(RuntimeError::from_property_error)
             }
@@ -3331,7 +3345,7 @@ impl VM {
                 self.get_member(&boxed, key, module)
             }
             Value::String(s) => {
-                if let Some(name) = key.as_str() {
+                if let Some(name) = key.resolve(&self.heap) {
                     if name == "length" {
                         return Ok(Value::Number(crate::vm::utf16::length(s) as f64));
                     }
@@ -3354,11 +3368,11 @@ impl VM {
             }
             Value::Undefined => Err(RuntimeError::TypeError(format!(
                 "Cannot read properties of undefined (reading '{}')",
-                key.display()
+                key.display(&self.heap)
             ))),
             Value::Null => Err(RuntimeError::TypeError(format!(
                 "Cannot read properties of null (reading '{}')",
-                key.display()
+                key.display(&self.heap)
             ))),
         }
     }
@@ -3545,7 +3559,7 @@ impl VM {
                     // which strict mode reports as a TypeError.
                     return Err(RuntimeError::TypeError(format!(
                         "'set' on proxy: trap returned falsish for property '{}'",
-                        key.display()
+                        key.display(&self.heap)
                     )));
                 }
                 // An accessor anywhere on the chain intercepts the assignment
@@ -3574,7 +3588,7 @@ impl VM {
                     if !desc.writable {
                         return Err(RuntimeError::TypeError(format!(
                             "Cannot assign to read-only property '{}'",
-                            key.display()
+                            key.display(&self.heap)
                         )));
                     }
                     let mut borrowed = obj_ref.borrow_mut();
@@ -3598,7 +3612,7 @@ impl VM {
             // sloppy-mode silence is not reachable: cf. G1 in the README).
             _ => Err(RuntimeError::TypeError(format!(
                 "Cannot create property '{}' on {}",
-                key.display(),
+                key.display(&self.heap),
                 match obj {
                     Value::String(_) => "string",
                     Value::Number(_) => "number",
@@ -3653,7 +3667,7 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         match obj {
             Value::Object(obj_ref) => {
-                let key = PropertyKey::from_str(prop_name);
+                let key = PropertyKey::intern(&mut self.heap, prop_name);
                 if obj_ref.borrow().kind() == ObjectKind::Proxy {
                     let proxy_val = Value::Object(*obj_ref);
                     if let Some(value) = self.proxy_get(&proxy_val, &key, &proxy_val, module)? {
@@ -3740,7 +3754,7 @@ impl VM {
             };
             strings_ref
                 .borrow_mut()
-                .define_property(PropertyKey::from_str("raw"), raw_desc)
+                .define_property(PropertyKey::well_known("raw").expect("well-known name"), raw_desc)
                 .map_err(RuntimeError::TypeError)?;
             strings_ref.borrow_mut().freeze();
         }
@@ -3779,7 +3793,7 @@ impl VM {
         // i.e. the constructor's own `prototype` property when it is an object.
         let func_obj = self.materialize_function(func_id);
         if let Value::Object(func_ref) = &func_obj {
-            if let Some(desc) = func_ref.borrow().property_get(&PropertyKey::from_str("prototype")) {
+            if let Some(desc) = func_ref.borrow().property_get(&PropertyKey::well_known("prototype").expect("well-known name")) {
                 if let Value::Object(proto) = desc.value {
                     gobj.set_prototype(Some(proto));
                 }
@@ -4207,7 +4221,7 @@ impl VM {
                 if let Some(iter) = frame.delegates.last().cloned() {
                     let iter = self.delegate_js_iterator(&iter).unwrap_or(iter);
                     let throw_method =
-                        self.get_member(&iter, &PropertyKey::from_str("throw"), module)?;
+                        self.get_member(&iter, &PropertyKey::well_known("throw").expect("well-known name"), module)?;
                     if throw_method.is_callable() {
                         let inner = self.invoke(&throw_method, iter, &[reason], module)?;
                         if !inner.is_object() {
@@ -4217,10 +4231,10 @@ impl VM {
                             ));
                         }
                         let done = self
-                            .get_member(&inner, &PropertyKey::from_str("done"), module)?
+                            .get_member(&inner, &PropertyKey::well_known("done").expect("well-known name"), module)?
                             .to_boolean();
                         let value =
-                            self.get_member(&inner, &PropertyKey::from_str("value"), module)?;
+                            self.get_member(&inner, &PropertyKey::well_known("value").expect("well-known name"), module)?;
                         if !done {
                             // The delegate produced another value: the generator
                             // stays parked on it, right where it was.
@@ -4518,7 +4532,7 @@ impl VM {
             // `yield*` has to see it (`? Call(return, iterator, …)` in step
             // 5.c.iv — `star-rhs-iter-rtrn-rtrn-call-err.js`).
             let iter = self.delegate_js_iterator(iter).unwrap_or_else(|| iter.clone());
-            let return_method = self.get_member(&iter, &PropertyKey::from_str("return"), module)?;
+            let return_method = self.get_member(&iter, &PropertyKey::well_known("return").expect("well-known name"), module)?;
             if return_method.is_undefined() || return_method.is_null() {
                 continue;
             }
@@ -4596,8 +4610,8 @@ impl VM {
     /// `{ value, done }` — the shape every iterator result has.
     fn iterator_result(heap: &mut Heap, value: Value, done: bool) -> Value {
         let mut result = crate::vm::object::OrdinaryObject::new();
-        let _ = result.property_set(PropertyKey::from_str("value"), value);
-        let _ = result.property_set(PropertyKey::from_str("done"), Value::Bool(done));
+        let _ = result.property_set(PropertyKey::well_known("value").expect("well-known name"), value);
+        let _ = result.property_set(PropertyKey::well_known("done").expect("well-known name"), Value::Bool(done));
         Value::Object(heap.alloc(Object::Ordinary(result)))
     }
 
@@ -4662,7 +4676,7 @@ impl VM {
         new_target: Option<&Value>,
     ) -> Option<Value> {
         if let Some(Value::Object(nt)) = new_target {
-            if let Some(desc) = nt.borrow().property_get(&PropertyKey::from_str("prototype")) {
+            if let Some(desc) = nt.borrow().property_get(&PropertyKey::well_known("prototype").expect("well-known name")) {
                 if desc.value.is_object() {
                     return Some(desc.value);
                 }
@@ -4671,7 +4685,7 @@ impl VM {
         match constructor_val {
             Value::Object(obj_ref) => obj_ref
                 .borrow()
-                .property_get(&PropertyKey::from_str("prototype"))
+                .property_get(&PropertyKey::well_known("prototype").expect("well-known name"))
                 .map(|d| d.value),
             _ => None,
         }
@@ -4950,20 +4964,20 @@ impl VM {
                     _ => unreachable!(),
                 }
             };
-            let next = self.get_member(&iterator, &PropertyKey::from_str("next"), module)?;
+            let next = self.get_member(&iterator, &PropertyKey::well_known("next").expect("well-known name"), module)?;
             let args = match &send {
                 Some(v) => vec![v.clone()],
                 None => Vec::new(),
             };
             let result = self.invoke(&next, iterator.clone(), &args, module)?;
-            let done = match self.get_member(&result, &PropertyKey::from_str("done"), module)? {
+            let done = match self.get_member(&result, &PropertyKey::well_known("done").expect("well-known name"), module)? {
                 Value::Undefined => false,
                 v => v.to_boolean(),
             };
             // The completion value is part of the result even when `done` is
             // true — `yield*` returns it (`function* i(){ return "R" }` gives
             // `yield* i()` the value `"R"`), and `IteratorResult` exposes it.
-            let item = self.get_member(&result, &PropertyKey::from_str("value"), module)?;
+            let item = self.get_member(&result, &PropertyKey::well_known("value").expect("well-known name"), module)?;
             Ok((item, done))
         } else {
             let mut borrowed = iter_obj.borrow_mut();
@@ -5010,7 +5024,7 @@ impl VM {
             return Ok(());
         };
         let return_fn = self
-            .get_member(&iterator, &PropertyKey::from_str("return"), module)
+            .get_member(&iterator, &PropertyKey::well_known("return").expect("well-known name"), module)
             .unwrap_or(Value::Undefined);
         if !return_fn.is_undefined() {
             // ES 7.4.6 step 4.b: a `return` that is neither `undefined` nor
@@ -5194,7 +5208,7 @@ impl VM {
         let prototype = match from {
             Value::Object(obj_ref) => obj_ref
                 .borrow()
-                .property_get(&PropertyKey::from_str("prototype"))
+                .property_get(&PropertyKey::well_known("prototype").expect("well-known name"))
                 .map(|d| d.value),
             _ => {
                 return Err(RuntimeError::TypeError("not a constructor".to_string()));
@@ -5405,7 +5419,7 @@ impl VM {
             Err(_) => {
                 // Fallback: unknown method, try property lookup via prototype chain
                 if let Value::Object(obj_ref) = obj {
-                    let key = crate::vm::property::PropertyKey::from_str(method_name);
+                    let key = PropertyKey::intern(&mut self.heap, method_name);
                     match crate::vm::prototype::internal_get(obj_ref.clone(), &key, None) {
                         Ok(v) => Ok(v),
                         Err(e) => Err(RuntimeError::from_property_error(e)),
@@ -5550,7 +5564,7 @@ struct State {
     seh_stack: Vec<SehRecord>,
     /// The script's globals — shared with the `globalThis` object (see
     /// `vm::object::GlobalObject`), so both views stay in step.
-    globals: Rc<RefCell<HashMap<String, Value>>>,
+    globals: Rc<RefCell<HashMap<PropertyKey, Value>>>,
     /// The `globalThis` object itself, kept here so it survives re-registration
     /// and can be published as a global of the same name.
     global_object: Value,
@@ -5912,7 +5926,9 @@ impl State {
             }
             None => {}
         }
-        Ok(self.get_global(name))
+        // 全局对象的回退**不在这里做**：`globals` 现在按 `Atom` 建键，而 `State`
+        // 自己不持有堆、没法驻留。调用方（`VM`）有堆，由它来查。
+        Ok(None)
     }
 
     /// The cell `name` resolves to in the **current frame's** environment: its
@@ -5937,8 +5953,12 @@ impl State {
         self.closure_var_stack.push(map);
     }
 
-    fn get_global(&self, name: &str) -> Option<Value> {
-        self.globals.borrow().get(name).cloned()
+    /// 全局对象的属性（`globals` 与 `globalThis` 是同一张表的两个视图）。
+    ///
+    /// 键是 [`PropertyKey`]：字符串键驻留成 `Atom`，所以存储、比较与哈希都是
+    /// 整数运算（1A）。调用方负责把名字驻留下来 —— `State` 自己不持有堆。
+    fn get_global(&self, key: &PropertyKey) -> Option<Value> {
+        self.globals.borrow().get(key).cloned()
     }
 
     /// Attach the global object's `[[Prototype]]` (`Object.prototype`).
@@ -6295,10 +6315,9 @@ impl std::fmt::Display for RuntimeError {
                 // types, so the whole chain has to be consulted.
                 if let Some(obj_ref) = val.as_object() {
                     let get = |prop: &str| -> Option<String> {
-                        crate::vm::prototype::find_descriptor(
-                            obj_ref,
-                            &PropertyKey::from_str(prop),
-                        )
+                        // `name` / `message` 都是常用名 ⇒ 静态表命中，不需要堆。
+                        let key = PropertyKey::well_known(prop)?;
+                        crate::vm::prototype::find_descriptor(obj_ref, &key)
                         .ok()
                         .flatten()
                         .and_then(|(_, d)| match d.value {
@@ -6587,12 +6606,13 @@ mod tests {
     fn test_state_global() {
         let mut heap = Heap::new();
         let mut state = State::new(&mut heap);
-        assert!(state.get_global("x").is_none());
+        let key = PropertyKey::intern(&mut heap, "x");
+        assert!(state.get_global(&key).is_none());
         state
             .globals
             .borrow_mut()
-            .insert("x".to_string(), Value::Number(42.0));
-        assert_eq!(state.get_global("x"), Some(Value::Number(42.0)));
+            .insert(key, Value::Number(42.0));
+        assert_eq!(state.get_global(&key), Some(Value::Number(42.0)));
     }
 
     // ──────────────────────── VM utility methods ────────────────────────
@@ -6659,14 +6679,16 @@ mod tests {
 
     #[test]
     fn test_js_prop_get_string_length() {
+        let mut heap = Heap::new();
         let s = Value::string("hello");
-        assert_eq!(VM::js_prop_get(&s, "length").unwrap(), Value::Number(5.0));
+        assert_eq!(VM::js_prop_get(&mut heap, &s, "length").unwrap(), Value::Number(5.0));
     }
 
     #[test]
     fn test_js_prop_get_string_unknown() {
+        let mut heap = Heap::new();
         let s = Value::string("hello");
-        assert_eq!(VM::js_prop_get(&s, "foo").unwrap(), Value::Undefined);
+        assert_eq!(VM::js_prop_get(&mut heap, &s, "foo").unwrap(), Value::Undefined);
     }
 
     #[test]
@@ -6685,7 +6707,7 @@ mod tests {
             arr
         };
         assert_eq!(
-            VM::js_prop_get(&arr_val, "length").unwrap(),
+            VM::js_prop_get(&mut heap, &arr_val, "length").unwrap(),
             Value::Number(2.0)
         );
     }
@@ -6699,19 +6721,20 @@ mod tests {
             let obj = new_ordinary_object(&mut heap);
             if let Value::Object(ref obj_ref) = obj {
                 let mut ob = obj_ref.borrow_mut();
-                ob.property_set(PropertyKey::from_str("x"), Value::Number(42.0))
+                ob.property_set(PropertyKey::intern(&mut heap, "x"), Value::Number(42.0))
                     .unwrap();
             }
             obj
         };
-        assert_eq!(VM::js_prop_get(&obj_val, "x").unwrap(), Value::Number(42.0));
-        assert_eq!(VM::js_prop_get(&obj_val, "y").unwrap(), Value::Undefined);
+        assert_eq!(VM::js_prop_get(&mut heap, &obj_val, "x").unwrap(), Value::Number(42.0));
+        assert_eq!(VM::js_prop_get(&mut heap, &obj_val, "y").unwrap(), Value::Undefined);
     }
 
     #[test]
     fn test_js_prop_get_number() {
+        let mut heap = Heap::new();
         let n = Value::Number(42.0);
-        assert_eq!(VM::js_prop_get(&n, "toString").unwrap(), Value::Undefined);
+        assert_eq!(VM::js_prop_get(&mut heap, &n, "toString").unwrap(), Value::Undefined);
     }
 
     // ──────────────────────── VM::run with simple modules ────────────────────────

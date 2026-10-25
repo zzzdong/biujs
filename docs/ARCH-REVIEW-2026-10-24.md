@@ -517,17 +517,33 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 
 **1A Atom + PropertyKey（5–8 人日）**
 
-**第一步已落地（2026-10-25）**：`PropertyKey::Index(u32)` + 唯一的规范索引判定
+**两步都已落地（2026-10-25）。**
+
+**第二步**：`PropertyKey::Str(Rc<String>)` → `Str(Atom)`，驻留表挂在 `Heap` 上
+（`src/vm/atom.rs`，`WELL_KNOWN` 预驻留 + 动态表）。要点：
+
+- 属性**存储**改成按 `PropertyKey` 建键（`globals`、`GlobalObject`、`OrdinaryObject`
+  的字典都是），于是哈希/比较变成整数运算；
+- 常用名比较走 `PropertyKey::is("length")`（静态表查一次 + 整数相等），不再解析回字符串；
+- 只有真要字符串的地方（`Object.keys`、JSON、错误消息、Proxy trap 参数）才
+  `key.resolve(&heap)` / `key.display(&heap)`；
+- 内建函数各自按需加 `&mut Heap`（分派表本来就有 heap）；注册用的闭包从不被调用，
+  一律换成占位实现 —— 顺手拆掉了"闭包捕获 `&mut heap`"那批假绑定。
+
+**第一步（同日，先前）**：`PropertyKey::Index(u32)` + 唯一的规范索引判定
 （`canonical_index` / `PropertyKey::array_index`）。索引键不再构造 `Rc<String>`，
 也不再在每次访问时重新解析字符串；顺带修掉一个静默 bug —— 判定原先散在两处且
 不一致（`keys()` 用规范判定，数组读写直接 `parse`），于是 `a["01"]` 读到了
 `a[1]`。全量 +2 条（Object +1、Array +1），无回退。
-另：`Str` → `Atom` 的驻留**推迟** —— 200 处 `from_str` 大多在内建函数里，而
-内建函数拿不到 `Heap`（那是 1D 的统一入口签名），先做 1D 再回来做驻留。
+验收（两步合并）：属性读不再有每次 `Rc::new(String)`；`Value` 仍 16 B；
+常用名比较是整数比较；全量 17,273 / 20,504 = 84.24%，无逐套件回退。
 
-剩余：
-- `Atom` 驻留表（挂在 `Heap` 上）；`PropertyKey::Str(Rc<String>)` → `Atom(Atom)`。
-- 验收：属性读不再有每次 `Rc::new(String)`；`Value` 仍 16 B；无逐套件回退。
+坑（值得记住）：
+- `PropertyKey::intern` 必须和 `from_str` 一样把规范索引折成 `Index`，否则
+  `{0:'a'}` 存 `Index(0)`、查用 `Str("0")` 对不上；
+- `State` 不持有堆，所以"名字 → 键"的驻留只能在 `VM` 侧做；`resolve_env_name`
+  不再回退查 globals（改由 `LoadEnv`/`TypeOfEnv` 带堆回退）；
+- 读路径用 `Heap::lookup`（不插入），避免未知变量名把驻留表撑大。
 
 **1B ObjectHeader + Shape + GlobalObject（10–15 人日）**
 - `ObjectHeader { shape, slots, proto, flags }`；20 变体嵌入 header；删重复字段。
@@ -623,10 +639,10 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 6（删 `BIUJS_REG_VARS` 与变量寄存器分配，固定内存驻留语义）、
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
-**1A 第一步**（`PropertyKey::Index(u32)` + 唯一的规范索引判定）。
+**1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）。
 
-剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，下面是架构阶段：
-    1A（Atom/PropertyKey，`Value::String` → `Atom(u32)`；同时把 GC 句柄代次补上）→
+剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，1A 也收口，下面是：
+    S0#4 第二档（GC 句柄代次 —— `Value` 仍 16 B，需要另找空间，或在 `Value` 缩小后补）→
     1B（ObjectHeader/Shape/全局对象/Realm/EnvRecord）→
     1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→
     Phase 2（帧几何/GC/字节码 v2）→ Phase 3（编译器简化）。

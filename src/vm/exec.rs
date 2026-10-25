@@ -6,7 +6,6 @@
 //! `step` 自己处理 `Halt` / `Ret`（它们决定还要不要继续跑），其余指令
 //! 交给 `run_instruction`。
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 use std::time::Instant;
@@ -365,7 +364,8 @@ impl VM {
         for name in [first, second] {
             // `[[Get]]`, not a descriptor lookup: the method may be an accessor
             // whose getter has to run (and can throw).
-            let method = self.get_member(val, &PropertyKey::from_str(name), module)?;
+            let key = PropertyKey::intern(&mut self.heap, name);
+            let method = self.get_member(val, &key, module)?;
             // `OrdinaryToPrimitive` skips a method that is missing or not
             // callable and falls through to the next name — a `{ toString: null,
             // get valueOf() { … } }` object must reach `valueOf`.
@@ -427,12 +427,11 @@ impl VM {
 
     /// Reject a class constructor that is being called without `new`.
     pub(crate) fn check_class_ctor(&self, callee: &Value) -> Result<(), RuntimeError> {
+        let flag = PropertyKey::well_known(crate::builtins::CLASS_CTOR_FLAG)
+            .expect("class ctor flag is a well-known name");
         if let Value::Object(obj_ref) = callee {
             let borrowed = obj_ref.borrow();
-            if borrowed.as_function()
-                .is_some()
-                && borrowed
-                    .property_get(&PropertyKey::from_str(crate::builtins::CLASS_CTOR_FLAG))
+            if borrowed.as_function().is_some() && borrowed.property_get(&flag)
                     .map(|d| d.value.to_boolean())
                     .unwrap_or(false)
             {
@@ -1049,7 +1048,7 @@ impl VM {
         let mut has_accessor_field = false;
         let mut has_data_field = false;
         for present_name in ["value", "writable", "get", "set"] {
-            let key = PropertyKey::from_str(present_name);
+            let key = PropertyKey::intern(&mut self.heap, present_name);
             let present = match value {
                 Value::Object(obj) => {
                     crate::vm::prototype::internal_has_property(*obj, &key)
@@ -1073,7 +1072,7 @@ impl VM {
             ));
         }
         for name in ["enumerable", "configurable", "value", "writable", "get", "set"] {
-            let key = PropertyKey::from_str(name);
+            let key = PropertyKey::intern(&mut self.heap, name);
             let present = match value {
                 Value::Object(obj) => {
                     crate::vm::prototype::internal_has_property(*obj, &key)
@@ -1258,8 +1257,9 @@ impl VM {
         if let Some(proto) = crate::builtins::wrapper_prototype("Object") {
             wrapper.set_prototype(Some(proto));
         }
+        let root_key = PropertyKey::intern(&mut self.heap, "");
         let _ = wrapper.define_property(
-            PropertyKey::from_str(""),
+            root_key,
             crate::vm::property::PropertyDescriptor::data_descriptor(value),
         );
         let wrapper = Value::Object(self.heap.alloc(Object::Ordinary(wrapper)));
@@ -1267,7 +1267,7 @@ impl VM {
         let mut indent = String::new();
         let mut stack: Vec<Value> = Vec::new();
         let serialized = self.json_serialize_property(
-            "",
+            &root_key,
             &wrapper,
             &gap,
             &replacer_fn,
@@ -1289,7 +1289,7 @@ impl VM {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn json_serialize_property(
         &mut self,
-        key: &str,
+        key: &PropertyKey,
         holder: &Value,
         gap: &str,
         replacer_fn: &Option<Value>,
@@ -1298,20 +1298,25 @@ impl VM {
         stack: &mut Vec<Value>,
         module: &Module,
     ) -> Result<Option<String>, RuntimeError> {
-        let mut value = self.get_member(holder, &PropertyKey::from_str(key), module)?;
+        let mut value = self.get_member(holder, key, module)?;
 
         // `toJSON` first (a Date or a user object can define one).
         if value.as_object().is_some() || matches!(value, Value::Function(_)) {
-            let to_json = self.get_member(&value, &PropertyKey::from_str("toJSON"), module)?;
+            let to_json = self.get_member(&value, &PropertyKey::well_known("toJSON").expect("well-known name"), module)?;
             if to_json.is_callable() {
-                value = self.invoke(&to_json, value.clone(), &[Value::string(key)], module)?;
+                value = self.invoke(
+                    &to_json,
+                    value.clone(),
+                    &[Value::string(&key.display(&self.heap))],
+                    module,
+                )?;
             }
         }
         if let Some(replacer) = replacer_fn {
             value = self.invoke(
                 replacer,
                 holder.clone(),
-                &[Value::string(key), value.clone()],
+                &[Value::string(&key.display(&self.heap)), value.clone()],
                 module,
             )?;
         }
@@ -1397,12 +1402,17 @@ impl VM {
         indent.push_str(gap);
         let inner = indent.clone();
 
-        let keys: Vec<String> = match property_list {
-            Some(list) => list.clone(),
-            None => crate::builtins::own_enumerable_string_keys(value),
+        // 显式 replacer 列表给的是名字；没有列表时用对象的（键, 名字）对 ——
+        // 键直接用于查值，名字只用于输出。
+        let keys: Vec<(PropertyKey, String)> = match property_list {
+            Some(list) => list
+                .iter()
+                .map(|name| (PropertyKey::intern(&mut self.heap, name), name.clone()))
+                .collect(),
+            None => crate::builtins::own_enumerable_string_keys(&mut self.heap, value),
         };
         let mut partial = Vec::new();
-        for key in keys {
+        for (key, name) in keys {
             if let Some(serialized) = self.json_serialize_property(
                 &key,
                 value,
@@ -1414,7 +1424,7 @@ impl VM {
                 module,
             )? {
                 let mut quoted = String::new();
-                crate::builtins::quote_json_string(&key, &mut quoted);
+                crate::builtins::quote_json_string(&name, &mut quoted);
                 let colon = if gap.is_empty() { ":" } else { ": " };
                 partial.push(format!("{quoted}{colon}{serialized}"));
             }
@@ -1449,8 +1459,9 @@ impl VM {
         let len = self.array_like_elements(value).map(|v| v.len()).unwrap_or(0);
         let mut partial = Vec::new();
         for index in 0..len {
+            let key = PropertyKey::element(&mut self.heap, index as u64);
             let serialized = self.json_serialize_property(
-                &index.to_string(),
+                &key,
                 value,
                 gap,
                 replacer_fn,
@@ -1495,11 +1506,12 @@ impl VM {
             holder.set_prototype(Some(proto));
         }
         let _ = holder.define_property(
-            PropertyKey::from_str(""),
+            PropertyKey::intern(&mut self.heap, ""),
             crate::vm::property::PropertyDescriptor::data_descriptor(parsed),
         );
         let holder = Value::Object(self.heap.alloc(Object::Ordinary(holder)));
-        self.json_internalize(&holder, "", &reviver, module)
+        let root_key = PropertyKey::intern(&mut self.heap, "");
+        self.json_internalize(&holder, &root_key, &reviver, module)
     }
 
     /// `InternalizeJSONProperty` (ES 25.5.1.1): walk bottom-up, letting the
@@ -1507,7 +1519,7 @@ impl VM {
     pub(crate) fn json_internalize(
         &mut self,
         holder: &Value,
-        name: &str,
+        name: &PropertyKey,
         reviver: &Value,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
@@ -1515,20 +1527,22 @@ impl VM {
         // 存活，而 reviver 是用户函数 ⇒ 必须登记（否则被回收 ⇒ 测试
         // `json::parse_reviver_walks_bottom_up` 在 GC stress 下输出错位）。
         let _root_holder = self.root(holder);
-        let value = self.get_member(holder, &PropertyKey::from_str(name), module)?;
+        let value = self.get_member(holder, name, module)?;
         let _root_value = self.root(&value);
         if matches!(&value, Value::Object(_)) {
             let is_array = matches!(&value, Value::Object(o) if o.borrow().kind() == ObjectKind::Array);
-            let keys: Vec<String> = if is_array {
+            let keys: Vec<PropertyKey> = if is_array {
                 (0..self.array_like_elements(&value).map(|v| v.len()).unwrap_or(0))
-                    .map(|i| i.to_string())
+                    .map(|i| PropertyKey::element(&mut self.heap, i as u64))
                     .collect()
             } else {
-                crate::builtins::own_enumerable_string_keys(&value)
+                crate::builtins::own_enumerable_string_keys(&mut self.heap, &value)
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect()
             };
             for key in keys {
                 let new_element = self.json_internalize(&value, &key, reviver, module)?;
-                let key = PropertyKey::from_str(&key);
                 if matches!(new_element, Value::Undefined) {
                     self.delete_member(&value, &key, module)?;
                 } else if let Value::Object(obj_ref) = &value {
@@ -1545,7 +1559,7 @@ impl VM {
         self.invoke(
             reviver,
             holder.clone(),
-            &[Value::string(name), value],
+            &[Value::string(&name.display(&self.heap)), value],
             module,
         )
     }
@@ -1959,7 +1973,10 @@ impl VM {
                             }
                             None => {
                                 // Fall back to global environment
-                                match self.state.get_global(name) {
+                                match self
+                                    .state
+                                    .get_global(&PropertyKey::intern(&mut self.heap, name))
+                                {
                                     Some(value) => {
                                         self.set_value(dst, value)?;
                                     }
@@ -2211,7 +2228,13 @@ impl VM {
                 };
                 // A dead-zone read *does* throw here — unlike an unresolvable
                 // name, which is the one case `typeof` has to tolerate.
-                let value = self.state.resolve_env_name(&name)?;
+                // 全局对象的回退在 VM 侧做：`globals` 按 `Atom` 建键，`State` 没有堆。
+                let value = match self.state.resolve_env_name(&name)? {
+                    Some(value) => Some(value),
+                    None => self
+                        .state
+                        .get_global(&PropertyKey::intern(&mut self.heap, &name)),
+                };
                 let type_str = match value {
                     Some(v) => v.type_of().to_string(),
                     None => "undefined".to_string(),
@@ -2263,7 +2286,7 @@ impl VM {
                             }
                             let ctor_proto = ctor_ref
                                 .borrow()
-                                .property_get(&PropertyKey::from("prototype"));
+                                .property_get(&PropertyKey::well_known("prototype").expect("well-known name"));
                             match ctor_proto {
                                 Some(desc) => {
                                     let target_proto = desc.value;
@@ -2717,13 +2740,20 @@ impl VM {
                             // without a directive expect today.
                             if module.strict
                                 && !module.declared_names.contains(&name)
-                                && !self.state.globals.borrow().contains_key(&name)
+                                && !self
+                                    .state
+                                    .globals
+                                    .borrow()
+                                    .contains_key(&PropertyKey::intern(&mut self.heap, &name))
                             {
                                 return Err(RuntimeError::ReferenceError(format!(
                                     "assignment to undeclared variable {name}"
                                 )));
                             }
-                            self.state.globals.borrow_mut().insert(name, value);
+                            self.state
+                                .globals
+                                .borrow_mut()
+                                .insert(PropertyKey::intern(&mut self.heap, &name), value);
                         }
                     }
                 }
@@ -3204,7 +3234,7 @@ impl VM {
                         if let Value::Object(func_ref) = &func_obj {
                             let proto = func_ref
                                 .borrow()
-                                .property_get(&PropertyKey::from_str("prototype"));
+                                .property_get(&PropertyKey::well_known("prototype").expect("well-known name"));
                             // Update the constructor to point to the FunctionObject for future accesses
                             self.set_value(callee, func_obj.clone())?;
                             (id, proto.map(|d| d.value))
@@ -3233,7 +3263,7 @@ impl VM {
                             {
                                 let id = func_obj.func_id;
                                 let proto =
-                                    borrowed.property_get(&PropertyKey::from_str("prototype"));
+                                    borrowed.property_get(&PropertyKey::well_known("prototype").expect("well-known name"));
                                 drop(borrowed);
                                 (id, proto.map(|d| d.value))
                             } else {
@@ -3433,7 +3463,7 @@ impl VM {
                             ["__super__", "__superProto__"]
                                 .iter()
                                 .filter_map(|name| {
-                                    let key = PropertyKey::from_str(name);
+                                    let key = PropertyKey::intern(&mut self.heap, name);
                                     borrowed
                                         .property_get(&key)
                                         .map(|desc| (key, desc))

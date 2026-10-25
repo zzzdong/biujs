@@ -195,10 +195,12 @@ impl JSObject for NativeIteratorObject {
         if *key == crate::vm::iterator::iterator_symbol_key() {
             return Some(PropertyDescriptor::data_descriptor(self.iterator_fn.clone()));
         }
-        match key.as_str() {
-            Some("next") => Some(PropertyDescriptor::data_descriptor(self.next_fn.clone())),
-            Some("return") => Some(PropertyDescriptor::data_descriptor(self.return_fn.clone())),
-            _ => None,
+        if key.is("next") {
+            Some(PropertyDescriptor::data_descriptor(self.next_fn.clone()))
+        } else if key.is("return") {
+            Some(PropertyDescriptor::data_descriptor(self.return_fn.clone()))
+        } else {
+            None
         }
     }
 
@@ -220,13 +222,13 @@ impl JSObject for NativeIteratorObject {
 
     fn has_property(&self, key: &PropertyKey) -> bool {
         *key == crate::vm::iterator::iterator_symbol_key()
-            || matches!(key.as_str(), Some("next") | Some("return"))
+            || key.is("next") || key.is("return")
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
         vec![
-            PropertyKey::from_str("next"),
-            PropertyKey::from_str("return"),
+            PropertyKey::well_known("next").expect("well-known name"),
+            PropertyKey::well_known("return").expect("well-known name"),
         ]
     }
 

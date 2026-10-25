@@ -38,8 +38,11 @@ pub fn register_array_prototype(proto: &Gc<Object>, heap: &mut Heap) {
             "Array.prototype.flatMap is dispatched by the VM".to_string(),
         ))
     });
-    set_prototype_method(proto, heap, "copyWithin", |this, args| {
-        array_copy_within(this, args)
+    // 闭包从不被调用（`set_prototype_method` 只登记名字）；实现住在分派表里。
+    set_prototype_method(proto, heap, "copyWithin", |_, _| {
+        Err(RuntimeError::NotImplemented(
+            "method implemented by the VM".to_string(),
+        ))
     });
 
     // Callback-driven methods: the VM runs the algorithm so it can call the
@@ -107,12 +110,12 @@ pub fn array_from(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError
             } else {
                 // Generic array-like: read `length` and then each index.
                 let len = borrowed
-                    .property_get(&PropertyKey::from_str("length"))
+                    .property_get(&PropertyKey::well_known("length").expect("well-known name"))
                     .map(|d| d.value.to_number())
                     .unwrap_or(0.0);
                 let len = len.max(0.0).min((1u32 << 20) as f64) as usize;
                 for i in 0..len {
-                    let key = PropertyKey::element(i as u64);
+                    let key = PropertyKey::element(heap, i as u64);
                     out.push(
                         borrowed
                             .property_get(&key)
@@ -294,11 +297,11 @@ fn to_object(heap: &mut Heap, obj: &Value) -> Result<Gc<Object>, RuntimeError> {
 
 /// `ToLength(Get(O, "length"))` — saturating, so a huge `length` cannot make
 /// the caller allocate or loop forever.
-fn generic_length(obj: &Value) -> u64 {
+fn generic_length(heap: &mut Heap, obj: &Value) -> u64 {
     let raw = match obj {
         Value::Object(o) => o
             .borrow()
-            .property_get(&PropertyKey::from_str("length"))
+            .property_get(&PropertyKey::well_known("length").expect("well-known name"))
             .map(|d| d.value.to_number()),
         _ => None,
     };
@@ -312,22 +315,22 @@ fn generic_length(obj: &Value) -> u64 {
     }
 }
 
-fn generic_get(obj: &Value, index: u64) -> Value {
+fn generic_get(heap: &mut Heap, obj: &Value, index: u64) -> Value {
     match obj {
         Value::Object(o) => o
             .borrow()
-            .property_get(&PropertyKey::element(index))
+            .property_get(&PropertyKey::element(heap, index))
             .map(|d| d.value)
             .unwrap_or(Value::Undefined),
         _ => Value::Undefined,
     }
 }
 
-fn generic_set(obj: &Value, index: u64, value: Value) -> Result<(), RuntimeError> {
+fn generic_set(heap: &mut Heap, obj: &Value, index: u64, value: Value) -> Result<(), RuntimeError> {
     match obj {
         Value::Object(o) => o
             .borrow_mut()
-            .property_set(PropertyKey::element(index), value)
+            .property_set(PropertyKey::element(heap, index), value)
             .map(|_| ())
             .map_err(RuntimeError::TypeError),
         _ => Ok(()),
@@ -335,11 +338,11 @@ fn generic_set(obj: &Value, index: u64, value: Value) -> Result<(), RuntimeError
 }
 
 /// `HasProperty(O, key)` — walks the prototype chain, as the spec requires.
-fn generic_has(obj: &Value, index: u64) -> bool {
+fn generic_has(heap: &mut Heap, obj: &Value, index: u64) -> bool {
     match obj {
         Value::Object(o) => crate::vm::prototype::internal_has_property(
             *o,
-            &PropertyKey::element(index),
+            &PropertyKey::element(heap, index),
         )
         .unwrap_or(false),
         _ => false,
@@ -347,11 +350,11 @@ fn generic_has(obj: &Value, index: u64) -> bool {
 }
 
 /// `[[Delete]](O, key)`.
-fn generic_delete(obj: &Value, index: u64) -> Result<bool, RuntimeError> {
+fn generic_delete(heap: &mut Heap, obj: &Value, index: u64) -> Result<bool, RuntimeError> {
     match obj {
         Value::Object(o) => crate::vm::prototype::internal_delete(
             *o,
-            &PropertyKey::element(index),
+            &PropertyKey::element(heap, index),
         )
         .map_err(RuntimeError::TypeError),
         _ => Ok(true),
@@ -359,11 +362,11 @@ fn generic_delete(obj: &Value, index: u64) -> Result<bool, RuntimeError> {
 }
 
 /// `Set(O, "length", len, true)`.
-fn generic_set_length(obj: &Value, len: u64) -> Result<(), RuntimeError> {
+fn generic_set_length(heap: &mut Heap, obj: &Value, len: u64) -> Result<(), RuntimeError> {
     match obj {
         Value::Object(o) => o
             .borrow_mut()
-            .property_set(PropertyKey::from_str("length"), Value::Number(len as f64))
+            .property_set(PropertyKey::well_known("length").expect("well-known name"), Value::Number(len as f64))
             .map(|_| ())
             .map_err(RuntimeError::TypeError),
         _ => Ok(()),
@@ -393,7 +396,14 @@ fn own_index_keys_below(obj: &Value, limit: u64) -> Vec<u64> {
 /// else Delete(to + k)" without paying O(length) on a sparse receiver: the
 /// destinations that do not receive a value are deleted, the rest are written
 /// from a snapshot taken before anything is modified.
-fn generic_window_move(obj: &Value, from: u64, to: u64, delta: i64, len: u64) -> Result<(), RuntimeError> {
+fn generic_window_move(
+    heap: &mut Heap,
+    obj: &Value,
+    from: u64,
+    to: u64,
+    delta: i64,
+    len: u64,
+) -> Result<(), RuntimeError> {
     if to <= from || delta == 0 {
         return Ok(());
     }
@@ -409,7 +419,7 @@ fn generic_window_move(obj: &Value, from: u64, to: u64, delta: i64, len: u64) ->
     let mut moves: Vec<(u64, Value)> = Vec::new();
     for k in &present {
         if *k >= from && *k < to {
-            let value = generic_get(obj, *k);
+            let value = generic_get(heap, obj, *k);
             moves.push((shift(*k), value));
         }
     }
@@ -418,23 +428,29 @@ fn generic_window_move(obj: &Value, from: u64, to: u64, delta: i64, len: u64) ->
     let (dest_from, dest_to) = (shift(from), shift(to - 1) + 1);
     for k in &present {
         if *k >= dest_from && *k < dest_to && !destinations.contains(k) {
-            generic_delete(obj, *k)?;
+            generic_delete(heap, obj, *k)?;
         }
     }
     for (dest, value) in moves {
-        generic_set(obj, dest, value)?;
+        generic_set(heap, obj, dest, value)?;
     }
     Ok(())
 }
 
 /// Delete every *present* index in `[from, to)`.
-fn generic_delete_range(obj: &Value, from: u64, to: u64, len: u64) -> Result<(), RuntimeError> {
+fn generic_delete_range(
+    heap: &mut Heap,
+    obj: &Value,
+    from: u64,
+    to: u64,
+    len: u64,
+) -> Result<(), RuntimeError> {
     if to <= from {
         return Ok(());
     }
     for k in own_index_keys_below(obj, len) {
         if k >= from && k < to {
-            generic_delete(obj, k)?;
+            generic_delete(heap, obj, k)?;
         }
     }
     Ok(())
@@ -515,14 +531,14 @@ pub fn array_at(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, R
         }
     }
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     let n = super::to_integer_or_infinity_throwing(args.first())?;
     let len_i = len.min(i64::MAX as u64) as i64;
     let index = if n < 0 { n.saturating_add(len_i) } else { n };
     if index < 0 || index >= len_i {
         return Ok(Value::Undefined);
     }
-    Ok(generic_get(obj, index as u64))
+    Ok(generic_get(heap, obj, index as u64))
 }
 
 /// `Array.prototype.copyWithin(target, start, end)`.
@@ -530,15 +546,19 @@ pub fn array_at(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value, R
 /// The range is read into a buffer first, which makes overlapping source and
 /// destination ranges behave as the spec requires (the algorithm is defined in
 /// terms of a snapshot of the values, not of the live elements).
-pub fn array_copy_within(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn array_copy_within(
+    heap: &mut Heap,
+    obj: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let len = if let Value::Object(obj_ref) = obj {
         if let Some(arr) = obj_ref.borrow().as_array() {
             arr.len() as u64
         } else {
-            generic_length(obj)
+            generic_length(heap, obj)
         }
     } else {
-        generic_length(obj)
+        generic_length(heap, obj)
     };
 
     let to = relative_index(args.first(), len)?;
@@ -557,10 +577,10 @@ pub fn array_copy_within(obj: &Value, args: &[Value]) -> Result<Value, RuntimeEr
 
     let mut buffer: Vec<Value> = Vec::with_capacity(count as usize);
     for k in 0..count {
-        buffer.push(generic_get(obj, from + k));
+        buffer.push(generic_get(heap, obj, from + k));
     }
     for (k, value) in buffer.into_iter().enumerate() {
-        generic_set(obj, to + k as u64, value)?;
+        generic_set(heap, obj, to + k as u64, value)?;
     }
     Ok(obj.clone())
 }
@@ -592,16 +612,16 @@ pub fn array_push(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
         }
     }
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     let count = args.len() as u64;
     let new_len = len.saturating_add(count);
     if new_len > MAX_ARRAY_LENGTH {
         return Err(RuntimeError::TypeError("Invalid array length".to_string()));
     }
     for (i, arg) in args.iter().enumerate() {
-        generic_set(obj, len + i as u64, arg.clone())?;
+        generic_set(heap, obj, len + i as u64, arg.clone())?;
     }
-    generic_set_length(obj, new_len)?;
+    generic_set_length(heap, obj, new_len)?;
     Ok(Value::Number(new_len as f64))
 }
 
@@ -616,17 +636,17 @@ pub fn array_pop(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> {
         }
     }
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     if len == 0 {
-        generic_set_length(obj, 0)?;
+        generic_set_length(heap, obj, 0)?;
         return Ok(Value::Undefined);
     }
     let index = len - 1;
-    let element = generic_get(obj, index);
-    if !generic_delete(obj, index)? {
+    let element = generic_get(heap, obj, index);
+    if !generic_delete(heap, obj, index)? {
         return Err(RuntimeError::TypeError("Cannot delete property".to_string()));
     }
-    generic_set_length(obj, index)?;
+    generic_set_length(heap, obj, index)?;
     Ok(element)
 }
 
@@ -639,15 +659,15 @@ pub fn array_shift(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError> 
         }
     }
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     if len == 0 {
-        generic_set_length(obj, 0)?;
+        generic_set_length(heap, obj, 0)?;
         return Ok(Value::Undefined);
     }
-    let first = generic_get(obj, 0);
-    generic_window_move(obj, 1, len, -1, len)?;
-    generic_delete_range(obj, len - 1, len, len)?;
-    generic_set_length(obj, len - 1)?;
+    let first = generic_get(heap, obj, 0);
+    generic_window_move(heap, obj, 1, len, -1, len)?;
+    generic_delete_range(heap, obj, len - 1, len, len)?;
+    generic_set_length(heap, obj, len - 1)?;
     Ok(first)
 }
 
@@ -663,19 +683,19 @@ pub fn array_unshift(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Val
         }
     }
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     let count = args.len() as u64;
     let new_len = len.saturating_add(count);
     if new_len > MAX_ARRAY_LENGTH {
         return Err(RuntimeError::TypeError("Invalid array length".to_string()));
     }
     if count > 0 {
-        generic_window_move(obj, 0, len, count as i64, len)?;
+        generic_window_move(heap, obj, 0, len, count as i64, len)?;
         for (i, arg) in args.iter().enumerate() {
-            generic_set(obj, i as u64, arg.clone())?;
+            generic_set(heap, obj, i as u64, arg.clone())?;
         }
     }
-    generic_set_length(obj, new_len)?;
+    generic_set_length(heap, obj, new_len)?;
     Ok(Value::Number(new_len as f64))
 }
 
@@ -694,7 +714,7 @@ pub fn array_reverse(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError
         }
     }
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     if len < 2 {
         return Ok(obj.clone());
     }
@@ -715,21 +735,21 @@ pub fn array_reverse(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError
                 swaps.push((*k, other));
             }
         } else {
-            moves.push((other, generic_get(obj, *k)));
+            moves.push((other, generic_get(heap, obj, *k)));
             deletes.push(*k);
         }
     }
 
     for (lo, hi) in swaps {
-        let (low_value, high_value) = (generic_get(obj, lo), generic_get(obj, hi));
-        generic_set(obj, lo, high_value)?;
-        generic_set(obj, hi, low_value)?;
+        let (low_value, high_value) = (generic_get(heap, obj, lo), generic_get(heap, obj, hi));
+        generic_set(heap, obj, lo, high_value)?;
+        generic_set(heap, obj, hi, low_value)?;
     }
     for (dest, value) in moves {
-        generic_set(obj, dest, value)?;
+        generic_set(heap, obj, dest, value)?;
     }
     for k in deletes {
-        generic_delete(obj, k)?;
+        generic_delete(heap, obj, k)?;
     }
     Ok(obj.clone())
 }
@@ -841,7 +861,7 @@ pub fn array_fill(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
         }
     }
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let start = relative_index(args.get(1), len)?;
     let end = match args.get(2) {
@@ -854,7 +874,7 @@ pub fn array_fill(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
         ));
     }
     for k in start..end {
-        generic_set(obj, k, value.clone())?;
+        generic_set(heap, obj, k, value.clone())?;
     }
     Ok(obj.clone())
 }
@@ -877,7 +897,7 @@ pub fn array_join(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
         .first()
         .map(|v| v.to_js_string())
         .unwrap_or_else(|| ",".to_string());
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     if len == 0 {
         return Ok(Value::string(""));
     }
@@ -900,7 +920,7 @@ pub fn array_join(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
             out.push_str(&separator);
         }
         written = k;
-        let value = generic_get(obj, k);
+        let value = generic_get(heap, obj, k);
         if !matches!(value, Value::Undefined | Value::Null) {
             out.push_str(&value.to_js_string());
         }
@@ -929,7 +949,7 @@ pub fn array_slice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value
         }
     }
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     let start = relative_index(args.first(), len)?;
     let end = match args.get(1) {
         Some(v) if !v.is_undefined() => relative_index(Some(v), len)?,
@@ -942,8 +962,8 @@ pub fn array_slice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value
     let mut result = ArrayObject::new();
     for k in 0..count {
         let index = start + k;
-        if generic_has(obj, index) {
-            result.push(generic_get(obj, index));
+        if generic_has(heap, obj, index) {
+            result.push(generic_get(heap, obj, index));
         } else {
             result.push(Value::Undefined);
             result.mark_hole(k as usize);
@@ -974,7 +994,7 @@ pub fn array_flat(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
         }
     };
     let mut out: Vec<Value> = Vec::new();
-    flatten_into(&mut out, obj, depth);
+    flatten_into(heap, &mut out, obj, depth);
     Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(out)))))
 }
 
@@ -982,18 +1002,18 @@ pub fn array_flat(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Value,
 /// an array element is spread while `depth > 0`, and only then do its own items
 /// get `depth - 1`. (Checking `depth == 0` on entry instead would keep the
 /// element whole and make `flat()` behave like `flat(0)`.)
-fn flatten_into(out: &mut Vec<Value>, value: &Value, depth: usize) {
-    let len = generic_length(value);
+fn flatten_into(heap: &mut Heap, out: &mut Vec<Value>, value: &Value, depth: usize) {
+    let len = generic_length(heap, value);
     for i in 0..len {
         // A hole is not an element, so `flat` drops it.
-        if !generic_has(value, i) {
+        if !generic_has(heap, value, i) {
             continue;
         }
-        let element = generic_get(value, i);
+        let element = generic_get(heap, value, i);
         let is_array =
             matches!(element, Value::Object(ref o) if o.borrow().kind() == ObjectKind::Array);
         if is_array && depth > 0 {
-            flatten_into(out, &element, depth - 1);
+            flatten_into(heap, out, &element, depth - 1);
         } else {
             out.push(element);
         }
@@ -1010,12 +1030,12 @@ pub fn array_concat(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Valu
                       result: &mut ArrayObject|
      -> Result<(), RuntimeError> {
         if is_concat_spreadable(item) {
-            let len = generic_length(item);
+            let len = generic_length(heap, item);
             if len > MAX_MATERIALIZED_LEN as u64 {
                 return Err(RuntimeError::RangeError("Invalid array length".to_string()));
             }
             for k in 0..len {
-                result.push(generic_get(item, k));
+                result.push(generic_get(heap, item, k));
             }
         } else {
             result.push(item.clone());
@@ -1066,7 +1086,7 @@ pub fn array_splice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Valu
     }
 
     to_object(heap, obj)?;
-    let len = generic_length(obj);
+    let len = generic_length(heap, obj);
     let start = relative_index(args.first(), len)?;
     let delete_count = if args.is_empty() {
         // `splice()` with no arguments: `start` is not present, so nothing is
@@ -1099,8 +1119,8 @@ pub fn array_splice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Valu
     let mut removed = ArrayObject::new();
     for k in 0..delete_count {
         let index = start + k;
-        if generic_has(obj, index) {
-            removed.push(generic_get(obj, index));
+        if generic_has(heap, obj, index) {
+            removed.push(generic_get(heap, obj, index));
         } else {
             removed.push(Value::Undefined);
             removed.mark_hole(k as usize);
@@ -1109,15 +1129,15 @@ pub fn array_splice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Valu
 
     // 2. Move the tail, then write the inserted items.
     if item_count < delete_count {
-        generic_window_move(obj, start + delete_count, len, -((delete_count - item_count) as i64), len)?;
+        generic_window_move(heap, obj, start + delete_count, len, -((delete_count - item_count) as i64), len)?;
         // Everything past the new length is dropped.
-        generic_delete_range(obj, new_len, len, len)?;
+        generic_delete_range(heap, obj, new_len, len, len)?;
     } else if item_count > delete_count {
-        generic_window_move(obj, start + delete_count, len, (item_count - delete_count) as i64, len)?;
+        generic_window_move(heap, obj, start + delete_count, len, (item_count - delete_count) as i64, len)?;
     }
     for (i, item) in items.iter().enumerate() {
-        generic_set(obj, start + i as u64, item.clone())?;
+        generic_set(heap, obj, start + i as u64, item.clone())?;
     }
-    generic_set_length(obj, new_len)?;
+    generic_set_length(heap, obj, new_len)?;
     Ok(Value::Object(heap.alloc(Object::Array(removed))))
 }

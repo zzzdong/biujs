@@ -189,7 +189,7 @@ pub fn regexp_exec(
     }
     let mut array = ArrayObject::from_vec(elements);
     let _ = array.define_property(
-        PropertyKey::from_str("index"),
+        PropertyKey::well_known("index").expect("well-known name"),
         PropertyDescriptor {
             value: Value::Number(whole.start() as f64),
             writable: true,
@@ -200,7 +200,7 @@ pub fn regexp_exec(
         },
     );
     let _ = array.define_property(
-        PropertyKey::from_str("input"),
+        PropertyKey::well_known("input").expect("well-known name"),
         PropertyDescriptor {
             value: Value::string(&text),
             writable: true,
@@ -305,7 +305,7 @@ fn match_array(heap: &mut Heap, captures: &regex::Captures, text: &str) -> Value
         ("groups", Value::Undefined),
     ] {
         let _ = array.define_property(
-            PropertyKey::from_str(key),
+            PropertyKey::intern(heap, key),
             PropertyDescriptor {
                 value,
                 writable: true,
@@ -417,7 +417,7 @@ pub fn regexp_match(
         });
     }
     let _ = array.define_property(
-        PropertyKey::from_str("index"),
+        PropertyKey::well_known("index").expect("well-known name"),
         PropertyDescriptor {
             value: Value::Number(whole.start() as f64),
             writable: true,
@@ -428,7 +428,7 @@ pub fn regexp_match(
         },
     );
     let _ = array.define_property(
-        PropertyKey::from_str("input"),
+        PropertyKey::well_known("input").expect("well-known name"),
         PropertyDescriptor {
             value: Value::string(&text),
             writable: true,

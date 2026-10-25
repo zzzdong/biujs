@@ -1,8 +1,5 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use crate::vm::gc::{Gc, Heap, Object};
-use crate::vm::object::JSObject;
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
@@ -226,17 +223,3 @@ pub fn internal_delete(obj: Gc<Object>, key: &PropertyKey) -> Result<bool, Strin
 // Property name-to-key conversion helpers
 // ─────────────────────────────────────────────────────────
 
-/// Convert a Value to a PropertyKey for property access
-pub fn value_to_property_key(val: &Value) -> PropertyKey {
-    match val {
-        Value::String(s) => PropertyKey::from_str(s.as_str()),
-        Value::Symbol(sym_data) => PropertyKey::Symbol(sym_data.id),
-        // All other types are coerced to string per JS spec
-        other => PropertyKey::from_str(&other.to_string()),
-    }
-}
-
-/// Convert a string to PropertyKey
-pub fn str_to_property_key(s: &str) -> PropertyKey {
-    PropertyKey::from_str(s)
-}

@@ -918,7 +918,7 @@ fn chained_reactions_run_including_when_the_executor_throws() {
     };
     let seen = obj
         .borrow()
-        .property_get(&biujs::vm::PropertyKey::from_str("seen"))
+        .property_get(&vm.property_key("seen"))
         .expect("seen property")
         .value;
     // Same order node reports: the reactions run in the order they were queued.

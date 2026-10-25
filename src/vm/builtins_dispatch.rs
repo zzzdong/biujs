@@ -469,7 +469,7 @@ impl VM {
                 result.set_prototype(Some(self.builtins.object_prototype));
                 for (field, value) in [("proxy", proxy), ("revoke", revoke)] {
                     let _ = result.define_property(
-                        PropertyKey::from_str(field),
+                        PropertyKey::intern(&mut self.heap, field),
                         PropertyDescriptor::data_descriptor(value),
                     );
                 }
@@ -563,13 +563,13 @@ impl VM {
             Value::Object(result_ref) => {
                 let borrowed = result_ref.borrow();
                 let len = borrowed
-                    .property_get(&PropertyKey::from_str("length"))
+                    .property_get(&PropertyKey::well_known("length").expect("well-known name"))
                     .map(|d| d.value.to_number() as usize)
                     .unwrap_or(0);
                 (0..len)
                     .filter_map(|i| {
                         borrowed
-                            .property_get(&PropertyKey::element(i as u64))
+                            .property_get(&PropertyKey::element(&mut self.heap, i as u64))
                             .map(|d| (i, d.value))
                     })
                     .collect()
@@ -577,7 +577,8 @@ impl VM {
             _ => Vec::new(),
         };
         for (i, value) in elements {
-            self.set_member(&target, PropertyKey::element(i as u64), value, module)?;
+            let key = PropertyKey::element(&mut self.heap, i as u64);
+            self.set_member(&target, key, value, module)?;
         }
         Ok(Some(target))
     }
@@ -771,14 +772,15 @@ impl VM {
             ));
         }
         // `Get(template, "raw")` —— 走真 [[Get]]，getter 可以抛。
-        let raw = self.get_member(&template, &PropertyKey::from_str("raw"), module)?;
+        let raw = self.get_member(&template, &PropertyKey::well_known("raw").expect("well-known name"), module)?;
         let len = self
             .array_like_elements(&raw)
             .map(|v| v.len())
             .unwrap_or(0);
         let mut out = String::new();
         for i in 0..len {
-            let chunk = self.get_member(&raw, &PropertyKey::element(i as u64), module)?;
+            let key = PropertyKey::element(&mut self.heap, i as u64);
+            let chunk = self.get_member(&raw, &key, module)?;
             // 每个替换值都 ToString（`undefined` / `null` 走 ToString 而非跳过 ——
             // `String.raw` 不做 `join` 那样的空串替换）。
             out.push_str(&chunk.to_js_string());
@@ -1170,7 +1172,7 @@ impl VM {
         len: usize,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
-        let ctor = self.get_member(receiver, &PropertyKey::from_str("constructor"), module)?;
+        let ctor = self.get_member(receiver, &PropertyKey::well_known("constructor").expect("well-known name"), module)?;
         let species = if ctor.is_object() {
             let s = self.get_member(&ctor, &crate::builtins::species_symbol_key(), module)?;
             if matches!(s, Value::Undefined | Value::Null) {
@@ -1223,12 +1225,8 @@ impl VM {
             )),
             Some(target) => {
                 for (i, v) in vals.iter().enumerate() {
-                    self.set_member(
-                        &target,
-                        PropertyKey::element(i as u64),
-                        v.clone(),
-                        module,
-                    )?;
+                    let key = PropertyKey::element(&mut self.heap, i as u64);
+                    self.set_member(&target, key, v.clone(), module)?;
                 }
                 Ok(target)
             }
@@ -1514,12 +1512,8 @@ impl VM {
                     }
                     Some(target) => {
                         for (i, v) in values {
-                            self.set_member(
-                                &target,
-                                PropertyKey::element(i as u64),
-                                v,
-                                module,
-                            )?;
+                            let key = PropertyKey::element(&mut self.heap, i as u64);
+                            self.set_member(&target, key, v, module)?;
                         }
                         target
                     }
@@ -1571,12 +1565,8 @@ impl VM {
                     None => crate::vm::object::new_array_object_from_vec(&mut self.heap, values),
                     Some(target) => {
                         for (i, v) in values.into_iter().enumerate() {
-                            self.set_member(
-                                &target,
-                                PropertyKey::element(i as u64),
-                                v,
-                                module,
-                            )?;
+                            let key = PropertyKey::element(&mut self.heap, i as u64);
+                            self.set_member(&target, key, v, module)?;
                         }
                         target
                     }
@@ -1606,12 +1596,8 @@ impl VM {
                     None => crate::vm::object::new_array_object_from_vec(&mut self.heap, out),
                     Some(target) => {
                         for (i, v) in out.iter().enumerate() {
-                            self.set_member(
-                                &target,
-                                PropertyKey::element(i as u64),
-                                v.clone(),
-                                module,
-                            )?;
+                            let key = PropertyKey::element(&mut self.heap, i as u64);
+                            self.set_member(&target, key, v.clone(), module)?;
                         }
                         target
                     }
@@ -2027,8 +2013,8 @@ impl VM {
                 let len = entries.len();
                 for lower in 0..len / 2 {
                     let upper = len - 1 - lower;
-                    let lower_key = PropertyKey::element(lower as u64);
-                    let upper_key = PropertyKey::element(upper as u64);
+                    let lower_key = PropertyKey::element(&mut self.heap, lower as u64);
+                    let upper_key = PropertyKey::element(&mut self.heap, upper as u64);
                     let (lower_v, upper_v) = (entries[lower].clone(), entries[upper].clone());
                     match upper_v {
                         Some(v) => {
@@ -2146,7 +2132,7 @@ impl VM {
                     if let Some(v) = entry
                         && !Self::create_data_property(
                             &target,
-                            &PropertyKey::element(i as u64),
+                            &PropertyKey::element(&mut self.heap, i as u64),
                             v,
                         )
                     {

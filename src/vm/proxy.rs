@@ -69,7 +69,10 @@ impl VM {
         // with an accessor for `get` is legal, and only the VM can run it.
         let trap = match &handler {
             Value::Object(_) => {
-                self.get_member(&handler, &PropertyKey::from_str(trap_name), module)?
+                {
+                    let key = PropertyKey::intern(&mut self.heap, trap_name);
+                    self.get_member(&handler, &key, module)?
+                }
             }
             _ => Value::Undefined,
         };
@@ -88,9 +91,12 @@ impl VM {
 
     /// A `PropertyKey` as the value a trap is called with: the key is an
     /// ordinary argument, symbols included.
-    pub(crate) fn key_to_value(key: &PropertyKey) -> Value {
+    pub(crate) fn key_to_value(
+        heap: &mut crate::vm::gc::Heap,
+        key: &PropertyKey,
+    ) -> Value {
         match key {
-            PropertyKey::Str(text) => Value::string(text),
+            PropertyKey::Str(atom) => Value::string(heap.resolve(*atom)),
             PropertyKey::Index(index) => Value::string(&index.to_string()),
             PropertyKey::Symbol(id) => {
                 Value::Symbol(Rc::new(crate::vm::value::SymbolData::new(None, *id)))
@@ -134,7 +140,7 @@ impl VM {
                 module,
             )?));
         };
-        let key_value = Self::key_to_value(key);
+        let key_value = Self::key_to_value(&mut self.heap, key);
         let value = self.invoke(
             &trap,
             handler,
@@ -149,7 +155,7 @@ impl VM {
                 if !value.strict_eq(&desc.value) {
                     return Err(RuntimeError::TypeError(format!(
                         "'get' on proxy: property '{}' is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value (expected '{}' but got '{}')",
-                        key.display(),
+                        key.display(&self.heap),
                         desc.value.to_js_string(),
                         value.to_js_string()
                     )));
@@ -179,15 +185,11 @@ impl VM {
             let target = self.proxy_parts(proxy, "set")?.0;
             return self.set_with_receiver(&target, key, value, receiver, module);
         };
+        let key_value = Self::key_to_value(&mut self.heap, key);
         let answer = self.invoke(
             &trap,
             handler,
-            &[
-                target.clone(),
-                Self::key_to_value(key),
-                value.clone(),
-                receiver.clone(),
-            ],
+            &[target.clone(), key_value, value.clone(), receiver.clone()],
             module,
         )?;
         // Invariant (step 21): a non-writable, non-configurable own data
@@ -197,7 +199,7 @@ impl VM {
                 if !value.strict_eq(&desc.value) {
                     return Err(RuntimeError::TypeError(format!(
                         "'set' on proxy: trap returned truish for property '{}' which exists in the proxy target as a non-configurable and non-writable data property with a different value",
-                        key.display()
+                        key.display(&self.heap)
                     )));
                 }
             }
@@ -226,13 +228,9 @@ impl VM {
                 _ => Ok(Some(false)),
             };
         };
+        let key_value = Self::key_to_value(&mut self.heap, key);
         let answer = self
-            .invoke(
-                &trap,
-                handler,
-                &[target.clone(), Self::key_to_value(key)],
-                module,
-            )?
+            .invoke(&trap, handler, &[target.clone(), key_value], module)?
             .to_boolean();
         // Invariants (ES 10.5.7): an existing non-configurable property, or any
         // own property of a non-extensible target, cannot be reported absent.
@@ -249,7 +247,7 @@ impl VM {
             if must_report {
                 return Err(RuntimeError::TypeError(format!(
                     "'has' on proxy: trap returned falsish for property '{}' which exists in the proxy target as non-configurable",
-                    key.display()
+                    key.display(&self.heap)
                 )));
             }
         }
@@ -278,13 +276,9 @@ impl VM {
                 _ => Ok(Some(true)),
             };
         };
+        let key_value = Self::key_to_value(&mut self.heap, key);
         let answer = self
-            .invoke(
-                &trap,
-                handler,
-                &[target.clone(), Self::key_to_value(key)],
-                module,
-            )?
+            .invoke(&trap, handler, &[target.clone(), key_value], module)?
             .to_boolean();
         // Invariant (ES 10.5.10): a non-configurable own property cannot be
         // reported as deleted. (A *frozen* target's property is covered too:
@@ -294,7 +288,7 @@ impl VM {
                 if !desc.configurable {
                     return Err(RuntimeError::TypeError(format!(
                         "'deleteProperty' on proxy: trap returned truish for property '{}' which is non-configurable in the proxy target",
-                        key.display()
+                        key.display(&self.heap)
                     )));
                 }
             }
@@ -464,14 +458,18 @@ impl VM {
                     "setPrototypeOf",
                 )?))
             }
-            "has" => Ok(Some(Value::Bool(
-                self.proxy_has(&receiver, &crate::builtins::reflect::to_key(&key), module)?
-                    .unwrap_or(false),
-            ))),
-            "deleteProperty" => Ok(Some(Value::Bool(
-                self.proxy_delete(&receiver, &crate::builtins::reflect::to_key(&key), module)?
-                    .unwrap_or(true),
-            ))),
+            "has" => {
+                let trap_key = crate::builtins::reflect::to_key(&mut self.heap, &key);
+                Ok(Some(Value::Bool(
+                    self.proxy_has(&receiver, &trap_key, module)?.unwrap_or(false),
+                )))
+            }
+            "deleteProperty" => {
+                let trap_key = crate::builtins::reflect::to_key(&mut self.heap, &key);
+                Ok(Some(Value::Bool(
+                    self.proxy_delete(&receiver, &trap_key, module)?.unwrap_or(true),
+                )))
+            }
             "isExtensible" => {
                 let answer = self
                     .invoke(&trap, handler, &[target.clone()], module)?
@@ -516,7 +514,7 @@ impl VM {
             "getOwnPropertyDescriptor" => {
                 let result = self.invoke(&trap, handler, &[target.clone(), key.clone()], module)?;
                 let target_desc =
-                    Self::proxy_target_descriptor(&target, &crate::builtins::reflect::to_key(&key));
+                    Self::proxy_target_descriptor(&target, &crate::builtins::reflect::to_key(&mut self.heap, &key));
                 let extensible = match &target {
                     Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
                     _ => false,
@@ -545,7 +543,7 @@ impl VM {
                     if !desc.configurable {
                         let reported = self.get_member(
                             &result,
-                            &PropertyKey::from_str("configurable"),
+                            &PropertyKey::well_known("configurable").expect("well-known name"),
                             module,
                         )?;
                         if reported.to_boolean() {
@@ -574,7 +572,7 @@ impl VM {
                 let mut keys: Vec<PropertyKey> = Vec::new();
                 for item in items {
                     match item {
-                        Value::String(text) => keys.push(PropertyKey::from_str(&text)),
+                        Value::String(text) => keys.push(PropertyKey::intern(&mut self.heap, &text)),
                         Value::Symbol(sym) => keys.push(PropertyKey::Symbol(sym.id)),
                         _ => {
                             return Err(RuntimeError::TypeError(
@@ -609,7 +607,7 @@ impl VM {
                     if required && !keys.contains(target_key) {
                         return Err(RuntimeError::TypeError(format!(
                             "'ownKeys' on proxy: trap result did not include '{}'",
-                            target_key.display()
+                            target_key.display(&self.heap)
                         )));
                     }
                 }
@@ -631,16 +629,16 @@ impl VM {
                     .iter()
                     .filter(|key| match name {
                         "Object.keys" => {
-                            key.as_str().is_some()
+                            !matches!(key, PropertyKey::Symbol(_))
                                 && Self::proxy_target_descriptor(&target, key)
                                     .map(|desc| desc.enumerable)
                                     .unwrap_or(false)
                         }
-                        "Object.getOwnPropertyNames" => key.as_str().is_some(),
-                        "Object.getOwnPropertySymbols" => key.as_str().is_none(),
+                        "Object.getOwnPropertyNames" => !matches!(key, PropertyKey::Symbol(_)),
+                        "Object.getOwnPropertySymbols" => matches!(key, PropertyKey::Symbol(_)),
                         _ => true,
                     })
-                    .map(Self::key_to_value)
+                    .map(|key| Self::key_to_value(&mut self.heap, key))
                     .collect();
                 Ok(Some(Value::Object(self.heap.alloc(Object::Array(
                     crate::vm::object::ArrayObject::from_vec(values),
@@ -663,7 +661,7 @@ impl VM {
                 if answer {
                     let target_desc = Self::proxy_target_descriptor(
                         &target,
-                        &crate::builtins::reflect::to_key(&key),
+                        &crate::builtins::reflect::to_key(&mut self.heap, &key),
                     );
                     let extensible = match &target {
                         Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
@@ -732,7 +730,7 @@ impl VM {
         // A revocation function is *anonymous* (ES 28.2.2.1.1): its `name` is
         // the empty string, not the synthetic name the VM dispatches on.
         let _ = revoke.define_property(
-            PropertyKey::from_str("name"),
+            PropertyKey::well_known("name").expect("well-known name"),
             PropertyDescriptor {
                 value: Value::string(""),
                 writable: false,

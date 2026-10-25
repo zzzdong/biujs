@@ -50,7 +50,7 @@ pub fn register_function_statics(
         let mut obj = obj_ref.borrow_mut();
         // `.prototype` is writable, non-enumerable, non-configurable.
         obj.define_property(
-            PropertyKey::from_str("prototype"),
+            PropertyKey::well_known("prototype").expect("well-known name"),
             super::constructor_prototype_descriptor(Value::Object(*function_prototype)),
         )
         .ok();
@@ -64,7 +64,7 @@ pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // These are placeholder prototypes — actual implementation requires this-aware calling
     for name in ["call", "apply", "bind", "toString"] {
         p.define_property(
-            PropertyKey::from_str(name),
+            PropertyKey::intern(heap, name),
             super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(name),
             )))),
