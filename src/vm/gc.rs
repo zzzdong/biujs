@@ -55,6 +55,13 @@ pub enum SlotState {
 ///
 /// `#[repr(C)]` + `state` 在前，使 `offset_of!(Slot, state) == 0` 成为可断言的
 /// 不变量：从 `Gc` 的裸指针取状态位不需要任何偏移换算。
+///
+/// 关于**悬垂句柄**（漏一次根 + 槽复用 ⇒ `Gc` 悄悄指向另一个对象）：句柄侧代次
+/// 检查要等 `Value` 缩下来才上得起 —— 代次进句柄会让 `Gc` 从 8 B 长到 12–16 B，
+/// `Value::Object` 跟着从 16 B 变 24 B（每个 JS 值 +50%，还有 5 条 Array 内存
+/// 护栏用例的回归风险）。当前的兜底是 `borrow` 族的 `Free` 态检查：能抓住"槽已
+/// 释放、还没被复用"这一档，复用过之后就看不出了。前置条件：1A 把
+/// `Value::String` 换成 `Atom(u32)` 之后 `Value` 有空间，届时补上句柄代次。
 #[repr(C)]
 pub struct Slot {
     pub state: Cell<SlotState>,
@@ -85,6 +92,24 @@ impl<T> Gc<T> {
         a.ptr.as_ptr() == b.ptr.as_ptr()
     }
 
+    /// 取槽，并挡住**已释放**槽上的对象访问。
+    ///
+    /// 只给 `borrow` / `borrow_mut` / `try_borrow` 用：`state` / `set_state` 是 GC
+    /// 自己的工具（单测也要读已释放槽的状态位），不能加这道检查。
+    ///
+    /// 这挡住的是"槽已释放、尚未被复用"这一档悬垂句柄 —— 漏根后最容易被踩到的
+    /// 窗口。复用过之后的别名问题要等句柄代次（见 [`Slot`] 的说明）。
+    fn live_slot(&self) -> &Slot {
+        // SAFETY: 句柄由 `Heap::alloc` 发出，槽地址在堆存活期内恒定。
+        let slot = unsafe { &*self.ptr.as_ptr() };
+        assert!(
+            slot.state.get() != SlotState::Free,
+            "use after free: this Gc points at a slot the collector already reclaimed \
+             (a rooting gap let the object die while a handle to it was still reachable)"
+        );
+        slot
+    }
+
     /// 读槽的状态位。**不触碰 `RefCell`**，故 GC 可在任何时刻安全调用。
     // P2：mark 阶段接线后即被调用（现阶段只有单测用）。
     #[allow(dead_code)]
@@ -103,20 +128,22 @@ impl<T> Gc<T> {
 impl Gc<Object> {
     /// 借用槽内对象，返回守卫。契约：调用方须保证堆仍存活。
     pub fn borrow(&self) -> Ref<'_, Object> {
-        // SAFETY: 句柄由 `Heap::alloc` 发出，槽地址在堆存活期内恒定。
-        unsafe { &(*self.ptr.as_ptr()).cell }.borrow()
+        self.live_slot().cell.borrow()
     }
 
     /// 可变借用槽内对象，返回守卫。契约同 [`Gc::borrow`]。
     pub fn borrow_mut(&self) -> RefMut<'_, Object> {
-        unsafe { &(*self.ptr.as_ptr()).cell }.borrow_mut()
+        self.live_slot().cell.borrow_mut()
     }
 
     /// `borrow` 的不 panic 版本。**GC 的 trace 一律用它**：撞上正在进行的可变借用时
     /// 放弃本轮收集（INV-5），而不是 panic —— release 下 `panic = "abort"`，
     /// 一次 panic 会带走整个进程及其所在分片的全部结果。
+    ///
+    /// 注意"不 panic"只针对**借用冲突**；对已释放槽的访问照样在这里断言失败 ——
+    /// 那意味着 trace 拿到了已死对象的句柄，是必须当场炸掉的 rooting bug。
     pub fn try_borrow(&self) -> Result<Ref<'_, Object>, std::cell::BorrowError> {
-        unsafe { &(*self.ptr.as_ptr()).cell }.try_borrow()
+        self.live_slot().cell.try_borrow()
     }
 }
 
@@ -1218,6 +1245,38 @@ mod tests {
         assert_eq!(live.borrow().class_name(), "live");
         // 标记位已复位，供下一轮。
         assert_eq!(live.state(), SlotState::Unmarked);
+    }
+
+    /// 14b. **对已释放槽的访问必须当场炸掉**。
+    ///
+    /// 这是悬垂句柄检查的第一档：槽已回收、还没被复用。漏根后最容易被踩到的就是
+    /// 这个窗口；没有检查时它读出来的是 sweep 写进去的占位对象 —— 一个类型完全不同
+    /// 的值，静默地错下去。
+    ///
+    /// 注意覆盖范围：槽一旦被复用，旧句柄就指向新对象，这一档看不出来（要等 `Value`
+    /// 缩下来后上句柄代次，见 [`Slot`] 的说明）。
+    #[test]
+    #[should_panic(expected = "use after free")]
+    fn accessing_a_reclaimed_slot_panics() {
+        let mut h = Heap::new();
+        let stale = h.alloc(Object::Ordinary(OrdinaryObject::with_class_name("old")));
+        // 没有任何根 ⇒ 回收；这里**故意不再分配**，让槽留在 free list 里。
+        assert_eq!(h.collect(Vec::new()).expect("本轮没有活跃借用"), 1);
+        assert_eq!(stale.state(), SlotState::Free);
+        let _ = stale.borrow(); // 必须 panic
+    }
+
+    /// 14c. 反过来：**活着的句柄跨收集仍然有效**（检查不能误伤）。
+    #[test]
+    fn a_live_handle_survives_a_collection() {
+        let mut h = Heap::new();
+        let live = h.alloc(Object::Ordinary(OrdinaryObject::with_class_name("live")));
+        h.collect(vec![live]).expect("本轮没有活跃借用");
+        assert_eq!(live.borrow().class_name(), "live");
+        // 再跑一轮（中间有别的分配与回收），句柄依旧有效。
+        let _other = h.alloc(Object::Ordinary(OrdinaryObject::new()));
+        h.collect(vec![live]).expect("本轮没有活跃借用");
+        assert_eq!(live.borrow().class_name(), "live");
     }
 
     /// 15. **环能被回收** —— 这是整个 P1/P2 的动机

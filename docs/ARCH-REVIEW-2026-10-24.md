@@ -58,7 +58,7 @@
    - **内建分派按名字字符串 + 前缀 + arity 表 + 旁路名单**：新增一个原型方法要改 5–9 处；
      `vm` 与 `builtins` 互相依赖（190 / 159 处），无法独立测试或替换。
    另外还有一组 **S0**：`invoke_boundaries` 提前返回泄漏、`pending_captured` 未入根、
-   `rsp` 三写者、GC 槽无 generation（悬垂句柄复用后静默类型混淆）。
+   `rsp` 三写者、GC 悬垂句柄（已加 `Free` 态检查；句柄代次要等 `Value` 缩下来）。
 
 **建议顺序**：先修 S0 + 测量口径（Phase 0），再做“对象/环境/分派”重构（Phase 1），
 然后“帧/GC/字节码”（Phase 2），最后“编译器简化 + 语义补齐”（Phase 3/4）。
@@ -405,7 +405,7 @@ ES 12.10.4 第 4 步规定 RHS 是**不可调用对象时抛 TypeError**，而�
 | 1 | `invoke_boundaries` 泄漏 | `exec.rs:887` push；`895/939` 的 `?` 提前返回；`965` 才 pop | 一次 RangeError 后本 run **不再回收**；`handle_throw` 的边界判定也会用过期值 |
 | 2 | `pending_captured` 未入根 | `mod.rs:5578` 字段；`trace.rs:77-98` 未 trace | 指令边界就是安全点；任何拉长 `ClosureVar`→`Make*FuncObj` 窗口的改动都会 UAF |
 | 3 | `rsp` 三写者 | `unwind_frames_to`（`mod.rs:3069` 派生）、`handle_throw`（`3108` 快照）、`restore_execution_state`（`4626` 快照）、`drive_bytecode_frame`（`exec.rs:983` 再压） | 跨挂起边界的几何没有单一所有者；生成器路径已有 8/5 处特例 |
-| 4 | GC 槽无 generation | `gc.rs:59-72`：`Gc` 只有 `NonNull<Slot>`；`sweep` 放回 free list（`328-351`） | 漏根后槽被复用 ⇒ 读到另一个类型合法的对象，静默类型混淆，断言也查不出 |
+| 4 | ~~GC 槽无 generation~~ **已部分修** | `gc.rs`：`Gc` 只有 `NonNull<Slot>`；`sweep` 放回 free list | 漏根后槽被复用 ⇒ 读到另一个类型合法的对象，静默类型混淆。**已加** `borrow` 族的 `Free` 态检查（对已释放、未复用槽的访问当场 abort）；**未加**句柄代次 —— 那会让 `Gc` 8B→12–16B、`Value` 16B→24B（+50% 且可能碰翻 5 条 Array 内存护栏用例）。前置条件：1A 把 `Value::String` 换成 `Atom(u32)` 后 `Value` 有空间，届时补上 |
 | 5 | 热路径 panic | `bytecode.rs:1276` `as_immd`、`exec.rs` 的 `constants[immd as usize]`、`-1` 哨兵 | release `panic=abort`，一条坏用例带走整片 |
 | 6 | 帧不变量无运行时守卫 | `mod.rs:5841-5849` 的互校只剩注释；`step` 不再调用 | `rbp == frame.base` 现在只靠约定 |
 | 7 | 宿主侧 rooting 与闸门 | `Scope/Root/Roots` 已接约 20 处，但 `invoke_boundaries` 非空时整段跳过收集 | 正确但脆弱；应改为 `RootScope` RAII + 完整入根后再撤闸门 |
@@ -612,10 +612,12 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 4（debug 几何断言）、5（运行时立即数/常量检查）、7（scope 表收口 + 基线刷新）、
 8（strict 运行时收口）、9（字节码 dumper + 16 组 golden，删除 IR 克隆）、
 6（删 `BIUJS_REG_VARS` 与变量寄存器分配，固定内存驻留语义）、
-0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）。
+0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
+S0#4 第一档（`borrow` 族对已释放槽的访问 abort）。
 
-剩余（按顺序）：**Phase 0 已全部收口**，进入架构阶段：
-    1A（Atom/PropertyKey）→ 1B（ObjectHeader/Shape/全局对象/Realm/EnvRecord）→
+剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，下面是架构阶段：
+    1A（Atom/PropertyKey，`Value::String` → `Atom(u32)`；同时把 GC 句柄代次补上）→
+    1B（ObjectHeader/Shape/全局对象/Realm/EnvRecord）→
     1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→
     Phase 2（帧几何/GC/字节码 v2）→ Phase 3（编译器简化）。
 
