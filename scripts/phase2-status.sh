@@ -133,7 +133,14 @@ INDEX=0
 JOBS="${TEST262_JOBS:-1}"
 # 直接跑编译好的二进制，而不是 `cargo test`：并发调用 cargo 会抢 target 目录的
 # 构建锁，实测会退化成串行 —— 并行白做。
-cargo test --release --test test262_runner --no-run >/dev/null 2>&1
+# **必须**确认构建成功：失败时 `ls -t` 会安静地挑到一个旧二进制，于是这一轮
+# 用旧的 lib 跑出"看起来很漂亮"的数字（2026-10-25 踩过：一次 interning 改动后
+# 全量仍报 17,273，实际跑的是改动前的 runner）。
+if ! cargo test --release --test test262_runner --no-run >/tmp/biujs-runner-build.log 2>&1; then
+  echo "test262_runner 构建失败 —— 拒绝用旧二进制跑全量：" >&2
+  tail -20 /tmp/biujs-runner-build.log >&2
+  exit 3
+fi
 RUNNER_BIN="$(ls -t target/release/deps/test262_runner-* 2>/dev/null | grep -v '\.d$' | head -1)"
 if [ -z "$RUNNER_BIN" ]; then
   echo "找不到 test262_runner 二进制（先 cargo test --release --test test262_runner --no-run）。" >&2
