@@ -1,6 +1,6 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
-# 最近更新：2026-10-25
+# 最近更新：2026-10-26
 # guards: timeout 0 step-limit 0 memory 14 (TEST262_TIMEOUT_MS=15000 TEST262_STEP_LIMIT=0 TEST262_MEMORY_MB=384)
 language/statements/for-of	605	52	94
 language/statements/for-in	72	28	15
@@ -24,11 +24,11 @@ language/statements/function	318	115	18
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	55	18	0
-built-ins/Array	2343	187	551
-built-ins/JSON	122	29	14
-built-ins/WeakSet	80	1	4
-built-ins/Number	196	38	106
-built-ins/Proxy	217	49	45
+built-ins/Array	2344	187	550
+built-ins/JSON	123	29	13
+built-ins/WeakSet	81	1	3
+built-ins/Number	197	38	105
+built-ins/Proxy	218	49	44
 language/statements/generators	229	21	16
 language/destructuring	17	1	1
 built-ins/String/prototype/Symbol.iterator	4	0	2
@@ -51,11 +51,11 @@ language/statements/if	47	22	0
 language/statements/throw	13	1	0
 language/literals/boolean	4	0	0
 language/computed-property-names	40	0	8
-built-ins/Boolean	28	3	20
-built-ins/Map	186	5	13
+built-ins/Boolean	29	3	19
+built-ins/Map	187	5	12
 built-ins/TypedArray	303	513	630
-built-ins/Object	3068	32	311
-built-ins/String	792	72	359
+built-ins/Object	3077	32	302
+built-ins/String	793	72	358
 language/expressions/generators	241	30	19
 language/expressions/assignment/destructuring	3	1	4
 language/expressions/addition	35	8	5
@@ -78,11 +78,11 @@ language/statements/let	133	5	7
 language/statements/try	165	27	9
 language/literals/null	3	0	0
 language/identifiers	202	66	0
-built-ins/Error	40	6	47
-built-ins/Set	347	4	32
-built-ins/Math	305	0	22
-built-ins/Promise	244	292	141
-built-ins/Symbol	58	21	19
+built-ins/Error	41	6	46
+built-ins/Set	348	4	31
+built-ins/Math	306	0	21
+built-ins/Promise	245	292	140
+built-ins/Symbol	59	21	18
 language/expressions/yield	42	2	19
 language/rest-parameters	11	0	0
 language/expressions/assignment	343	88	54
@@ -105,7 +105,7 @@ language/statements/return	5	1	10
 language/statements/variable	142	25	11
 language/literals/numeric	91	66	0
 language/types	95	16	2
-built-ins/Function	140	240	129
-built-ins/WeakMap	132	2	7
-built-ins/NativeErrors	74	6	14
-built-ins/Reflect	151	1	1
+built-ins/Function	141	240	128
+built-ins/WeakMap	133	2	6
+built-ins/NativeErrors	80	6	8
+built-ins/Reflect	152	1	0

@@ -473,7 +473,10 @@ impl VM {
         state
             .globals
             .borrow_mut()
-            .insert(PropertyKey::intern(&mut heap, "globalThis"), state.global_object.clone());
+            .insert(
+                PropertyKey::intern(&mut heap, "globalThis"),
+                crate::builtins::method_descriptor(state.global_object.clone()),
+            );
         // The global object is an ordinary object with `Object.prototype` as its
         // prototype, not a bare property bag.
         state.set_global_prototype(builtins.object_prototype);
@@ -579,7 +582,7 @@ impl VM {
             .borrow_mut()
             .insert(
                 PropertyKey::intern(&mut self.heap, "globalThis"),
-                self.state.global_object.clone(),
+                crate::builtins::method_descriptor(self.state.global_object.clone()),
             );
         self.state.set_global_prototype(self.builtins.object_prototype);
 
@@ -625,7 +628,7 @@ impl VM {
             .globals
             .borrow()
             .get(&PropertyKey::Str(atom))
-            .cloned()
+            .map(|descriptor| descriptor.value.clone())
     }
 
     /// Box a bare `Value::Function(id)` into a stable `FunctionObject`.
@@ -5564,7 +5567,7 @@ struct State {
     seh_stack: Vec<SehRecord>,
     /// The script's globals — shared with the `globalThis` object (see
     /// `vm::object::GlobalObject`), so both views stay in step.
-    globals: Rc<RefCell<HashMap<PropertyKey, Value>>>,
+    globals: Rc<RefCell<HashMap<PropertyKey, PropertyDescriptor>>>,
     /// The `globalThis` object itself, kept here so it survives re-registration
     /// and can be published as a global of the same name.
     global_object: Value,
@@ -5958,7 +5961,7 @@ impl State {
     /// 键是 [`PropertyKey`]：字符串键驻留成 `Atom`，所以存储、比较与哈希都是
     /// 整数运算（1A）。调用方负责把名字驻留下来 —— `State` 自己不持有堆。
     fn get_global(&self, key: &PropertyKey) -> Option<Value> {
-        self.globals.borrow().get(key).cloned()
+        self.globals.borrow().get(key).map(|d| d.value.clone())
     }
 
     /// Attach the global object's `[[Prototype]]` (`Object.prototype`).
@@ -6611,7 +6614,7 @@ mod tests {
         state
             .globals
             .borrow_mut()
-            .insert(key, Value::Number(42.0));
+            .insert(key, PropertyDescriptor::data_descriptor(Value::Number(42.0)));
         assert_eq!(state.get_global(&key), Some(Value::Number(42.0)));
     }
 

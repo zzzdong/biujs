@@ -2397,7 +2397,7 @@ impl JSObject for PromiseObject {
 /// `globalThis.x` stays `undefined` for `let x`, per B21.)
 #[derive(Debug)]
 pub struct GlobalObject {
-    store: Rc<RefCell<std::collections::HashMap<PropertyKey, Value>>>,
+    store: Rc<RefCell<std::collections::HashMap<PropertyKey, PropertyDescriptor>>>,
     /// `[[Prototype]]`. It is `Object.prototype`, which is what makes
     /// `globalThis.hasOwnProperty` and `Object.getPrototypeOf(globalThis)`
     /// behave — the globals map alone only answers *own* properties.
@@ -2406,7 +2406,7 @@ pub struct GlobalObject {
 
 impl GlobalObject {
     pub fn new(
-        store: Rc<RefCell<std::collections::HashMap<PropertyKey, Value>>>,
+        store: Rc<RefCell<std::collections::HashMap<PropertyKey, PropertyDescriptor>>>,
     ) -> Self {
         Self {
             store,
@@ -2415,22 +2415,12 @@ impl GlobalObject {
     }
 
     pub fn with_prototype(
-        store: Rc<RefCell<std::collections::HashMap<PropertyKey, Value>>>,
+        store: Rc<RefCell<std::collections::HashMap<PropertyKey, PropertyDescriptor>>>,
         prototype: Gc<Object>,
     ) -> Self {
         Self {
             store,
             prototype: Some(prototype),
-        }
-    }
-
-    /// 键在 `store` 里的查找键：字符串键用它的 `Atom`（存储按 `Atom` 建键，
-    /// 所以这里**不需要**把 `Atom` 解析回字符串）；索引键退回十进制名字。
-    fn key_name(key: &PropertyKey) -> Option<PropertyKey> {
-        match key {
-            PropertyKey::Str(_) => Some(*key),
-            PropertyKey::Index(_) => Some(*key),
-            _ => None,
         }
     }
 
@@ -2453,46 +2443,62 @@ impl JSObject for GlobalObject {
 
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        let name = Self::key_name(key)?;
-        self.store.borrow().get(&name).cloned().map(Self::data)
+        self.store.borrow().get(key).cloned()
     }
 
+    /// ES `OrdinarySetWithOwnDescriptor` (10.1.9.2) on the globals map.
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        let Some(name) = Self::key_name(&key) else {
-            return Ok(false);
-        };
-        self.store.borrow_mut().insert(name, value);
-        Ok(true)
+        let mut store = self.store.borrow_mut();
+        match store.get_mut(&key) {
+            Some(existing) => {
+                if existing.is_accessor_descriptor() {
+                    return Err("Cannot assign to accessor property".to_string());
+                }
+                if !existing.writable {
+                    return Err("Cannot assign to read-only property".to_string());
+                }
+                existing.value = value;
+                Ok(true)
+            }
+            // The global object is always extensible, so a new name is added.
+            None => {
+                store.insert(key, PropertyDescriptor::data_descriptor(value));
+                Ok(true)
+            }
+        }
     }
 
+    /// `[[DefineOwnProperty]]` (ES 10.1.6): an existing entry goes through the
+    /// ordinary redefinition rules — a non-configurable one can only be
+    /// redefined opaquely, and accessors are kept as accessors.
     fn define_property(
         &mut self,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
-        // Accessors have nowhere to live on a plain map-backed global; a data
-        // descriptor is what every built-in registration uses anyway.
-        let Some(name) = Self::key_name(&key) else {
-            return Ok(false);
-        };
-        self.store
-            .borrow_mut()
-            .insert(name, descriptor.value.clone());
+        let mut store = self.store.borrow_mut();
+        match store.get(&key) {
+            Some(current) => validate_property_redefinition(current, &descriptor)?,
+            None => {}
+        }
+        store.insert(key, descriptor);
         Ok(true)
     }
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        match Self::key_name(key) {
-            Some(name) => self.store.borrow_mut().remove(&name).is_some(),
-            None => false,
+        let mut store = self.store.borrow_mut();
+        match store.get(key) {
+            Some(existing) if !existing.configurable => false,
+            Some(_) => {
+                store.remove(key);
+                true
+            }
+            None => true,
         }
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        match Self::key_name(key) {
-            Some(name) => self.store.borrow().contains_key(&name),
-            None => false,
-        }
+        self.store.borrow().contains_key(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {

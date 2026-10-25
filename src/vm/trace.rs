@@ -83,8 +83,8 @@ impl Trace for State {
         self.registers.trace(out);
         self.seh_stack.trace(out);
         // `globals` 刻意仍是 `Rc<RefCell<..>>`：它不是堆对象，是全局对象的另一面视图。
-        for v in self.globals.borrow().values() {
-            v.trace(out);
+        for descriptor in self.globals.borrow().values() {
+            descriptor.value.trace(out);
         }
         self.global_object.trace(out);
         self.script_env.trace(out);
@@ -167,7 +167,11 @@ mod tests {
         vm.state
             .globals
             .borrow_mut()
-            .insert(crate::vm::property::PropertyKey::well_known("x").unwrap_or(crate::vm::property::PropertyKey::from_index(0)), Value::Object(g));
+            .insert(
+                crate::vm::property::PropertyKey::well_known("x")
+                    .unwrap_or(crate::vm::property::PropertyKey::from_index(0)),
+                crate::vm::property::PropertyDescriptor::data_descriptor(Value::Object(g)),
+            );
         assert!(traced_contains(&vm, &g));
     }
 

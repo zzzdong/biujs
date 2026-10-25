@@ -2738,22 +2738,56 @@ impl VM {
                             // property (ES 8.1.1.4 / 13.15). Sloppy code still
                             // creates one, which is what REPL-style sources
                             // without a directive expect today.
+                            let key = PropertyKey::intern(&mut self.heap, &name);
                             if module.strict
                                 && !module.declared_names.contains(&name)
-                                && !self
-                                    .state
-                                    .globals
-                                    .borrow()
-                                    .contains_key(&PropertyKey::intern(&mut self.heap, &name))
+                                && !self.state.globals.borrow().contains_key(&key)
                             {
                                 return Err(RuntimeError::ReferenceError(format!(
                                     "assignment to undeclared variable {name}"
                                 )));
                             }
-                            self.state
-                                .globals
-                                .borrow_mut()
-                                .insert(PropertyKey::intern(&mut self.heap, &name), value);
+                            // 写全局走它的**描述符**：只读（`writable: false`）的全局
+                            // 属性必须被观察到，stric 代码抛 TypeError、sloppy 静默失败。
+                            // （以前这里直接 `insert`，于是 `Object.defineProperty(
+                            // globalThis, 'x', {writable:false})` 之后 `x = 2` 照样改。）
+                            let global_object = self.state.global_object.clone();
+                            let existing = self.state.globals.borrow().get(&key).cloned();
+                            match existing {
+                                Some(descriptor) if descriptor.is_accessor_descriptor() => {
+                                    let _ = self.set_member(&global_object, key, value, module)?;
+                                }
+                                Some(descriptor) => {
+                                    if !descriptor.writable {
+                                        if module.strict {
+                                            return Err(RuntimeError::TypeError(format!(
+                                                "Cannot assign to read-only property '{name}'"
+                                            )));
+                                        }
+                                    } else {
+                                        self.state
+                                            .globals
+                                            .borrow_mut()
+                                            .get_mut(&key)
+                                            .expect("checked above")
+                                            .value = value;
+                                    }
+                                }
+                                None => {
+                                    // ES `CreateGlobalVarBinding`: a `var` (or a
+                                    // top-level function declaration) creates a
+                                    // **non-configurable** property —— `delete
+                                    // globalThis.x` is a no-op (a TypeError in
+                                    // strict code), while a sloppy assignment to
+                                    // an undeclared name stays configurable.
+                                    // 判据是"这个名字在本程序里被声明过"（`let`/`const`
+                                    // 走 script_env，到不了这里）。
+                                    let mut descriptor =
+                                        crate::vm::property::PropertyDescriptor::data_descriptor(value);
+                                    descriptor.configurable = !module.declared_names.contains(&name);
+                                    self.state.globals.borrow_mut().insert(key, descriptor);
+                                }
+                            }
                         }
                     }
                 }

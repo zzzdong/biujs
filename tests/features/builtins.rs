@@ -972,10 +972,59 @@ fn global_this_is_the_script_s_global_object() {
         eval_string("let gl = 5; String(typeof globalThis.gl)"),
         "undefined"
     );
-    // Enumerating it lists the realm's globals (built-ins included). Each
-    // `eval_string` is its own program, so this cannot look for the `gv` above.
-    assert_eq!(eval_string("String(Object.keys(globalThis).indexOf('Math') >= 0)"), "true");
-    assert_eq!(eval_string("String(Object.keys(globalThis).length > 10)"), "true");
+    // Enumerating it lists **only the script's own `var` bindings**: every
+    // built-in global is `{writable: true, enumerable: false, configurable: true}`
+    // (ES 19.2), so `Object.keys(globalThis)` does not contain `Math`, and a
+    // `for-in` over the global object does not see it either. (Used to be the
+    // other way round: the globals map stored bare values, so every built-in
+    // came out enumerable.)
+    assert_eq!(eval_string("String(Object.keys(globalThis).indexOf('Math') >= 0)"), "false");
+    assert_eq!(eval_string("String(Object.keys(globalThis).length)"), "0");
+    assert_eq!(
+        eval_string("var gv2 = 1; Object.keys(globalThis).join(',')"),
+        "gv2"
+    );
+    assert_eq!(
+        eval_string("(function () { for (var k in globalThis) { return 'saw ' + k; } return 'none'; })()"),
+        "none"
+    );
+    // `CreateGlobalVarBinding` makes the property non-configurable, so
+    // `delete` on a `var` is a no-op, while a sloppy assignment to an
+    // undeclared name stays deletable.
+    assert_eq!(
+        eval_string("var gv5 = 1; String(delete globalThis.gv5) + ',' + String(gv5)"),
+        "false,1"
+    );
+    assert_eq!(
+        eval_string("gu = 1; String(delete globalThis.gu) + ',' + String(typeof gu)"),
+        "true,undefined"
+    );
+    // The descriptors themselves are observable: `Math` is writable and
+    // configurable but not enumerable.
+    assert_eq!(
+        eval_string(
+            "var d = Object.getOwnPropertyDescriptor(globalThis, 'Math'); \
+             String(d.writable) + ',' + String(d.enumerable) + ',' + String(d.configurable)"
+        ),
+        "true,false,true"
+    );
+    // A non-configurable property cannot be redefined away …
+    assert_eq!(
+        eval_string(
+            "Object.defineProperty(globalThis, 'gv3', {value: 1, writable: false, configurable: false}); \
+             try { Object.defineProperty(globalThis, 'gv3', {value: 2}); 'no' } catch (e) { 'threw' }"
+        ),
+        "threw"
+    );
+    // … and a read-only one is not writable.
+    assert_eq!(
+        eval_string(
+            "'use strict'; \
+             Object.defineProperty(globalThis, 'gv4', {value: 1, writable: false}); \
+             try { gv4 = 2; 'no' } catch (e) { e instanceof TypeError ? 'TypeError' : 'other' }"
+        ),
+        "TypeError"
+    );
 }
 
 #[test]

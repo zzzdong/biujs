@@ -546,11 +546,28 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 - 读路径用 `Heap::lookup`（不插入），避免未知变量名把驻留表撑大。
 
 **1B ObjectHeader + Shape + GlobalObject（10–15 人日）**
+
+**第一片已落地（2026-10-26）：全局对象的属性带上真描述符。**
+
+`GlobalObject` 以前只是 `HashMap<PropertyKey, Value>` —— 一张裸表，于是每个内建
+全局都是 `w/e/c = true`：`Object.keys(globalThis)` 会列出 50 个内建，`for-in` 也能
+看到 `Math`。现在 `globals` / `GlobalObject` 存 `PropertyDescriptor`，并且：
+
+- 内建注册用 `{writable: true, enumerable: false, configurable: true}`（ES 19.2）；
+- `var` / 顶层函数声明按 `CreateGlobalVarBinding` 是 **non-configurable**：
+  `delete globalThis.x` 现在是无操作（判据是名字在本程序里声明过；sloppy 给未声明
+  名赋值仍然 configurable）；
+- 写全局走描述符：只读的全局属性被观察到（strict 抛 TypeError，sloppy 静默失败）；
+- `[[DefineOwnProperty]]` 走 `validate_property_redefinition`。
+
+**验收：全量 17,273 → 17,304（84.24% → 84.39%，+31 条），无逐套件回退。** 提升全部
+来自"内建全局非可枚举"这一条：每个内建各 +1，`Object` +9、`NativeErrors` +6。
+
+剩余（按序）：
 - `ObjectHeader { shape, slots, proto, flags }`；20 变体嵌入 header；删重复字段。
 - `Shape` + transition cache；`Dictionary` fallback；descriptor 惰性物化。
-- `Realm` + 真 `GlobalObject`（原型、var/let 分离、描述符）。
-- 验收：`Object.getPrototypeOf(globalThis) === Object.prototype`；`this` 顶层正确；
-  `Object.getOwnPropertyDescriptor(globalThis,"undefined")` 有值；对象尺寸断言仍过。
+- `Realm`；`Object.getOwnPropertyDescriptor(globalThis,"undefined")` 有值；
+  对象尺寸断言仍过。
 
 **1C 数组 + 函数（8–12 人日）**
 - `Vec<Element>` + `BitSet` holes + 稀疏 fallback；删 `MAX_DENSE_ELEMENTS` 硬报错。
@@ -639,7 +656,8 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 6（删 `BIUJS_REG_VARS` 与变量寄存器分配，固定内存驻留语义）、
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
-**1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）。
+**1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
+> **1B 第一片**（全局对象存真描述符；内建非可枚举、`var` 不可配置）。
 
 剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，1A 也收口，下面是：
     S0#4 第二档（GC 句柄代次 —— `Value` 仍 16 B，需要另找空间，或在 `Value` 缩小后补）→

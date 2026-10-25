@@ -554,7 +554,7 @@ impl Builtins {
 
     pub fn register(
         &self,
-        globals: &mut HashMap<PropertyKey, Value>,
+        globals: &mut HashMap<PropertyKey, PropertyDescriptor>,
         heap: &mut Heap,
     ) {
         use crate::vm::object::NativeFunctionObject;
@@ -565,7 +565,7 @@ impl Builtins {
         object::register_object_statics(&object_fn_val, self, heap);
         Self::link_constructor_prototype(&object_fn_val, &self.object_prototype);
         object::register_object_prototype(&self.object_prototype, &object_fn_val, heap);
-        globals.insert(PropertyKey::intern(heap, "Object"), object_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Object"), method_descriptor(object_fn_val));
 
         let array_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new("Array"),
@@ -573,7 +573,7 @@ impl Builtins {
         array::register_array_prototype(&self.array_prototype, heap);
         array::register_array_statics(&array_fn_val, heap);
         Self::link_constructor_prototype(&array_fn_val, &self.array_prototype);
-        globals.insert(PropertyKey::intern(heap, "Array"), array_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Array"), method_descriptor(array_fn_val));
 
         // Error constructors with prototype property setup
         let error_constructors = [
@@ -604,7 +604,7 @@ impl Builtins {
                     )))
                 });
             }
-            globals.insert(PropertyKey::intern(heap, name), fn_val);
+            globals.insert(PropertyKey::intern(heap, name), method_descriptor(fn_val));
         }
 
         // Setup Error.prototype methods, then the `name` own property of each
@@ -661,7 +661,7 @@ impl Builtins {
         )));
         boolean::register_boolean_prototype(&self.boolean_prototype, heap);
         Self::link_constructor_prototype(&bool_fn_val, &self.boolean_prototype);
-        globals.insert(PropertyKey::intern(heap, "Boolean"), bool_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Boolean"), method_descriptor(bool_fn_val));
 
         let number_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new("Number"),
@@ -669,7 +669,7 @@ impl Builtins {
         number::register_number_statics(&number_fn_val, &self.number_prototype, heap);
         number::register_number_prototype(&self.number_prototype, heap);
         Self::link_constructor_prototype(&number_fn_val, &self.number_prototype);
-        globals.insert(PropertyKey::intern(heap, "Number"), number_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Number"), method_descriptor(number_fn_val));
 
         let string_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new("String"),
@@ -677,14 +677,14 @@ impl Builtins {
         string::register_string_prototype(&self.string_prototype, heap);
         string::register_string_statics(&string_fn_val, heap);
         Self::link_constructor_prototype(&string_fn_val, &self.string_prototype);
-        globals.insert(PropertyKey::intern(heap, "String"), string_fn_val);
+        globals.insert(PropertyKey::intern(heap, "String"), method_descriptor(string_fn_val));
 
         let function_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new("Function"),
         )));
         function::register_function_statics(&function_fn_val, &self.function_prototype, heap);
         Self::link_constructor_prototype(&function_fn_val, &self.function_prototype);
-        globals.insert(PropertyKey::intern(heap, "Function"), function_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Function"), method_descriptor(function_fn_val));
 
         // Symbol constructor
         let symbol_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
@@ -708,7 +708,7 @@ impl Builtins {
         set_static_method(&ab_fn_val, "isView", heap, |args| {
             typedarray::arraybuffer_is_view(args)
         });
-        globals.insert(PropertyKey::intern(heap, "ArrayBuffer"), ab_fn_val);
+        globals.insert(PropertyKey::intern(heap, "ArrayBuffer"), method_descriptor(ab_fn_val));
 
         // `DataView` (ES 25.3): a byte-addressable view over an `ArrayBuffer`.
         let dv_proto = self.dataview_prototype;
@@ -717,7 +717,7 @@ impl Builtins {
         )));
         typedarray::register_dataview_prototype(&dv_proto, heap);
         Self::link_constructor_prototype(&dv_fn_val, &dv_proto);
-        globals.insert(PropertyKey::intern(heap, "DataView"), dv_fn_val);
+        globals.insert(PropertyKey::intern(heap, "DataView"), method_descriptor(dv_fn_val));
 
         // ── `%TypedArray%`（ES 22.2.1）──
         //
@@ -823,7 +823,7 @@ impl Builtins {
                     },
                 );
             }
-            globals.insert(PropertyKey::intern(heap, name), ctor_val);
+            globals.insert(PropertyKey::intern(heap, name), method_descriptor(ctor_val));
         }
 
         // `Map` (ES 23.1). The constructor itself is dispatched by the VM:
@@ -874,7 +874,7 @@ impl Builtins {
                 },
             );
         }
-        globals.insert(PropertyKey::intern(heap, "Map"), map_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Map"), method_descriptor(map_fn_val));
 
         // `Set` (ES 23.2) — same shape as `Map`; the constructor is the VM's
         // (`new Set(iterable)` drives the iteration protocol, `Set()` without
@@ -922,7 +922,7 @@ impl Builtins {
                 },
             );
         }
-        globals.insert(PropertyKey::intern(heap, "Set"), set_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Set"), method_descriptor(set_fn_val));
 
         // `WeakMap` / `WeakSet` (ES 23.3 / 23.4): four and three methods
         // respectively, no `size`, no iteration. The constructors are the VM's
@@ -933,7 +933,7 @@ impl Builtins {
         weak::register_weakmap_prototype(&self.weakmap_prototype, heap);
         Self::link_constructor_prototype(&weakmap_fn_val, &self.weakmap_prototype);
         register_wrapper_prototype("WeakMap", self.weakmap_prototype);
-        globals.insert(PropertyKey::intern(heap, "WeakMap"), weakmap_fn_val);
+        globals.insert(PropertyKey::intern(heap, "WeakMap"), method_descriptor(weakmap_fn_val));
 
         let weakset_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new("WeakSet"),
@@ -941,7 +941,7 @@ impl Builtins {
         weak::register_weakset_prototype(&self.weakset_prototype, heap);
         Self::link_constructor_prototype(&weakset_fn_val, &self.weakset_prototype);
         register_wrapper_prototype("WeakSet", self.weakset_prototype);
-        globals.insert(PropertyKey::intern(heap, "WeakSet"), weakset_fn_val);
+        globals.insert(PropertyKey::intern(heap, "WeakSet"), method_descriptor(weakset_fn_val));
 
         // Well-known symbols (ES6 §19.4.2): `Symbol.iterator` is required by
         // the iteration protocol; `toPrimitive` / `toStringTag` / `hasInstance`
@@ -989,23 +989,23 @@ impl Builtins {
                     .define_property(PropertyKey::intern(heap, name), desc);
             }
         }
-        globals.insert(PropertyKey::intern(heap, "Symbol"), symbol_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Symbol"), method_descriptor(symbol_fn_val));
 
         // `Math` — a plain namespace object of numeric helpers.
-        globals.insert(PropertyKey::intern(heap, "Math"), math::create_math_object(heap));
+        globals.insert(PropertyKey::intern(heap, "Math"), method_descriptor(math::create_math_object(heap)));
         // `console` — a host object, not part of ES, but the one thing a script
         // cannot do without: without it the only way to observe a value is to
         // `throw` it.
-        globals.insert(PropertyKey::intern(heap, "console"), console::create_console_object(heap));
+        globals.insert(PropertyKey::intern(heap, "console"), method_descriptor(console::create_console_object(heap)));
         // `Reflect` (ES 28.1) — the internal methods as functions. Registered
         // before `Proxy` exists on purpose: a proxy handler *is* this list, and
         // building it first is what keeps the proxy work from re-inventing it.
-        globals.insert(PropertyKey::intern(heap, "Reflect"), reflect::create_reflect_object(heap));
+        globals.insert(PropertyKey::intern(heap, "Reflect"), method_descriptor(reflect::create_reflect_object(heap)));
         // `Proxy` (ES 28.2): the exotic object is inert until something operates on
         // it, and every operation is a trap lookup — so the constructor only checks
         // its two arguments and the VM does the rest (`new Proxy(t, h)` and
         // `Proxy.revocable`). No `prototype`: instances inherit from the target.
-        globals.insert(PropertyKey::intern(heap, "Proxy"), proxy::create_proxy_constructor(heap));
+        globals.insert(PropertyKey::intern(heap, "Proxy"), method_descriptor(proxy::create_proxy_constructor(heap)));
 
         // `Date`: everyday scripts need wall-clock time. `new Date(...)` builds
         // the object in the VM (`Date()` without `new` answers a *string*, so
@@ -1017,7 +1017,7 @@ impl Builtins {
         date::register_date_statics(&date_fn_val, heap);
         Self::link_constructor_prototype(&date_fn_val, &self.date_prototype);
         register_wrapper_prototype("Date", self.date_prototype);
-        globals.insert(PropertyKey::intern(heap, "Date"), date_fn_val);
+        globals.insert(PropertyKey::intern(heap, "Date"), method_descriptor(date_fn_val));
 
         // `RegExp`: the matcher lives in `vm::object::RegExpObject` (a
         // `regex::Regex`). `RegExp(...)` answers an object whether or not it is
@@ -1028,7 +1028,7 @@ impl Builtins {
         regexp::register_regexp_prototype(&self.regexp_prototype, heap);
         Self::link_constructor_prototype(&regexp_fn_val, &self.regexp_prototype);
         register_wrapper_prototype("RegExp", self.regexp_prototype);
-        globals.insert(PropertyKey::intern(heap, "RegExp"), regexp_fn_val);
+        globals.insert(PropertyKey::intern(heap, "RegExp"), method_descriptor(regexp_fn_val));
 
         // `Promise`: the object lives in `vm::object::PromiseObject`, and the
         // methods that must *call* JS (`then`, `catch`) are dispatched by the
@@ -1060,8 +1060,8 @@ impl Builtins {
         }
         Self::link_constructor_prototype(&promise_fn_val, &self.promise_prototype);
         register_wrapper_prototype("Promise", self.promise_prototype);
-        globals.insert(PropertyKey::intern(heap, "Promise"), promise_fn_val);
-        globals.insert(PropertyKey::intern(heap, "JSON"), json::register_json(heap));
+        globals.insert(PropertyKey::intern(heap, "Promise"), method_descriptor(promise_fn_val));
+        globals.insert(PropertyKey::intern(heap, "JSON"), method_descriptor(json::register_json(heap)));
 
         // Global convenience functions (they are plain functions, not
         // constructors, so they have no `prototype` slot).
@@ -1079,7 +1079,9 @@ impl Builtins {
         ] {
             globals.insert(
                 PropertyKey::intern(heap, name),
-                Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(name)))),
+                method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
+                    NativeFunctionObject::new(name),
+                )))),
             );
         }
 
