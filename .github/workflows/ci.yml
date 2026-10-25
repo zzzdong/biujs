@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  schedule:
+    # 周度全量（UTC 周日 18:00）。全量约 8–10 分钟，放在计划任务里，
+    # 不让每个 PR 都付这个代价。
+    - cron: "0 18 * * 0"
+  workflow_dispatch:
+
+jobs:
+  # 每个 PR / push 都跑：构建 + 三级快验 + 字节码 golden + 编译警告基线。
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # 注意：clippy **不是**门禁。它的警告数随工具链版本漂（2026-10-24 实测 442），
+      # 拿它当基线只会制造假红。门禁用 `cargo build` 的警告数，那个稳定。
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build (warning baseline)
+        run: |
+          set -o pipefail
+          warnings=$(cargo build --release 2>&1 | grep -c '^warning' || true)
+          baseline=$(cat scripts/warning-baseline.txt)
+          echo "build warnings: $warnings (baseline $baseline)"
+          if [ "$warnings" -gt "$baseline" ]; then
+            echo "::error::编译警告数超过基线 $baseline（当前 $warnings）—— 清掉或显式更新 scripts/warning-baseline.txt"
+            exit 1
+          fi
+
+      - name: unit
+        run: cargo test --release --lib
+
+      - name: feature assertions
+        run: cargo test --release --test features
+
+      - name: guards
+        run: cargo test --release --test guards
+
+      - name: bytecode golden
+        run: cargo test --release --test bytecode_dump
+
+  # 周度 / 手动：全量 test262 与基线逐套件对比（退出码就是判据）。
+  full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: full test262 vs baseline
+        run: ./scripts/phase2-status.sh

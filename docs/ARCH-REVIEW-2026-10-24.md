@@ -510,7 +510,7 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 | 0.6 | 字节码 dumper + 20–30 个脚本的 golden 测试；`Module` 去掉 `debug_instructions` 克隆（或改为可选 feature） | 同一源码字节码逐字节稳定；Module 内存下降 |
 | ~~0.7~~ **已完成** | scope 表收口：删 `"Date"`/`"RegExp"`/`"label:"`/`print(`/`$ERROR` 等过宽 pattern；`noStrict`/`raw` 跳过；所有用例统一前置 `"use strict"`；`is_unsupported` 加了陷阱用例 | 全量 17,206 / 20,504（83.92%）；Object +166、String +49、Array +28；基线已刷新并写入 guard 行 |
 | ~~0.8~~ **已完成** | strict 运行时收口：`with` 永远编译报错；严格模式隐式全局赋 `ReferenceError`（用"脚本声明过名字"集合区分）；顶层 `this = globalThis`；全局对象接 `Object.prototype` | 四条探针通过；`instanceof` 套件回到基线（顺带修掉一个真 bug：ES 12.10.4 第 4 步"RHS 不可调用应抛 TypeError"） |
-| 0.9 | CI：build + unit + features + guards + clippy baseline；周度全量 | PR 不再把回归留到人工发现 |
+| ~~0.9~~ **已完成** | CI：push/PR 跑 build + unit + features + guards + bytecode golden + 编译警告基线；周度 scheduled 跑全量 `phase2-status.sh` | PR 不再把回归留到人工发现 |
 | ~~0.10~~ **已完成** | 文档去重：`scripts/doc-numbers.sh` 从基线快照生成 README / PROJECT 的通过率（含护栏预算），`--update` 自动调用；PLAN 的历史验收数字不属于管辖范围 | 一处数据源 |
 
 ### Phase 1 — 对象 / 环境 / 分派（30–50 人日，分 4 批）
@@ -612,11 +612,9 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 4（debug 几何断言）、5（运行时立即数/常量检查）、7（scope 表收口 + 基线刷新）、
 8（strict 运行时收口）、9（字节码 dumper + 16 组 golden，删除 IR 克隆）、
 6（删 `BIUJS_REG_VARS` 与变量寄存器分配，固定内存驻留语义）、
-0.10（文档数字由 `doc-numbers.sh` 从快照生成）。
+0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）。
 
-剩余（按顺序）：
-
-10. CI（0.9），再进入架构阶段：
+剩余（按顺序）：**Phase 0 已全部收口**，进入架构阶段：
     1A（Atom/PropertyKey）→ 1B（ObjectHeader/Shape/全局对象/Realm/EnvRecord）→
     1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→
     Phase 2（帧几何/GC/字节码 v2）→ Phase 3（编译器简化）。

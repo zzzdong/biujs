@@ -81,6 +81,8 @@ tests/
   test262/            固定 revision 的 submodule
 scripts/phase2-status.sh   全量 + 逐套件回退检测
 scripts/doc-numbers.sh     README / PROJECT 的通过率由基线快照生成（`--update` 会自动调用）
+scripts/warning-baseline.txt  编译警告数基线（CI 门禁）
+.github/workflows/ci.yml  push/PR 跑 build + 三级 + golden + 警告基线；全量是周度 scheduled
 docs/                  项目文档与基线快照
 ```
 
