@@ -357,6 +357,8 @@ if [ "$UPDATE" = "1" ]; then
     echo "$GUARDS_LINE"
     cat "$TMP/new.tsv"
   } > "$SNAP"
+  # 文档数字跟着快照走（README / PROJECT 的通过率由它生成，不手改）。
+  "$(dirname "$0")/doc-numbers.sh"
   echo
   echo "已写入 $SNAP —— 记得把它和本批改动一起提交（它记录了本批的基线）。"
 fi

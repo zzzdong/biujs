@@ -37,7 +37,8 @@ cargo test --release --test bytecode_dump  # 字节码 golden（UPDATE_GOLDEN=1 
 # 全量 + 与基线逐套件对比（推荐，约 7–8 分钟）
 ./scripts/phase2-status.sh
 ./scripts/phase2-status.sh --quick       # 跳全量，只跑单元 + feature
-./scripts/phase2-status.sh --update      # 完成一批后刷新基线快照
+./scripts/phase2-status.sh --update      # 完成一批后刷新基线快照（并同步 README/PROJECT 的数字）
+bash scripts/doc-numbers.sh              # 单独重算 README / PROJECT 的通过率（数字不手改）
 ```
 
 test262 是 git submodule（约 245 MB），首次需要：
@@ -79,6 +80,7 @@ tests/
   test262_runner.rs   test262 驱动器（SUITES / 特性门控 / 三档预算）
   test262/            固定 revision 的 submodule
 scripts/phase2-status.sh   全量 + 逐套件回退检测
+scripts/doc-numbers.sh     README / PROJECT 的通过率由基线快照生成（`--update` 会自动调用）
 docs/                  项目文档与基线快照
 ```
 
@@ -101,6 +103,10 @@ docs/                  项目文档与基线快照
    实现，等于往池里倒垃圾（实测 +1552 条纯失败、通过数零增长）。入册前先定向跑，通过率
    **≥ 50%** 才留下。注意标签匹配是 `starts_with` 或 `contains` 的宽松匹配，增删标签前
    对照整张表检查（`"Array.prototype.flatMap".contains("Map")` 为真，历史上踩过）。
+5b. **文档里的通过率不手改**。`README.md` / `docs/PROJECT.md` 的数字由
+   `scripts/doc-numbers.sh` 从基线快照生成（`phase2-status.sh --update` 会自动调用），
+   数字必须带上护栏预算 —— 同一份代码在不同 `TEST262_MEMORY_MB` 下通过数会差几条。
+   `docs/PLAN.md` 里的是历史验收记录，不属于本脚本管辖范围。
 6. **结构变化与语义变化不要放在同一个提交里**。拆文件/搬家 = 纯移动，逻辑一行不改，
    每移动一个模块跑一次全量确认零回退。
 7. **改动核心类型不要分批**。`Value` / `Object` / `Frame` 这类类型一次性铺开迁移，
