@@ -358,7 +358,8 @@ if [ "$UPDATE" = "1" ]; then
     cat "$TMP/new.tsv"
   } > "$SNAP"
   # 文档数字跟着快照走（README / PROJECT 的通过率由它生成，不手改）。
-  "$(dirname "$0")/doc-numbers.sh"
+  # 用 `bash` 显式调用：不依赖执行位，缺文件时也会把错误打出来。
+  bash "$(dirname "$0")/doc-numbers.sh"
   echo
   echo "已写入 $SNAP —— 记得把它和本批改动一起提交（它记录了本批的基线）。"
 fi
