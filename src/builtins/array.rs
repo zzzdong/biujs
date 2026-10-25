@@ -378,7 +378,7 @@ fn own_index_keys_below(obj: &Value, limit: u64) -> Vec<u64> {
     let keys = o.borrow().own_keys();
     let mut indices: Vec<u64> = keys
         .iter()
-        .filter_map(|key| key.as_str().and_then(|s| s.parse::<u64>().ok()))
+        .filter_map(|key| key.array_index().map(|index| index as u64))
         .filter(|index| *index < limit)
         .collect();
     indices.sort_unstable();

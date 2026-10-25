@@ -210,12 +210,14 @@ impl PropertyTable {
         let mut symbols: Vec<PropertyKey> = Vec::new();
 
         for key in &self.creation_order {
-            match key {
-                PropertyKey::Str(s) => match array_index_of(s.as_str()) {
-                    Some(index) => indices.push((index, key.clone())),
-                    None => strings.push(key.clone()),
+            // `array_index()` 是唯一的索引判定（规范形式），`Index` 与字符串形式的
+            // 规范索引在这里走同一条路。
+            match key.array_index() {
+                Some(index) => indices.push((index, key.clone())),
+                None => match key {
+                    PropertyKey::Str(_) => strings.push(key.clone()),
+                    _ => symbols.push(key.clone()),
                 },
-                PropertyKey::Symbol(_) => symbols.push(key.clone()),
             }
         }
 
@@ -709,11 +711,7 @@ impl ArrayObject {
             .properties
             .keys()
             .into_iter()
-            .filter(|k| {
-                k.as_str()
-                    .map(|s| s.parse::<usize>().is_ok())
-                    .unwrap_or(false)
-            })
+            .filter(|k| k.array_index().is_some())
             .collect();
         for key in index_keys {
             self.properties.remove(&key);
@@ -817,8 +815,10 @@ impl ArrayObject {
         self.elements.is_empty()
     }
 
+    /// 密集元素的键。`Index` 而不是 `Str`：索引键不再需要 `Rc<String>` 分配，
+    /// 也不需要在每次访问时重新解析字符串（判定统一走 `PropertyKey::array_index`）。
     fn index_key(index: usize) -> PropertyKey {
-        PropertyKey::Str(std::rc::Rc::new(index.to_string()))
+        PropertyKey::from_index(index as u32)
     }
 
     /// ES 10.4.2.4 `ArraySetLength`: change the dense store's length, deleting
@@ -854,11 +854,7 @@ impl ArrayObject {
             .properties
             .keys()
             .into_iter()
-            .filter(|k| {
-                k.as_str()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .is_some_and(|i| i >= clamped)
-            })
+            .filter(|k| k.array_index().is_some_and(|i| (i as usize) >= clamped))
             .collect();
         for key in stale {
             self.properties.remove(&key);
@@ -874,43 +870,40 @@ impl JSObject for ArrayObject {
 
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        match key {
-            PropertyKey::Str(s) if s.as_str() == "length" => {
+        if let PropertyKey::Str(s) = key {
+            if s.as_str() == "length" {
                 // Array `length`: writable (until frozen so), non-enumerable,
                 // non-configurable (ES 10.4.2.1).
-                Some(PropertyDescriptor {
+                return Some(PropertyDescriptor {
                     value: Value::Number(self.elements.len() as f64),
                     writable: self.length_writable,
                     enumerable: false,
                     configurable: false,
                     getter: None,
                     setter: None,
-                })
+                });
             }
-            // An index key with a stored override (non-default attributes or
-            // an accessor) is reported from the property table; plain dense
-            // elements keep the implicit default descriptor.
-            PropertyKey::Str(_) if self.properties.contains_key(key) => {
-                self.properties.get(key).cloned()
-            }
-            PropertyKey::Str(s) => {
-                // Try parsing index
-                if let Ok(idx) = s.parse::<usize>() {
-                    // A hole is *absent*, so it must not shadow an inherited
-                    // property: after `delete arr[1]`, `arr[1]` still sees
-                    // `Array.prototype[1]` (and `has_property`/`own_keys` agree).
-                    if self.holes.contains(&idx) {
-                        return None;
-                    }
-                    self.elements
-                        .get(idx)
-                        .map(|v| PropertyDescriptor::data_descriptor(v.clone()))
-                } else {
-                    self.properties.get(key).cloned()
-                }
-            }
-            _ => self.properties.get(key).cloned(),
         }
+        // 索引键（`Index` 或规范形式的字符串键）—— 判定只有 `array_index()` 一处。
+        if let Some(index) = key.array_index() {
+            let idx = index as usize;
+            // An index key with a stored override (non-default attributes or
+            // an accessor) is reported from the property table.
+            if let Some(desc) = self.properties.get(key) {
+                return Some(desc.clone());
+            }
+            // A hole is *absent*, so it must not shadow an inherited
+            // property: after `delete arr[1]`, `arr[1]` still sees
+            // `Array.prototype[1]` (and `has_property`/`own_keys` agree).
+            if self.holes.contains(&idx) {
+                return None;
+            }
+            return self
+                .elements
+                .get(idx)
+                .map(|v| PropertyDescriptor::data_descriptor(v.clone()));
+        }
+        self.properties.get(key).cloned()
     }
 
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
@@ -918,8 +911,8 @@ impl JSObject for ArrayObject {
             return Err("Cannot set property on frozen array".to_string());
         }
 
-        match &key {
-            PropertyKey::Str(s) if s.as_str() == "length" => {
+        if let PropertyKey::Str(s) = &key {
+            if s.as_str() == "length" {
                 if !self.length_writable {
                     return Err("Cannot assign to read-only property 'length'".to_string());
                 }
@@ -935,13 +928,15 @@ impl JSObject for ArrayObject {
                             .to_string(),
                     );
                 }
-                Ok(true)
+                return Ok(true);
             }
-            // An existing table entry (index override or named property):
-            // update through the descriptor, keeping the dense slot in sync.
-            PropertyKey::Str(s) if self.properties.contains_key(&key) => {
-                let idx = s.parse::<usize>().ok();
-                let desc = self.properties.get_mut(&key).expect("checked above");
+        }
+
+        if let Some(index) = key.array_index() {
+            let idx = index as usize;
+            // An existing table entry (index override): update through the
+            // descriptor, keeping the dense slot in sync.
+            if let Some(desc) = self.properties.get_mut(&key) {
                 if desc.is_accessor_descriptor() {
                     return Err("Cannot assign to accessor property".to_string());
                 }
@@ -949,71 +944,49 @@ impl JSObject for ArrayObject {
                     return Err("Cannot assign to read-only property".to_string());
                 }
                 desc.value = value.clone();
-                if let Some(idx) = idx {
-                    if let Some(slot) = self.elements.get_mut(idx) {
-                        *slot = value;
-                    }
+                if let Some(slot) = self.elements.get_mut(idx) {
+                    *slot = value;
                 }
-                Ok(true)
+                return Ok(true);
             }
-            PropertyKey::Str(s) => {
-                if let Ok(idx) = s.parse::<usize>() {
-                    // Elements are stored densely, so refuse indices that would
-                    // require an enormous (or non-representable) backing store.
-                    // Without this, `arr[4294967295] = x` tries to allocate
-                    // 2**32 slots (≈96 GB) and aborts the process.
-                    if idx >= MAX_DENSE_ELEMENTS {
-                        return Err(format!(
-                            "Array index {idx} is out of the supported range"
-                        ));
-                    }
-                    // An assignment that would *add* an element goes through
-                    // `[[DefineOwnProperty]]` (ES 10.4.2.1 step 4.b), which
-                    // refuses it while `length` is read-only — the same guard
-                    // as in `define_property`.
-                    if idx >= self.elements.len() && !self.length_writable {
-                        return Err(
-                            "Cannot add element to an array with a non-writable length"
-                                .to_string(),
-                        );
-                    }
-                    if idx >= self.elements.len() {
-                        self.elements.resize(idx + 1, Value::Undefined);
-                    }
-                    // Assigning to a hole gives the index a value again, so it
-                    // stops being absent (`delete arguments[0]` followed by
-                    // `arguments[0] = x` must be observable).
-                    self.holes.remove(&idx);
-                    self.elements[idx] = value;
-                    Ok(true)
-                } else if let Some(existing) = self.properties.get(&key) {
-                    if !existing.writable {
-                        return Err("Cannot assign to read-only property".to_string());
-                    }
-                    self.properties
-                        .insert(key, PropertyDescriptor::data_descriptor(value));
-                    Ok(true)
-                } else if !self.extensible {
-                    Err("Cannot add property to non-extensible array".to_string())
-                } else {
-                    self.properties
-                        .insert(key, PropertyDescriptor::data_descriptor(value));
-                    Ok(true)
-                }
+            // Elements are stored densely, so refuse indices that would
+            // require an enormous (or non-representable) backing store.
+            // Without this, `arr[4294967295] = x` tries to allocate
+            // 2**32 slots (≈96 GB) and aborts the process.
+            if idx >= MAX_DENSE_ELEMENTS {
+                return Err(format!("Array index {idx} is out of the supported range"));
             }
-            _ => {
-                if let Some(existing) = self.properties.get(&key) {
-                    if !existing.writable {
-                        return Err("Cannot assign to read-only property".to_string());
-                    }
-                } else if !self.extensible {
-                    return Err("Cannot add property to non-extensible array".to_string());
-                }
-                self.properties
-                    .insert(key, PropertyDescriptor::data_descriptor(value));
-                Ok(true)
+            // An assignment that would *add* an element goes through
+            // `[[DefineOwnProperty]]` (ES 10.4.2.1 step 4.b), which
+            // refuses it while `length` is read-only — the same guard
+            // as in `define_property`.
+            if idx >= self.elements.len() && !self.length_writable {
+                return Err(
+                    "Cannot add element to an array with a non-writable length".to_string(),
+                );
             }
+            if idx >= self.elements.len() {
+                self.elements.resize(idx + 1, Value::Undefined);
+            }
+            // Assigning to a hole gives the index a value again, so it
+            // stops being absent (`delete arguments[0]` followed by
+            // `arguments[0] = x` must be observable).
+            self.holes.remove(&idx);
+            self.elements[idx] = value;
+            return Ok(true);
         }
+
+        // 普通（非索引）属性
+        if let Some(existing) = self.properties.get(&key) {
+            if !existing.writable {
+                return Err("Cannot assign to read-only property".to_string());
+            }
+        } else if !self.extensible {
+            return Err("Cannot add property to non-extensible array".to_string());
+        }
+        self.properties
+            .insert(key, PropertyDescriptor::data_descriptor(value));
+        Ok(true)
     }
 
     /// `Object.defineProperty` on an array.
@@ -1029,8 +1002,8 @@ impl JSObject for ArrayObject {
         if self.frozen {
             return Err("Cannot define property on frozen array".to_string());
         }
-        match &key {
-            PropertyKey::Str(s) if s.as_str() == "length" => {
+        if let PropertyKey::Str(s) = &key {
+            if s.as_str() == "length" {
                 if desc.is_accessor_descriptor() {
                     return Err("Cannot redefine property: length".to_string());
                 }
@@ -1060,82 +1033,68 @@ impl JSObject for ArrayObject {
                             .to_string(),
                     );
                 }
-                Ok(true)
-            }
-            PropertyKey::Str(s) => {
-                if let Ok(idx) = s.parse::<usize>() {
-                    if idx >= MAX_DENSE_ELEMENTS {
-                        return Err(format!(
-                            "Array index {idx} is out of the supported range"
-                        ));
-                    }
-                    let current = self.property_get(&key);
-                    match current {
-                        Some(current) => validate_property_redefinition(&current, &desc)?,
-                        None if !self.extensible => {
-                            return Err("Cannot add property to non-extensible array".to_string());
-                        }
-                        // ES 10.4.2.1: an index at or above the length can only
-                        // be *added* while the length itself is writable — a
-                        // read-only `length` makes the array behave as if it
-                        // were non-extensible for new indices.
-                        None if idx >= self.elements.len() && !self.length_writable => {
-                            return Err(
-                                "Cannot add element to an array with a non-writable length"
-                                    .to_string(),
-                            );
-                        }
-                        None => {}
-                    }
-                    if desc.is_accessor_descriptor() {
-                        // Accessors live in the property table; the dense slot
-                        // is turned into a hole so reads find the accessor.
-                        if idx >= self.elements.len() {
-                            self.elements.resize(idx + 1, Value::Undefined);
-                        }
-                        self.elements[idx] = Value::Undefined;
-                        self.holes.insert(idx);
-                        self.properties.insert(key, desc);
-                        return Ok(true);
-                    }
-                    if idx >= self.elements.len() {
-                        self.elements.resize(idx + 1, Value::Undefined);
-                    }
-                    self.elements[idx] = desc.value.clone();
-                    if desc.writable && desc.enumerable && desc.configurable {
-                        // Default data descriptor: no override needed.
-                        self.properties.remove(&key);
-                        self.holes.remove(&idx);
-                    } else {
-                        self.properties.insert(key, desc);
-                    }
-                    Ok(true)
-                } else {
-                    let current = self.property_get(&key);
-                    match current {
-                        Some(current) => validate_property_redefinition(&current, &desc)?,
-                        None if !self.extensible => {
-                            return Err("Cannot add property to non-extensible array".to_string());
-                        }
-                        None => {}
-                    }
-                    self.properties.insert(key, desc);
-                    Ok(true)
-                }
-            }
-            _ => {
-                let current = self.property_get(&key);
-                match current {
-                    Some(current) => validate_property_redefinition(&current, &desc)?,
-                    None if !self.extensible => {
-                        return Err("Cannot add property to non-extensible array".to_string());
-                    }
-                    None => {}
-                }
-                self.properties.insert(key, desc);
-                Ok(true)
+                return Ok(true);
             }
         }
+
+        if let Some(index) = key.array_index() {
+            let idx = index as usize;
+            if idx >= MAX_DENSE_ELEMENTS {
+                return Err(format!("Array index {idx} is out of the supported range"));
+            }
+            let current = self.property_get(&key);
+            match current {
+                Some(current) => validate_property_redefinition(&current, &desc)?,
+                None if !self.extensible => {
+                    return Err("Cannot add property to non-extensible array".to_string());
+                }
+                // ES 10.4.2.1: an index at or above the length can only
+                // be *added* while the length itself is writable — a
+                // read-only `length` makes the array behave as if it
+                // were non-extensible for new indices.
+                None if idx >= self.elements.len() && !self.length_writable => {
+                    return Err(
+                        "Cannot add element to an array with a non-writable length".to_string(),
+                    );
+                }
+                None => {}
+            }
+            if desc.is_accessor_descriptor() {
+                // Accessors live in the property table; the dense slot
+                // is turned into a hole so reads find the accessor.
+                if idx >= self.elements.len() {
+                    self.elements.resize(idx + 1, Value::Undefined);
+                }
+                self.elements[idx] = Value::Undefined;
+                self.holes.insert(idx);
+                self.properties.insert(key, desc);
+                return Ok(true);
+            }
+            if idx >= self.elements.len() {
+                self.elements.resize(idx + 1, Value::Undefined);
+            }
+            self.elements[idx] = desc.value.clone();
+            if desc.writable && desc.enumerable && desc.configurable {
+                // Default data descriptor: no override needed.
+                self.properties.remove(&key);
+                self.holes.remove(&idx);
+            } else {
+                self.properties.insert(key, desc);
+            }
+            return Ok(true);
+        }
+
+        // 普通（非索引）属性
+        let current = self.property_get(&key);
+        match current {
+            Some(current) => validate_property_redefinition(&current, &desc)?,
+            None if !self.extensible => {
+                return Err("Cannot add property to non-extensible array".to_string());
+            }
+            None => {}
+        }
+        self.properties.insert(key, desc);
+        Ok(true)
     }
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
@@ -1146,21 +1105,22 @@ impl JSObject for ArrayObject {
             if s.as_str() == "length" {
                 return false;
             }
-            if let Ok(idx) = s.parse::<usize>() {
-                if let Some(desc) = self.properties.get(key) {
-                    if !desc.configurable {
-                        return false;
-                    }
+        }
+        if let Some(index) = key.array_index() {
+            let idx = index as usize;
+            if let Some(desc) = self.properties.get(key) {
+                if !desc.configurable {
+                    return false;
                 }
-                if idx < self.elements.len() {
-                    // Deleting an element leaves a hole; the length is unchanged.
-                    self.properties.remove(key);
-                    self.elements[idx] = Value::Undefined;
-                    self.holes.insert(idx);
-                    return true;
-                }
-                return self.properties.remove(key).is_some();
             }
+            if idx < self.elements.len() {
+                // Deleting an element leaves a hole; the length is unchanged.
+                self.properties.remove(key);
+                self.elements[idx] = Value::Undefined;
+                self.holes.insert(idx);
+                return true;
+            }
+            return self.properties.remove(key).is_some();
         }
         if let Some(desc) = self.properties.get(key) {
             if !desc.configurable {
@@ -1171,18 +1131,19 @@ impl JSObject for ArrayObject {
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        match key {
-            PropertyKey::Str(s) if s.as_str() == "length" => true,
-            PropertyKey::Str(s) => {
-                if self.properties.contains_key(key) {
-                    return true;
-                }
-                s.parse::<usize>().is_ok_and(|i| {
-                    i < self.elements.len() && !self.holes.contains(&i)
-                })
+        if let PropertyKey::Str(s) = key {
+            if s.as_str() == "length" {
+                return true;
             }
-            _ => self.properties.contains_key(key),
         }
+        if let Some(index) = key.array_index() {
+            if self.properties.contains_key(key) {
+                return true;
+            }
+            let idx = index as usize;
+            return idx < self.elements.len() && !self.holes.contains(&idx);
+        }
+        self.properties.contains_key(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
@@ -1880,17 +1841,17 @@ impl JSObject for PrimitiveWrapperObject {
                         setter: None,
                     });
                 }
-                if let Ok(idx) = k.parse::<usize>() {
-                    // 索引按码元：非 BMP 字符的第 0 位是半个代理对（U+FFFD）。
-                    return s.encode_utf16().nth(idx).map(|unit| PropertyDescriptor {
-                        value: Value::string(&crate::vm::utf16::from_units(&[unit])),
-                        writable: false,
-                        enumerable: true,
-                        configurable: false,
-                        getter: None,
-                        setter: None,
-                    });
-                }
+            }
+            if let Some(idx) = key.array_index() {
+                // 索引按码元：非 BMP 字符的第 0 位是半个代理对（U+FFFD）。
+                return s.encode_utf16().nth(idx as usize).map(|unit| PropertyDescriptor {
+                    value: Value::string(&crate::vm::utf16::from_units(&[unit])),
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                    getter: None,
+                    setter: None,
+                });
             }
         }
         self.properties.get(key).cloned()
@@ -1900,11 +1861,16 @@ impl JSObject for PrimitiveWrapperObject {
         if matches!(self.primitive, Value::String(_)) {
             if let PropertyKey::Str(s) = &key {
                 // String wrapper index keys and `length` are read-only.
-                if s.as_str() == "length" || s.parse::<usize>().is_ok() {
+                if s.as_str() == "length" {
                     return Err(
                         "Cannot assign to read-only property of a String wrapper".to_string()
                     );
                 }
+            }
+            if key.array_index().is_some() {
+                return Err(
+                    "Cannot assign to read-only property of a String wrapper".to_string()
+                );
             }
         }
         self.properties
@@ -1937,23 +1903,26 @@ impl JSObject for PrimitiveWrapperObject {
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
         if matches!(self.primitive, Value::String(_)) {
             if let PropertyKey::Str(s) = key {
-                if s.as_str() == "length" || s.parse::<usize>().is_ok() {
+                if s.as_str() == "length" {
                     return false;
                 }
+            }
+            if key.array_index().is_some() {
+                return false;
             }
         }
         self.properties.remove(key).is_some()
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        if let PropertyKey::Str(s) = key {
-            if matches!(self.primitive, Value::String(_)) {
+        if matches!(self.primitive, Value::String(_)) {
+            if let PropertyKey::Str(s) = key {
                 if s.as_str() == "length" {
                     return true;
                 }
-                if let Ok(idx) = s.parse::<usize>() {
-                    return idx < self.string_len();
-                }
+            }
+            if let Some(idx) = key.array_index() {
+                return (idx as usize) < self.string_len();
             }
         }
         self.properties.contains_key(key)
@@ -1963,7 +1932,8 @@ impl JSObject for PrimitiveWrapperObject {
         let mut keys: Vec<PropertyKey> = Vec::new();
         if let Value::String(s) = &self.primitive {
             for i in 0..s.chars().count() {
-                keys.push(PropertyKey::Str(Rc::new(i.to_string())));
+                // 索引键用 `Index`（与读路径的 `Index` 同一个键）。
+                keys.push(PropertyKey::from_index(i as u32));
             }
             // `length` is installed when the wrapper is created (ES 22.1.5.1),
             // so it precedes every property added afterwards — putting it last
@@ -2465,6 +2435,8 @@ impl GlobalObject {
     fn key_name(key: &PropertyKey) -> Option<String> {
         match key {
             PropertyKey::Str(s) => Some(s.as_str().to_string()),
+            // 索引键的名字就是它的十进制写法（`arr[1]` 与 `arr["1"]` 同一个键）。
+            PropertyKey::Index(index) => Some(index.to_string()),
             _ => None,
         }
     }
@@ -2862,15 +2834,10 @@ impl TypedArrayObject {
 
     /// Canonical integer key, as `[[Get]]` on an integer-indexed object sees it:
     /// `"0"`, `"1"`, … and *not* `"01"`, `"1.0"` or `"-0"`.
+    ///
+    /// 判定交给 `PropertyKey::array_index()`（唯一的索引定义），这里只做 `usize` 转换。
     fn canonical_index(key: &PropertyKey) -> Option<usize> {
-        let text = key.as_str()?;
-        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        if text.len() > 1 && text.starts_with('0') {
-            return None;
-        }
-        text.parse::<usize>().ok()
+        key.array_index().map(|index| index as usize)
     }
 }
 

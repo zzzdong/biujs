@@ -42,7 +42,9 @@ fn to_object_string_keys(value: &Value) -> Result<Vec<PropertyKey>, RuntimeError
             .borrow()
             .own_keys()
             .into_iter()
-            .filter(|k| k.as_str().is_some())
+            // 字符串键**和**索引键都算；只有 Symbol 键被 `Object.keys` 排除。
+            // （这里原来是 `k.as_str().is_some()`，1A 之后索引键是 `Index`，会被漏掉。）
+            .filter(|k| !matches!(k, PropertyKey::Symbol(_)))
             .filter(|k| {
                 obj_ref
                     .borrow()
@@ -71,9 +73,8 @@ fn to_object_get(value: &Value, key: &PropertyKey) -> Value {
             .map(|d| d.value)
             .unwrap_or(Value::Undefined),
         Value::String(s) => key
-            .as_str()
-            .and_then(|k| k.parse::<usize>().ok())
-            .and_then(|i| s.chars().nth(i))
+            .array_index()
+            .and_then(|i| s.chars().nth(i as usize))
             .map(|c| Value::string(&c.to_string()))
             .unwrap_or(Value::Undefined),
         _ => Value::Undefined,
@@ -89,7 +90,11 @@ pub fn object_keys(heap: &mut super::Heap, args: &[Value]) -> Result<Value, Runt
     let keys = to_object_string_keys(&args[0])?;
     let str_keys: Vec<Value> = keys
         .iter()
-        .filter_map(|k| k.as_str().map(Value::string))
+        .filter_map(|k| match k {
+            PropertyKey::Str(s) => Some(Value::string(s)),
+            PropertyKey::Index(index) => Some(Value::string(&index.to_string())),
+            PropertyKey::Symbol(_) => None,
+        })
         .collect();
     Ok(new_array_object_from_vec(heap, str_keys))
 }
@@ -312,7 +317,11 @@ pub fn object_get_own_property_names(
     let str_keys: Vec<Value> = borrowed
         .own_keys()
         .into_iter()
-        .filter_map(|k| k.as_str().map(|s| Value::string(s)))
+        .filter_map(|k| match k {
+            PropertyKey::Str(s) => Some(Value::string(&s)),
+            PropertyKey::Index(index) => Some(Value::string(&index.to_string())),
+            PropertyKey::Symbol(_) => None,
+        })
         .collect();
     Ok(new_array_object_from_vec(heap, str_keys))
 }
@@ -796,6 +805,7 @@ pub fn object_define_properties(args: &[Value]) -> Result<Value, RuntimeError> {
     for (key, descriptor) in descriptors {
         let key_value = match &key {
             PropertyKey::Str(s) => Value::string(s),
+            PropertyKey::Index(index) => Value::string(&index.to_string()),
             PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(*id),
         };
         object_define_property(&[target.clone(), key_value, descriptor])?;
@@ -835,11 +845,10 @@ pub fn object_has_own_property(obj: &Value, args: &[Value]) -> Result<Value, Run
             // String wrappers expose an own `length` and their index keys.
             let own = match key.as_str() {
                 Some("length") => true,
-                Some(k) => k
-                    .parse::<usize>()
-                    .ok()
-                    .is_some_and(|i| i < s.chars().count()),
-                None => false,
+                // 索引键走统一的 `array_index()`（`"01"` 之类不是索引）。
+                _ => key
+                    .array_index()
+                    .is_some_and(|i| (i as usize) < s.chars().count()),
             };
             Ok(Value::Bool(own))
         }

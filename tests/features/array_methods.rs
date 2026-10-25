@@ -408,3 +408,37 @@ fn array_prototype_methods_accept_array_likes() {
     // … but a string receiver keeps its own substring semantics.
     assert_eq!(eval_number("Array.prototype.indexOf.call('ab', 'b')"), 1.0);
 }
+
+/// 数组索引必须是**规范形式**（1A）：`"01"` 是普通字符串键，不是索引 1。
+///
+/// 以前判定散在两处且不一致：`keys()` 用规范判定，而 `ArrayObject` 的读写直接
+/// `s.parse::<usize>()` —— 于是 `a["01"]` 读到了 `a[1]`，写也会写进索引 1。
+#[test]
+fn non_canonical_index_strings_are_ordinary_keys() {
+    assert_eq!(
+        eval_string(
+            "var a = [10, 20];
+             String(a['01']) + ',' + String(a[1]) + ',' + String(a['1'])"
+        ),
+        "undefined,20,20"
+    );
+    // 写 `"01"` 不能动索引 1，也不能改变 length。
+    assert_eq!(
+        eval_string(
+            "var a = [10, 20];
+             a['01'] = 99;
+             String(a[1]) + ',' + String(a['01']) + ',' + String(a.length)"
+        ),
+        "20,99,2"
+    );
+    // `"01"` 作为字符串键出现在 `Object.keys` 里（且排在整数键之后）。
+    assert_eq!(
+        eval_string("var a = [1]; a['01'] = 2; Object.keys(a).join(',')"),
+        "0,01"
+    );
+    // 同样的键在字符串包装对象上：`'x'["00"]` 不是索引 0。
+    assert_eq!(
+        eval_string("var s = new String('x'); String(s[0]) + ',' + String(s['00'])"),
+        "x,undefined"
+    );
+}

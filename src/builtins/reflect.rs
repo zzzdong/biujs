@@ -94,6 +94,7 @@ pub fn reflect_own_keys(heap: &mut Heap, args: &[Value]) -> Result<Value, Runtim
                 // value is `===` the one used to create the property.
                 symbols.push(Value::Symbol(Rc::new(SymbolData::new(None, id))));
             }
+            PropertyKey::Index(index) => strings.push(Value::string(&index.to_string())),
             PropertyKey::Str(text) => strings.push(Value::string(&text)),
         }
     }

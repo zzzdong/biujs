@@ -3331,15 +3331,17 @@ impl VM {
                 self.get_member(&boxed, key, module)
             }
             Value::String(s) => {
-                let name = key.as_str().unwrap_or("");
-                if name == "length" {
-                    return Ok(Value::Number(crate::vm::utf16::length(s) as f64));
+                if let Some(name) = key.as_str() {
+                    if name == "length" {
+                        return Ok(Value::Number(crate::vm::utf16::length(s) as f64));
+                    }
                 }
-                if let Ok(idx) = name.parse::<usize>() {
+                // 索引键（`Index` 或规范字符串形式）—— `"1"` 与 `1` 是同一个键。
+                if let Some(idx) = key.array_index() {
                     // `s[i]` 取的是**码元**：非 BMP 字符会得到半个代理对。
                     return Ok(s
                         .encode_utf16()
-                        .nth(idx)
+                        .nth(idx as usize)
                         .map(|unit| Value::string(&crate::vm::utf16::from_units(&[unit])))
                         .unwrap_or(Value::Undefined));
                 }

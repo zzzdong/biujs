@@ -425,7 +425,12 @@ pub fn own_enumerable_string_keys(value: &Value) -> Vec<String> {
         .own_keys()
         .into_iter()
         .filter_map(|key| {
-            let name = key.as_str()?.to_string();
+            let name = match &key {
+                PropertyKey::Str(s) => s.to_string(),
+                // 索引键（`Index`）也要输出 —— 它们是普通（非 Symbol）键。
+                PropertyKey::Index(index) => index.to_string(),
+                PropertyKey::Symbol(_) => return None,
+            };
             if borrowed.property_get(&key).is_some_and(|d| d.enumerable) {
                 Some(name)
             } else {

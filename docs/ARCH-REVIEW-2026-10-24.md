@@ -516,9 +516,18 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 ### Phase 1 — 对象 / 环境 / 分派（30–50 人日，分 4 批）
 
 **1A Atom + PropertyKey（5–8 人日）**
-- `Atom` 驻留表；`PropertyKey::{Index, Atom, Symbol}`；常量池直接产出 `Atom`。
-- 替换 `PropertyKey::from_str` 的约 200 处；索引路径不再构造字符串。
-- 验收：属性读微基准下降；`Object.keys` 顺序全绿；无逐套件回退。
+
+**第一步已落地（2026-10-25）**：`PropertyKey::Index(u32)` + 唯一的规范索引判定
+（`canonical_index` / `PropertyKey::array_index`）。索引键不再构造 `Rc<String>`，
+也不再在每次访问时重新解析字符串；顺带修掉一个静默 bug —— 判定原先散在两处且
+不一致（`keys()` 用规范判定，数组读写直接 `parse`），于是 `a["01"]` 读到了
+`a[1]`。全量 +2 条（Object +1、Array +1），无回退。
+另：`Str` → `Atom` 的驻留**推迟** —— 200 处 `from_str` 大多在内建函数里，而
+内建函数拿不到 `Heap`（那是 1D 的统一入口签名），先做 1D 再回来做驻留。
+
+剩余：
+- `Atom` 驻留表（挂在 `Heap` 上）；`PropertyKey::Str(Rc<String>)` → `Atom(Atom)`。
+- 验收：属性读不再有每次 `Rc::new(String)`；`Value` 仍 16 B；无逐套件回退。
 
 **1B ObjectHeader + Shape + GlobalObject（10–15 人日）**
 - `ObjectHeader { shape, slots, proto, flags }`；20 变体嵌入 header；删重复字段。
@@ -613,7 +622,8 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 8（strict 运行时收口）、9（字节码 dumper + 16 组 golden，删除 IR 克隆）、
 6（删 `BIUJS_REG_VARS` 与变量寄存器分配，固定内存驻留语义）、
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
-S0#4 第一档（`borrow` 族对已释放槽的访问 abort）。
+S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
+**1A 第一步**（`PropertyKey::Index(u32)` + 唯一的规范索引判定）。
 
 剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，下面是架构阶段：
     1A（Atom/PropertyKey，`Value::String` → `Atom(u32)`；同时把 GC 句柄代次补上）→

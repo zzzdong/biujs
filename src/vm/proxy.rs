@@ -91,6 +91,7 @@ impl VM {
     pub(crate) fn key_to_value(key: &PropertyKey) -> Value {
         match key {
             PropertyKey::Str(text) => Value::string(text),
+            PropertyKey::Index(index) => Value::string(&index.to_string()),
             PropertyKey::Symbol(id) => {
                 Value::Symbol(Rc::new(crate::vm::value::SymbolData::new(None, *id)))
             }
