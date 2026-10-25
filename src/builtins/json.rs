@@ -454,7 +454,7 @@ fn serialize_array(value: &Value, stack: &mut Vec<Value>) -> Result<Option<Strin
         let element = match value {
             Value::Object(obj_ref) => obj_ref
                 .borrow()
-                .property_get(&PropertyKey::from_str(&index.to_string()))
+                .property_get(&PropertyKey::element(index))
                 .map(|d| d.value)
                 .unwrap_or(Value::Undefined),
             _ => Value::Undefined,

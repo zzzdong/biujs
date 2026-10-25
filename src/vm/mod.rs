@@ -749,7 +749,7 @@ impl VM {
                     (0..len)
                         .map(|i| {
                             borrowed
-                                .property_get(&PropertyKey::from_str(&i.to_string()))
+                                .property_get(&PropertyKey::element(i as u64))
                                 .map(|d| d.value)
                                 .unwrap_or(Value::Undefined)
                         })
@@ -814,7 +814,7 @@ impl VM {
 
         let mut entries: Vec<Option<Value>> = Vec::with_capacity(len);
         for i in 0..len {
-            let key = PropertyKey::from_str(&i.to_string());
+            let key = PropertyKey::element(i as u64);
             let present = crate::vm::prototype::internal_has_property(obj, &key)
                 .map_err(RuntimeError::TypeError)?;
             if present {
@@ -883,7 +883,7 @@ impl VM {
                 return Ok(Some(value.clone()));
             }
         }
-        let key = PropertyKey::from_str(&index.to_string());
+        let key = PropertyKey::element(index as u64);
         let present = crate::vm::prototype::internal_has_property(*obj_ref, &key)
             .map_err(RuntimeError::TypeError)?;
         if !present {
@@ -1073,7 +1073,7 @@ impl VM {
                     items.push(
                         self.get_member(
                             value,
-                            &PropertyKey::from_str(&index.to_string()),
+                            &PropertyKey::element(index as u64),
                             module,
                         )?,
                     );

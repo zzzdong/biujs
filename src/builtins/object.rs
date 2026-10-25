@@ -53,7 +53,7 @@ fn to_object_string_keys(value: &Value) -> Result<Vec<PropertyKey>, RuntimeError
             })
             .collect()),
         Value::String(s) => Ok((0..s.chars().count())
-            .map(|i| PropertyKey::from_str(&i.to_string()))
+            .map(|i| PropertyKey::element(i as u64))
             .collect()),
         Value::Number(_) | Value::Bool(_) | Value::Symbol(_) => Ok(Vec::new()),
         Value::Undefined | Value::Null => Err(RuntimeError::TypeError(

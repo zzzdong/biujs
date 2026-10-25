@@ -53,6 +53,18 @@ impl PropertyKey {
         PropertyKey::Index(index)
     }
 
+    /// 由**长度内**的下标构造键（`arr[i]` / `arguments[i]` / TypedArray 下标…）。
+    ///
+    /// 下标一定小于数组长度（ES 上限 2^32-1），所以除 `u32::MAX` 外都能走 `Index`；
+    /// 越界值退回字符串形式，与 `from_str` 的行为一致 —— 不会把键悄悄改掉。
+    pub fn element(index: u64) -> Self {
+        if index < u32::MAX as u64 {
+            PropertyKey::Index(index as u32)
+        } else {
+            PropertyKey::from_str(&index.to_string())
+        }
+    }
+
     /// 数组索引（无论键是 `Index` 还是字符串形式的规范索引）。
     ///
     /// 老代码里"先匹配 `Str`、再 `array_index_of(s)`"的形状一律改成问它，
@@ -250,5 +262,21 @@ mod tests {
         assert_eq!(PropertyKey::Index(12).display(), "12");
         assert_eq!(PropertyKey::from_str("12").display(), "12");
         assert_eq!(PropertyKey::from_str("a").display(), "a");
+    }
+
+    /// `element()`：长度内的下标走 `Index`，越界值退回字符串形式。
+    #[test]
+    fn element_uses_index_for_in_range_values() {
+        assert_eq!(PropertyKey::element(0), PropertyKey::Index(0));
+        assert_eq!(PropertyKey::element(7), PropertyKey::Index(7));
+        assert_eq!(
+            PropertyKey::element(u32::MAX as u64 - 1),
+            PropertyKey::Index(u32::MAX - 1)
+        );
+        // 越界（≥ u32::MAX）不是数组索引，退回字符串形式，不把键悄悄改掉。
+        assert!(matches!(
+            PropertyKey::element(u32::MAX as u64),
+            PropertyKey::Str(_)
+        ));
     }
 }

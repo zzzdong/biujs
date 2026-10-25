@@ -112,7 +112,7 @@ pub fn array_from(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError
                     .unwrap_or(0.0);
                 let len = len.max(0.0).min((1u32 << 20) as f64) as usize;
                 for i in 0..len {
-                    let key = PropertyKey::from_str(&i.to_string());
+                    let key = PropertyKey::element(i as u64);
                     out.push(
                         borrowed
                             .property_get(&key)
@@ -316,7 +316,7 @@ fn generic_get(obj: &Value, index: u64) -> Value {
     match obj {
         Value::Object(o) => o
             .borrow()
-            .property_get(&PropertyKey::from_str(&index.to_string()))
+            .property_get(&PropertyKey::element(index))
             .map(|d| d.value)
             .unwrap_or(Value::Undefined),
         _ => Value::Undefined,
@@ -327,7 +327,7 @@ fn generic_set(obj: &Value, index: u64, value: Value) -> Result<(), RuntimeError
     match obj {
         Value::Object(o) => o
             .borrow_mut()
-            .property_set(PropertyKey::from_str(&index.to_string()), value)
+            .property_set(PropertyKey::element(index), value)
             .map(|_| ())
             .map_err(RuntimeError::TypeError),
         _ => Ok(()),
@@ -339,7 +339,7 @@ fn generic_has(obj: &Value, index: u64) -> bool {
     match obj {
         Value::Object(o) => crate::vm::prototype::internal_has_property(
             *o,
-            &PropertyKey::from_str(&index.to_string()),
+            &PropertyKey::element(index),
         )
         .unwrap_or(false),
         _ => false,
@@ -351,7 +351,7 @@ fn generic_delete(obj: &Value, index: u64) -> Result<bool, RuntimeError> {
     match obj {
         Value::Object(o) => crate::vm::prototype::internal_delete(
             *o,
-            &PropertyKey::from_str(&index.to_string()),
+            &PropertyKey::element(index),
         )
         .map_err(RuntimeError::TypeError),
         _ => Ok(true),

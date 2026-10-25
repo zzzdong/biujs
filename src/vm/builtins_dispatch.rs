@@ -569,7 +569,7 @@ impl VM {
                 (0..len)
                     .filter_map(|i| {
                         borrowed
-                            .property_get(&PropertyKey::from_str(&i.to_string()))
+                            .property_get(&PropertyKey::element(i as u64))
                             .map(|d| (i, d.value))
                     })
                     .collect()
@@ -577,7 +577,7 @@ impl VM {
             _ => Vec::new(),
         };
         for (i, value) in elements {
-            self.set_member(&target, PropertyKey::from_str(&i.to_string()), value, module)?;
+            self.set_member(&target, PropertyKey::element(i as u64), value, module)?;
         }
         Ok(Some(target))
     }
@@ -778,7 +778,7 @@ impl VM {
             .unwrap_or(0);
         let mut out = String::new();
         for i in 0..len {
-            let chunk = self.get_member(&raw, &PropertyKey::from_str(&i.to_string()), module)?;
+            let chunk = self.get_member(&raw, &PropertyKey::element(i as u64), module)?;
             // 每个替换值都 ToString（`undefined` / `null` 走 ToString 而非跳过 ——
             // `String.raw` 不做 `join` 那样的空串替换）。
             out.push_str(&chunk.to_js_string());
@@ -1225,7 +1225,7 @@ impl VM {
                 for (i, v) in vals.iter().enumerate() {
                     self.set_member(
                         &target,
-                        PropertyKey::from_str(&i.to_string()),
+                        PropertyKey::element(i as u64),
                         v.clone(),
                         module,
                     )?;
@@ -1516,7 +1516,7 @@ impl VM {
                         for (i, v) in values {
                             self.set_member(
                                 &target,
-                                PropertyKey::from_str(&i.to_string()),
+                                PropertyKey::element(i as u64),
                                 v,
                                 module,
                             )?;
@@ -1573,7 +1573,7 @@ impl VM {
                         for (i, v) in values.into_iter().enumerate() {
                             self.set_member(
                                 &target,
-                                PropertyKey::from_str(&i.to_string()),
+                                PropertyKey::element(i as u64),
                                 v,
                                 module,
                             )?;
@@ -1608,7 +1608,7 @@ impl VM {
                         for (i, v) in out.iter().enumerate() {
                             self.set_member(
                                 &target,
-                                PropertyKey::from_str(&i.to_string()),
+                                PropertyKey::element(i as u64),
                                 v.clone(),
                                 module,
                             )?;
@@ -2027,8 +2027,8 @@ impl VM {
                 let len = entries.len();
                 for lower in 0..len / 2 {
                     let upper = len - 1 - lower;
-                    let lower_key = PropertyKey::from_str(&lower.to_string());
-                    let upper_key = PropertyKey::from_str(&upper.to_string());
+                    let lower_key = PropertyKey::element(lower as u64);
+                    let upper_key = PropertyKey::element(upper as u64);
                     let (lower_v, upper_v) = (entries[lower].clone(), entries[upper].clone());
                     match upper_v {
                         Some(v) => {
@@ -2146,7 +2146,7 @@ impl VM {
                     if let Some(v) = entry
                         && !Self::create_data_property(
                             &target,
-                            &PropertyKey::from_str(&i.to_string()),
+                            &PropertyKey::element(i as u64),
                             v,
                         )
                     {

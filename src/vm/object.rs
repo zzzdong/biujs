@@ -2907,7 +2907,7 @@ impl JSObject for TypedArrayObject {
     /// Uint8Array(2))` is `["0", "1"]`.
     fn own_keys(&self) -> Vec<PropertyKey> {
         let mut keys: Vec<PropertyKey> = (0..self.length)
-            .map(|i| PropertyKey::from_str(&i.to_string()))
+            .map(|i| PropertyKey::element(i as u64))
             .collect();
         keys.extend(self.base.own_keys());
         keys

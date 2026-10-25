@@ -483,7 +483,7 @@ fn source_numbers(value: &Value, bytes_per_element: usize) -> Result<Vec<f64>, R
     let length = checked_byte_length(length, bytes_per_element)? / bytes_per_element;
     for i in 0..length {
         let element = borrowed
-            .property_get(&PropertyKey::from_str(&i.to_string()))
+            .property_get(&PropertyKey::element(i as u64))
             .map(|d| d.value.to_number())
             .unwrap_or(f64::NAN);
         out.push(element);
