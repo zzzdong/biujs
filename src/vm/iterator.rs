@@ -146,7 +146,7 @@ pub struct NativeIteratorObject {
     /// the VM's registry (user-facing methods, e.g. `it.next()`).
     pub id: u64,
     state: RefCell<NativeIteratorState>,
-    prototype: Option<Gc<Object>>,
+    header: crate::vm::object::ObjectHeader,
     /// 预先构造的 `[Symbol.iterator]` / `next` / `return` 原生方法 Value。
     ///
     /// `property_get` 是 `&self`、拿不到堆，无法现分配 `NativeFunctionObject`；
@@ -171,7 +171,7 @@ impl NativeIteratorObject {
         Self {
             id,
             state: RefCell::new(state),
-            prototype: None,
+            header: crate::vm::object::ObjectHeader::new(),
             iterator_fn,
             next_fn,
             return_fn,
@@ -233,11 +233,11 @@ impl JSObject for NativeIteratorObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.prototype = proto;
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
@@ -379,7 +379,7 @@ impl Trace for NativeIteratorState {
 
 impl Trace for NativeIteratorObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.iterator_fn.trace(out);
         self.next_fn.trace(out);
         self.return_fn.trace(out);

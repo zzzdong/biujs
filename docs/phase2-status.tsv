@@ -54,7 +54,7 @@ language/computed-property-names	40	0	8
 built-ins/Boolean	29	3	19
 built-ins/Map	187	5	12
 built-ins/TypedArray	303	513	630
-built-ins/Object	3077	32	302
+built-ins/Object	3078	32	301
 built-ins/String	793	72	358
 language/expressions/generators	241	30	19
 language/expressions/assignment/destructuring	3	1	4

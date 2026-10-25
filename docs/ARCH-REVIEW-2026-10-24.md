@@ -563,9 +563,23 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 **验收：全量 17,273 → 17,304（84.24% → 84.39%，+31 条），无逐套件回退。** 提升全部
 来自"内建全局非可枚举"这一条：每个内建各 +1，`Object` +9、`NativeErrors` +6。
 
+**第二片已落地（2026-10-26）：`ObjectHeader`。**
+
+`prototype` / `extensible` / `frozen` / `sealed` 以前在 7 个变体里各存一份，另有 7 个
+变体内嵌 `OrdinaryObject`（`base`）间接持有 —— "取原型"有两条路，冻结/密封要同步三个
+布尔。现在它们只有一处（`src/vm/object.rs` 的 `ObjectHeader`），20 个变体统一嵌入
+（含 `iterator.rs` 的 `NativeIteratorObject` 与 `builtins` 的 `ProtoObject`）。
+
+顺带把三处不一致收成 ES 的样子（这也是 +1 的来源）：
+- `set_prototype` 一律拒绝冻结对象（以前只有部分变体检查）；
+- `freeze` 一律置"已冻结"（以前 Function/NativeFunction/PrimitiveWrapper 只关了可扩展）；
+- 全局对象的 `[[Prototype]]` 也是 GC 根（其它变体早就 trace，漏了它）。
+
+**验收：全量 17,304 → 17,305（84.39% → 84.40%，+1），无逐套件回退。**
+
 剩余（按序）：
-- `ObjectHeader { shape, slots, proto, flags }`；20 变体嵌入 header；删重复字段。
-- `Shape` + transition cache；`Dictionary` fallback；descriptor 惰性物化。
+- `Shape` + transition cache；`Dictionary` fallback；descriptor 惰性物化
+  （`ObjectHeader` 已为 `shape` / `slots` 留好位置）。
 - `Realm`；`Object.getOwnPropertyDescriptor(globalThis,"undefined")` 有值；
   对象尺寸断言仍过。
 
@@ -657,7 +671,7 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 **1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
-> **1B 第一片**（全局对象存真描述符；内建非可枚举、`var` 不可配置）。
+> **1B 两片**（全局对象存真描述符；`ObjectHeader` 统一原型/可扩展/冻结/密封）。
 
 剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，1A 也收口，下面是：
     S0#4 第二档（GC 句柄代次 —— `Value` 仍 16 B，需要另找空间，或在 `Value` 缩小后补）→

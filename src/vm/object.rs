@@ -367,14 +367,102 @@ fn is_sealed_desc_set(obj: &dyn JSObject) -> bool {
 // OrdinaryObject — standard JS object
 // ─────────────────────────────────────────────────────────
 
-/// Standard JS object with named properties, prototype chain, and extensibility.
+/// 每个对象的公共头部（1B）。
+///
+/// 以前 `prototype` / `extensible` / `frozen` / `sealed` 在 7 个变体里各存一份，
+/// 另有 7 个变体内嵌一个 `OrdinaryObject`（`base`）间接持有 —— 于是"取原型"有两条
+/// 路，冻结/密封要同步三个布尔，"能不能加属性"每个变体各写一遍。现在只有一处。
+///
+/// 下一步（Shape）会把 `shape` / `slots` 也放进来，属性字典降级为 `Dictionary`
+/// fallback；那时这里就是对象模型真正的公共前缀。
 #[derive(Debug, Clone)]
-pub struct OrdinaryObject {
-    properties: PropertyTable,
+pub struct ObjectHeader {
     prototype: Option<Gc<Object>>,
     extensible: bool,
     frozen: bool,
     sealed: bool,
+}
+
+impl ObjectHeader {
+    /// 新对象默认：无原型、可扩展、未冻结、未密封。
+    pub fn new() -> Self {
+        Self {
+            prototype: None,
+            extensible: true,
+            frozen: false,
+            sealed: false,
+        }
+    }
+
+    pub fn with_prototype(prototype: Gc<Object>) -> Self {
+        Self {
+            prototype: Some(prototype),
+            ..Self::new()
+        }
+    }
+
+    /// 变体从外面拿到的是 `Option<Gc<Object>>`（注册时原型表可能还没建好），所以
+    /// 这才是它们真正会用的构造入口。
+    pub fn with_optional_prototype(prototype: Option<Gc<Object>>) -> Self {
+        Self {
+            prototype,
+            ..Self::new()
+        }
+    }
+
+    pub fn prototype(&self) -> Option<Gc<Object>> {
+        self.prototype.clone()
+    }
+
+    /// `[[SetPrototypeOf]]`：冻结对象的原型是不可改的（ES 10.1.2.1）。
+    pub fn set_prototype(&mut self, prototype: Option<Gc<Object>>) {
+        if !self.frozen {
+            self.prototype = prototype;
+        }
+    }
+
+    pub fn is_extensible(&self) -> bool {
+        self.extensible
+    }
+
+    pub fn prevent_extensions(&mut self) {
+        self.extensible = false;
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
+    /// 冻结 = 密封 + 数据属性只读。变体里"把元素也标成只读"的那部分仍由变体自己
+    /// 做（`ArrayObject::freeze` 要把密集元素标成 `writable: false`）。
+    pub fn freeze(&mut self) {
+        self.frozen = true;
+        self.sealed = true;
+        self.extensible = false;
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    /// 密封 = 不可配置 + 不可扩展（值仍可写）。
+    pub fn seal(&mut self) {
+        self.sealed = true;
+        self.extensible = false;
+    }
+}
+
+impl Default for ObjectHeader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Standard JS object with named properties, prototype chain, and extensibility.
+#[derive(Debug, Clone)]
+pub struct OrdinaryObject {
+    header: ObjectHeader,
+    properties: PropertyTable,
     /// `[[Class]]` as reported by `Object.prototype.toString` (ES 19.1.3.6).
     /// `"Object"` for everything the engine creates except error instances,
     /// which all report `"Error"`.
@@ -385,10 +473,7 @@ impl OrdinaryObject {
     pub fn new() -> Self {
         Self {
             properties: PropertyTable::new(),
-            prototype: None,
-            extensible: true,
-            frozen: false,
-            sealed: false,
+            header: ObjectHeader::new(),
             class_name: "Object",
         }
     }
@@ -404,10 +489,7 @@ impl OrdinaryObject {
     pub fn with_prototype(proto: Gc<Object>) -> Self {
         Self {
             properties: PropertyTable::new(),
-            prototype: Some(proto),
-            extensible: true,
-            frozen: false,
-            sealed: false,
+            header: ObjectHeader::with_prototype(proto),
             class_name: "Object",
         }
     }
@@ -419,10 +501,7 @@ impl OrdinaryObject {
             .collect();
         Self {
             properties,
-            prototype: None,
-            extensible: true,
-            frozen: false,
-            sealed: false,
+            header: ObjectHeader::new(),
             class_name: "Object",
         }
     }
@@ -441,7 +520,7 @@ impl OrdinaryObject {
         let current = self.properties.get(&key).cloned();
         match current {
             None => {
-                if !self.extensible {
+                if !self.header.is_extensible() {
                     return Err("Cannot add property to non-extensible object".to_string());
                 }
             }
@@ -463,7 +542,7 @@ impl JSObject for OrdinaryObject {
     }
 
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        if self.frozen {
+        if self.header.is_frozen() {
             return Err("Cannot set property on frozen object".to_string());
         }
 
@@ -474,7 +553,7 @@ impl JSObject for OrdinaryObject {
             desc.value = value;
             Ok(true)
         } else {
-            if !self.extensible {
+            if !self.header.is_extensible() {
                 return Err("Cannot add property to non-extensible object".to_string());
             }
             self.properties
@@ -492,7 +571,7 @@ impl JSObject for OrdinaryObject {
     }
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        if self.frozen || self.sealed {
+        if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
         // ES6 [[Delete]]: an own property whose [[Configurable]] is false cannot
@@ -514,21 +593,20 @@ impl JSObject for OrdinaryObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        if !self.frozen {
-            self.prototype = proto;
-        }
+        // 头部的 `set_prototype` 自己会拒绝冻结对象（ES 10.1.2.1）。
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.extensible
+        self.header.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
@@ -536,9 +614,7 @@ impl JSObject for OrdinaryObject {
     }
 
     fn freeze(&mut self) {
-        self.frozen = true;
-        self.extensible = false;
-        self.sealed = true;
+        self.header.freeze();
         // Freezing makes every own property non-configurable, and data
         // properties non-writable as well.
         freeze_property_table(&mut self.properties);
@@ -549,8 +625,7 @@ impl JSObject for OrdinaryObject {
     }
 
     fn seal(&mut self) {
-        self.sealed = true;
-        self.extensible = false;
+        self.header.seal();
         // Sealing makes every own property non-configurable.
         seal_property_table(&mut self.properties);
     }
@@ -576,6 +651,7 @@ impl Default for OrdinaryObject {
 /// `length` is managed dynamically.
 #[derive(Debug, Clone)]
 pub struct ArrayObject {
+    header: ObjectHeader,
     elements: Vec<Value>,
     /// Non-index own properties (`length` aside): `arr.x = 1`, methods hung
     /// off an instance, symbol keys. Elements *with non-default descriptors or
@@ -587,10 +663,6 @@ pub struct ArrayObject {
     /// Array `length` starts writable; `Object.defineProperty(arr, "length",
     /// {writable: false})` can freeze it.
     length_writable: bool,
-    prototype: Option<Gc<Object>>,
-    extensible: bool,
-    frozen: bool,
-    sealed: bool,
 }
 
 impl ArrayObject {
@@ -602,10 +674,7 @@ impl ArrayObject {
             length_writable: true,
             // Arrays created by the engine (literals, `Array(...)`, `map`,
             // `slice`, …) inherit from `Array.prototype` unconditionally.
-            prototype: crate::builtins::wrapper_prototype("Array"),
-            extensible: true,
-            frozen: false,
-            sealed: false,
+            header: ObjectHeader::with_optional_prototype(crate::builtins::wrapper_prototype("Array")),
         }
     }
 
@@ -617,7 +686,7 @@ impl ArrayObject {
     /// read-only `length`; every one of them ends with `? Set(O, "length", …,
     /// true)`, so it has to be validated explicitly.
     pub fn length_is_writable(&self) -> bool {
-        self.length_writable && !self.frozen
+        self.length_writable && !self.header.is_frozen()
     }
 
     pub fn with_capacity(cap: usize) -> Self {
@@ -628,10 +697,7 @@ impl ArrayObject {
             length_writable: true,
             // Arrays created by the engine (literals, `Array(...)`, `map`,
             // `slice`, …) inherit from `Array.prototype` unconditionally.
-            prototype: crate::builtins::wrapper_prototype("Array"),
-            extensible: true,
-            frozen: false,
-            sealed: false,
+            header: ObjectHeader::with_optional_prototype(crate::builtins::wrapper_prototype("Array")),
         }
     }
 
@@ -643,10 +709,7 @@ impl ArrayObject {
             length_writable: true,
             // Arrays created by the engine (literals, `Array(...)`, `map`,
             // `slice`, …) inherit from `Array.prototype` unconditionally.
-            prototype: crate::builtins::wrapper_prototype("Array"),
-            extensible: true,
-            frozen: false,
-            sealed: false,
+            header: ObjectHeader::with_optional_prototype(crate::builtins::wrapper_prototype("Array")),
         }
     }
 
@@ -841,8 +904,8 @@ impl ArrayObject {
             idx -= 1;
             let key = Self::index_key(idx);
             let undeletable = self.properties.get(&key).is_some_and(|d| !d.configurable)
-                || self.frozen
-                || self.sealed;
+                || self.header.is_frozen()
+                || self.header.is_sealed();
             if undeletable {
                 clamped = idx + 1;
                 break;
@@ -905,7 +968,7 @@ impl JSObject for ArrayObject {
     }
 
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        if self.frozen {
+        if self.header.is_frozen() {
             return Err("Cannot set property on frozen array".to_string());
         }
 
@@ -977,7 +1040,7 @@ impl JSObject for ArrayObject {
             if !existing.writable {
                 return Err("Cannot assign to read-only property".to_string());
             }
-        } else if !self.extensible {
+        } else if !self.header.is_extensible() {
             return Err("Cannot add property to non-extensible array".to_string());
         }
         self.properties
@@ -995,7 +1058,7 @@ impl JSObject for ArrayObject {
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        if self.frozen {
+        if self.header.is_frozen() {
             return Err("Cannot define property on frozen array".to_string());
         }
         if key.is("length") {
@@ -1039,7 +1102,7 @@ impl JSObject for ArrayObject {
             let current = self.property_get(&key);
             match current {
                 Some(current) => validate_property_redefinition(&current, &desc)?,
-                None if !self.extensible => {
+                None if !self.header.is_extensible() => {
                     return Err("Cannot add property to non-extensible array".to_string());
                 }
                 // ES 10.4.2.1: an index at or above the length can only
@@ -1082,7 +1145,7 @@ impl JSObject for ArrayObject {
         let current = self.property_get(&key);
         match current {
             Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.extensible => {
+            None if !self.header.is_extensible() => {
                 return Err("Cannot add property to non-extensible array".to_string());
             }
             None => {}
@@ -1092,7 +1155,7 @@ impl JSObject for ArrayObject {
     }
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        if self.frozen || self.sealed {
+        if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
         if key.is("length") {
@@ -1155,21 +1218,20 @@ impl JSObject for ArrayObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        if !self.frozen {
-            self.prototype = proto;
-        }
+        // 头部的 `set_prototype` 自己会拒绝冻结对象（ES 10.1.2.1）。
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.extensible
+        self.header.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
@@ -1177,9 +1239,7 @@ impl JSObject for ArrayObject {
     }
 
     fn freeze(&mut self) {
-        self.frozen = true;
-        self.extensible = false;
-        self.sealed = true;
+        self.header.freeze();
         for key in self.properties.keys() {
             if let Some(desc) = self.properties.get_mut(&key) {
                 desc.configurable = false;
@@ -1211,8 +1271,7 @@ impl JSObject for ArrayObject {
     }
 
     fn seal(&mut self) {
-        self.sealed = true;
-        self.extensible = false;
+        self.header.seal();
         for key in self.properties.keys() {
             if let Some(desc) = self.properties.get_mut(&key) {
                 desc.configurable = false;
@@ -1296,9 +1355,8 @@ pub fn new_array_object_from_vec(heap: &mut Heap, vec: Vec<Value>) -> Value {
 pub struct FunctionObject {
     pub func_id: u32,
     pub name: String,
+    header: ObjectHeader,
     properties: PropertyTable,
-    extensible: bool,
-    prototype: Option<Gc<Object>>,
     /// For arrow functions: captured `this` value
     pub captured_this: Option<Value>,
     /// For arrow functions: the enclosing frame's `new.target` at creation
@@ -1317,8 +1375,7 @@ impl FunctionObject {
             func_id,
             name: name.to_string(),
             properties: PropertyTable::new(),
-            extensible: true,
-            prototype: None,
+            header: ObjectHeader::new(),
             captured_this: None,
             captured_new_target: None,
             captured_vars: Vec::new(),
@@ -1336,8 +1393,7 @@ impl FunctionObject {
             func_id,
             name: name.to_string(),
             properties: PropertyTable::new(),
-            extensible: true,
-            prototype: None,
+            header: ObjectHeader::new(),
             captured_this: Some(captured_this),
             captured_new_target: None,
             captured_vars,
@@ -1370,7 +1426,7 @@ impl JSObject for FunctionObject {
         // the descriptor attributes have to survive on function objects.
         match self.properties.get(&key).cloned() {
             Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.extensible => {
+            None if !self.header.is_extensible() => {
                 return Err("Cannot add property to non-extensible object".to_string());
             }
             None => {}
@@ -1397,19 +1453,19 @@ impl JSObject for FunctionObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.prototype = proto;
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.extensible
+        self.header.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
@@ -1417,7 +1473,7 @@ impl JSObject for FunctionObject {
     }
 
     fn freeze(&mut self) {
-        self.extensible = false;
+        self.header.freeze();
         freeze_property_table(&mut self.properties);
     }
 
@@ -1426,7 +1482,7 @@ impl JSObject for FunctionObject {
     }
 
     fn seal(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
         seal_property_table(&mut self.properties);
     }
 
@@ -1567,18 +1623,17 @@ pub fn new_arrow_function_object(
 #[derive(Debug)]
 pub struct NativeFunctionObject {
     pub name: String,
-    /// `[[Prototype]]` of the function object itself.
-    prototype: Option<Gc<Object>>,
+    /// `[[Prototype]]` of the function object itself, plus the extensibility
+    /// flags. Built-in function objects start extensible like any other
+    /// object, so `Object.isExtensible(Object)` reports `true` and
+    /// `Object.freeze` has something to switch off.
+    header: ObjectHeader,
     /// Own properties (`length`, `name`, `prototype`, static methods, …).
     ///
     /// `length` / `name` live here like any other own property so that
     /// `Object.getOwnPropertyDescriptor`, `delete` and redefinition behave
     /// uniformly instead of going through special cases.
     properties: PropertyTable,
-    /// Built-in function objects start extensible like any other object, so
-    /// `Object.isExtensible(Object)` reports `true` and `Object.freeze` has
-    /// something to switch off.
-    extensible: bool,
 }
 
 impl NativeFunctionObject {
@@ -1588,9 +1643,8 @@ impl NativeFunctionObject {
         // property installed separately (`link_constructor_prototype`).
         let mut obj = Self {
             name: name.to_string(),
-            prototype: crate::builtins::wrapper_prototype("Function"),
+            header: ObjectHeader::with_optional_prototype(crate::builtins::wrapper_prototype("Function")),
             properties: PropertyTable::new(),
-            extensible: true,
         };
         obj.install_metadata();
         obj
@@ -1700,7 +1754,7 @@ impl JSObject for NativeFunctionObject {
         // replacing it (`built-ins/*/descriptor.js` checks exactly that).
         match self.properties.get(&key).cloned() {
             Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.extensible => {
+            None if !self.header.is_extensible() => {
                 return Err("Cannot add property to non-extensible object".to_string());
             }
             None => {}
@@ -1727,19 +1781,19 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.prototype = proto;
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.extensible
+        self.header.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
@@ -1747,7 +1801,7 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn freeze(&mut self) {
-        self.extensible = false;
+        self.header.freeze();
         freeze_property_table(&mut self.properties);
     }
 
@@ -1756,7 +1810,7 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn seal(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
         seal_property_table(&mut self.properties);
     }
 
@@ -1782,10 +1836,9 @@ impl JSObject for NativeFunctionObject {
 /// and `length` of the wrapped string.
 #[derive(Debug)]
 pub struct PrimitiveWrapperObject {
+    header: ObjectHeader,
     primitive: Value,
     properties: PropertyTable,
-    prototype: Option<Gc<Object>>,
-    extensible: bool,
 }
 
 impl PrimitiveWrapperObject {
@@ -1793,8 +1846,7 @@ impl PrimitiveWrapperObject {
         Self {
             primitive,
             properties: PropertyTable::new(),
-            prototype,
-            extensible: true,
+            header: ObjectHeader::with_optional_prototype(prototype),
         }
     }
 
@@ -1880,7 +1932,7 @@ impl JSObject for PrimitiveWrapperObject {
         // impossible to redefine (ES 10.4.3).
         match self.property_get(&key) {
             Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.extensible => {
+            None if !self.header.is_extensible() => {
                 return Err("Cannot add property to non-extensible object".to_string());
             }
             None => {}
@@ -1937,19 +1989,19 @@ impl JSObject for PrimitiveWrapperObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.prototype = proto;
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.extensible
+        self.header.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
@@ -1957,7 +2009,7 @@ impl JSObject for PrimitiveWrapperObject {
     }
 
     fn freeze(&mut self) {
-        self.extensible = false;
+        self.header.freeze();
         freeze_property_table(&mut self.properties);
     }
 
@@ -1966,7 +2018,7 @@ impl JSObject for PrimitiveWrapperObject {
     }
 
     fn seal(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
         seal_property_table(&mut self.properties);
     }
 
@@ -2397,11 +2449,11 @@ impl JSObject for PromiseObject {
 /// `globalThis.x` stays `undefined` for `let x`, per B21.)
 #[derive(Debug)]
 pub struct GlobalObject {
-    store: Rc<RefCell<std::collections::HashMap<PropertyKey, PropertyDescriptor>>>,
-    /// `[[Prototype]]`. It is `Object.prototype`, which is what makes
+    /// `[[Prototype]]` is `Object.prototype`, which is what makes
     /// `globalThis.hasOwnProperty` and `Object.getPrototypeOf(globalThis)`
     /// behave — the globals map alone only answers *own* properties.
-    prototype: Option<Gc<Object>>,
+    header: ObjectHeader,
+    store: Rc<RefCell<std::collections::HashMap<PropertyKey, PropertyDescriptor>>>,
 }
 
 impl GlobalObject {
@@ -2410,7 +2462,7 @@ impl GlobalObject {
     ) -> Self {
         Self {
             store,
-            prototype: None,
+            header: ObjectHeader::new(),
         }
     }
 
@@ -2420,7 +2472,7 @@ impl GlobalObject {
     ) -> Self {
         Self {
             store,
-            prototype: Some(prototype),
+            header: ObjectHeader::with_prototype(prototype),
         }
     }
 
@@ -2506,10 +2558,10 @@ impl JSObject for GlobalObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype
+        self.header.prototype()
     }
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.prototype = proto;
+        self.header.set_prototype(proto);
     }
     fn is_extensible(&self) -> bool {
         true
@@ -3218,12 +3270,9 @@ impl JSObject for ProxyObject {
 
 #[derive(Debug)]
 pub struct MapObject {
+    header: ObjectHeader,
     entries: Vec<Option<(Value, Value)>>,
     properties: PropertyTable,
-    prototype: Option<Gc<Object>>,
-    extensible: bool,
-    frozen: bool,
-    sealed: bool,
 }
 
 impl MapObject {
@@ -3231,10 +3280,7 @@ impl MapObject {
         Self {
             entries: Vec::new(),
             properties: PropertyTable::new(),
-            prototype,
-            extensible: true,
-            frozen: false,
-            sealed: false,
+            header: ObjectHeader::with_optional_prototype(prototype),
         }
     }
 
@@ -3302,7 +3348,7 @@ impl MapObject {
 
     /// 只 trace 原型与自身属性 —— **不含条目**。
     pub(crate) fn trace_shallow(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
     }
 
@@ -3358,14 +3404,14 @@ impl JSObject for MapObject {
     }
 
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        if self.frozen {
+        if self.header.is_frozen() {
             return Err("Cannot set property on frozen object".to_string());
         }
         if let Some(existing) = self.properties.get(&key) {
             if !existing.writable {
                 return Err("Cannot assign to read-only property".to_string());
             }
-        } else if !self.extensible {
+        } else if !self.header.is_extensible() {
             return Err("Cannot add property to non-extensible object".to_string());
         }
         self.properties
@@ -3380,7 +3426,7 @@ impl JSObject for MapObject {
     ) -> Result<bool, String> {
         match self.properties.get(&key).cloned() {
             Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.extensible => {
+            None if !self.header.is_extensible() => {
                 return Err("Cannot add property to non-extensible object".to_string());
             }
             None => {}
@@ -3390,7 +3436,7 @@ impl JSObject for MapObject {
     }
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        if self.frozen || self.sealed {
+        if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
         if let Some(desc) = self.properties.get(key) {
@@ -3410,21 +3456,20 @@ impl JSObject for MapObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        if !self.frozen {
-            self.prototype = proto;
-        }
+        // 头部的 `set_prototype` 自己会拒绝冻结对象（ES 10.1.2.1）。
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.extensible
+        self.header.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
@@ -3432,7 +3477,7 @@ impl JSObject for MapObject {
     }
 
     fn freeze(&mut self) {
-        self.extensible = false;
+        self.header.freeze();
         freeze_property_table(&mut self.properties);
     }
 
@@ -3441,7 +3486,7 @@ impl JSObject for MapObject {
     }
 
     fn seal(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
         seal_property_table(&mut self.properties);
     }
 
@@ -3645,12 +3690,9 @@ delegate_collection_object!(
 /// walk skip the entry that shifts into the freed slot).
 #[derive(Debug)]
 pub struct SetObject {
+    header: ObjectHeader,
     entries: Vec<Option<Value>>,
     properties: PropertyTable,
-    prototype: Option<Gc<Object>>,
-    extensible: bool,
-    frozen: bool,
-    sealed: bool,
 }
 
 impl SetObject {
@@ -3658,10 +3700,7 @@ impl SetObject {
         Self {
             entries: Vec::new(),
             properties: PropertyTable::new(),
-            prototype,
-            extensible: true,
-            frozen: false,
-            sealed: false,
+            header: ObjectHeader::with_optional_prototype(prototype),
         }
     }
 
@@ -3710,7 +3749,7 @@ impl SetObject {
 
     /// 只 trace 原型与自身属性 —— **不含条目**。
     pub(crate) fn trace_shallow(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
     }
 
@@ -3749,14 +3788,14 @@ impl JSObject for SetObject {
     }
 
     fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        if self.frozen {
+        if self.header.is_frozen() {
             return Err("Cannot set property on frozen object".to_string());
         }
         if let Some(existing) = self.properties.get(&key) {
             if !existing.writable {
                 return Err("Cannot assign to read-only property".to_string());
             }
-        } else if !self.extensible {
+        } else if !self.header.is_extensible() {
             return Err("Cannot add property to non-extensible object".to_string());
         }
         self.properties
@@ -3771,7 +3810,7 @@ impl JSObject for SetObject {
     ) -> Result<bool, String> {
         match self.properties.get(&key).cloned() {
             Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.extensible => {
+            None if !self.header.is_extensible() => {
                 return Err("Cannot add property to non-extensible object".to_string());
             }
             None => {}
@@ -3781,7 +3820,7 @@ impl JSObject for SetObject {
     }
 
     fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        if self.frozen || self.sealed {
+        if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
         if let Some(desc) = self.properties.get(key) {
@@ -3801,21 +3840,20 @@ impl JSObject for SetObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        if !self.frozen {
-            self.prototype = proto;
-        }
+        // 头部的 `set_prototype` 自己会拒绝冻结对象（ES 10.1.2.1）。
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.extensible
+        self.header.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
@@ -3823,7 +3861,7 @@ impl JSObject for SetObject {
     }
 
     fn freeze(&mut self) {
-        self.extensible = false;
+        self.header.freeze();
         freeze_property_table(&mut self.properties);
     }
 
@@ -3832,7 +3870,7 @@ impl JSObject for SetObject {
     }
 
     fn seal(&mut self) {
-        self.extensible = false;
+        self.header.prevent_extensions();
         seal_property_table(&mut self.properties);
     }
 
@@ -3922,10 +3960,10 @@ pub struct GeneratorObject {
     /// （624 B），于是**每个**对象（哪怕只是个 `{}`）都要为生成器付账。
     /// 见 `docs/GC-DESIGN.md` §4.1。
     pub suspended: Option<Box<SuspendedFrame>>,
-    prototype: Option<Gc<Object>>,
     /// 预先构造的原生方法 Value（`[Symbol.iterator]` / `next` / `return` / `throw`）。
     ///
     /// `property_get` 是 `&self`、拿不到堆；这些句柄在构造点（有堆）一次性生成。
+    header: ObjectHeader,
     iterator_fn: Value,
     next_fn: Value,
     return_fn: Value,
@@ -3962,7 +4000,7 @@ impl GeneratorObject {
             captured_new_target: None,
             captured_vars: Vec::new(),
             suspended: None,
-            prototype: None,
+            header: ObjectHeader::new(),
             iterator_fn,
             next_fn,
             return_fn,
@@ -4023,11 +4061,11 @@ impl JSObject for GeneratorObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.prototype = proto;
+        self.header.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
@@ -4088,14 +4126,14 @@ impl Trace for PropertyDescriptor {
 
 impl Trace for OrdinaryObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
     }
 }
 
 impl Trace for ArrayObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
         self.elements.trace(out);
     }
@@ -4103,7 +4141,7 @@ impl Trace for ArrayObject {
 
 impl Trace for FunctionObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
         self.captured_this.trace(out);
         self.captured_new_target.trace(out);
@@ -4117,14 +4155,14 @@ impl Trace for FunctionObject {
 
 impl Trace for NativeFunctionObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
     }
 }
 
 impl Trace for PrimitiveWrapperObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
         self.primitive.trace(out);
     }
@@ -4152,6 +4190,9 @@ impl Trace for PromiseObject {
 
 impl Trace for GlobalObject {
     fn trace(&self, out: &mut Worklist) {
+        // `Object.prototype`：全局对象的 `[[Prototype]]` 是它的一条根（和其它变体
+        // 一样走 header）。
+        self.header.prototype().trace(out);
         // 全局对象的属性就是那个共享的 `store`（它不是 PropertyTable）。
         if let Ok(store) = self.store.try_borrow() {
             for v in store.values() {
@@ -4191,7 +4232,7 @@ impl Trace for ProxyObject {
 
 impl Trace for MapObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
         // `Vec<Option<(Value, Value)>>`
         for entry in &self.entries {
@@ -4205,7 +4246,7 @@ impl Trace for MapObject {
 
 impl Trace for SetObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
         for entry in &self.entries {
             entry.trace(out);
@@ -4255,7 +4296,7 @@ impl Trace for SuspendedFrame {
 
 impl Trace for GeneratorObject {
     fn trace(&self, out: &mut Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.args.trace(out);
         self.this.trace(out);
         self.captured_new_target.trace(out);

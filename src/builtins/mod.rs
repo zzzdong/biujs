@@ -464,7 +464,7 @@ impl crate::vm::gc::Trace for Builtins {
 
 impl crate::vm::gc::Trace for ProtoObject {
     fn trace(&self, out: &mut crate::vm::gc::Worklist) {
-        self.prototype.trace(out);
+        self.header.prototype().trace(out);
         self.properties.trace(out);
     }
 }
@@ -1831,14 +1831,15 @@ fn new_proto(heap: &mut Heap, parent: Option<Gc<Object>>, _class_name: &str) -> 
 #[derive(Debug)]
 pub(crate) struct ProtoObject {
     properties: PropertyTable,
-    prototype: Option<Gc<Object>>,
+    /// 与其它变体同一个头部（1B）：原型与可扩展/冻结/密封标记只有一份。
+    header: crate::vm::object::ObjectHeader,
 }
 
 impl ProtoObject {
     pub(crate) fn new(prototype: Option<Gc<Object>>) -> Self {
         Self {
             properties: PropertyTable::new(),
-            prototype,
+            header: crate::vm::object::ObjectHeader::with_optional_prototype(prototype),
         }
     }
 }
@@ -1872,23 +1873,29 @@ impl JSObject for ProtoObject {
         self.properties.keys()
     }
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.prototype.clone()
+        self.header.prototype()
     }
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.prototype = proto;
+        self.header.set_prototype(proto);
     }
     fn is_extensible(&self) -> bool {
-        true
+        self.header.is_extensible()
     }
-    fn prevent_extensions(&mut self) {}
+    fn prevent_extensions(&mut self) {
+        self.header.prevent_extensions();
+    }
     fn is_frozen(&self) -> bool {
-        false
+        self.header.is_frozen()
     }
-    fn freeze(&mut self) {}
+    fn freeze(&mut self) {
+        self.header.freeze();
+    }
     fn is_sealed(&self) -> bool {
-        false
+        self.header.is_sealed()
     }
-    fn seal(&mut self) {}
+    fn seal(&mut self) {
+        self.header.seal();
+    }
     fn class_name(&self) -> &'static str {
         "Object"
     }
