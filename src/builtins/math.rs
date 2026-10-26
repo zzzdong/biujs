@@ -23,8 +23,7 @@ pub fn create_math_object(heap: &mut Heap) -> Value {
     ];
     // Built-in methods are writable, non-enumerable and configurable (ES 17).
     for name in methods {
-        let _ = math.define_property(
-            PropertyKey::intern(heap, name),
+        let _ = math.define_property(PropertyKey::intern(heap, name),
             super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(&format!("Math.{name}")),
             )))),
@@ -43,8 +42,7 @@ pub fn create_math_object(heap: &mut Heap) -> Value {
     ];
     // `Math` constants are read-only, non-enumerable, non-configurable.
     for (name, value) in constants {
-        let _ = math.define_property(
-            PropertyKey::intern(heap, name),
+        let _ = math.define_property(PropertyKey::intern(heap, name),
             super::constant_descriptor(Value::Number(value)),
         );
     }

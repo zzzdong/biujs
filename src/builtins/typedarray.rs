@@ -1004,9 +1004,11 @@ pub fn register_arraybuffer_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `ArrayBuffer.prototype.slice` 实际由 `call_prototype_method` 按名字分派到
     // `ab_slice`（它需要 `heap`，而闭包签名拿不到）。
     set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
+    let desc = accessor(heap, AB_BYTE_LENGTH_NATIVE);
     let _ = proto.borrow_mut().define_property(
+        heap,
         PropertyKey::well_known("byteLength").expect("well-known name"),
-        accessor(heap, AB_BYTE_LENGTH_NATIVE),
+        desc,
     );
 }
 
@@ -1042,18 +1044,12 @@ pub fn register_dataview_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         let ty = ty;
         set_prototype_method(proto, heap, name, move |this, args| dv_set(this, args, ty));
     }
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("buffer").expect("well-known name"),
-        accessor(heap, DV_BUFFER_NATIVE),
-    );
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("byteLength").expect("well-known name"),
-        accessor(heap, DV_BYTE_LENGTH_NATIVE),
-    );
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("byteOffset").expect("well-known name"),
-        accessor(heap, DV_BYTE_OFFSET_NATIVE),
-    );
+    let desc = accessor(heap, DV_BUFFER_NATIVE);
+    let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("buffer").expect("well-known name"), desc);
+    let desc = accessor(heap, DV_BYTE_LENGTH_NATIVE);
+    let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("byteLength").expect("well-known name"), desc);
+    let desc = accessor(heap, DV_BYTE_OFFSET_NATIVE);
+    let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("byteOffset").expect("well-known name"), desc);
 }
 
 pub fn register_arraybuffer_statics(ctor: &Value) {
@@ -1116,10 +1112,10 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     }
     // `get %TypedArray%.prototype[@@toStringTag]`（23.2.3.32）：返回接收者自己的
     // TypedArray 名，不是常量 —— 故必须是取值器而非数据属性。
-    let _ = proto.borrow_mut().define_property(
-        crate::builtins::to_string_tag_symbol_key(),
-        accessor(heap, TA_TO_STRING_TAG_NATIVE),
-    );
+    let desc = accessor(heap, TA_TO_STRING_TAG_NATIVE);
+    let _ = proto
+        .borrow_mut()
+        .define_property(heap, crate::builtins::to_string_tag_symbol_key(), desc);
     for m in [
         "map",
         "filter",
@@ -1134,38 +1130,35 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
 
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("length").expect("well-known name"),
-        accessor(heap, TA_LENGTH_NATIVE),
-    );
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("byteLength").expect("well-known name"),
-        accessor(heap, TA_BYTE_LENGTH_NATIVE),
-    );
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("byteOffset").expect("well-known name"),
-        accessor(heap, TA_BYTE_OFFSET_NATIVE),
-    );
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("buffer").expect("well-known name"),
-        accessor(heap, TA_BUFFER_NATIVE),
-    );
+    let desc = accessor(heap, TA_LENGTH_NATIVE);
+    let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("length").expect("well-known name"), desc);
+    let desc = accessor(heap, TA_BYTE_LENGTH_NATIVE);
+    let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("byteLength").expect("well-known name"), desc);
+    let desc = accessor(heap, TA_BYTE_OFFSET_NATIVE);
+    let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("byteOffset").expect("well-known name"), desc);
+    let desc = accessor(heap, TA_BUFFER_NATIVE);
+    let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("buffer").expect("well-known name"), desc);
     // Iterating a view yields its elements: the factory reads `length` (a getter
     // here, which the VM dispatches) and then the indices.
-    let _ = proto.borrow_mut().define_property(
-        crate::vm::iterator::iterator_symbol_key(),
-        super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME),
-        )))),
-    );
+    let desc = super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
+        NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME),
+    ))));
+    let _ = proto
+        .borrow_mut()
+        .define_property(heap, crate::vm::iterator::iterator_symbol_key(), desc);
 }
 
 /// 具体 prototype 上唯一**与类型有关**的一项：`BYTES_PER_ELEMENT`（ES 23.2.5.3）。
 ///
 /// 它是数据属性且不可配置，所以必须逐类型给值 —— 不能放到共享基类上
 /// （`%TypedArray%.prototype` 上并没有这一项）。
-pub fn register_typedarray_bytes_per_element(kind: TypedArrayKind, proto: &Gc<Object>) {
+pub fn register_typedarray_bytes_per_element(
+    heap: &mut Heap,
+    kind: TypedArrayKind,
+    proto: &Gc<Object>,
+) {
     let _ = proto.borrow_mut().define_property(
+        heap,
         PropertyKey::well_known("BYTES_PER_ELEMENT").expect("well-known name"),
         data(Value::Number(kind.bytes_per_element() as f64)),
     );

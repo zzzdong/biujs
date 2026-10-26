@@ -100,7 +100,7 @@ where
 }
 
 /// Symbol constructor: Symbol(description?)
-pub fn symbol_constructor(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
+pub fn symbol_constructor(_heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     // Get optional description argument
     let description = if args.is_empty() {
         None
@@ -236,7 +236,7 @@ pub fn register_symbol_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     };
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::well_known("description").expect("well-known name"), description_desc);
+        .define_property(heap, PropertyKey::well_known("description").expect("well-known name"), description_desc);
 
     // `Symbol.prototype[Symbol.toStringTag] === "Symbol"`.
     let tag_desc = PropertyDescriptor {
@@ -249,7 +249,7 @@ pub fn register_symbol_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     };
     let _ = proto
         .borrow_mut()
-        .define_property(to_string_tag_symbol_key(), tag_desc);
+        .define_property(heap, to_string_tag_symbol_key(), tag_desc);
 }
 
 /// Register Symbol static methods
@@ -260,8 +260,7 @@ pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Gc<Object>, hea
             "Symbol.for",
         ))));
         obj.borrow_mut()
-            .define_property(
-                PropertyKey::well_known("for").expect("well-known name"),
+            .define_property(heap, PropertyKey::well_known("for").expect("well-known name"),
                 super::method_descriptor(for_fn),
             );
 
@@ -270,14 +269,12 @@ pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Gc<Object>, hea
             "Symbol.keyFor",
         ))));
         obj.borrow_mut()
-            .define_property(
-                PropertyKey::well_known("keyFor").expect("well-known name"),
+            .define_property(heap, PropertyKey::well_known("keyFor").expect("well-known name"),
                 super::method_descriptor(key_for_fn),
             );
 
         // Set Symbol.prototype
-        obj.borrow_mut().define_property(
-            PropertyKey::well_known("prototype").expect("well-known name"),
+        obj.borrow_mut().define_property(heap, PropertyKey::well_known("prototype").expect("well-known name"),
             super::constructor_prototype_descriptor(Value::Object(*symbol_proto)),
         );
     }

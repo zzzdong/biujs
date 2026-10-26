@@ -156,7 +156,7 @@ pub fn register_weakmap_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     ] {
         super::set_vm_method(proto, heap, super::WEAKMAP_METHOD_PREFIX, name);
     }
-    super::define_string_tag(proto, "WeakMap");
+    super::define_string_tag(heap, proto, "WeakMap");
 }
 
 /// Populate `WeakSet.prototype` (ES 23.4.3): `add` / `has` / `delete`.
@@ -164,5 +164,5 @@ pub fn register_weakset_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     for name in ["add", "has", "delete"] {
         super::set_vm_method(proto, heap, super::WEAKSET_METHOD_PREFIX, name);
     }
-    super::define_string_tag(proto, "WeakSet");
+    super::define_string_tag(heap, proto, "WeakSet");
 }

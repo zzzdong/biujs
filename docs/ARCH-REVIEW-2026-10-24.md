@@ -593,12 +593,20 @@ undefined 且名字是本程序声明的 var"判成声明。**待办**：IR 里�
 
 **验收：全量 17,305 → 17,311（84.40% → 84.43%，+6），无逐套件回退。**
 
+**第四片已落地（2026-10-26）：把堆传到对象模型的可变路径（1D 入口签名的头一件）。**
+
+`JSObject::property_set` / `define_property` / `property_delete` 现在带
+`&mut Heap`（约 146 个调用点，含 `Object` 的转发、`prototype.rs` 的 `internal_set` /
+`internal_delete`、以及一批原本拿不到堆的注册辅助函数）。**语义零变化**：全量
+17,311 / 20,504（84.43%）与改前逐位相同，护栏计数不变。
+
+它解掉的是一个具体的阻塞：形状（Shape）必须**按 VM 共享**（`Atom` 是 per-heap 的，
+跨 VM 复用形状会把 `length` 和 `x` 串味），所以形状表得挂在堆上；而形状迁移发生在
+"加属性"时 —— 也就是这三个方法里。此前它们只能 `&mut self`，Shape 无处落地。
+
 剩余（按序）：
 - `Shape` + transition cache；`Dictionary` fallback；descriptor 惰性物化
-  （`ObjectHeader` 已为 `shape` / `slots` 留好位置）。**前提**：形状要按 VM 共享
-  （`Atom` 是 per-heap 的，跨 VM 复用会串味），而 `JSObject` 的可变方法
-  （`property_set` / `define_property` / `property_delete`，约 146 个调用点）拿不到
-  堆 —— 这正是 1D「统一入口签名」那一件事。
+  （`ObjectHeader` 已为 `shape` / `slots` 留好位置，**堆也已经进来了**）。
 - `Realm`；对象尺寸断言仍过。
 
 **1C 数组 + 函数（8–12 人日）**
@@ -689,8 +697,8 @@ undefined 且名字是本程序声明的 var"判成声明。**待办**：IR 里�
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 **1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
-> **1B 三片**（全局对象存真描述符；`ObjectHeader` 统一标志位；`undefined`/`NaN`/
-> `Infinity` 成为全局属性）。
+> **1B 四片**（全局对象存真描述符；`ObjectHeader` 统一标志位；`undefined`/`NaN`/
+> `Infinity` 成为全局属性；堆进入对象模型的可变路径）。
 
 剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，1A 也收口，下面是：
     S0#4 第二档（GC 句柄代次 —— `Value` 仍 16 B，需要另找空间，或在 `Value` 缩小后补）→

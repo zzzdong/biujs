@@ -142,21 +142,22 @@ pub fn register_map_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
         MAP_SIZE_NATIVE,
     ))));
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("size").expect("well-known name"),
-        PropertyDescriptor {
-            value: Value::Undefined,
-            writable: false,
-            enumerable: false,
-            configurable: true,
-            getter: Some(getter),
-            setter: None,
-        },
-    );
+    let desc = PropertyDescriptor {
+        value: Value::Undefined,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+        getter: Some(getter),
+        setter: None,
+    };
+    let _ = proto
+        .borrow_mut()
+        .define_property(heap, PropertyKey::well_known("size").expect("well-known name"), desc);
 
     // `Map.prototype[Symbol.toStringTag] === "Map"` — and `new Map()` already
     // reports `[object Map]` through `class_name`.
     let _ = proto.borrow_mut().define_property(
+        heap,
         super::to_string_tag_symbol_key(),
         PropertyDescriptor {
             value: Value::string("Map"),

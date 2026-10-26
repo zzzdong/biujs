@@ -340,12 +340,15 @@ pub fn register_date_statics(ctor: &Value, heap: &mut Heap) {
         return;
     };
     for name in ["now", "parse", "UTC"] {
+        let key = PropertyKey::intern(heap, name);
+        let value = Value::Object(heap.alloc(Object::NativeFunction(
+            NativeFunctionObject::new(&format!("Date.{name}")),
+        )));
         let _ = obj_ref.borrow_mut().define_property(
-            PropertyKey::intern(heap, name),
+            heap,
+            key,
             PropertyDescriptor {
-                value: Value::Object(heap.alloc(Object::NativeFunction(
-                    NativeFunctionObject::new(&format!("Date.{name}")),
-                ))),
+                value,
                 writable: true,
                 enumerable: false,
                 configurable: true,

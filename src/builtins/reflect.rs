@@ -74,7 +74,7 @@ pub fn reflect_delete_property(heap: &mut Heap, args: &[Value]) -> Result<Value,
     // `[[Delete]]` answers `true` for an absent property — the rule lives in
     // `internal_delete`, shared with the `delete` operator, which had answered
     // `false` there too.
-    let deleted = crate::vm::prototype::internal_delete(target, &key)
+    let deleted = crate::vm::prototype::internal_delete(heap, target, &key)
         .map_err(RuntimeError::TypeError)?;
     Ok(Value::Bool(deleted))
 }
@@ -201,15 +201,13 @@ pub fn create_reflect_object(heap: &mut Heap) -> Value {
         .chain(VM_METHODS.iter().copied())
         .collect();
     for name in names {
-        let _ = obj.define_property(
-            PropertyKey::intern(heap, name),
+        let _ = obj.define_property(PropertyKey::intern(heap, name),
             super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(&format!("Reflect.{name}")),
             )))),
         );
     }
-    let _ = obj.define_property(
-        PropertyKey::Symbol(super::symbol::TO_STRING_TAG_SYMBOL_ID),
+    let _ = obj.define_property(PropertyKey::Symbol(super::symbol::TO_STRING_TAG_SYMBOL_ID),
         PropertyDescriptor {
             value: Value::string("Reflect"),
             writable: false,

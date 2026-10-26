@@ -36,7 +36,14 @@ pub trait JSObject: fmt::Debug + Any {
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor>;
 
     /// Set a property value, creating or updating as needed
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String>;
+    /// 可变路径带堆：形状迁移（1B 的 Shape）要按 VM 共享形状表，而形状表挂在
+    /// 堆上；`&mut self` 拿不到它。
+    fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String>;
 
     /// Install a property with a full descriptor (`Object.defineProperty`).
     ///
@@ -47,12 +54,13 @@ pub trait JSObject: fmt::Debug + Any {
     /// through this path.
     fn define_property(
         &mut self,
+        heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String>;
 
     /// Delete a property, returns true if the property was successfully deleted
-    fn property_delete(&mut self, key: &PropertyKey) -> bool;
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool;
 
     /// Check if a property exists
     fn has_property(&self, key: &PropertyKey) -> bool;
@@ -541,7 +549,12 @@ impl JSObject for OrdinaryObject {
         self.properties.get(key).cloned()
     }
 
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         if self.header.is_frozen() {
             return Err("Cannot set property on frozen object".to_string());
         }
@@ -564,13 +577,14 @@ impl JSObject for OrdinaryObject {
 
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
         OrdinaryObject::define_property(self, key, desc)
     }
 
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
@@ -967,7 +981,12 @@ impl JSObject for ArrayObject {
         self.properties.get(key).cloned()
     }
 
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         if self.header.is_frozen() {
             return Err("Cannot set property on frozen array".to_string());
         }
@@ -1055,6 +1074,7 @@ impl JSObject for ArrayObject {
     /// property table (keyed by the index string) so the attributes survive.
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -1154,7 +1174,7 @@ impl JSObject for ArrayObject {
         Ok(true)
     }
 
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
@@ -1411,7 +1431,12 @@ impl JSObject for FunctionObject {
         self.properties.get(key).cloned()
     }
 
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         self.properties
             .insert(key, PropertyDescriptor::data_descriptor(value));
         Ok(true)
@@ -1419,6 +1444,7 @@ impl JSObject for FunctionObject {
 
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -1435,7 +1461,7 @@ impl JSObject for FunctionObject {
         Ok(true)
     }
 
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         if let Some(desc) = self.properties.get(key) {
             if !desc.configurable {
                 return false;
@@ -1521,11 +1547,13 @@ pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usi
     }
 
     obj_ref.borrow_mut().define_property(
+        heap,
         crate::vm::property::PropertyKey::well_known("length").expect("well-known name"),
         fn_meta(Value::Number(arity as f64)),
     )
     .ok();
     obj_ref.borrow_mut().define_property(
+        heap,
         crate::vm::property::PropertyKey::well_known("name").expect("well-known name"),
         fn_meta(Value::string(name)),
     )
@@ -1540,6 +1568,7 @@ pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usi
     if let Value::Object(ref proto_ref) = proto_obj {
         // `F.prototype.constructor` — writable, non-enumerable, configurable.
         proto_ref.borrow_mut().define_property(
+            heap,
             crate::vm::property::PropertyKey::well_known("constructor").expect("well-known name"),
             PropertyDescriptor {
                 value: Value::Function(func_id),
@@ -1556,6 +1585,7 @@ pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usi
         obj_ref
             .borrow_mut()
             .define_property(
+                heap,
                 crate::vm::property::PropertyKey::well_known("prototype")
                     .expect("well-known name"),
                 PropertyDescriptor {
@@ -1594,12 +1624,14 @@ pub fn new_arrow_function_object(
     let mut borrowed = obj_ref.borrow_mut();
     borrowed
         .define_property(
+            heap,
             PropertyKey::well_known("length").expect("well-known name"),
             function_metadata_descriptor(Value::Number(arity as f64)),
         )
         .ok();
     borrowed
         .define_property(
+            heap,
             PropertyKey::well_known("name").expect("well-known name"),
             function_metadata_descriptor(Value::string(name)),
         )
@@ -1737,7 +1769,12 @@ impl JSObject for NativeFunctionObject {
         self.properties.get(key).cloned()
     }
 
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         self.properties
             .insert(key, PropertyDescriptor::data_descriptor(value));
         Ok(true)
@@ -1745,6 +1782,7 @@ impl JSObject for NativeFunctionObject {
 
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -1763,7 +1801,7 @@ impl JSObject for NativeFunctionObject {
         Ok(true)
     }
 
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         if let Some(desc) = self.properties.get(key) {
             if !desc.configurable {
                 return false;
@@ -1898,7 +1936,12 @@ impl JSObject for PrimitiveWrapperObject {
         self.properties.get(key).cloned()
     }
 
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         if matches!(self.primitive, Value::String(_)) {
             {
                 // String wrapper index keys and `length` are read-only.
@@ -1921,6 +1964,7 @@ impl JSObject for PrimitiveWrapperObject {
 
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -1941,7 +1985,7 @@ impl JSObject for PrimitiveWrapperObject {
         Ok(true)
     }
 
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         if matches!(self.primitive, Value::String(_)) {
             if key.is("length") {
             return false;
@@ -2114,18 +2158,24 @@ impl JSObject for DateObject {
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.base.property_get(key)
     }
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        self.base.property_set(key, value)
+    fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
+        self.base.property_set(heap, key, value)
     }
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
         self.base.define_property(key, descriptor)
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        self.base.property_delete(key)
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
     fn has_property(&self, key: &PropertyKey) -> bool {
         self.base.has_property(key)
@@ -2273,7 +2323,12 @@ impl JSObject for RegExpObject {
         }
         self.base.property_get(key)
     }
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         if key.is("lastIndex") {
             self.last_index = value.to_number();
             return Ok(true);
@@ -2284,17 +2339,18 @@ impl JSObject for RegExpObject {
         {
             return Err("Cannot assign to read only property".to_string());
         }
-        self.base.property_set(key, value)
+        self.base.property_set(heap, key, value)
     }
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
         self.base.define_property(key, descriptor)
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        self.base.property_delete(key)
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
     fn has_property(&self, key: &PropertyKey) -> bool {
         self.base.has_property(key)
@@ -2392,18 +2448,24 @@ impl JSObject for PromiseObject {
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.base.property_get(key)
     }
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        self.base.property_set(key, value)
+    fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
+        self.base.property_set(heap, key, value)
     }
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
         self.base.define_property(key, descriptor)
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        self.base.property_delete(key)
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
     fn has_property(&self, key: &PropertyKey) -> bool {
         self.base.has_property(key)
@@ -2499,7 +2561,12 @@ impl JSObject for GlobalObject {
     }
 
     /// ES `OrdinarySetWithOwnDescriptor` (10.1.9.2) on the globals map.
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         let mut store = self.store.borrow_mut();
         match store.get_mut(&key) {
             Some(existing) => {
@@ -2525,6 +2592,7 @@ impl JSObject for GlobalObject {
     /// redefined opaquely, and accessors are kept as accessors.
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -2537,7 +2605,7 @@ impl JSObject for GlobalObject {
         Ok(true)
     }
 
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         let mut store = self.store.borrow_mut();
         match store.get(key) {
             Some(existing) if !existing.configurable => false,
@@ -2626,18 +2694,24 @@ impl JSObject for ArrayBufferObject {
     }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.base.property_get(key)
     }
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        self.base.property_set(key, value)
+    fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
+        self.base.property_set(heap, key, value)
     }
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
         self.base.define_property(key, descriptor)
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        self.base.property_delete(key)
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
     fn has_property(&self, key: &PropertyKey) -> bool {
         self.base.has_property(key)
@@ -2907,17 +2981,23 @@ impl JSObject for TypedArrayObject {
         }
         self.base.property_get(key)
     }
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         if let Some(index) = Self::canonical_index(&key) {
             // An index at or past `length` is not an element: the write is
             // dropped (ES 10.4.5.5 IntegerIndexedElementSet step 9).
             self.set_element(index, value);
             return Ok(index < self.length);
         }
-        self.base.property_set(key, value)
+        self.base.property_set(heap, key, value)
     }
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -2937,12 +3017,12 @@ impl JSObject for TypedArrayObject {
         }
         self.base.define_property(key, descriptor)
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         if let Some(index) = Self::canonical_index(key) {
             // Elements cannot be deleted — only absent ones stay absent.
             return index >= self.length;
         }
-        self.base.property_delete(key)
+        self.base.property_delete(heap, key)
     }
     fn has_property(&self, key: &PropertyKey) -> bool {
         if let Some(index) = Self::canonical_index(key) {
@@ -3038,18 +3118,24 @@ impl JSObject for DataViewObject {
     }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.base.property_get(key)
     }
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        self.base.property_set(key, value)
+    fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
+        self.base.property_set(heap, key, value)
     }
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
         self.base.define_property(key, descriptor)
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        self.base.property_delete(key)
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
     fn has_property(&self, key: &PropertyKey) -> bool {
         self.base.has_property(key)
@@ -3146,17 +3232,23 @@ impl JSObject for ProxyObject {
         }
         self.target_object()?.borrow().property_get(key)
     }
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         if self.revoked {
             return Ok(false);
         }
         match self.target_object() {
-            Some(target) => target.borrow_mut().property_set(key, value),
+            Some(target) => target.borrow_mut().property_set(heap, key, value),
             None => Ok(false),
         }
     }
     fn define_property(
         &mut self,
+        heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -3164,16 +3256,16 @@ impl JSObject for ProxyObject {
             return Ok(false);
         }
         match self.target_object() {
-            Some(target) => target.borrow_mut().define_property(key, descriptor),
+            Some(target) => target.borrow_mut().define_property(heap, key, descriptor),
             None => Ok(false),
         }
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         if self.revoked {
             return false;
         }
         match self.target_object() {
-            Some(target) => target.borrow_mut().property_delete(key),
+            Some(target) => target.borrow_mut().property_delete(heap, key),
             None => false,
         }
     }
@@ -3403,7 +3495,12 @@ impl JSObject for MapObject {
         self.properties.get(key).cloned()
     }
 
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         if self.header.is_frozen() {
             return Err("Cannot set property on frozen object".to_string());
         }
@@ -3421,6 +3518,7 @@ impl JSObject for MapObject {
 
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -3435,7 +3533,7 @@ impl JSObject for MapObject {
         Ok(true)
     }
 
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
@@ -3565,20 +3663,26 @@ macro_rules! delegate_collection_object {
                 self.$inner.property_get(key)
             }
 
-            fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-                self.$inner.property_set(key, value)
+            fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
+                self.$inner.property_set(heap, key, value)
             }
 
             fn define_property(
                 &mut self,
+                heap: &mut Heap,
                 key: PropertyKey,
                 desc: PropertyDescriptor,
             ) -> Result<bool, String> {
-                self.$inner.define_property(key, desc)
+                self.$inner.define_property(heap, key, desc)
             }
 
-            fn property_delete(&mut self, key: &PropertyKey) -> bool {
-                self.$inner.property_delete(key)
+            fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+                self.$inner.property_delete(heap, key)
             }
 
             fn has_property(&self, key: &PropertyKey) -> bool {
@@ -3787,7 +3891,12 @@ impl JSObject for SetObject {
         self.properties.get(key).cloned()
     }
 
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         if self.header.is_frozen() {
             return Err("Cannot set property on frozen object".to_string());
         }
@@ -3805,6 +3914,7 @@ impl JSObject for SetObject {
 
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -3819,7 +3929,7 @@ impl JSObject for SetObject {
         Ok(true)
     }
 
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
@@ -4031,19 +4141,25 @@ impl JSObject for GeneratorObject {
         }
     }
 
-    fn property_set(&mut self, _key: PropertyKey, _value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut Heap,
+        _key: PropertyKey,
+        _value: Value,
+    ) -> Result<bool, String> {
         Ok(true)
     }
 
     fn define_property(
         &mut self,
+        _heap: &mut Heap,
         _key: PropertyKey,
         _desc: PropertyDescriptor,
     ) -> Result<bool, String> {
         Ok(true)
     }
 
-    fn property_delete(&mut self, _key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut Heap, _key: &PropertyKey) -> bool {
         true
     }
 

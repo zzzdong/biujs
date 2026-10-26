@@ -714,8 +714,7 @@ impl VM {
                 return;
             }
             borrowed
-                .define_property(
-                    crate::vm::property::PropertyKey::well_known("name").expect("well-known name"),
+                .define_property(&mut self.heap, crate::vm::property::PropertyKey::well_known("name").expect("well-known name"),
                     crate::vm::property::PropertyDescriptor {
                         value: Value::string(name),
                         writable: false,
@@ -2647,16 +2646,14 @@ impl VM {
         )));
         if let Value::Object(obj) = &mut value {
             obj.borrow_mut()
-                .define_property(
-                    PropertyKey::well_known("name").expect("well-known name"),
+                .define_property(&mut self.heap, PropertyKey::well_known("name").expect("well-known name"),
                     crate::vm::property::PropertyDescriptor::data_descriptor(Value::string(
                         "AggregateError",
                     )),
                 )
                 .ok();
             obj.borrow_mut()
-                .define_property(
-                    PropertyKey::well_known("errors").expect("well-known name"),
+                .define_property(&mut self.heap, PropertyKey::well_known("errors").expect("well-known name"),
                     crate::vm::property::PropertyDescriptor::data_descriptor(array),
                 )
                 .ok();
@@ -2740,13 +2737,11 @@ impl VM {
                     let status = Value::string(if fulfilled { "fulfilled" } else { "rejected" });
                     let key = if fulfilled { "value" } else { "reason" };
                     let mut obj = crate::vm::object::OrdinaryObject::new();
-                    obj.define_property(
-                        PropertyKey::well_known("status").expect("well-known name"),
+                    obj.define_property(PropertyKey::well_known("status").expect("well-known name"),
                         crate::vm::property::PropertyDescriptor::data_descriptor(status),
                     )
                     .ok();
-                    obj.define_property(
-                        PropertyKey::intern(&mut self.heap, key),
+                    obj.define_property(PropertyKey::intern(&mut self.heap, key),
                         crate::vm::property::PropertyDescriptor::data_descriptor(argument),
                     )
                     .ok();
@@ -3485,7 +3480,7 @@ impl VM {
                     }
                     // Step 5: no parent, so the property is created — on the
                     // receiver — with every attribute `true`.
-                    None => Ok(Self::create_data_property(receiver, key, value)),
+                    None => Ok(Self::create_data_property(&mut self.heap, receiver, key, value)),
                 };
             }
         };
@@ -3503,7 +3498,7 @@ impl VM {
                     return Ok(false);
                 }
             }
-            return Ok(Self::create_data_property(receiver, key, value));
+            return Ok(Self::create_data_property(&mut self.heap, receiver, key, value));
         }
         match own.invoked_setter() {
             Some(setter) => {
@@ -3516,12 +3511,16 @@ impl VM {
 
     /// `CreateDataProperty` (ES 7.3.5): `[[DefineOwnProperty]]` of a fresh
     /// all-true data descriptor, answering whether it landed.
-    fn create_data_property(obj: &Value, key: &PropertyKey, value: &Value) -> bool {
+    fn create_data_property(
+        heap: &mut Heap,
+        obj: &Value,
+        key: &PropertyKey,
+        value: &Value,
+    ) -> bool {
         match obj {
             Value::Object(obj_ref) => obj_ref
                 .borrow_mut()
-                .define_property(
-                    key.clone(),
+                .define_property(heap, key.clone(),
                     crate::vm::property::PropertyDescriptor::data_descriptor(value.clone()),
                 )
                 .unwrap_or(false),
@@ -3596,13 +3595,13 @@ impl VM {
                     }
                     let mut borrowed = obj_ref.borrow_mut();
                     borrowed
-                        .property_set(key, value)
+                        .property_set(&mut self.heap, key, value)
                         .map_err(RuntimeError::from_property_error)?;
                     return Ok(());
                 }
                 let mut borrowed = obj_ref.borrow_mut();
                 borrowed
-                    .property_set(key, value)
+                    .property_set(&mut self.heap, key, value)
                     .map_err(RuntimeError::from_property_error)?;
                 Ok(())
             }
@@ -3641,12 +3640,12 @@ impl VM {
                 let proxy_val = Value::Object(*obj_ref);
                 match self.proxy_delete(&proxy_val, key, module)? {
                     Some(removed) => Ok(removed),
-                    None => crate::vm::prototype::internal_delete(*obj_ref, key)
+                    None => crate::vm::prototype::internal_delete(&mut self.heap, *obj_ref, key)
                         .map_err(RuntimeError::TypeError),
                 }
             }
             Value::Object(obj_ref) => {
-                crate::vm::prototype::internal_delete(*obj_ref, key)
+                crate::vm::prototype::internal_delete(&mut self.heap, *obj_ref, key)
                     .map_err(RuntimeError::TypeError)
             }
             Value::Function(id) => {
@@ -3757,7 +3756,7 @@ impl VM {
             };
             strings_ref
                 .borrow_mut()
-                .define_property(PropertyKey::well_known("raw").expect("well-known name"), raw_desc)
+                .define_property(&mut self.heap, PropertyKey::well_known("raw").expect("well-known name"), raw_desc)
                 .map_err(RuntimeError::TypeError)?;
             strings_ref.borrow_mut().freeze();
         }
@@ -4613,8 +4612,17 @@ impl VM {
     /// `{ value, done }` — the shape every iterator result has.
     fn iterator_result(heap: &mut Heap, value: Value, done: bool) -> Value {
         let mut result = crate::vm::object::OrdinaryObject::new();
-        let _ = result.property_set(PropertyKey::well_known("value").expect("well-known name"), value);
-        let _ = result.property_set(PropertyKey::well_known("done").expect("well-known name"), Value::Bool(done));
+        // `result` 是 OrdinaryObject：走它的 inherent `property_set`（不带堆）。
+        let _ = result.property_set(
+            heap,
+            PropertyKey::well_known("value").expect("well-known name"),
+            value,
+        );
+        let _ = result.property_set(
+            heap,
+            PropertyKey::well_known("done").expect("well-known name"),
+            Value::Bool(done),
+        );
         Value::Object(heap.alloc(Object::Ordinary(result)))
     }
 
@@ -6724,7 +6732,8 @@ mod tests {
             let obj = new_ordinary_object(&mut heap);
             if let Value::Object(ref obj_ref) = obj {
                 let mut ob = obj_ref.borrow_mut();
-                ob.property_set(PropertyKey::intern(&mut heap, "x"), Value::Number(42.0))
+                let key = PropertyKey::intern(&mut heap, "x");
+                ob.property_set(&mut heap, key, Value::Number(42.0))
                     .unwrap();
             }
             obj

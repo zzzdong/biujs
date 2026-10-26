@@ -177,7 +177,7 @@ fn register_species_accessor(array_fn: &Value, heap: &mut Heap) {
     };
     let _ = obj
         .borrow_mut()
-        .define_property(super::species_symbol_key(), desc);
+        .define_property(heap, super::species_symbol_key(), desc);
 }
 
 /// `Array.prototype.toString()`
@@ -297,7 +297,7 @@ fn to_object(heap: &mut Heap, obj: &Value) -> Result<Gc<Object>, RuntimeError> {
 
 /// `ToLength(Get(O, "length"))` — saturating, so a huge `length` cannot make
 /// the caller allocate or loop forever.
-fn generic_length(heap: &mut Heap, obj: &Value) -> u64 {
+fn generic_length(_heap: &mut Heap, obj: &Value) -> u64 {
     let raw = match obj {
         Value::Object(o) => o
             .borrow()
@@ -328,11 +328,13 @@ fn generic_get(heap: &mut Heap, obj: &Value, index: u64) -> Value {
 
 fn generic_set(heap: &mut Heap, obj: &Value, index: u64, value: Value) -> Result<(), RuntimeError> {
     match obj {
-        Value::Object(o) => o
-            .borrow_mut()
-            .property_set(PropertyKey::element(heap, index), value)
-            .map(|_| ())
-            .map_err(RuntimeError::TypeError),
+        Value::Object(o) => {
+            let key = PropertyKey::element(heap, index);
+            o.borrow_mut()
+                .property_set(heap, key, value)
+                .map(|_| ())
+                .map_err(RuntimeError::TypeError)
+        }
         _ => Ok(()),
     }
 }
@@ -352,10 +354,10 @@ fn generic_has(heap: &mut Heap, obj: &Value, index: u64) -> bool {
 /// `[[Delete]](O, key)`.
 fn generic_delete(heap: &mut Heap, obj: &Value, index: u64) -> Result<bool, RuntimeError> {
     match obj {
-        Value::Object(o) => crate::vm::prototype::internal_delete(
-            *o,
-            &PropertyKey::element(heap, index),
-        )
+        Value::Object(o) => {
+            let key = PropertyKey::element(heap, index);
+            crate::vm::prototype::internal_delete(heap, *o, &key)
+        }
         .map_err(RuntimeError::TypeError),
         _ => Ok(true),
     }
@@ -366,7 +368,7 @@ fn generic_set_length(heap: &mut Heap, obj: &Value, len: u64) -> Result<(), Runt
     match obj {
         Value::Object(o) => o
             .borrow_mut()
-            .property_set(PropertyKey::well_known("length").expect("well-known name"), Value::Number(len as f64))
+            .property_set(heap, PropertyKey::well_known("length").expect("well-known name"), Value::Number(len as f64))
             .map(|_| ())
             .map_err(RuntimeError::TypeError),
         _ => Ok(()),

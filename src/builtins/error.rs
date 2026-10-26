@@ -81,8 +81,7 @@ pub fn create_error_object(
     let mut obj = OrdinaryObject::with_class_name("Error");
     obj.set_prototype(Some(prototype));
     if let Some(msg) = message {
-        obj.define_property(
-            PropertyKey::well_known("message").expect("well-known name"),
+        obj.define_property(PropertyKey::well_known("message").expect("well-known name"),
             error_message_descriptor(Value::string(&msg)),
         )
         .ok();
@@ -109,8 +108,7 @@ pub fn error_constructor(heap: &mut Heap, error_type: ErrorType, args: &[Value])
         obj.set_prototype(Some(proto));
     }
     if let Some(msg) = message {
-        obj.define_property(
-            PropertyKey::well_known("message").expect("well-known name"),
+        obj.define_property(PropertyKey::well_known("message").expect("well-known name"),
             error_message_descriptor(Value::string(&msg)),
         )
         .ok();
@@ -186,7 +184,7 @@ pub fn runtime_error_to_js_error(
 /// `name` and `message` are read with `[[Get]]`, i.e. through the prototype
 /// chain, and an `undefined` value falls back to `"Error"` / `""`.
 pub fn error_prototype_to_string(
-    heap: &mut Heap,
+    _heap: &mut Heap,
     obj: &Value,
 ) -> Result<Value, RuntimeError> {
     let Value::Object(obj_ref) = obj else {
@@ -251,10 +249,10 @@ pub fn setup_error_prototype(
     };
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::well_known("name").expect("well-known name"), writable_string(Value::string("Error")));
+        .define_property(heap, PropertyKey::well_known("name").expect("well-known name"), writable_string(Value::string("Error")));
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::well_known("message").expect("well-known name"), writable_string(Value::string("")));
+        .define_property(heap, PropertyKey::well_known("message").expect("well-known name"), writable_string(Value::string("")));
 
     // Error.prototype.toString
     // 闭包从不被调用（`set_prototype_method` 忽略它）；实现需要 heap，住在
@@ -271,7 +269,11 @@ pub fn setup_error_prototype(
 /// `TypeError.prototype.name` is `"TypeError"` and its `message` starts as the
 /// empty string (ES 19.5.6.3.2); every other property is inherited from
 /// `Error.prototype`.
-pub fn setup_native_error_prototype(proto: &Gc<Object>, name: &str) {
+pub fn setup_native_error_prototype(
+    heap: &mut Heap,
+    proto: &Gc<Object>,
+    name: &str,
+) {
     use crate::vm::property::PropertyDescriptor;
 
     let writable = |value: Value| PropertyDescriptor {
@@ -284,8 +286,8 @@ pub fn setup_native_error_prototype(proto: &Gc<Object>, name: &str) {
     };
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::well_known("name").expect("well-known name"), writable(Value::string(name)));
+        .define_property(heap, PropertyKey::well_known("name").expect("well-known name"), writable(Value::string(name)));
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::well_known("message").expect("well-known name"), writable(Value::string("")));
+        .define_property(heap, PropertyKey::well_known("message").expect("well-known name"), writable(Value::string("")));
 }

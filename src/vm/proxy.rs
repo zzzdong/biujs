@@ -270,7 +270,7 @@ impl VM {
             }
             return match &target {
                 Value::Object(obj_ref) => Ok(Some(
-                    crate::vm::prototype::internal_delete(*obj_ref, key)
+                    crate::vm::prototype::internal_delete(&mut self.heap, *obj_ref, key)
                         .map_err(RuntimeError::TypeError)?,
                 )),
                 _ => Ok(Some(true)),
@@ -730,6 +730,7 @@ impl VM {
         // A revocation function is *anonymous* (ES 28.2.2.1.1): its `name` is
         // the empty string, not the synthetic name the VM dispatches on.
         let _ = revoke.define_property(
+            &mut self.heap,
             PropertyKey::well_known("name").expect("well-known name"),
             PropertyDescriptor {
                 value: Value::string(""),

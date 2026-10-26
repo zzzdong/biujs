@@ -188,8 +188,7 @@ pub fn regexp_exec(
         });
     }
     let mut array = ArrayObject::from_vec(elements);
-    let _ = array.define_property(
-        PropertyKey::well_known("index").expect("well-known name"),
+    let _ = array.define_property(heap, PropertyKey::well_known("index").expect("well-known name"),
         PropertyDescriptor {
             value: Value::Number(whole.start() as f64),
             writable: true,
@@ -199,8 +198,7 @@ pub fn regexp_exec(
             setter: None,
         },
     );
-    let _ = array.define_property(
-        PropertyKey::well_known("input").expect("well-known name"),
+    let _ = array.define_property(heap, PropertyKey::well_known("input").expect("well-known name"),
         PropertyDescriptor {
             value: Value::string(&text),
             writable: true,
@@ -304,8 +302,8 @@ fn match_array(heap: &mut Heap, captures: &regex::Captures, text: &str) -> Value
         ("input", Value::string(text)),
         ("groups", Value::Undefined),
     ] {
-        let _ = array.define_property(
-            PropertyKey::intern(heap, key),
+        let prop_key = PropertyKey::intern(heap, key);
+        let _ = array.define_property(heap, prop_key,
             PropertyDescriptor {
                 value,
                 writable: true,
@@ -341,19 +339,19 @@ pub fn register_regexp_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // It has to be defined under the *symbol key*: registering it as the method
     // name "Symbol.matchAll" put it on the wrong key, and `re[Symbol.matchAll]`
     // then found nothing.
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::Symbol(MATCH_ALL_SYMBOL_ID),
-        super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(&format!(
-                "{}{}",
-                super::PROTO_METHOD_PREFIX,
-                "matchAll"
-            )),
-        )))),
-    );
+    let match_all = super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
+        NativeFunctionObject::new(&format!(
+            "{}{}",
+            super::PROTO_METHOD_PREFIX,
+            "matchAll"
+        )),
+    ))));
+    let _ = proto
+        .borrow_mut()
+        .define_property(heap, PropertyKey::Symbol(MATCH_ALL_SYMBOL_ID), match_all);
 }
 
-pub fn register_regexp_statics(ctor: &Value, heap: &mut Heap) {
+pub fn register_regexp_statics(ctor: &Value, _heap: &mut Heap) {
     // `RegExp` has no own static methods in ES6; nothing to do. The hook exists
     // so the registration site reads like the other constructors'.
     let _ = ctor;
@@ -416,8 +414,7 @@ pub fn regexp_match(
             None => Value::Undefined,
         });
     }
-    let _ = array.define_property(
-        PropertyKey::well_known("index").expect("well-known name"),
+    let _ = array.define_property(heap, PropertyKey::well_known("index").expect("well-known name"),
         PropertyDescriptor {
             value: Value::Number(whole.start() as f64),
             writable: true,
@@ -427,8 +424,7 @@ pub fn regexp_match(
             setter: None,
         },
     );
-    let _ = array.define_property(
-        PropertyKey::well_known("input").expect("well-known name"),
+    let _ = array.define_property(heap, PropertyKey::well_known("input").expect("well-known name"),
         PropertyDescriptor {
             value: Value::string(&text),
             writable: true,

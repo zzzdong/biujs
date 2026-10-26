@@ -1097,7 +1097,7 @@ impl VM {
                 _ => Value::Bool(raw.to_boolean()),
             };
             if let Value::Object(desc_ref) = &desc {
-                let _ = desc_ref.borrow_mut().property_set(key, converted);
+                let _ = desc_ref.borrow_mut().property_set(&mut self.heap, key, converted);
             }
         }
         Ok(desc)
@@ -1136,7 +1136,7 @@ impl VM {
             let value = self.get_member(props, &key, module)?;
             let converted = self.to_property_descriptor(&value, module)?;
             if let Value::Object(out_ref) = &out {
-                let _ = out_ref.borrow_mut().property_set(key, converted);
+                let _ = out_ref.borrow_mut().property_set(&mut self.heap, key, converted);
             }
         }
         Ok(out)
@@ -1258,8 +1258,7 @@ impl VM {
             wrapper.set_prototype(Some(proto));
         }
         let root_key = PropertyKey::intern(&mut self.heap, "");
-        let _ = wrapper.define_property(
-            root_key,
+        let _ = wrapper.define_property(root_key,
             crate::vm::property::PropertyDescriptor::data_descriptor(value),
         );
         let wrapper = Value::Object(self.heap.alloc(Object::Ordinary(wrapper)));
@@ -1505,8 +1504,7 @@ impl VM {
         if let Some(proto) = crate::builtins::wrapper_prototype("Object") {
             holder.set_prototype(Some(proto));
         }
-        let _ = holder.define_property(
-            PropertyKey::intern(&mut self.heap, ""),
+        let _ = holder.define_property(PropertyKey::intern(&mut self.heap, ""),
             crate::vm::property::PropertyDescriptor::data_descriptor(parsed),
         );
         let holder = Value::Object(self.heap.alloc(Object::Ordinary(holder)));
@@ -1549,8 +1547,7 @@ impl VM {
                     // `CreateDataProperty` (not `[[Set]]`): a failure — e.g. a
                     // non-configurable property the reviver created — is
                     // ignored, and the existing value simply stays.
-                    let _ = obj_ref.borrow_mut().define_property(
-                        key,
+                    let _ = obj_ref.borrow_mut().define_property(&mut self.heap, key,
                         crate::vm::property::PropertyDescriptor::data_descriptor(new_element),
                     );
                 }
@@ -3521,7 +3518,7 @@ impl VM {
                     };
                 if let Value::Object(arrow_ref) = &obj_val {
                     for (key, desc) in inherited_super {
-                        let _ = arrow_ref.borrow_mut().define_property(key, desc);
+                        let _ = arrow_ref.borrow_mut().define_property(&mut self.heap, key, desc);
                     }
                 }
                 self.set_value(dst, obj_val)?;

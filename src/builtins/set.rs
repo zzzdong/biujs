@@ -114,19 +114,20 @@ pub fn register_set_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
         SET_SIZE_NATIVE,
     ))));
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::well_known("size").expect("well-known name"),
-        PropertyDescriptor {
-            value: Value::Undefined,
-            writable: false,
-            enumerable: false,
-            configurable: true,
-            getter: Some(getter),
-            setter: None,
-        },
-    );
+    let desc = PropertyDescriptor {
+        value: Value::Undefined,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+        getter: Some(getter),
+        setter: None,
+    };
+    let _ = proto
+        .borrow_mut()
+        .define_property(heap, PropertyKey::well_known("size").expect("well-known name"), desc);
 
     let _ = proto.borrow_mut().define_property(
+        heap,
         super::to_string_tag_symbol_key(),
         PropertyDescriptor {
             value: Value::string("Set"),

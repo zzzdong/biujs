@@ -828,20 +828,26 @@ impl Object {
         forward!(self, property_get, key)
     }
 
-    pub fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
-        forward!(self, property_set, key, value)
+    pub fn property_set(
+        &mut self,
+        heap: &mut Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
+        forward!(self, property_set, heap, key, value)
     }
 
     pub fn define_property(
         &mut self,
+        heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        forward!(self, define_property, key, desc)
+        forward!(self, define_property, heap, key, desc)
     }
 
-    pub fn property_delete(&mut self, key: &PropertyKey) -> bool {
-        forward!(self, property_delete, key)
+    pub fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        forward!(self, property_delete, heap, key)
     }
 
     pub fn has_property(&self, key: &PropertyKey) -> bool {
@@ -1019,7 +1025,7 @@ mod tests {
         let g = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         assert_eq!(g.borrow().kind(), ObjectKind::Ordinary);
         g.borrow_mut()
-            .property_set(key("x"), Value::Number(42.0))
+            .property_set(&mut h, key("x"), Value::Number(42.0))
             .unwrap();
         let desc = g.borrow().property_get(&key("x")).expect("property set");
         assert_eq!(desc.value, Value::Number(42.0));
@@ -1223,10 +1229,10 @@ mod tests {
         let a = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         a.borrow_mut()
-            .property_set(key("b"), Value::Object(b))
+            .property_set(&mut h, key("b"), Value::Object(b))
             .unwrap();
         b.borrow_mut()
-            .property_set(key("a"), Value::Object(a))
+            .property_set(&mut h, key("a"), Value::Object(a))
             .unwrap();
 
         // 根 → a
@@ -1312,10 +1318,10 @@ mod tests {
         let a = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         a.borrow_mut()
-            .property_set(key("b"), Value::Object(b))
+            .property_set(&mut h, key("b"), Value::Object(b))
             .unwrap();
         b.borrow_mut()
-            .property_set(key("a"), Value::Object(a))
+            .property_set(&mut h, key("a"), Value::Object(a))
             .unwrap();
 
         // 只有 a 是根：b 经环可达 ⇒ 两个都活着。
@@ -1347,7 +1353,7 @@ mod tests {
         let a = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         let b = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         a.borrow_mut()
-            .property_set(key("b"), Value::Object(b))
+            .property_set(&mut h, key("b"), Value::Object(b))
             .unwrap();
 
         let _guard = b.borrow_mut(); // b 正被可变借用
@@ -1363,20 +1369,20 @@ mod tests {
         let mut h = Heap::new();
         let g = h.alloc(Object::Ordinary(OrdinaryObject::new()));
         g.borrow_mut()
-            .property_set(key("a"), Value::Bool(true))
+            .property_set(&mut h, key("a"), Value::Bool(true))
             .unwrap();
         assert!(g.borrow().has_property(&key("a")));
 
         let a = h.alloc(Object::Array(ArrayObject::new()));
         a.borrow_mut()
-            .property_set(key("b"), Value::Number(1.0))
+            .property_set(&mut h, key("b"), Value::Number(1.0))
             .unwrap();
         assert_eq!(a.borrow().class_name(), "Array");
         assert!(a.borrow().has_property(&key("b")));
 
         let p = h.alloc(Object::Proto(crate::builtins::ProtoObject::new(None)));
         p.borrow_mut()
-            .property_set(key("c"), Value::Number(2.0))
+            .property_set(&mut h, key("c"), Value::Number(2.0))
             .unwrap();
         assert!(p.borrow().has_property(&key("c")));
         assert_eq!(p.borrow().class_name(), "Object");

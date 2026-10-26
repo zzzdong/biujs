@@ -204,19 +204,29 @@ impl JSObject for NativeIteratorObject {
         }
     }
 
-    fn property_set(&mut self, _key: PropertyKey, _value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut crate::vm::gc::Heap,
+        _key: PropertyKey,
+        _value: Value,
+    ) -> Result<bool, String> {
         Err("Cannot add properties to an iterator".to_string())
     }
 
     fn define_property(
         &mut self,
+        _heap: &mut crate::vm::gc::Heap,
         _key: PropertyKey,
         _desc: PropertyDescriptor,
     ) -> Result<bool, String> {
         Err("Cannot add properties to an iterator".to_string())
     }
 
-    fn property_delete(&mut self, _key: &PropertyKey) -> bool {
+    fn property_delete(
+        &mut self,
+        _heap: &mut crate::vm::gc::Heap,
+        _key: &PropertyKey,
+    ) -> bool {
         false
     }
 

@@ -37,12 +37,10 @@ pub fn register_json(heap: &mut Heap) -> Value {
         crate::vm::object::NativeFunctionObject::new("JSON.stringify"),
     )));
     let _ = json.define_property(PropertyKey::well_known("parse").expect("well-known name"), super::method_descriptor(parse));
-    let _ = json.define_property(
-        PropertyKey::well_known("stringify").expect("well-known name"),
+    let _ = json.define_property(PropertyKey::well_known("stringify").expect("well-known name"),
         super::method_descriptor(stringify),
     );
-    let _ = json.define_property(
-        crate::builtins::to_string_tag_symbol_key(),
+    let _ = json.define_property(crate::builtins::to_string_tag_symbol_key(),
         PropertyDescriptor {
             value: Value::string("JSON"),
             writable: false,
@@ -202,8 +200,7 @@ impl<'a> JsonParser<'a> {
             let value = self.parse_value()?;
             // CreateDataProperty: a later duplicate key wins, and a `__proto__`
             // key becomes an ordinary own property.
-            let _ = obj.define_property(
-                PropertyKey::intern(self.heap, &key),
+            let _ = obj.define_property(PropertyKey::intern(&mut self.heap, &key),
                 PropertyDescriptor::data_descriptor(value),
             );
             self.skip_whitespace();

@@ -539,15 +539,16 @@ impl Builtins {
     /// `C.prototype === proto` (needed by `Object.prototype.toString.call(x)`)
     /// and `proto.constructor === C` (needed by `assert.throws`, which compares
     /// a caught error's `constructor` against `TypeError` and friends).
-    fn link_constructor_prototype(fn_val: &Value, proto: &Gc<Object>) {
+    fn link_constructor_prototype(heap: &mut Heap, fn_val: &Value, proto: &Gc<Object>) {
         if let Value::Object(obj_ref) = fn_val {
+            let desc = constructor_prototype_descriptor(Value::Object(*proto));
             let _ = obj_ref.borrow_mut().define_property(
+                heap,
                 PropertyKey::well_known("prototype").expect("well-known name"),
-                constructor_prototype_descriptor(Value::Object(*proto)),
+                desc,
             );
         }
-        let _ = proto.borrow_mut().define_property(
-            PropertyKey::well_known("constructor").expect("well-known name"),
+        let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("constructor").expect("well-known name"),
             method_descriptor(fn_val.clone()),
         );
     }
@@ -563,7 +564,7 @@ impl Builtins {
             NativeFunctionObject::new("Object"),
         )));
         object::register_object_statics(&object_fn_val, self, heap);
-        Self::link_constructor_prototype(&object_fn_val, &self.object_prototype);
+        Self::link_constructor_prototype(heap, &object_fn_val, &self.object_prototype);
         object::register_object_prototype(&self.object_prototype, &object_fn_val, heap);
         globals.insert(PropertyKey::intern(heap, "Object"), method_descriptor(object_fn_val));
 
@@ -572,7 +573,7 @@ impl Builtins {
         )));
         array::register_array_prototype(&self.array_prototype, heap);
         array::register_array_statics(&array_fn_val, heap);
-        Self::link_constructor_prototype(&array_fn_val, &self.array_prototype);
+        Self::link_constructor_prototype(heap, &array_fn_val, &self.array_prototype);
         globals.insert(PropertyKey::intern(heap, "Array"), method_descriptor(array_fn_val));
 
         // Error constructors with prototype property setup
@@ -591,7 +592,7 @@ impl Builtins {
                 NativeFunctionObject::new(name),
             )));
 
-            Self::link_constructor_prototype(&fn_val, &proto);
+            Self::link_constructor_prototype(heap, &fn_val, &proto);
             if name == "Error" {
                 // `Error.isError(value)`: true for objects carrying
                 // `[[ErrorData]]`, which the engine marks with the `[[Class]]`
@@ -619,7 +620,7 @@ impl Builtins {
             ("EvalError", &self.eval_error_prototype),
             ("SyntaxError", &self.syntax_error_prototype),
         ] {
-            error::setup_native_error_prototype(proto, name);
+            error::setup_native_error_prototype(heap, proto, name);
         }
 
         // Register `Symbol.iterator` on the natively iterable prototypes.
@@ -643,16 +644,14 @@ impl Builtins {
             .property_get(&PropertyKey::well_known("values").expect("well-known name"))
             .map(|desc| desc.value);
         if let Some(values_fn) = array_values_fn {
-            let _ = self.array_prototype.borrow_mut().define_property(
-                crate::vm::iterator::iterator_symbol_key(),
+            let _ = self.array_prototype.borrow_mut().define_property(heap, crate::vm::iterator::iterator_symbol_key(),
                 method_descriptor(values_fn),
             );
         }
         let string_iterator_fn = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME),
         )));
-        let _ = self.string_prototype.borrow_mut().define_property(
-            crate::vm::iterator::iterator_symbol_key(),
+        let _ = self.string_prototype.borrow_mut().define_property(heap, crate::vm::iterator::iterator_symbol_key(),
             method_descriptor(string_iterator_fn),
         );
 
@@ -660,7 +659,7 @@ impl Builtins {
             NativeFunctionObject::new("Boolean"),
         )));
         boolean::register_boolean_prototype(&self.boolean_prototype, heap);
-        Self::link_constructor_prototype(&bool_fn_val, &self.boolean_prototype);
+        Self::link_constructor_prototype(heap, &bool_fn_val, &self.boolean_prototype);
         globals.insert(PropertyKey::intern(heap, "Boolean"), method_descriptor(bool_fn_val));
 
         let number_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
@@ -668,7 +667,7 @@ impl Builtins {
         )));
         number::register_number_statics(&number_fn_val, &self.number_prototype, heap);
         number::register_number_prototype(&self.number_prototype, heap);
-        Self::link_constructor_prototype(&number_fn_val, &self.number_prototype);
+        Self::link_constructor_prototype(heap, &number_fn_val, &self.number_prototype);
         globals.insert(PropertyKey::intern(heap, "Number"), method_descriptor(number_fn_val));
 
         let string_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
@@ -676,14 +675,14 @@ impl Builtins {
         )));
         string::register_string_prototype(&self.string_prototype, heap);
         string::register_string_statics(&string_fn_val, heap);
-        Self::link_constructor_prototype(&string_fn_val, &self.string_prototype);
+        Self::link_constructor_prototype(heap, &string_fn_val, &self.string_prototype);
         globals.insert(PropertyKey::intern(heap, "String"), method_descriptor(string_fn_val));
 
         let function_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new("Function"),
         )));
         function::register_function_statics(&function_fn_val, &self.function_prototype, heap);
-        Self::link_constructor_prototype(&function_fn_val, &self.function_prototype);
+        Self::link_constructor_prototype(heap, &function_fn_val, &self.function_prototype);
         globals.insert(PropertyKey::intern(heap, "Function"), method_descriptor(function_fn_val));
 
         // Symbol constructor
@@ -692,7 +691,7 @@ impl Builtins {
         )));
         symbol::register_symbol_statics(&symbol_fn_val, &self.symbol_prototype, heap);
         symbol::register_symbol_prototype(&self.symbol_prototype, heap);
-        Self::link_constructor_prototype(&symbol_fn_val, &self.symbol_prototype);
+        Self::link_constructor_prototype(heap, &symbol_fn_val, &self.symbol_prototype);
 
         // `ArrayBuffer` and the TypedArray views (ES 25.1 / 23.2). The
         // constructors are dispatched by the VM: `new Uint8Array(buf)` builds a
@@ -704,7 +703,7 @@ impl Builtins {
             NativeFunctionObject::new("ArrayBuffer"),
         )));
         typedarray::register_arraybuffer_prototype(&ab_proto, heap);
-        Self::link_constructor_prototype(&ab_fn_val, &ab_proto);
+        Self::link_constructor_prototype(heap, &ab_fn_val, &ab_proto);
         set_static_method(&ab_fn_val, "isView", heap, |args| {
             typedarray::arraybuffer_is_view(args)
         });
@@ -716,7 +715,7 @@ impl Builtins {
             NativeFunctionObject::new("DataView"),
         )));
         typedarray::register_dataview_prototype(&dv_proto, heap);
-        Self::link_constructor_prototype(&dv_fn_val, &dv_proto);
+        Self::link_constructor_prototype(heap, &dv_fn_val, &dv_proto);
         globals.insert(PropertyKey::intern(heap, "DataView"), method_descriptor(dv_fn_val));
 
         // ── `%TypedArray%`（ES 22.2.1）──
@@ -737,7 +736,7 @@ impl Builtins {
         let ta_ctor = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new("TypedArray"),
         )));
-        Self::link_constructor_prototype(&ta_ctor, &ta_proto);
+        Self::link_constructor_prototype(heap, &ta_ctor, &ta_proto);
         // `%TypedArray%.from` / `%TypedArray%.of`（22.2.2.1 / 22.2.2.2）：要迭代、
         // 可能回调、还要 `new C(len)`，只有 VM 能做 —— 故登记在这里、由 VM 分派
         // （限定名 "TypedArray.from" / "TypedArray.of"）。八个具体构造器经
@@ -762,8 +761,7 @@ impl Builtins {
             let species_getter = Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(typedarray::TA_SPECIES_NATIVE),
             )));
-            let _ = ta_obj.borrow_mut().define_property(
-                species_symbol_key(),
+            let _ = ta_obj.borrow_mut().define_property(heap, species_symbol_key(),
                 PropertyDescriptor {
                     value: Value::Undefined,
                     writable: false,
@@ -789,12 +787,11 @@ impl Builtins {
             }
             // 共享方法**不再**在这里注册 —— 它们在 `%TypedArray%.prototype` 上，
             // 具体 prototype 经原型链继承。这里只放与类型有关的 `BYTES_PER_ELEMENT`。
-            typedarray::register_typedarray_bytes_per_element(kind, &proto);
-            Self::link_constructor_prototype(&ctor_val, &proto);
+            typedarray::register_typedarray_bytes_per_element(heap, kind, &proto);
+            Self::link_constructor_prototype(heap, &ctor_val, &proto);
             // `Uint8Array.BYTES_PER_ELEMENT` (ES 23.2.5.3), read-only.
             if let Value::Object(ctor_obj) = &ctor_val {
-                let _ = ctor_obj.borrow_mut().define_property(
-                    PropertyKey::well_known("BYTES_PER_ELEMENT").expect("well-known name"),
+                let _ = ctor_obj.borrow_mut().define_property(heap, PropertyKey::well_known("BYTES_PER_ELEMENT").expect("well-known name"),
                     PropertyDescriptor {
                         value: Value::Number(kind.bytes_per_element() as f64),
                         writable: false,
@@ -811,8 +808,7 @@ impl Builtins {
                 let species_getter = Value::Object(heap.alloc(Object::NativeFunction(
                     NativeFunctionObject::new(typedarray::TA_SPECIES_NATIVE),
                 )));
-                let _ = ctor_obj.borrow_mut().define_property(
-                    species_symbol_key(),
+                let _ = ctor_obj.borrow_mut().define_property(heap, species_symbol_key(),
                     PropertyDescriptor {
                         value: Value::Undefined,
                         writable: false,
@@ -833,7 +829,7 @@ impl Builtins {
             NativeFunctionObject::new("Map"),
         )));
         map::register_map_prototype(&self.map_prototype, heap);
-        Self::link_constructor_prototype(&map_fn_val, &self.map_prototype);
+        Self::link_constructor_prototype(heap, &map_fn_val, &self.map_prototype);
         // `%Map.prototype.entries%` and `Map.prototype[Symbol.iterator]` are
         // the same object (ES 23.1.3.4), which also makes `for (x of map)`
         // reach the VM through the ordinary `GetMethod` lookup.
@@ -843,8 +839,7 @@ impl Builtins {
             .property_get(&PropertyKey::well_known("entries").expect("well-known name"))
             .map(|desc| desc.value);
         if let Some(entries_fn) = entries_fn {
-            let _ = self.map_prototype.borrow_mut().define_property(
-                crate::vm::iterator::iterator_symbol_key(),
+            let _ = self.map_prototype.borrow_mut().define_property(heap, crate::vm::iterator::iterator_symbol_key(),
                 method_descriptor(entries_fn),
             );
         }
@@ -862,8 +857,7 @@ impl Builtins {
             NativeFunctionObject::new(map::MAP_SPECIES_NATIVE),
         )));
         if let Value::Object(map_obj) = &map_fn_val {
-            let _ = map_obj.borrow_mut().define_property(
-                species_symbol_key(),
+            let _ = map_obj.borrow_mut().define_property(heap, species_symbol_key(),
                 PropertyDescriptor {
                     value: Value::Undefined,
                     writable: false,
@@ -883,7 +877,7 @@ impl Builtins {
             NativeFunctionObject::new("Set"),
         )));
         set::register_set_prototype(&self.set_prototype, heap);
-        Self::link_constructor_prototype(&set_fn_val, &self.set_prototype);
+        Self::link_constructor_prototype(heap, &set_fn_val, &self.set_prototype);
         // `Set.prototype.keys` and `Set.prototype[Symbol.iterator]` are the
         // *same* function object, namely `Set.prototype.values` (ES 23.2.3.10).
         let set_values_fn = self
@@ -894,12 +888,10 @@ impl Builtins {
         if let Some(values_fn) = set_values_fn {
             {
                 let mut proto = self.set_prototype.borrow_mut();
-                let _ = proto.define_property(
-                    PropertyKey::well_known("keys").expect("well-known name"),
+                let _ = proto.define_property(heap, PropertyKey::well_known("keys").expect("well-known name"),
                     method_descriptor(values_fn.clone()),
                 );
-                let _ = proto.define_property(
-                    crate::vm::iterator::iterator_symbol_key(),
+                let _ = proto.define_property(heap, crate::vm::iterator::iterator_symbol_key(),
                     method_descriptor(values_fn),
                 );
             }
@@ -910,8 +902,7 @@ impl Builtins {
             NativeFunctionObject::new(set::SET_SPECIES_NATIVE),
         )));
         if let Value::Object(set_obj) = &set_fn_val {
-            let _ = set_obj.borrow_mut().define_property(
-                species_symbol_key(),
+            let _ = set_obj.borrow_mut().define_property(heap, species_symbol_key(),
                 PropertyDescriptor {
                     value: Value::Undefined,
                     writable: false,
@@ -931,7 +922,7 @@ impl Builtins {
             NativeFunctionObject::new("WeakMap"),
         )));
         weak::register_weakmap_prototype(&self.weakmap_prototype, heap);
-        Self::link_constructor_prototype(&weakmap_fn_val, &self.weakmap_prototype);
+        Self::link_constructor_prototype(heap, &weakmap_fn_val, &self.weakmap_prototype);
         register_wrapper_prototype("WeakMap", self.weakmap_prototype);
         globals.insert(PropertyKey::intern(heap, "WeakMap"), method_descriptor(weakmap_fn_val));
 
@@ -939,7 +930,7 @@ impl Builtins {
             NativeFunctionObject::new("WeakSet"),
         )));
         weak::register_weakset_prototype(&self.weakset_prototype, heap);
-        Self::link_constructor_prototype(&weakset_fn_val, &self.weakset_prototype);
+        Self::link_constructor_prototype(heap, &weakset_fn_val, &self.weakset_prototype);
         register_wrapper_prototype("WeakSet", self.weakset_prototype);
         globals.insert(PropertyKey::intern(heap, "WeakSet"), method_descriptor(weakset_fn_val));
 
@@ -984,9 +975,8 @@ impl Builtins {
                     getter: None,
                     setter: None,
                 };
-                let _ = symbol_obj
-                    .borrow_mut()
-                    .define_property(PropertyKey::intern(heap, name), desc);
+                let key = PropertyKey::intern(heap, name);
+                let _ = symbol_obj.borrow_mut().define_property(heap, key, desc);
             }
         }
         globals.insert(PropertyKey::intern(heap, "Symbol"), method_descriptor(symbol_fn_val));
@@ -1015,7 +1005,7 @@ impl Builtins {
         )));
         date::register_date_prototype(&self.date_prototype, heap);
         date::register_date_statics(&date_fn_val, heap);
-        Self::link_constructor_prototype(&date_fn_val, &self.date_prototype);
+        Self::link_constructor_prototype(heap, &date_fn_val, &self.date_prototype);
         register_wrapper_prototype("Date", self.date_prototype);
         globals.insert(PropertyKey::intern(heap, "Date"), method_descriptor(date_fn_val));
 
@@ -1026,7 +1016,7 @@ impl Builtins {
             NativeFunctionObject::new("RegExp"),
         )));
         regexp::register_regexp_prototype(&self.regexp_prototype, heap);
-        Self::link_constructor_prototype(&regexp_fn_val, &self.regexp_prototype);
+        Self::link_constructor_prototype(heap, &regexp_fn_val, &self.regexp_prototype);
         register_wrapper_prototype("RegExp", self.regexp_prototype);
         globals.insert(PropertyKey::intern(heap, "RegExp"), method_descriptor(regexp_fn_val));
 
@@ -1039,15 +1029,14 @@ impl Builtins {
         promise::register_promise_prototype(&self.promise_prototype, heap);
         promise::register_promise_statics(&promise_fn_val, heap);
         // `Promise.prototype[Symbol.toStringTag] === "Promise"` (ES 27.2.5.5).
-        define_string_tag(&self.promise_prototype, "Promise");
+        define_string_tag(heap, &self.promise_prototype, "Promise");
         // `Promise[Symbol.species]` (ES 27.2.2.3) is an accessor returning its
         // receiver, mirroring `Map`/`Set`/`Array`; the VM answers the getter.
         let promise_species_getter = Value::Object(heap.alloc(Object::NativeFunction(
             NativeFunctionObject::new(promise::PROMISE_SPECIES_NATIVE),
         )));
         if let Value::Object(promise_obj) = &promise_fn_val {
-            let _ = promise_obj.borrow_mut().define_property(
-                species_symbol_key(),
+            let _ = promise_obj.borrow_mut().define_property(heap, species_symbol_key(),
                 PropertyDescriptor {
                     value: Value::Undefined,
                     writable: false,
@@ -1058,7 +1047,7 @@ impl Builtins {
                 },
             );
         }
-        Self::link_constructor_prototype(&promise_fn_val, &self.promise_prototype);
+        Self::link_constructor_prototype(heap, &promise_fn_val, &self.promise_prototype);
         register_wrapper_prototype("Promise", self.promise_prototype);
         globals.insert(PropertyKey::intern(heap, "Promise"), method_descriptor(promise_fn_val));
         globals.insert(PropertyKey::intern(heap, "JSON"), method_descriptor(json::register_json(heap)));
@@ -1871,20 +1860,26 @@ impl JSObject for ProtoObject {
     }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
         self.properties.get(key).cloned()
     }
-    fn property_set(&mut self, key: PropertyKey, value: Value) -> Result<bool, String> {
+    fn property_set(
+        &mut self,
+        _heap: &mut crate::vm::gc::Heap,
+        key: PropertyKey,
+        value: Value,
+    ) -> Result<bool, String> {
         self.properties
             .insert(key, PropertyDescriptor::data_descriptor(value));
         Ok(true)
     }
     fn define_property(
         &mut self,
+        _heap: &mut crate::vm::gc::Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
         self.properties.insert(key, desc);
         Ok(true)
     }
-    fn property_delete(&mut self, key: &PropertyKey) -> bool {
+    fn property_delete(&mut self, _heap: &mut crate::vm::gc::Heap, key: &PropertyKey) -> bool {
         self.properties.remove(key).is_some()
     }
     fn has_property(&self, key: &PropertyKey) -> bool {
@@ -1940,12 +1935,10 @@ where
             format!("{owner}.{name}")
         };
         let key = PropertyKey::intern(heap, name);
-        let _ = obj_ref.borrow_mut().define_property(
-            key,
-            method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-                crate::vm::object::NativeFunctionObject::new(&full),
-            )))),
-        );
+        let desc = method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
+            crate::vm::object::NativeFunctionObject::new(&full),
+        ))));
+        let _ = obj_ref.borrow_mut().define_property(heap, key, desc);
     }
 }
 
@@ -1980,9 +1973,8 @@ pub const WEAKSET_METHOD_PREFIX: &str = "__weakset_method__";
 
 /// Install the `Symbol.toStringTag` of a collection prototype
 /// (`Map.prototype[Symbol.toStringTag] === "Map"`, ES 23.1.3.14 & friends).
-pub fn define_string_tag(proto: &Gc<Object>, tag: &str) {
-    let _ = proto.borrow_mut().define_property(
-        to_string_tag_symbol_key(),
+pub fn define_string_tag(heap: &mut Heap, proto: &Gc<Object>, tag: &str) {
+    let _ = proto.borrow_mut().define_property(heap, to_string_tag_symbol_key(),
         PropertyDescriptor {
             value: Value::string(tag),
             writable: false,
@@ -2002,9 +1994,10 @@ pub fn set_vm_method(proto: &Gc<Object>, heap: &mut Heap, prefix: &str, name: &s
     let method_val = Value::Object(heap.alloc(Object::NativeFunction(
         crate::vm::object::NativeFunctionObject::new(&format!("{prefix}{name}")),
     )));
+    let key = PropertyKey::intern(heap, name);
     let _ = proto
         .borrow_mut()
-        .define_property(PropertyKey::intern(heap, name), method_descriptor(method_val));
+        .define_property(heap, key, method_descriptor(method_val));
 }
 
 /// [`set_vm_method`] for `Map.prototype`.
@@ -2144,7 +2137,7 @@ where
     let method_val = Value::Object(heap.alloc(Object::NativeFunction(
         crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}")),
     )));
-    let _ = proto.borrow_mut().define_property(key, method_descriptor(method_val));
+    let _ = proto.borrow_mut().define_property(heap, key, method_descriptor(method_val));
 }
 
 /// Like [`set_prototype_method`], but with an explicit `length`, for the few
@@ -2162,10 +2155,11 @@ pub fn set_prototype_method_arity<F>(
     let mut method =
         crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}"));
     method.set_length(arity);
-    let _ = proto.borrow_mut().define_property(
-        PropertyKey::intern(heap, name),
-        method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(method)))),
-    );
+    let key = PropertyKey::intern(heap, name);
+    let value = method_descriptor(Value::Object(
+        heap.alloc(Object::NativeFunction(method)),
+    ));
+    let _ = proto.borrow_mut().define_property(heap, key, value);
 }
 
 /// Register a prototype method whose implementation lives in the VM

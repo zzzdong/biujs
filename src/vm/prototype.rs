@@ -106,6 +106,7 @@ pub fn find_descriptor(
 ///
 /// Returns Ok(true) if the set succeeded, Ok(false) if strict mode should throw.
 pub fn internal_set(
+    heap: &mut Heap,
     obj: Gc<Object>,
     key: PropertyKey,
     value: Value,
@@ -122,14 +123,14 @@ pub fn internal_set(
                 return Ok(false);
             }
             let mut borrowed = obj.borrow_mut();
-            return borrowed.property_set(key, value);
+            return borrowed.property_set(heap, key, value);
         } else {
             // Accessor property — call setter
             if desc.invoked_setter().is_some() {
                 // TODO: call setter function with value
                 // For now, just store the value directly
                 let mut borrowed = obj.borrow_mut();
-                return borrowed.property_set(key, value);
+                return borrowed.property_set(heap, key, value);
             }
             return Ok(false);
         }
@@ -153,13 +154,13 @@ pub fn internal_set(
                     return Ok(false);
                 }
                 let mut borrowed = obj.borrow_mut();
-                return borrowed.property_set(key, value);
+                return borrowed.property_set(heap, key, value);
             }
             // Accessor on prototype — call setter
             if desc.invoked_setter().is_some() {
                 // TODO: call setter on obj with value
                 let mut borrowed = obj.borrow_mut();
-                return borrowed.property_set(key, value);
+                return borrowed.property_set(heap, key, value);
             }
             return Ok(false);
         }
@@ -170,7 +171,7 @@ pub fn internal_set(
 
     // Step 3: No property found anywhere — create on obj
     let mut borrowed = obj.borrow_mut();
-    borrowed.property_set(key, value)
+    borrowed.property_set(heap, key, value)
 }
 
 // ─────────────────────────────────────────────────────────
@@ -207,7 +208,11 @@ pub fn internal_has_property(
 // ─────────────────────────────────────────────────────────
 
 /// ES6 [[Delete]](P) — delete an own property.
-pub fn internal_delete(obj: Gc<Object>, key: &PropertyKey) -> Result<bool, String> {
+pub fn internal_delete(
+    heap: &mut Heap,
+    obj: Gc<Object>,
+    key: &PropertyKey,
+) -> Result<bool, String> {
     // ES 10.1.9.1: `[[Delete]]` answers `true` when the own property is *already*
     // absent — `false` means "it is there and refuses to go" (a non-configurable
     // one). Without the first branch `delete o.missing` answered `false`, which
@@ -216,7 +221,7 @@ pub fn internal_delete(obj: Gc<Object>, key: &PropertyKey) -> Result<bool, Strin
         return Ok(true);
     }
     let mut borrowed = obj.borrow_mut();
-    Ok(borrowed.property_delete(key))
+    Ok(borrowed.property_delete(heap, key))
 }
 
 // ─────────────────────────────────────────────────────────

@@ -468,8 +468,7 @@ impl VM {
                 let mut result = crate::vm::object::OrdinaryObject::new();
                 result.set_prototype(Some(self.builtins.object_prototype));
                 for (field, value) in [("proxy", proxy), ("revoke", revoke)] {
-                    let _ = result.define_property(
-                        PropertyKey::intern(&mut self.heap, field),
+                    let _ = result.define_property(PropertyKey::intern(&mut self.heap, field),
                         PropertyDescriptor::data_descriptor(value),
                     );
                 }
@@ -2129,12 +2128,9 @@ impl VM {
                 // write (non-extensible, frozen) has to raise, not silently drop
                 // the element (`result_writes_are_abrupt_when_the_target_blocks_them`).
                 for (i, entry) in entries.iter().enumerate() {
+                    let key = PropertyKey::element(&mut self.heap, i as u64);
                     if let Some(v) = entry
-                        && !Self::create_data_property(
-                            &target,
-                            &PropertyKey::element(&mut self.heap, i as u64),
-                            v,
-                        )
+                        && !Self::create_data_property(&mut self.heap, &target, &key, v)
                     {
                         return Err(RuntimeError::TypeError(format!(
                             "Cannot define property {i} on the array-species result"

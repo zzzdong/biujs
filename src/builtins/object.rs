@@ -160,8 +160,7 @@ pub fn object_from_entries(heap: &mut super::Heap, args: &[Value]) -> Result<Val
         }
         let key = to_object_get(&entry, &zero);
         let value = to_object_get(&entry, &one);
-        let _ = result.define_property(
-            PropertyKey::intern(heap, &key.to_js_string()),
+        let _ = result.define_property(PropertyKey::intern(heap, &key.to_js_string()),
             PropertyDescriptor {
                 value,
                 writable: true,
@@ -264,37 +263,32 @@ pub fn descriptor_to_value(
             // Accessor descriptor: report get/set, never value/writable.
             let undefined = Value::Undefined;
             desc_obj
-                .property_set(
-                    PropertyKey::well_known("get").expect("well-known name"),
+                .property_set(heap, PropertyKey::well_known("get").expect("well-known name"),
                     desc.getter.clone().unwrap_or(undefined.clone()),
                 )
                 .ok();
             desc_obj
-                .property_set(
-                    PropertyKey::well_known("set").expect("well-known name"),
+                .property_set(heap, PropertyKey::well_known("set").expect("well-known name"),
                     desc.setter.clone().unwrap_or(undefined),
                 )
                 .ok();
         } else {
             desc_obj
-                .property_set(PropertyKey::well_known("value").expect("well-known name"), desc.value.clone())
+                .property_set(heap, PropertyKey::well_known("value").expect("well-known name"), desc.value.clone())
                 .ok();
             desc_obj
-                .property_set(
-                    PropertyKey::well_known("writable").expect("well-known name"),
+                .property_set(heap, PropertyKey::well_known("writable").expect("well-known name"),
                     Value::Bool(desc.writable),
                 )
                 .ok();
         }
         desc_obj
-            .property_set(
-                PropertyKey::well_known("enumerable").expect("well-known name"),
+            .property_set(heap, PropertyKey::well_known("enumerable").expect("well-known name"),
                 Value::Bool(desc.enumerable),
             )
             .ok();
         desc_obj
-            .property_set(
-                PropertyKey::well_known("configurable").expect("well-known name"),
+            .property_set(heap, PropertyKey::well_known("configurable").expect("well-known name"),
                 Value::Bool(desc.configurable),
             )
             .ok();
@@ -611,7 +605,7 @@ pub fn apply_property_descriptor(
             .map(|v| v.to_boolean())
             .unwrap_or_else(|| current(|d| d.configurable));
         return obj
-            .define_property(key.clone(), descriptor)
+            .define_property(heap, key.clone(), descriptor)
             .map_err(RuntimeError::from_property_error);
     }
 
@@ -629,7 +623,7 @@ pub fn apply_property_descriptor(
     descriptor.configurable = read(heap, "configurable")
         .map(|v| v.to_boolean())
         .unwrap_or_else(|| current(|d| d.configurable));
-    obj.define_property(key.clone(), descriptor)
+    obj.define_property(heap, key.clone(), descriptor)
         .map_err(RuntimeError::from_property_error)
 }
 
@@ -772,7 +766,7 @@ pub fn object_assign(heap: &mut super::Heap, args: &[Value]) -> Result<Value, Ru
         };
         if let Value::Object(target_ref) = &target {
             for (key, value) in entries {
-                let _ = target_ref.borrow_mut().property_set(key, value);
+                let _ = target_ref.borrow_mut().property_set(heap, key, value);
             }
         }
     }
@@ -975,11 +969,13 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
     use super::set_prototype_method;
 
     // Dedicated native so that `.call(receiver)` keeps Array/Number semantics.
+    let desc = super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
+        crate::vm::object::NativeFunctionObject::new(OBJECT_TO_STRING_NATIVE),
+    ))));
     let _ = proto.borrow_mut().define_property(
+        heap,
         PropertyKey::well_known("toString").expect("well-known name"),
-        super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-            crate::vm::object::NativeFunctionObject::new(OBJECT_TO_STRING_NATIVE),
-        )))),
+        desc,
     );
     set_prototype_method(proto, heap, "valueOf", |this, _args| Ok(this.clone()));
     // 闭包从不被调用（`set_prototype_method` 忽略它，真正走
@@ -1007,12 +1003,11 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
     set_prototype_method(proto, heap, "toLocaleString", |this, args| {
         object_prototype_to_string(this, args)
     });
-    let _ = proto
-        .borrow_mut()
-        .define_property(
-            PropertyKey::well_known("constructor").expect("well-known name"),
-            super::method_descriptor(object_fn.clone()),
-        );
+    let _ = proto.borrow_mut().define_property(
+        heap,
+        PropertyKey::well_known("constructor").expect("well-known name"),
+        super::method_descriptor(object_fn.clone()),
+    );
 }
 
 pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins, heap: &mut Heap) {
