@@ -577,11 +577,29 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 
 **验收：全量 17,304 → 17,305（84.39% → 84.40%，+1），无逐套件回退。**
 
+**第三片已落地（2026-10-26）：`undefined` / `NaN` / `Infinity` 成为全局对象的属性。**
+
+ES 19.1.1–19.1.3：三者是全局对象的属性，`{writable: false, enumerable: false,
+configurable: false}`。之前它们只是编译器里的字面量，于是
+`Object.getOwnPropertyDescriptor(globalThis, 'undefined')` 是 `undefined`，而
+`undefined = 5` 会造出一个可写的同名全局。现在：描述符可读、`getOwnPropertyNames`
+列出它们、`Object.keys` 不列、`NaN = 5` 是空操作（严格模式 TypeError）。
+
+顺带修掉一处：`var NaN;` 在严格模式不能抛 —— ES `CreateGlobalVarBinding` 第 4 步
+规定"名字已存在时声明不写"（ES5 里 `NaN` 不是关键字，`S8.5_A4_T1` 就测这条）。当前
+IR 把提升写拼成了普通 `StoreEnv undefined`，所以在 `StoreEnv` 的全局分支里按"值是
+undefined 且名字是本程序声明的 var"判成声明。**待办**：IR 里加一条
+`DeclareGlobalVar` 把"声明"与"赋值"真正分开，这段启发式才能去掉。
+
+**验收：全量 17,305 → 17,311（84.40% → 84.43%，+6），无逐套件回退。**
+
 剩余（按序）：
 - `Shape` + transition cache；`Dictionary` fallback；descriptor 惰性物化
-  （`ObjectHeader` 已为 `shape` / `slots` 留好位置）。
-- `Realm`；`Object.getOwnPropertyDescriptor(globalThis,"undefined")` 有值；
-  对象尺寸断言仍过。
+  （`ObjectHeader` 已为 `shape` / `slots` 留好位置）。**前提**：形状要按 VM 共享
+  （`Atom` 是 per-heap 的，跨 VM 复用会串味），而 `JSObject` 的可变方法
+  （`property_set` / `define_property` / `property_delete`，约 146 个调用点）拿不到
+  堆 —— 这正是 1D「统一入口签名」那一件事。
+- `Realm`；对象尺寸断言仍过。
 
 **1C 数组 + 函数（8–12 人日）**
 - `Vec<Element>` + `BitSet` holes + 稀疏 fallback；删 `MAX_DENSE_ELEMENTS` 硬报错。
@@ -671,7 +689,8 @@ Engine/Context ── Realm { global, intrinsics } ── VM { Heap, Frame, EnvR
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 **1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
-> **1B 两片**（全局对象存真描述符；`ObjectHeader` 统一原型/可扩展/冻结/密封）。
+> **1B 三片**（全局对象存真描述符；`ObjectHeader` 统一标志位；`undefined`/`NaN`/
+> `Infinity` 成为全局属性）。
 
 剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，1A 也收口，下面是：
     S0#4 第二档（GC 句柄代次 —— `Value` 仍 16 B，需要另找空间，或在 `Value` 缩小后补）→

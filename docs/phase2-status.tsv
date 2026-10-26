@@ -41,7 +41,7 @@ language/expressions/left-shift	34	8	3
 language/expressions/logical-not	15	4	0
 language/expressions/multiplication	32	7	1
 language/expressions/postfix-decrement	26	8	3
-language/expressions/property-accessors	13	2	6
+language/expressions/property-accessors	14	2	5
 language/expressions/subtraction	30	7	1
 language/expressions/typeof	12	3	1
 language/expressions/void	8	1	0
@@ -54,7 +54,7 @@ language/computed-property-names	40	0	8
 built-ins/Boolean	29	3	19
 built-ins/Map	187	5	12
 built-ins/TypedArray	303	513	630
-built-ins/Object	3078	32	301
+built-ins/Object	3081	32	298
 built-ins/String	793	72	358
 language/expressions/generators	241	30	19
 language/expressions/assignment/destructuring	3	1	4
@@ -85,7 +85,7 @@ built-ins/Promise	245	292	140
 built-ins/Symbol	59	21	18
 language/expressions/yield	42	2	19
 language/rest-parameters	11	0	0
-language/expressions/assignment	343	88	54
+language/expressions/assignment	345	88	52
 language/expressions/bitwise-xor	19	8	3
 language/expressions/comma	4	2	0
 language/expressions/division	35	9	1

@@ -1085,6 +1085,27 @@ impl Builtins {
             );
         }
 
+        // ES 19.1.1–19.1.3: `undefined` / `NaN` / `Infinity` are properties of the
+        // global object with `{writable: false, enumerable: false, configurable:
+        // false}`. The lowering reads them as literals, so registering them only
+        // makes their *property* semantics observable:
+        // `Object.getOwnPropertyDescriptor(globalThis, 'undefined')` has a value,
+        // `Object.getOwnPropertyNames(globalThis)` lists them (but `Object.keys`
+        // does not), and `undefined = 5` is a silent no-op / strict TypeError
+        // instead of creating a writable global of that name.
+        globals.insert(
+            PropertyKey::intern(heap, "undefined"),
+            constant_descriptor(Value::Undefined),
+        );
+        globals.insert(
+            PropertyKey::intern(heap, "NaN"),
+            constant_descriptor(Value::Number(f64::NAN)),
+        );
+        globals.insert(
+            PropertyKey::intern(heap, "Infinity"),
+            constant_descriptor(Value::Number(f64::INFINITY)),
+        );
+
         // Prototype registry for `Object(value)` / ToObject boxing, and for the
         // array objects the engine creates outside the `New` prologue.
         register_wrapper_prototype("Array", self.array_prototype);

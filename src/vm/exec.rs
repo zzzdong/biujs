@@ -2759,7 +2759,20 @@ impl VM {
                                 }
                                 Some(descriptor) => {
                                     if !descriptor.writable {
-                                        if module.strict {
+                                        // ES `CreateGlobalVarBinding` 第 4 步：
+                                        // 名字已经存在时，`var` 声明**不写**。我们
+                                        // 的 IR 把提升写拼成了普通的 `StoreEnv
+                                        // undefined`，所以"给一个已存在的只读全局
+                                        // 写 undefined 且名字是本程序声明的 var"
+                                        // 判成声明而非赋值 —— `var NaN;` 即使在
+                                        // 严格模式也不能抛（ES5 `NaN` 不是关键字）。
+                                        //
+                                        // 待办：真正的区分要在 IR 里加一条
+                                        // `DeclareGlobalVar`（声明 vs 赋值），
+                                        // 这一段才能去掉。
+                                        let is_var_declaration = value.is_undefined()
+                                            && module.declared_names.contains(&name);
+                                        if !is_var_declaration && module.strict {
                                             return Err(RuntimeError::TypeError(format!(
                                                 "Cannot assign to read-only property '{name}'"
                                             )));

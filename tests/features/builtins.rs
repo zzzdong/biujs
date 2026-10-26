@@ -1008,6 +1008,42 @@ fn global_this_is_the_script_s_global_object() {
         ),
         "true,false,true"
     );
+    // ES 19.1.1–19.1.3: `undefined` / `NaN` / `Infinity` are properties of the
+    // global object, all `{writable: false, enumerable: false, configurable:
+    // false}`. They appear in `getOwnPropertyNames` but not in `Object.keys`,
+    // and a sloppy assignment to one is a no-op instead of creating a global.
+    for name in ["undefined", "NaN", "Infinity"] {
+        assert_eq!(
+            eval_string(&format!(
+                "var d = Object.getOwnPropertyDescriptor(globalThis, '{name}'); \
+                 String(d !== undefined) + ',' + String(d.writable) + ',' + \
+                 String(d.enumerable) + ',' + String(d.configurable)"
+            )),
+            "true,false,false,false",
+            "{name} 的描述符"
+        );
+    }
+    assert_eq!(
+        eval_string("String(Object.getOwnPropertyNames(globalThis).indexOf('NaN') >= 0)"),
+        "true"
+    );
+    assert_eq!(
+        eval_string("String(Object.keys(globalThis).indexOf('NaN') >= 0)"),
+        "false"
+    );
+    assert_eq!(
+        eval_string("undefined = 5; String(globalThis.undefined) + ',' + String(typeof undefined)"),
+        "undefined,undefined"
+    );
+
+    // ES5: they are *not keywords* — `var NaN;` is legal. Per
+    // `CreateGlobalVarBinding` a `var` declaration does not write to an
+    // existing binding, so this must not throw even in strict code.
+    assert_eq!(
+        eval_string("'use strict'; var NaN; var Infinity; var undefined; 'ok'"),
+        "ok"
+    );
+
     // A non-configurable property cannot be redefined away …
     assert_eq!(
         eval_string(
