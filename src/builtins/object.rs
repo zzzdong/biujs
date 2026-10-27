@@ -160,7 +160,8 @@ pub fn object_from_entries(heap: &mut super::Heap, args: &[Value]) -> Result<Val
         }
         let key = to_object_get(&entry, &zero);
         let value = to_object_get(&entry, &one);
-        let _ = result.define_property(PropertyKey::intern(heap, &key.to_js_string()),
+        let key = PropertyKey::intern(heap, &key.to_js_string());
+        let _ = result.define_property(heap, key,
             PropertyDescriptor {
                 value,
                 writable: true,

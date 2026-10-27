@@ -182,6 +182,33 @@ impl FromIterator<(PropertyKey, PropertyDescriptor)> for PropertyTable {
     }
 }
 
+/// ES `OrdinaryOwnPropertyKeys`：索引键升序在前，其余字符串键按创建顺序，符号键
+/// 最后。形状（`Shape::keys`）记的是创建顺序，属性表记的也是创建顺序，所以两处
+/// 共用这一遍排序。
+pub(crate) fn es_own_key_order(creation_order: &[PropertyKey]) -> Vec<PropertyKey> {
+    let mut indices: Vec<(u32, PropertyKey)> = Vec::new();
+    let mut strings: Vec<PropertyKey> = Vec::new();
+    let mut symbols: Vec<PropertyKey> = Vec::new();
+
+    for key in creation_order {
+        // `array_index()` 是唯一的索引判定（规范形式），`Index` 与字符串形式的
+        // 规范索引在这里走同一条路。
+        match key.array_index() {
+            Some(index) => indices.push((index, *key)),
+            None => match key {
+                PropertyKey::Str(_) => strings.push(*key),
+                _ => symbols.push(*key),
+            },
+        }
+    }
+
+    indices.sort_by_key(|(index, _)| *index);
+    let mut ordered: Vec<PropertyKey> = indices.into_iter().map(|(_, key)| key).collect();
+    ordered.extend(strings);
+    ordered.extend(symbols);
+    ordered
+}
+
 impl PropertyTable {
 
     pub(crate) fn get(&self, key: &PropertyKey) -> Option<&PropertyDescriptor> {
@@ -213,27 +240,7 @@ impl PropertyTable {
 
     /// Keys in `OrdinaryOwnPropertyKeys` order.
     pub(crate) fn keys(&self) -> Vec<PropertyKey> {
-        let mut indices: Vec<(u32, PropertyKey)> = Vec::new();
-        let mut strings: Vec<PropertyKey> = Vec::new();
-        let mut symbols: Vec<PropertyKey> = Vec::new();
-
-        for key in &self.creation_order {
-            // `array_index()` 是唯一的索引判定（规范形式），`Index` 与字符串形式的
-            // 规范索引在这里走同一条路。
-            match key.array_index() {
-                Some(index) => indices.push((index, key.clone())),
-                None => match key {
-                    PropertyKey::Str(_) => strings.push(key.clone()),
-                    _ => symbols.push(key.clone()),
-                },
-            }
-        }
-
-        indices.sort_by_key(|(index, _)| *index);
-        let mut ordered: Vec<PropertyKey> = indices.into_iter().map(|(_, key)| key).collect();
-        ordered.extend(strings);
-        ordered.extend(symbols);
-        ordered
+        es_own_key_order(&self.creation_order)
     }
 }
 
@@ -467,10 +474,32 @@ impl Default for ObjectHeader {
 }
 
 /// Standard JS object with named properties, prototype chain, and extensibility.
+///
+/// # 属性存在哪里
+///
+/// 两条路径（1B 的 Shape）：
+///
+/// - **快速模式**：[`Shape`](crate::vm::shape::Shape) 给出"属性名 → 槽位"，值以裸
+///   `Value` 存在 `slots` 里；只有属性**不是默认属性**（accessor / 只读 / 不可枚举 /
+///   不可配置）时才需要一份完整描述符，那些放在 `attrs`（通常为空）。
+/// - **字典模式**：删过属性之后（`delete o.x`）降级成一张 `PropertyTable`，所有属性
+///   回到表里，`shape` / `slots` / `attrs` 停用。V8 也是这么做的 —— 删除会打乱布局，
+///   硬留在快速模式只会让形状越分越碎。
+///
+/// 形状的 root 挂在堆上（**按 VM 共享**，因为 atom 是 per-heap 的），所以对象创建时
+/// 不需要它：`shape: None` 就是"还没有属性"，第一次加属性时才从 `heap.root_shape()`
+/// 起一条链（可变路径现在都拿得到堆）。
 #[derive(Debug, Clone)]
 pub struct OrdinaryObject {
     header: ObjectHeader,
-    properties: PropertyTable,
+    /// 快速模式的形状。`None` = 还没有任何属性。
+    shape: Option<Rc<crate::vm::shape::Shape>>,
+    /// 快速模式的属性值，下标即形状里的槽位。
+    slots: Vec<Value>,
+    /// 快速模式下的**非默认**属性。
+    attrs: PropertyTable,
+    /// 字典模式（`delete` 之后）。有值时快速模式的三个字段都停用。
+    dict: Option<PropertyTable>,
     /// `[[Class]]` as reported by `Object.prototype.toString` (ES 19.1.3.6).
     /// `"Object"` for everything the engine creates except error instances,
     /// which all report `"Error"`.
@@ -480,8 +509,11 @@ pub struct OrdinaryObject {
 impl OrdinaryObject {
     pub fn new() -> Self {
         Self {
-            properties: PropertyTable::new(),
             header: ObjectHeader::new(),
+            shape: None,
+            slots: Vec::new(),
+            attrs: PropertyTable::new(),
+            dict: None,
             class_name: "Object",
         }
     }
@@ -496,9 +528,8 @@ impl OrdinaryObject {
 
     pub fn with_prototype(proto: Gc<Object>) -> Self {
         Self {
-            properties: PropertyTable::new(),
             header: ObjectHeader::with_prototype(proto),
-            class_name: "Object",
+            ..Self::new()
         }
     }
 
@@ -508,10 +539,61 @@ impl OrdinaryObject {
             .map(|(k, v)| (k, PropertyDescriptor::data_descriptor(v)))
             .collect();
         Self {
-            properties,
-            header: ObjectHeader::new(),
-            class_name: "Object",
+            dict: Some(properties),
+            ..Self::new()
         }
+    }
+
+    /// 快速模式下 `key` 的槽位（字典模式恒为 `None`）。
+    fn slot_of(&self, key: &PropertyKey) -> Option<u32> {
+        self.shape.as_ref().and_then(|shape| shape.slot_of(key))
+    }
+
+    /// 降级为字典模式：把快速模式的全部属性搬进一张表。
+    fn to_dict(&mut self) {
+        if self.dict.is_some() {
+            return;
+        }
+        let mut dict = PropertyTable::new();
+        if let Some(shape) = self.shape.take() {
+            for (index, key) in shape.keys().iter().enumerate() {
+                let desc = match self.attrs.get(key) {
+                    Some(desc) => desc.clone(),
+                    None => PropertyDescriptor::data_descriptor(
+                        self.slots.get(index).cloned().unwrap_or(Value::Undefined),
+                    ),
+                };
+                dict.insert(*key, desc);
+            }
+        }
+        // `attrs` 里的键按构造都有槽位；这一遍只是兜底，避免丢属性。
+        for key in self.attrs.keys() {
+            if dict.contains_key(&key) {
+                continue;
+            }
+            if let Some(desc) = self.attrs.get(&key) {
+                dict.insert(key, desc.clone());
+            }
+        }
+        self.slots.clear();
+        self.attrs = PropertyTable::new();
+        self.dict = Some(dict);
+    }
+
+    /// 保证 `key` 有一个槽位（必要时迁移形状），返回槽位下标。
+    fn ensure_slot(&mut self, heap: &mut Heap, key: PropertyKey) -> u32 {
+        if let Some(slot) = self.slot_of(&key) {
+            return slot;
+        }
+        let (next, slot) = match self.shape.take() {
+            Some(shape) => shape.transition(key),
+            // 还没有形状：从堆上的空形状起一条链（同布局的对象因此共享形状）。
+            None => heap.root_shape().clone().transition(key),
+        };
+        self.shape = Some(next);
+        self.slots.push(Value::Undefined);
+        debug_assert_eq!(slot as usize + 1, self.slots.len());
+        slot
     }
 
     /// Install a property with a full descriptor (`Object.defineProperty`).
@@ -522,10 +604,24 @@ impl OrdinaryObject {
     /// requires extensibility.
     pub fn define_property(
         &mut self,
+        heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        let current = self.properties.get(&key).cloned();
+        if let Some(dict) = self.dict.as_mut() {
+            match dict.get(&key) {
+                None => {
+                    if !self.header.is_extensible() {
+                        return Err("Cannot add property to non-extensible object".to_string());
+                    }
+                }
+                Some(current) => validate_property_redefinition(current, &desc)?,
+            }
+            dict.insert(key, desc);
+            return Ok(true);
+        }
+
+        let current = self.property_get(&key);
         match current {
             None => {
                 if !self.header.is_extensible() {
@@ -534,8 +630,56 @@ impl OrdinaryObject {
             }
             Some(current) => validate_property_redefinition(&current, &desc)?,
         }
-        self.properties.insert(key, desc);
+        // 默认数据描述符（`{writable, enumerable, configurable}` 全真）只占一个槽位；
+        // 其余的（含 accessor）额外存一份完整描述符。
+        let is_plain_data = !desc.is_accessor_descriptor()
+            && desc.writable
+            && desc.enumerable
+            && desc.configurable;
+        let slot = self.ensure_slot(heap, key);
+        if is_plain_data {
+            self.attrs.remove(&key);
+            self.slots[slot as usize] = desc.value;
+        } else {
+            let value = if desc.is_accessor_descriptor() {
+                Value::Undefined
+            } else {
+                desc.value.clone()
+            };
+            self.attrs.insert(key, desc);
+            self.slots[slot as usize] = value;
+        }
         Ok(true)
+    }
+
+    /// 冻结 / 密封自己的属性：`freeze` 把数据属性也标成只读，`seal` 只标不可配置。
+    ///
+    /// 冻结与密封都是稀有一次的操作，所以这里直接把每个属性都搬成"非默认"描述符
+    /// （进 `attrs` / `dict`）—— 反正它们本来也都不再是默认属性了。
+    fn freeze_or_seal_own_properties(&mut self, also_readonly: bool) {
+        if let Some(dict) = self.dict.as_mut() {
+            for key in dict.keys() {
+                if let Some(desc) = dict.get_mut(&key) {
+                    desc.configurable = false;
+                    if also_readonly && desc.is_data_descriptor() {
+                        desc.writable = false;
+                    }
+                }
+            }
+            return;
+        }
+        let keys = self.own_keys();
+        for key in keys {
+            let Some(mut desc) = self.property_get(&key) else {
+                continue;
+            };
+            desc.configurable = false;
+            if also_readonly && desc.is_data_descriptor() {
+                desc.writable = false;
+            }
+            // 一定是非默认属性了 ⇒ 进 `attrs`（槽位里的值留作备份，读优先用 attrs）。
+            self.attrs.insert(key, desc);
+        }
     }
 }
 
@@ -546,12 +690,23 @@ impl JSObject for OrdinaryObject {
 
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        self.properties.get(key).cloned()
+        if let Some(dict) = &self.dict {
+            return dict.get(key).cloned();
+        }
+        if let Some(desc) = self.attrs.get(key) {
+            return Some(desc.clone());
+        }
+        // 槽位里的值一律是"默认数据属性"（w/e/c 全真）—— 非默认的都在 `attrs`。
+        let slot = self.slot_of(key)?;
+        self.slots
+            .get(slot as usize)
+            .cloned()
+            .map(PropertyDescriptor::data_descriptor)
     }
 
     fn property_set(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         value: Value,
     ) -> Result<bool, String> {
@@ -559,51 +714,94 @@ impl JSObject for OrdinaryObject {
             return Err("Cannot set property on frozen object".to_string());
         }
 
-        if let Some(desc) = self.properties.get_mut(&key) {
+        // 字典模式
+        if let Some(dict) = self.dict.as_mut() {
+            if let Some(desc) = dict.get(&key) {
+                if !desc.writable {
+                    return Err("Cannot assign to read-only property".to_string());
+                }
+            } else if !self.header.is_extensible() {
+                return Err("Cannot add property to non-extensible object".to_string());
+            }
+            dict.insert(key, PropertyDescriptor::data_descriptor(value));
+            return Ok(true);
+        }
+
+        // 非默认属性：走它的描述符（只读 / accessor 都要按它来），值写回 `attrs`
+        // —— 读是优先读 `attrs`，只改槽位会让赋值看起来没生效。
+        if self.attrs.contains_key(&key) {
+            let desc = self.attrs.get(&key).expect("checked above");
+            if desc.is_accessor_descriptor() {
+                return Err("Cannot assign to accessor property".to_string());
+            }
             if !desc.writable {
                 return Err("Cannot assign to read-only property".to_string());
             }
-            desc.value = value;
-            Ok(true)
-        } else {
-            if !self.header.is_extensible() {
-                return Err("Cannot add property to non-extensible object".to_string());
+            if let Some(slot) = self.slot_of(&key) {
+                self.slots[slot as usize] = value.clone();
             }
-            self.properties
-                .insert(key, PropertyDescriptor::data_descriptor(value));
-            Ok(true)
+            self.attrs
+                .get_mut(&key)
+                .expect("checked above")
+                .value = value;
+            return Ok(true);
         }
+        if let Some(slot) = self.slot_of(&key) {
+            self.slots[slot as usize] = value;
+            return Ok(true);
+        }
+        if !self.header.is_extensible() {
+            return Err("Cannot add property to non-extensible object".to_string());
+        }
+        // 新属性：迁移形状（需要堆）并占一个槽位。
+        let slot = self.ensure_slot(heap, key);
+        self.slots[slot as usize] = value;
+        Ok(true)
     }
 
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        OrdinaryObject::define_property(self, key, desc)
+        OrdinaryObject::define_property(self, heap, key, desc)
     }
 
     fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
         if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
+        // 删除打乱布局 ⇒ 转字典模式，之后所有属性都在一张表里。
+        self.to_dict();
+        let dict = self.dict.as_mut().expect("刚转过字典模式");
         // ES6 [[Delete]]: an own property whose [[Configurable]] is false cannot
         // be removed — the request reports failure instead.
-        if let Some(desc) = self.properties.get(key) {
+        if let Some(desc) = dict.get(key) {
             if !desc.configurable {
                 return false;
             }
         }
-        self.properties.remove(key).is_some()
+        dict.remove(key).is_some()
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        self.properties.contains_key(key)
+        if let Some(dict) = &self.dict {
+            return dict.contains_key(key);
+        }
+        self.attrs.contains_key(key) || self.slot_of(key).is_some()
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys()
+        if let Some(dict) = &self.dict {
+            return dict.keys();
+        }
+        // 形状按创建顺序记着全部键（`attrs` 里的键也都占着槽位）；顺序要按
+        // `OrdinaryOwnPropertyKeys` 重排（索引键升序在前）。
+        match &self.shape {
+            Some(shape) => es_own_key_order(shape.keys()),
+            None => Vec::new(),
+        }
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
@@ -631,7 +829,7 @@ impl JSObject for OrdinaryObject {
         self.header.freeze();
         // Freezing makes every own property non-configurable, and data
         // properties non-writable as well.
-        freeze_property_table(&mut self.properties);
+        self.freeze_or_seal_own_properties(true);
     }
 
     fn is_sealed(&self) -> bool {
@@ -640,8 +838,7 @@ impl JSObject for OrdinaryObject {
 
     fn seal(&mut self) {
         self.header.seal();
-        // Sealing makes every own property non-configurable.
-        seal_property_table(&mut self.properties);
+        self.freeze_or_seal_own_properties(false);
     }
 
     fn class_name(&self) -> &'static str {
@@ -2168,11 +2365,11 @@ impl JSObject for DateObject {
     }
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
-        self.base.define_property(key, descriptor)
+        self.base.define_property(heap, key, descriptor)
     }
     fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         self.base.property_delete(heap, key)
@@ -2343,11 +2540,11 @@ impl JSObject for RegExpObject {
     }
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
-        self.base.define_property(key, descriptor)
+        self.base.define_property(heap, key, descriptor)
     }
     fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         self.base.property_delete(heap, key)
@@ -2458,11 +2655,11 @@ impl JSObject for PromiseObject {
     }
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
-        self.base.define_property(key, descriptor)
+        self.base.define_property(heap, key, descriptor)
     }
     fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         self.base.property_delete(heap, key)
@@ -2704,11 +2901,11 @@ impl JSObject for ArrayBufferObject {
     }
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
-        self.base.define_property(key, descriptor)
+        self.base.define_property(heap, key, descriptor)
     }
     fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         self.base.property_delete(heap, key)
@@ -2997,7 +3194,7 @@ impl JSObject for TypedArrayObject {
     }
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
@@ -3015,7 +3212,7 @@ impl JSObject for TypedArrayObject {
             }
             return Ok(false);
         }
-        self.base.define_property(key, descriptor)
+        self.base.define_property(heap, key, descriptor)
     }
     fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         if let Some(index) = Self::canonical_index(key) {
@@ -3128,11 +3325,11 @@ impl JSObject for DataViewObject {
     }
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         descriptor: PropertyDescriptor,
     ) -> Result<bool, String> {
-        self.base.define_property(key, descriptor)
+        self.base.define_property(heap, key, descriptor)
     }
     fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         self.base.property_delete(heap, key)
@@ -4243,7 +4440,15 @@ impl Trace for PropertyDescriptor {
 impl Trace for OrdinaryObject {
     fn trace(&self, out: &mut Worklist) {
         self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // 快速模式的槽位值 / 非默认描述符，以及字典模式那张表（二选一，都追一遍
+        // 也没错：`to_dict` 之后另外两个字段已经清空）。
+        for value in &self.slots {
+            value.trace(out);
+        }
+        self.attrs.trace(out);
+        if let Some(dict) = &self.dict {
+            dict.trace(out);
+        }
     }
 }
 
@@ -4425,5 +4630,110 @@ impl Trace for GeneratorObject {
         self.next_fn.trace(out);
         self.return_fn.trace(out);
         self.throw_fn.trace(out);
+    }
+}
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+    use crate::vm::property::{PropertyDescriptor, PropertyKey};
+
+    fn plain(value: Value) -> PropertyDescriptor {
+        PropertyDescriptor::data_descriptor(value)
+    }
+
+    /// 同布局的两个对象共享同一个 `Shape`（这是"形状"能省掉属性表哈希的前提）。
+    #[test]
+    fn objects_with_the_same_layout_share_a_shape() {
+        let mut heap = Heap::new();
+        let mut a = OrdinaryObject::new();
+        let mut b = OrdinaryObject::new();
+        let key = PropertyKey::intern(&mut heap, "x");
+
+        a.property_set(&mut heap, key, Value::Number(1.0)).unwrap();
+        b.property_set(&mut heap, key, Value::Number(2.0)).unwrap();
+
+        let shape_a = a.shape.clone().expect("加过属性就有形状");
+        let shape_b = b.shape.clone().expect("加过属性就有形状");
+        assert!(std::rc::Rc::ptr_eq(&shape_a, &shape_b));
+
+        assert_eq!(a.property_get(&key).unwrap().value, Value::Number(1.0));
+        assert_eq!(b.property_get(&key).unwrap().value, Value::Number(2.0));
+    }
+
+    /// 非默认属性（不可枚举）仍然读得回来，且赋值要落在它自己那份描述符上
+    /// —— 只写槽位会让 `e.message = undefined` 看起来没生效。
+    #[test]
+    fn non_default_attributes_are_kept_and_written_back() {
+        let mut heap = Heap::new();
+        let mut obj = OrdinaryObject::new();
+        let key = PropertyKey::intern(&mut heap, "message");
+        let mut desc = plain(Value::string("x"));
+        desc.enumerable = false;
+        obj.define_property(&mut heap, key, desc).unwrap();
+
+        let got = obj.property_get(&key).expect("有这个属性");
+        assert!(!got.enumerable, "不可枚举要保住");
+
+        obj.property_set(&mut heap, key, Value::Undefined).unwrap();
+        assert_eq!(
+            obj.property_get(&key).expect("还在").value,
+            Value::Undefined
+        );
+    }
+
+    /// 删过属性就转字典模式：剩下的属性一个不少，顺序仍按 `OrdinaryOwnPropertyKeys`。
+    #[test]
+    fn deleting_switches_to_dictionary_mode() {
+        let mut heap = Heap::new();
+        let mut obj = OrdinaryObject::new();
+        let a = PropertyKey::intern(&mut heap, "a");
+        let b = PropertyKey::intern(&mut heap, "b");
+        obj.property_set(&mut heap, a, Value::Number(1.0)).unwrap();
+        obj.property_set(&mut heap, b, Value::Number(2.0)).unwrap();
+
+        assert!(obj.dict.is_none());
+        assert!(obj.property_delete(&mut heap, &a));
+        assert!(obj.dict.is_some(), "删除之后应转为字典模式");
+        assert!(!obj.has_property(&a));
+        assert!(obj.has_property(&b));
+        assert_eq!(obj.property_get(&b).unwrap().value, Value::Number(2.0));
+        assert_eq!(obj.own_keys(), vec![b]);
+    }
+
+    /// 索引键按升序排在字符串键之前（形状记的是创建顺序，这一遍排序不能省）。
+    #[test]
+    fn own_keys_put_array_indices_first() {
+        let mut heap = Heap::new();
+        let mut obj = OrdinaryObject::new();
+        let length = PropertyKey::intern(&mut heap, "length");
+        obj.property_set(&mut heap, length, Value::Number(2.0)).unwrap();
+        obj.property_set(&mut heap, PropertyKey::from_index(0), Value::string("p"))
+            .unwrap();
+        obj.property_set(&mut heap, PropertyKey::from_index(1), Value::string("q"))
+            .unwrap();
+
+        assert_eq!(
+            obj.own_keys(),
+            vec![
+                PropertyKey::from_index(0),
+                PropertyKey::from_index(1),
+                length
+            ]
+        );
+    }
+
+    /// 冻结 / 密封把属性标成不可配置（数据属性还额外标成只读）。
+    #[test]
+    fn freeze_and_seal_mark_the_own_properties() {
+        let mut heap = Heap::new();
+        let mut obj = OrdinaryObject::new();
+        let key = PropertyKey::intern(&mut heap, "x");
+        obj.property_set(&mut heap, key, Value::Number(1.0)).unwrap();
+
+        obj.freeze();
+        let desc = obj.property_get(&key).expect("还在");
+        assert!(!desc.writable);
+        assert!(!desc.configurable);
+        assert!(obj.is_frozen());
     }
 }

@@ -621,9 +621,30 @@ added, slot_count, transitions }`，空形状挂在 `Heap` 上（`Heap::root_sha
 **验收：全量 17,311 / 20,504（84.43%）逐位不变；单测 255 → 259**（新增 4 条：
 槽位按创建序、迁移共享、父边是 Weak、`added` 记录迁移键）。
 
+**第六片已落地（2026-10-26）：`OrdinaryObject` 接入形状。**
+
+`properties: PropertyTable` → `shape + slots + attrs + dict`：
+
+- 默认数据属性（w/e/c 全真）只占一个**槽位**，值以裸 `Value` 存在 `slots` 里；
+- 非默认属性（accessor / 只读 / 不可枚举 / 不可配置）额外存一份描述符到 `attrs`；
+- **首次 `delete` 转字典模式**（`to_dict`），之后所有属性回到一张 `PropertyTable`
+  —— 删除会打乱布局，硬留快速模式只会让形状越分越碎（V8 同样处理）；
+- 形状的 root 在堆上，所以对象**创建时不需要形状**：`shape: None` 就是"还没有属性"，
+  第一次加属性时才从 `heap.root_shape()` 起链 —— 这正是上一批把堆传进来的用处；
+- `own_keys` 走 `Shape::keys`（创建序）再按 `OrdinaryOwnPropertyKeys` 重排（索引键
+  升序在前）。排序抽成了 `es_own_key_order`，属性表与形状共用一遍。
+
+过程中修掉的两处（都是"两条存储路径"的典型坑）：
+- `own_keys` 忘了重排 ⇒ `{0:'p',1:'q',length:2}` 的键序变成 `length,0,1`；
+- `property_set` 只写槽位没写 `attrs` ⇒ 非默认数据属性的赋值看起来没生效
+  （`e.message = undefined` 不生效，`Error#toString` 就错了）。
+
+**验收：全量 17,311 / 20,504（84.43%）逐位不变；单测 259 → 264**（新增 5 条：同布局
+共享形状、非默认属性读写、删除转字典模式、索引键排序、冻结标属性）。
+
 剩余（按序）：
-- **`OrdinaryObject` 接入形状**：`shape + slots + attrs(非默认属性) + dict(删除后
-  降级)`；`property_set` 用刚拿到的堆做迁移。这是真正的切换点，下一批做。
+- descriptor 惰性物化（`PropertyTable` 的其它使用者：Function / NativeFunction /
+  PrimitiveWrapper / Map / Set 也换到槽位）；把 `PropertyTable` 收成"只有字典模式用"。
 - `Realm`；对象尺寸断言仍过。
 
 **1C 数组 + 函数（8–12 人日）**
@@ -714,8 +735,7 @@ added, slot_count, transitions }`，空形状挂在 `Heap` 上（`Heap::root_sha
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 **1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
-> **1B 五片**（全局对象存真描述符；`ObjectHeader` 统一标志位；`undefined`/`NaN`/
-> `Infinity` 成为全局属性；堆进入对象模型的可变路径；`Shape` 结构与迁移表）。
+> **1B 六片**（…；`Shape` 结构与迁移表；`OrdinaryObject` 接入形状 + 字典模式降级）。
 
 剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，1A 也收口，下面是：
     S0#4 第二档（GC 句柄代次 —— `Value` 仍 16 B，需要另找空间，或在 `Value` 缩小后补）→

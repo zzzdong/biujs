@@ -201,13 +201,14 @@ pub fn create_reflect_object(heap: &mut Heap) -> Value {
         .chain(VM_METHODS.iter().copied())
         .collect();
     for name in names {
-        let _ = obj.define_property(PropertyKey::intern(heap, name),
-            super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-                NativeFunctionObject::new(&format!("Reflect.{name}")),
-            )))),
-        );
+        let key = PropertyKey::intern(heap, name);
+
+        let value = super::method_descriptor(Value::Object(heap.alloc(
+            Object::NativeFunction(NativeFunctionObject::new(&format!("Reflect.{name}"))),
+        )));
+        let _ = obj.define_property(heap, key, value);
     }
-    let _ = obj.define_property(PropertyKey::Symbol(super::symbol::TO_STRING_TAG_SYMBOL_ID),
+    let _ = obj.define_property(heap, PropertyKey::Symbol(super::symbol::TO_STRING_TAG_SYMBOL_ID),
         PropertyDescriptor {
             value: Value::string("Reflect"),
             writable: false,

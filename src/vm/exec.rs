@@ -1258,7 +1258,7 @@ impl VM {
             wrapper.set_prototype(Some(proto));
         }
         let root_key = PropertyKey::intern(&mut self.heap, "");
-        let _ = wrapper.define_property(root_key,
+        let _ = wrapper.define_property(&mut self.heap, root_key,
             crate::vm::property::PropertyDescriptor::data_descriptor(value),
         );
         let wrapper = Value::Object(self.heap.alloc(Object::Ordinary(wrapper)));
@@ -1504,7 +1504,8 @@ impl VM {
         if let Some(proto) = crate::builtins::wrapper_prototype("Object") {
             holder.set_prototype(Some(proto));
         }
-        let _ = holder.define_property(PropertyKey::intern(&mut self.heap, ""),
+        let key = PropertyKey::intern(&mut self.heap, "");
+        let _ = holder.define_property(&mut self.heap, key,
             crate::vm::property::PropertyDescriptor::data_descriptor(parsed),
         );
         let holder = Value::Object(self.heap.alloc(Object::Ordinary(holder)));

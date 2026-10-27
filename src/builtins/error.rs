@@ -81,7 +81,7 @@ pub fn create_error_object(
     let mut obj = OrdinaryObject::with_class_name("Error");
     obj.set_prototype(Some(prototype));
     if let Some(msg) = message {
-        obj.define_property(PropertyKey::well_known("message").expect("well-known name"),
+        obj.define_property(heap, PropertyKey::well_known("message").expect("well-known name"),
             error_message_descriptor(Value::string(&msg)),
         )
         .ok();
@@ -108,7 +108,7 @@ pub fn error_constructor(heap: &mut Heap, error_type: ErrorType, args: &[Value])
         obj.set_prototype(Some(proto));
     }
     if let Some(msg) = message {
-        obj.define_property(PropertyKey::well_known("message").expect("well-known name"),
+        obj.define_property(heap, PropertyKey::well_known("message").expect("well-known name"),
             error_message_descriptor(Value::string(&msg)),
         )
         .ok();
@@ -116,7 +116,8 @@ pub fn error_constructor(heap: &mut Heap, error_type: ErrorType, args: &[Value])
     // `new Error(message, { cause })` installs an own, non-enumerable `cause`
     // (ES 20.5.1.1 step 3).
     if let Some(cause) = options_cause(args.get(1)) {
-        obj.define_property(PropertyKey::well_known("cause").expect("well-known name"), cause).ok();
+        obj.define_property(heap, PropertyKey::well_known("cause").expect("well-known name"), cause)
+        .ok();
     }
 
     Ok(Value::Object(heap.alloc(Object::Ordinary(obj))))

@@ -2738,11 +2738,12 @@ impl VM {
                     let status = Value::string(if fulfilled { "fulfilled" } else { "rejected" });
                     let key = if fulfilled { "value" } else { "reason" };
                     let mut obj = crate::vm::object::OrdinaryObject::new();
-                    obj.define_property(PropertyKey::well_known("status").expect("well-known name"),
+                    obj.define_property(&mut self.heap, PropertyKey::well_known("status").expect("well-known name"),
                         crate::vm::property::PropertyDescriptor::data_descriptor(status),
                     )
                     .ok();
-                    obj.define_property(PropertyKey::intern(&mut self.heap, key),
+                    let key = PropertyKey::intern(&mut self.heap, key);
+                    obj.define_property(&mut self.heap, key,
                         crate::vm::property::PropertyDescriptor::data_descriptor(argument),
                     )
                     .ok();

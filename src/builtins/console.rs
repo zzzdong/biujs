@@ -37,11 +37,14 @@ thread_local! {
 pub fn create_console_object(heap: &mut Heap) -> Value {
     let mut console = OrdinaryObject::new();
     for name in METHODS {
-        let _ = console.define_property(PropertyKey::intern(heap, name),
+        let key = PropertyKey::intern(heap, name);
+
+        let value = Value::Object(heap.alloc(Object::NativeFunction(
+            NativeFunctionObject::new(&format!("console.{name}")),
+        )));
+        let _ = console.define_property(heap, key,
             PropertyDescriptor {
-                value: Value::Object(heap.alloc(Object::NativeFunction(
-                    NativeFunctionObject::new(&format!("console.{name}")),
-                ))),
+                value,
                 writable: true,
                 enumerable: false,
                 configurable: true,
