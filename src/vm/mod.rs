@@ -5,6 +5,7 @@ pub(crate) mod gc;
 pub mod atom;
 pub mod object;
 pub mod property;
+pub(crate) mod shape;
 pub mod prototype;
 pub(crate) mod proxy;
 pub(crate) mod trace;

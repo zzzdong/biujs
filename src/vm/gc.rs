@@ -174,6 +174,9 @@ pub struct Heap {
     /// 属性名驻留表（见 [`crate::vm::atom`]）。跟着堆走：atom 与 `Gc` 一样
     /// 不得活过它所属的堆。
     interner: crate::vm::atom::Interner,
+    /// 空形状（见 [`crate::vm::shape`]）：所有对象的形状之根。**按堆共享** ——
+    /// atom 是 per-heap 的，跨 VM 复用形状会把不同的字符串串成同一个键。
+    root_shape: std::rc::Rc<crate::vm::shape::Shape>,
 }
 
 /// 收集阈值的下限。
@@ -193,7 +196,13 @@ impl Heap {
             threshold: MIN_THRESHOLD,
             stress: std::env::var_os("BIUJS_GC_STRESS").is_some(),
             interner: crate::vm::atom::Interner::new(),
+            root_shape: crate::vm::shape::Shape::root(),
         }
+    }
+
+    /// 空形状：新对象的形状之根（1B 的 Shape）。
+    pub fn root_shape(&self) -> &std::rc::Rc<crate::vm::shape::Shape> {
+        &self.root_shape
     }
 
     /// 驻留一个属性名（见 [`crate::vm::atom`]）。

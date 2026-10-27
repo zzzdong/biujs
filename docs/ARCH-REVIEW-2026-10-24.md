@@ -604,9 +604,26 @@ undefined 且名字是本程序声明的 var"判成声明。**待办**：IR 里�
 跨 VM 复用形状会把 `length` 和 `x` 串味），所以形状表得挂在堆上；而形状迁移发生在
 "加属性"时 —— 也就是这三个方法里。此前它们只能 `&mut self`，Shape 无处落地。
 
+**第五片已落地（2026-10-26）：`Shape` 结构与迁移表（`src/vm/shape.rs`）。**
+
+纯新增，还没有接到对象上：`Shape { parent: Weak, table(全量键→槽位), keys(创建序),
+added, slot_count, transitions }`，空形状挂在 `Heap` 上（`Heap::root_shape`）。
+
+三个决定：
+- **`table` 装全量键**而不是只装新增的那一个：读就是一次哈希，不必沿链往上走。
+  代价是迁移要复制表 —— 我们的对象普遍只有几十个属性，形状数量有限，可接受
+  （ChakraCore 的类型也是这么做的）。
+- **父边用 `Weak`**：父→子强（迁移表要留住子形状才能复用），子→父弱，否则父子
+  互相强引用就是个环，形状永远回收不掉。
+- **形状按堆共享**：root 在 `Heap` 上；atom 是 per-heap 的，跨 VM 复用会把不同的
+  字符串串成同一个键。
+
+**验收：全量 17,311 / 20,504（84.43%）逐位不变；单测 255 → 259**（新增 4 条：
+槽位按创建序、迁移共享、父边是 Weak、`added` 记录迁移键）。
+
 剩余（按序）：
-- `Shape` + transition cache；`Dictionary` fallback；descriptor 惰性物化
-  （`ObjectHeader` 已为 `shape` / `slots` 留好位置，**堆也已经进来了**）。
+- **`OrdinaryObject` 接入形状**：`shape + slots + attrs(非默认属性) + dict(删除后
+  降级)`；`property_set` 用刚拿到的堆做迁移。这是真正的切换点，下一批做。
 - `Realm`；对象尺寸断言仍过。
 
 **1C 数组 + 函数（8–12 人日）**
@@ -697,8 +714,8 @@ undefined 且名字是本程序声明的 var"判成声明。**待办**：IR 里�
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 **1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
-> **1B 四片**（全局对象存真描述符；`ObjectHeader` 统一标志位；`undefined`/`NaN`/
-> `Infinity` 成为全局属性；堆进入对象模型的可变路径）。
+> **1B 五片**（全局对象存真描述符；`ObjectHeader` 统一标志位；`undefined`/`NaN`/
+> `Infinity` 成为全局属性；堆进入对象模型的可变路径；`Shape` 结构与迁移表）。
 
 剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，1A 也收口，下面是：
     S0#4 第二档（GC 句柄代次 —— `Value` 仍 16 B，需要另找空间，或在 `Value` 缩小后补）→
