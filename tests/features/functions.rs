@@ -384,3 +384,77 @@ fn a_function_expression_captures_its_enclosing_scope() {
         1.0
     );
 }
+
+// ── 函数对象的属性存储（shape 槽位 / 字典模式）────────────────────────────
+
+#[test]
+fn function_metadata_keeps_its_attributes_and_order() {
+    // `length` 是 {writable:false, enumerable:false, configurable:true}：以前的
+    // 独立属性表会被一次普通赋值冲成默认描述符，现在和普通对象共用一套存储。
+    assert_eq!(
+        eval_bool(
+            "'use strict';
+             function f(a, b) {}
+             var d = Object.getOwnPropertyDescriptor(f, 'length');
+             d.value === 2 && d.writable === false && d.enumerable === false &&
+             d.configurable === true"
+        ),
+        true
+    );
+    assert_eq!(
+        eval_string("'use strict'; function f(a) {} Object.getOwnPropertyNames(f).join(',')"),
+        "length,name,prototype"
+    );
+    assert_eq!(
+        eval_number(
+            "'use strict';
+             function f(a, b) {}
+             try { f.length = 9; } catch (e) {}
+             f.length"
+        ),
+        2.0
+    );
+}
+
+#[test]
+fn function_property_delete_and_freeze_use_the_shared_storage() {
+    // 删属性降级为字典模式后，剩下的非默认描述符不能被冲掉。
+    assert_eq!(
+        eval_bool(
+            "'use strict';
+             function f(a) {}
+             f.extra = 1;
+             delete f.extra;
+             var d = Object.getOwnPropertyDescriptor(f, 'length');
+             Object.getOwnPropertyNames(f).join(',') === 'length,name,prototype' &&
+             d.writable === false && d.enumerable === false"
+        ),
+        true
+    );
+    // 冻结/密封的状态与属性位由同一套实现给出（旧实现的 seal 只关了可扩展）。
+    assert_eq!(
+        eval_bool(
+            "'use strict';
+             function f(a) {}
+             Object.freeze(f);
+             var d = Object.getOwnPropertyDescriptor(f, 'length');
+             Object.isFrozen(f) && d.configurable === false && d.writable === false"
+        ),
+        true
+    );
+}
+
+#[test]
+fn class_static_accessor_descriptor_survives_shape_storage() {
+    // 类构造器也是 FunctionObject，`static get x()` 走 define_property 存 accessor。
+    assert_eq!(
+        eval_bool(
+            "'use strict';
+             class C { static get x() { return 1; } }
+             var d = Object.getOwnPropertyDescriptor(C, 'x');
+             typeof d.get === 'function' && d.enumerable === false &&
+             d.configurable === true"
+        ),
+        true
+    );
+}

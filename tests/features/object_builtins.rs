@@ -487,6 +487,44 @@ fn integrity_levels_cover_wrappers_and_functions() {
 }
 
 #[test]
+fn primitive_wrapper_own_properties_use_the_shared_storage() {
+    // 包装对象的自有属性走 shape 槽位 / attrs / 字典模式；String 的虚拟属性
+    // （length / 规范索引）仍由被包装的字符串决定，不占槽位。
+    eval_js(
+        "'use strict';
+         var n = new Number(1);
+         Object.defineProperty(n, 'x', { value: 1, writable: false, enumerable: false, configurable: false });
+         var dx = Object.getOwnPropertyDescriptor(n, 'x');
+         if (dx.value !== 1 || dx.writable !== false || dx.enumerable !== false || dx.configurable !== false) {
+           throw new Error('descriptor lost: ' + JSON.stringify(dx));
+         }
+         var threw = 'no';
+         try { n.x = 2; } catch (e) { threw = e.name; }
+         if (n.x !== 1) throw new Error('read-only property was overwritten');
+         if (threw !== 'TypeError') throw new Error('strict assignment: ' + threw);
+         if (Object.getOwnPropertyNames(n).join(',') !== 'x') throw new Error('own keys of Number wrapper');
+
+         // 删除会降级为字典模式：属性位不能丢，剩下的键也不变。
+         n.y = 2;
+         if (delete n.y !== true) throw new Error('delete configurable property');
+         var after = Object.getOwnPropertyDescriptor(n, 'x');
+         if (after.configurable !== false || after.writable !== false) throw new Error('dictionary mode lost attributes');
+         if (Object.getOwnPropertyNames(n).join(',') !== 'x') throw new Error('own keys after delete');
+
+         var s = new String('ab');
+         s.extra = 1;
+         var names = Object.getOwnPropertyNames(s).join(',');
+         if (names !== '0,1,length,extra') throw new Error('own keys of String wrapper: ' + names);
+         if (s.length !== 2 || s[0] !== 'a' || s[1] !== 'b') throw new Error('virtual keys');
+         threw = 'no';
+         try { s.length = 9; } catch (e) { threw = e.name; }
+         if (s.length !== 2) throw new Error('virtual length is writable');
+         if (threw !== 'TypeError') throw new Error('virtual length assignment: ' + threw);",
+    )
+    .unwrap();
+}
+
+#[test]
 fn set_prototype_of_rejects_frozen_targets_and_cycles() {
     eval_js(
         "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }

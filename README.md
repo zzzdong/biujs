@@ -34,13 +34,21 @@ test262 口径 / 批次表 / 快照纪律在
 
 ## Conformance
 
-<!-- doc-numbers -->**84.43%**（17311 / 执行 20504；跳过 8577；2026-10-26 基线，TEST262_MEMORY_MB=384）<!-- /doc-numbers -->。
+<!-- doc-numbers -->**84.52%**（17329 / 执行 20504；跳过 8577；2026-11-10 基线，TEST262_MEMORY_MB=384）<!-- /doc-numbers -->。
 
 一条命令跑齐三级验证并与基线逐套件对比：
 
 ```sh
 ./scripts/phase2-status.sh            # 检查是否有回退
 ./scripts/phase2-status.sh --update   # 完成一批后刷新基线快照
+```
+
+Windows 上用 PowerShell 版（不需要 Git Bash；三级 + 全量 + 逐套件对比等价）：
+
+```powershell
+pwsh -File scripts/phase2-status.ps1           # 检查是否有回退
+pwsh -File scripts/phase2-status.ps1 -Quick    # 只跑三级
+pwsh -File scripts/phase2-status.ps1 -Update   # 刷新基线快照并同步文档数字
 ```
 
 快验三档：

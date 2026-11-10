@@ -18,7 +18,7 @@ use crate::vm::{
     FrameMode, GUARD_CHECK_INTERVAL, GuardFired,
     ObjectKind, PropertyKey, RuntimeError, SehRecord, THIS_DERIVED_BOUND,
     THIS_DERIVED_UNBOUND, THIS_NONE, Value, VM, constant_at, finalize_json, immd,
-    is_addressable, memory_pressure, to_int32, to_uint32, vm_trace_steps,
+    is_addressable, memory_pressure, pc_immd, to_int32, to_uint32, vm_trace_steps,
 };
 
 /// `ResumeExc`（finally 末尾）按区域身份认领到记录之后的四种收尾。
@@ -1787,13 +1787,14 @@ impl VM {
     pub(crate) fn run_jump(&mut self, inst: &Instr, _module: &Module) -> Result<bool, RuntimeError> {
         match *inst {
             Instr::Jump { offset } => {
-                let offset = offset.as_immd();
+                let offset = pc_immd(offset.try_immd(), "Jump offset")?;
                 self.state.jump_offset(offset);
                 return Ok(true);
             }
             Instr::DelayedJump { target, seh_depth } => {
-                let offset = target.as_immd();
-                let seh_depth = seh_depth.as_immd() as usize;
+                let offset = pc_immd(target.try_immd(), "DelayedJump target")?;
+                // 坏字节码里出现负深度时不要 `as usize` 变成一个巨型循环。
+                let seh_depth = immd(&seh_depth, "DelayedJump seh depth")?.max(0) as usize;
 
                 // Check if we need to execute any finally blocks
                 let mut finally_to_execute = None;
@@ -1846,9 +1847,9 @@ impl VM {
                 let cond = self.get_value(condition)?;
                 let b = cond.to_boolean();
                 let offset = if b {
-                    true_target.as_immd()
+                    pc_immd(true_target.try_immd(), "BrIf true target")?
                 } else {
-                    false_target.as_immd()
+                    pc_immd(false_target.try_immd(), "BrIf false target")?
                 };
                 self.state.jump_offset(offset);
                 return Ok(true);
@@ -3132,7 +3133,10 @@ impl VM {
                         }
                     };
                     debug_assert_eq!(
-                        (abs(catch_offset.as_immd()), abs(finally_offset.as_immd())),
+                        (
+                            abs(catch_offset.try_immd().unwrap_or(0)),
+                            abs(finally_offset.try_immd().unwrap_or(0))
+                        ),
                         (catch_pc, finally_pc),
                         "Try(pc={})：指令操作数与 EH 表不一致 —— 两条回填路径分叉了",
                         self.state.pc()
@@ -3634,7 +3638,7 @@ impl VM {
                 // 递归调用下同一条 `try` 同时有多条记录；而正常完成路径上本 finally
                 // 的记录**一定**还在栈上（`EndTry` 保留它），所以身份是唯一可靠的
                 // 判据。找不到记录 ⇒ 这是一次普通控制流的延续，安静落到下一条。
-                let region = region.as_immd() as usize;
+                let region = pc_immd(region.try_immd(), "ResumeExc region")?.max(0) as usize;
                 let outcome = self
                     .state
                     .seh_stack

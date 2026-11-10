@@ -642,10 +642,51 @@ added, slot_count, transitions }`，空形状挂在 `Heap` 上（`Heap::root_sha
 **验收：全量 17,311 / 20,504（84.43%）逐位不变；单测 259 → 264**（新增 5 条：同布局
 共享形状、非默认属性读写、删除转字典模式、索引键排序、冻结标属性）。
 
+**第七片已落地（2026-11-10）：`FunctionObject` 接入形状槽位。**
+
+函数对象此前自带 `ObjectHeader` + `PropertyTable`，并抄了一份属性实现：
+`property_set` 无条件把属性覆盖成默认数据描述符（`f.length = 9` 会冲掉只读位）、
+`property_delete` 不看冻结/密封、`seal` 只调 `prevent_extensions`。现在内嵌
+`OrdinaryObject`（`base`），14 个 `JSObject` 方法全部委托，函数本体只留
+`func_id` / `name` / 捕获环境；`Trace` 一并交给 `base`（槽位 / `attrs` / 字典三路）。
+顺带收成 ES 的样子：`length` / `name` 的非默认描述符不再被赋值冲掉、类静态
+getter 的 accessor 由同一套 `attrs` 保管、冻结/密封正确标注属性位、删除降级字典。
+
+**验收**：三级 267 / 638 / 7 + 字节码 golden 全绿（新增 3 条单元 + 3 条 feature
+断言）；`Object` 尺寸断言仍过。全量 **17,311 → 17,316 / 20,504
+（84.43% → 84.45%，+5）**，无逐套件回退，护栏 0/0/14 与跳过 8577 均不变。
+提升：`built-ins/Object` +2、`language/statements/function` +1、
+`language/statements/generators` +1、`language/expressions/generators` +1。
+
+**第八片已落地（2026-11-10）：`PrimitiveWrapperObject` 接入槽位 + 0.5 收尾。**
+
+两件事同批，都是"两条属性存储路径 / 运行期隐式崩溃"这条线：
+
+1. `PrimitiveWrapperObject` 的 `header + properties` 换成 `base: OrdinaryObject`，
+   自有属性走 shape / `attrs` / 字典模式；String 包装的**虚拟**属性（`length` 与规范
+   索引）抽成 `virtual_property()`，仍由被包装的字符串决定、不占槽位。顺带收掉三处
+   旧偏差：普通赋值冲掉非默认描述符、删除不看 `configurable`/冻结、`seal` 只调
+   `prevent_extensions`；`define_property` 对虚拟键校验通过后不再把它写进属性表
+   （那会让 `own_keys` 出现重复索引键）。`Trace` 由 `base` 覆盖原型/槽位/attrs/字典。
+2. **0.5 收尾**：`try_immd` / `immd` / `constant_at` 早已落地，但跳转类操作数
+   `RelPc` / `AbsPc` 上 6 处运行期 `as_immd()` 仍会 `panic`（release 是
+   `panic = "abort"`，一条坏字节码会带走整个分片）。现在两类都有 `try_immd()`，
+   VM 侧新增 `pc_immd()` 统一转成 `RuntimeError::InternalError`，并补一条
+   "畸形模块返回错误而非 abort"的单测。`src/vm` 运行期 `as_immd()` 归零
+   （只剩编译期 codegen 与字节码单测在用）。
+
+**验收**：三级 270 / 639 / 7 + 字节码 golden 全绿（新增 1 条 VM 单测、2 条 shape
+单测、1 条 feature 断言）；`Object` 尺寸断言仍过；debug 构建（`cfg(debug_assertions)`
+的 `Try` 一致性断言）编译通过。全量 **17,316 → 17,329 / 20,504
+（84.45% → 84.52%，+13）**，无逐套件回退，护栏 0/0/14 与跳过 8577 均不变，
+墙钟 108.3s。提升：`built-ins/Object` +12、`built-ins/Proxy` +1。
+
 剩余（按序）：
-- descriptor 惰性物化（`PropertyTable` 的其它使用者：Function / NativeFunction /
-  PrimitiveWrapper / Map / Set 也换到槽位）；把 `PropertyTable` 收成"只有字典模式用"。
-- `Realm`；对象尺寸断言仍过。
+- descriptor 惰性物化：`NativeFunction` / `Map` / `Set` / `ProtoObject` 也换到槽位，
+  把 `PropertyTable` 收成"只有字典模式用"。`NativeFunction::new` 构造期直接写属性表
+  且还没有堆参数，要先改构造签名；`Map` / `Set` 牵动 `WeakMap` / `WeakSet` 的
+  ephemeron trace；`Array` 与 1C 耦合，留到那时。
+- `Realm` / `EnvRecord`；对象尺寸断言仍过。
 
 **1C 数组 + 函数（8–12 人日）**
 - `Vec<Element>` + `BitSet` holes + 稀疏 fallback；删 `MAX_DENSE_ELEMENTS` 硬报错。
@@ -728,18 +769,41 @@ added, slot_count, transitions }`，空形状挂在 `Heap` 上（`Heap::root_sha
 
 ## 6. 接下来 10 个具体动作（按顺序）
 
-已完成：1（boundary RAII）、2（pending_captured 入根）、3（guard 配置+预算 384MB）、
-4（debug 几何断言）、5（运行时立即数/常量检查）、7（scope 表收口 + 基线刷新）、
+已完成：1（boundary 泄漏修复，闭包式）、2（pending_captured 入根）、
+3（guard 配置+预算 384MB）、4（`rbp <= rsp` 几何断言）、
+5（运行时立即数/常量检查，2026-11-10 收尾）、7（scope 表收口 + 基线刷新）、
 8（strict 运行时收口）、9（字节码 dumper + 16 组 golden，删除 IR 克隆）、
 6（删 `BIUJS_REG_VARS` 与变量寄存器分配，固定内存驻留语义）、
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 **1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
-> **1B 六片**（…；`Shape` 结构与迁移表；`OrdinaryObject` 接入形状 + 字典模式降级）。
+**1B 八片**（…；`Shape` 结构与迁移表；`OrdinaryObject` 接入形状 + 字典模式降级；
+第七片 `FunctionObject` 委托、第八片 `PrimitiveWrapperObject` 委托）。
 
-剩余（按顺序）—— **Phase 0（止血 + 测量可信化）已收口**，1A 也收口，下面是：
-    S0#4 第二档（GC 句柄代次 —— `Value` 仍 16 B，需要另找空间，或在 `Value` 缩小后补）→
-    1B（ObjectHeader/Shape/全局对象/Realm/EnvRecord）→
+### 6.1 对账（2026-11-10，按代码逐项核对）
+
+文档此前把 0.2 / 0.4 / 0.5 记为「已完成」，实际只完成了一部分：
+
+| 项 | 真实状态 | 证据 |
+|---|---|---|
+| 0.2 | 部分：`with_invoke_boundary` 闭包式守卫 + 2 条泄漏回归已落地，但 `drive_bytecode_frame` 仍手动 push/pop，没有 Drop 型 `BoundaryGuard` | `vm/mod.rs`、`vm/exec.rs` |
+| 0.4 | 部分：`step` 里只有 `debug_assert!(rbp <= rsp)`；`rbp == frames.last().base` 在生成器挂起路径尚不成立，frame 深度断言未加 | `vm/exec.rs` `step` |
+| 0.5 | **本轮收尾**：`try_immd` / `immd` / `constant_at` 早已有，但 `RelPc`/`AbsPc` 上 6 处运行期 `as_immd()` 仍会 abort；现补 `try_immd` + `pc_immd` + 坏模块回归 | `bytecode.rs`、`vm/mod.rs`、`vm/exec.rs` |
+| 0.1 / 0.3 / 0.6–0.10 | 已完成 | 见 §5 表格 |
+
+S0 仍挂着三项：`Gc` 句柄代次（被 `Value == 16 B` 硬阻塞；文档原写的前置
+「1A 把 `Value::String` 换成 `Atom`」**并未发生**，`value.rs` 仍是 `Rc<String>`）、
+`invoke_boundaries` 收集闸门（原生回调完整入根前不能撤）、`rsp` 的 7 个写者
+（2A 几何单一所有者的前置）。**M0 因此不能算全清**，M1 还差 1B 剩余 + 1C/1D；
+M2/M3/M4 未开始。Phase 3 只有 3A（删 `BIUJS_REG_VARS`）落地，IR/SSA 仍在；
+1C（`MAX_DENSE_ELEMENTS`、三处数组存储、`Value::Function`）、1D（名字字符串分派）、
+Phase 2（`FunctionCode` / `OpInfo` / 单层 match）都还是原样。
+
+剩余（按顺序）—— Phase 0 主体已收口，1A 也收口，下面是：
+    0.2 / 0.4 收尾（Drop 守卫、完整几何断言）→
+    S0#4 第二档（GC 句柄代次 —— 先解决 `Value::String` 的表示才有空间）→
+    1B 剩余（NativeFunction / Map / Set / ProtoObject 换到槽位；Array 与 1C 耦合；
+            之后 Realm / EnvRecord）→
     1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→
     Phase 2（帧几何/GC/字节码 v2）→ Phase 3（编译器简化）。
 

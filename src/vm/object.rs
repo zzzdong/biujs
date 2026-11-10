@@ -47,11 +47,11 @@ pub trait JSObject: fmt::Debug + Any {
 
     /// Install a property with a full descriptor (`Object.defineProperty`).
     ///
-    /// Every object kind keeps its own properties in a `PropertyTable`, so the
-    /// descriptor attributes (`writable`/`enumerable`/`configurable`, getter,
-    /// setter) survive on functions, arrays and prototype objects too — a class
-    /// constructor is a `FunctionObject`, and `static get x()` is defined
-    /// through this path.
+    /// `OrdinaryObject`（以及委托给它的函数 / Date / Promise…）把默认属性放在
+    /// shape 槽位、非默认属性放在 `attrs` 或字典模式；其余变体暂时仍用
+    /// `PropertyTable`。两条路都必须保住描述符的
+    /// (`writable`/`enumerable`/`configurable`, getter, setter) —— 类构造器是
+    /// `FunctionObject`，`static get x()` 就走这条路径。
     fn define_property(
         &mut self,
         heap: &mut Heap,
@@ -1568,12 +1568,15 @@ pub fn new_array_object_from_vec(heap: &mut Heap, vec: Vec<Value>) -> Value {
 /// (e.g., class constructors that need a `.prototype` property).
 /// Stored as `Value::Object` with `ObjectKind::Function`.
 /// When `CallEx` encounters this, it extracts the `func_id` and jumps to it.
+/// 属性（含头部）委托给 [`OrdinaryObject`]：函数对象因此和 `{}`、`new Date()`
+/// 一样走 shape 槽位，只有函数特有的内部槽（`func_id` / 捕获环境）留在这里。
+/// 这样 `length` / `name` / `prototype` 这些非默认描述符由同一套
+/// `attrs` + 字典降级逻辑保管，不再为每个变体抄一份属性表实现。
 #[derive(Debug)]
 pub struct FunctionObject {
     pub func_id: u32,
     pub name: String,
-    header: ObjectHeader,
-    properties: PropertyTable,
+    base: OrdinaryObject,
     /// For arrow functions: captured `this` value
     pub captured_this: Option<Value>,
     /// For arrow functions: the enclosing frame's `new.target` at creation
@@ -1591,8 +1594,7 @@ impl FunctionObject {
         Self {
             func_id,
             name: name.to_string(),
-            properties: PropertyTable::new(),
-            header: ObjectHeader::new(),
+            base: OrdinaryObject::new(),
             captured_this: None,
             captured_new_target: None,
             captured_vars: Vec::new(),
@@ -1609,8 +1611,7 @@ impl FunctionObject {
         Self {
             func_id,
             name: name.to_string(),
-            properties: PropertyTable::new(),
-            header: ObjectHeader::new(),
+            base: OrdinaryObject::new(),
             captured_this: Some(captured_this),
             captured_new_target: None,
             captured_vars,
@@ -1624,89 +1625,73 @@ impl JSObject for FunctionObject {
     }
 
 
+    // Everything below is ordinary object behaviour, delegated: a function's
+    // `length` / `name` / `prototype` (and class static members) are plain own
+    // properties, so they belong in the shared shape/slots/attrs storage.
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        self.properties.get(key).cloned()
+        self.base.property_get(key)
     }
 
     fn property_set(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         value: Value,
     ) -> Result<bool, String> {
-        self.properties
-            .insert(key, PropertyDescriptor::data_descriptor(value));
-        Ok(true)
+        self.base.property_set(heap, key, value)
     }
 
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        // Class members are defined through this path (`static get x()`), so
-        // the descriptor attributes have to survive on function objects.
-        match self.properties.get(&key).cloned() {
-            Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.header.is_extensible() => {
-                return Err("Cannot add property to non-extensible object".to_string());
-            }
-            None => {}
-        }
-        self.properties.insert(key, desc);
-        Ok(true)
+        self.base.define_property(heap, key, desc)
     }
 
-    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
-        if let Some(desc) = self.properties.get(key) {
-            if !desc.configurable {
-                return false;
-            }
-        }
-        self.properties.remove(key).is_some()
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        self.properties.contains_key(key)
+        self.base.has_property(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys()
+        self.base.own_keys()
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.header.prototype()
+        self.base.get_prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.header.set_prototype(proto);
+        self.base.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.header.is_extensible()
+        self.base.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.header.prevent_extensions();
+        self.base.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
-        crate::vm::object::is_frozen_desc_set(self)
+        self.base.is_frozen()
     }
 
     fn freeze(&mut self) {
-        self.header.freeze();
-        freeze_property_table(&mut self.properties);
+        self.base.freeze();
     }
 
     fn is_sealed(&self) -> bool {
-        crate::vm::object::is_sealed_desc_set(self)
+        self.base.is_sealed()
     }
 
     fn seal(&mut self) {
-        self.header.prevent_extensions();
-        seal_property_table(&mut self.properties);
+        self.base.seal();
     }
 
     fn type_of(&self) -> &'static str {
@@ -2069,20 +2054,22 @@ impl JSObject for NativeFunctionObject {
 /// which converts back to the wrapped primitive (`obj == 1.1`, stringification,
 /// arithmetic). String wrappers additionally expose the synthesized index keys
 /// and `length` of the wrapped string.
+/// 自有属性（含头部）委托给 [`OrdinaryObject`]，走 shape 槽位 / `attrs` / 字典降级；
+/// 只有 String 包装的**虚拟**属性（`length` 与规范索引）留在这里 —— 值由被包装的
+/// 字符串决定，不占槽位，且按 ES 10.4.3 不可写、不可配置。
 #[derive(Debug)]
 pub struct PrimitiveWrapperObject {
-    header: ObjectHeader,
+    base: OrdinaryObject,
     primitive: Value,
-    properties: PropertyTable,
 }
 
 impl PrimitiveWrapperObject {
     pub fn new(primitive: Value, prototype: Option<Gc<Object>>) -> Self {
-        Self {
-            primitive,
-            properties: PropertyTable::new(),
-            header: ObjectHeader::with_optional_prototype(prototype),
+        let mut base = OrdinaryObject::new();
+        if let Some(proto) = prototype {
+            base.set_prototype(Some(proto));
         }
+        Self { primitive, base }
     }
 
     /// `String.prototype.length` 的口径：**UTF-16 码元**（不是码点）。
@@ -2091,6 +2078,42 @@ impl PrimitiveWrapperObject {
             Value::String(s) => crate::vm::utf16::length(s),
             _ => 0,
         }
+    }
+
+    /// String 包装对象的虚拟自有属性。写进形状只会让 `own_keys` 出现重复键，
+    /// 也表达不了"字符串不可变"这件事。
+    fn virtual_property(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        let Value::String(s) = &self.primitive else {
+            return None;
+        };
+        if key.is("length") {
+            return Some(PropertyDescriptor {
+                value: Value::Number(crate::vm::utf16::length(s) as f64),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+                getter: None,
+                setter: None,
+            });
+        }
+        let idx = key.array_index()?;
+        s.encode_utf16()
+            .nth(idx as usize)
+            .map(|unit| PropertyDescriptor {
+                value: Value::string(&crate::vm::utf16::from_units(&[unit])),
+                writable: false,
+                enumerable: true,
+                configurable: false,
+                getter: None,
+                setter: None,
+            })
+    }
+
+    /// 赋值 / 删除要拦住的键：ES 对 String exotic 的**所有**规范索引都拒绝写，
+    /// 不只是字符串长度内的那些（与委托前的口径一致）。
+    fn is_virtual_key(&self, key: &PropertyKey) -> bool {
+        matches!(self.primitive, Value::String(_))
+            && (key.is("length") || key.array_index().is_some())
     }
 }
 
@@ -2107,103 +2130,57 @@ impl JSObject for PrimitiveWrapperObject {
 
 
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        if let Value::String(s) = &self.primitive {
-            if key.is("length") {
-                return Some(PropertyDescriptor {
-                    value: Value::Number(crate::vm::utf16::length(s) as f64),
-                    writable: false,
-                    enumerable: false,
-                    configurable: false,
-                    getter: None,
-                    setter: None,
-                });
-            }
-            if let Some(idx) = key.array_index() {
-                // 索引按码元：非 BMP 字符的第 0 位是半个代理对（U+FFFD）。
-                return s.encode_utf16().nth(idx as usize).map(|unit| PropertyDescriptor {
-                    value: Value::string(&crate::vm::utf16::from_units(&[unit])),
-                    writable: false,
-                    enumerable: true,
-                    configurable: false,
-                    getter: None,
-                    setter: None,
-                });
-            }
-        }
-        self.properties.get(key).cloned()
+        self.virtual_property(key)
+            .or_else(|| self.base.property_get(key))
     }
 
     fn property_set(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         value: Value,
     ) -> Result<bool, String> {
-        if matches!(self.primitive, Value::String(_)) {
-            {
-                // String wrapper index keys and `length` are read-only.
-                if key.is("length") {
-                return Err(
-                    "Cannot assign to read-only property of a String wrapper".to_string()
-                );
-            }
-            }
-            if key.array_index().is_some() {
-                return Err(
-                    "Cannot assign to read-only property of a String wrapper".to_string()
-                );
-            }
+        if self.is_virtual_key(&key) {
+            return Err("Cannot assign to read-only property of a String wrapper".to_string());
         }
-        self.properties
-            .insert(key, PropertyDescriptor::data_descriptor(value));
-        Ok(true)
+        // 普通自有属性走共享存储：只读 / accessor / frozen / extensible 由同一套
+        // 规则判定（旧实现无条件覆盖成默认描述符，会把属性位冲掉）。
+        self.base.property_set(heap, key, value)
     }
 
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        // A wrapper is an ordinary object as far as its own extra keys go, so
-        // `[[DefineOwnProperty]]` applies: extensibility gates additions and an
-        // existing non-configurable entry can only be redefined opaquely. The
-        // index keys of a String wrapper (`length` included) already report
-        // `configurable: false` from `property_get`, which is what makes them
-        // impossible to redefine (ES 10.4.3).
-        match self.property_get(&key) {
-            Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.header.is_extensible() => {
-                return Err("Cannot add property to non-extensible object".to_string());
-            }
-            None => {}
+        // 虚拟键是 non-configurable：先按现有描述符校验；即便校验通过也不能写进
+        // base —— 旧实现把它塞进属性表，`own_keys` 会出现重复的索引键。
+        if let Some(current) = self.virtual_property(&key) {
+            validate_property_redefinition(&current, &desc)?;
+            return Ok(true);
         }
-        self.properties.insert(key, desc);
-        Ok(true)
+        self.base.define_property(heap, key, desc)
     }
 
-    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
-        if matches!(self.primitive, Value::String(_)) {
-            if key.is("length") {
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        if self.is_virtual_key(key) {
             return false;
         }
-            if key.array_index().is_some() {
-                return false;
-            }
-        }
-        self.properties.remove(key).is_some()
+        // 删除会降级成字典模式，且 configurable / frozen 也由共享实现判定。
+        self.base.property_delete(heap, key)
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
         if matches!(self.primitive, Value::String(_)) {
             if key.is("length") {
-            return true;
-        }
+                return true;
+            }
             if let Some(idx) = key.array_index() {
                 return (idx as usize) < self.string_len();
             }
         }
-        self.properties.contains_key(key)
+        self.base.has_property(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
@@ -2221,8 +2198,8 @@ impl JSObject for PrimitiveWrapperObject {
         }
         let wraps_string = matches!(self.primitive, Value::String(_));
         keys.extend(
-            self.properties
-                .keys()
+            self.base
+                .own_keys()
                 .into_iter()
                 .filter(|key| !wraps_string || !key.is("length")),
         );
@@ -2230,28 +2207,29 @@ impl JSObject for PrimitiveWrapperObject {
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.header.prototype()
+        self.base.get_prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.header.set_prototype(proto);
+        self.base.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.header.is_extensible()
+        self.base.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.header.prevent_extensions();
+        self.base.prevent_extensions();
     }
 
+    // 冻结/密封的**判定**仍走 `own_keys()` + `property_get()`（含虚拟属性），
+    // `base.is_frozen()` 只看得到形状里的键。
     fn is_frozen(&self) -> bool {
         is_frozen_desc_set(self)
     }
 
     fn freeze(&mut self) {
-        self.header.freeze();
-        freeze_property_table(&mut self.properties);
+        self.base.freeze();
     }
 
     fn is_sealed(&self) -> bool {
@@ -2259,8 +2237,7 @@ impl JSObject for PrimitiveWrapperObject {
     }
 
     fn seal(&mut self) {
-        self.header.prevent_extensions();
-        seal_property_table(&mut self.properties);
+        self.base.seal();
     }
 
     fn class_name(&self) -> &'static str {
@@ -4462,8 +4439,9 @@ impl Trace for ArrayObject {
 
 impl Trace for FunctionObject {
     fn trace(&self, out: &mut Worklist) {
-        self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // `base` 覆盖原型、快速模式槽位/attrs 与字典模式的表（三路都由
+        // `Trace for OrdinaryObject` 负责），别在这里再拆一遍，漏一路就是静默 UAF。
+        self.base.trace(out);
         self.captured_this.trace(out);
         self.captured_new_target.trace(out);
         // `Vec<(String, EnvCell)>`：容器 impl 覆盖不到元组，手工拆；
@@ -4483,8 +4461,8 @@ impl Trace for NativeFunctionObject {
 
 impl Trace for PrimitiveWrapperObject {
     fn trace(&self, out: &mut Worklist) {
-        self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // base 覆盖原型、快速模式槽位 / `attrs` 与字典模式那张表。
+        self.base.trace(out);
         self.primitive.trace(out);
     }
 }
@@ -4735,5 +4713,133 @@ mod shape_tests {
         assert!(!desc.writable);
         assert!(!desc.configurable);
         assert!(obj.is_frozen());
+    }
+
+    /// 函数对象的 `length` / `name` 是**非默认**描述符：换到形状槽位之后仍要
+    /// 读得回三个属性位；同布局的函数还必须共享同一个形状。
+    #[test]
+    fn function_metadata_lives_in_shape_slots() {
+        let mut heap = Heap::new();
+        let mut a = FunctionObject::new(1, "a");
+        let mut b = FunctionObject::new(2, "b");
+        let length = PropertyKey::well_known("length").expect("well-known name");
+        let name = PropertyKey::well_known("name").expect("well-known name");
+        let mut meta = plain(Value::Number(2.0));
+        meta.writable = false;
+        meta.enumerable = false;
+        for f in [&mut a, &mut b] {
+            f.define_property(&mut heap, length, meta.clone()).unwrap();
+            f.define_property(&mut heap, name, plain(Value::string("f")))
+                .unwrap();
+        }
+
+        let desc = a.property_get(&length).expect("length 还在");
+        assert_eq!(desc.value, Value::Number(2.0));
+        assert!(!desc.writable);
+        assert!(!desc.enumerable);
+        assert!(desc.configurable);
+        assert_eq!(a.own_keys(), vec![length, name]);
+        assert!(
+            std::rc::Rc::ptr_eq(
+                a.base.shape.as_ref().expect("加过属性就有形状"),
+                b.base.shape.as_ref().expect("加过属性就有形状"),
+            ),
+            "同布局的函数对象必须共享形状"
+        );
+        // 只读的 `length` 不能被普通赋值覆盖（旧的属性表实现会把描述符冲掉）。
+        assert!(a.property_set(&mut heap, length, Value::Number(9.0)).is_err());
+        assert_eq!(
+            a.property_get(&length).expect("还在").value,
+            Value::Number(2.0)
+        );
+    }
+
+    /// 删函数属性会降级成字典模式，剩下的描述符属性一个不少。
+    #[test]
+    fn function_property_delete_switches_to_dictionary_mode() {
+        let mut heap = Heap::new();
+        let mut f = FunctionObject::new(1, "f");
+        let length = PropertyKey::well_known("length").expect("well-known name");
+        let name = PropertyKey::well_known("name").expect("well-known name");
+        let mut meta = plain(Value::Number(1.0));
+        meta.enumerable = false;
+        f.define_property(&mut heap, length, meta).unwrap();
+        f.define_property(&mut heap, name, plain(Value::string("f")))
+            .unwrap();
+
+        assert!(f.base.dict.is_none());
+        assert!(f.property_delete(&mut heap, &name));
+        assert!(f.base.dict.is_some(), "删除之后应转为字典模式");
+        assert!(!f.has_property(&name));
+        assert!(
+            !f.property_get(&length).expect("length 还在").enumerable,
+            "字典模式要保住非默认描述符"
+        );
+        assert_eq!(f.own_keys(), vec![length]);
+    }
+
+    /// 冻结函数时，属性位和头部要一起变（委托之前 `seal` 只调了
+    /// `prevent_extensions`，冻结/密封的状态是错的）。
+    #[test]
+    fn freezing_a_function_marks_its_own_properties() {
+        let mut heap = Heap::new();
+        let mut f = FunctionObject::new(1, "f");
+        let length = PropertyKey::well_known("length").expect("well-known name");
+        f.define_property(&mut heap, length, plain(Value::Number(1.0)))
+            .unwrap();
+
+        f.freeze();
+        assert!(f.is_frozen());
+        let desc = f.property_get(&length).expect("还在");
+        assert!(!desc.writable);
+        assert!(!desc.configurable);
+        assert!(!f.property_delete(&mut heap, &length));
+    }
+
+    /// String 包装的虚拟属性不占槽位，普通自有属性仍走形状；键序不变。
+    #[test]
+    fn string_wrapper_keeps_virtual_keys_and_shape_backed_own_keys() {
+        let mut heap = Heap::new();
+        let mut w = PrimitiveWrapperObject::new(Value::string("ab"), None);
+        let length = PropertyKey::well_known("length").expect("well-known name");
+        let x = PropertyKey::intern(&mut heap, "x");
+
+        assert_eq!(
+            w.property_get(&length).expect("length").value,
+            Value::Number(2.0)
+        );
+        assert!(w.property_get(&PropertyKey::from_index(0)).is_some());
+        assert!(w.property_get(&PropertyKey::from_index(2)).is_none());
+        w.property_set(&mut heap, x, Value::Number(1.0)).unwrap();
+        assert!(w.base.shape.is_some(), "自有属性应占形状槽位");
+        assert_eq!(
+            w.own_keys(),
+            vec![
+                PropertyKey::from_index(0),
+                PropertyKey::from_index(1),
+                length,
+                x
+            ]
+        );
+        assert!(w.property_set(&mut heap, length, Value::Number(9.0)).is_err());
+        assert!(!w.property_delete(&mut heap, &length));
+    }
+
+    /// 非默认描述符、冻结与删除按 OrdinaryObject 的规则（旧实现会冲掉描述符）。
+    #[test]
+    fn number_wrapper_uses_shared_descriptor_rules() {
+        let mut heap = Heap::new();
+        let mut w = PrimitiveWrapperObject::new(Value::Number(1.0), None);
+        let key = PropertyKey::intern(&mut heap, "x");
+        let mut desc = plain(Value::Number(1.0));
+        desc.writable = false;
+        desc.enumerable = false;
+        w.define_property(&mut heap, key, desc).unwrap();
+
+        assert!(w.property_set(&mut heap, key, Value::Number(2.0)).is_err());
+        assert!(!w.property_get(&key).expect("还在").writable);
+        w.freeze();
+        assert!(w.is_frozen());
+        assert!(!w.property_delete(&mut heap, &key));
     }
 }

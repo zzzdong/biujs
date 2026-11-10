@@ -6019,6 +6019,16 @@ pub(crate) fn immd(operand: &Operand, what: &str) -> Result<isize, RuntimeError>
     })
 }
 
+/// 跳转类操作数（`RelPc` / `AbsPc`）不是 `Operand`，所以先 `try_immd()` 取
+/// `Option`，再在这里统一变成 `InternalError` —— 运行期一处都不许 panic。
+pub(crate) fn pc_immd(value: Option<isize>, what: &str) -> Result<isize, RuntimeError> {
+    value.ok_or_else(|| {
+        RuntimeError::InternalError(format!(
+            "malformed bytecode: {what} must be an immediate pc operand"
+        ))
+    })
+}
+
 /// Bounds-checked constant-pool access for the interpreter.
 pub(crate) fn constant_at<'a>(
     module: &'a Module,
@@ -6807,6 +6817,40 @@ mod tests {
         let mut vm = VM::new();
         let result = vm.run(&module).unwrap();
         assert_eq!(result, Value::string("hello"));
+    }
+
+    /// 坏字节码必须变成可恢复的 `InternalError`：release 是 `panic = "abort"`，
+    /// 一条畸形指令会带走整个 test262 分片。0.5 的最后一截：运行期不再有
+    /// `as_immd()`，跳转目标与常量索引都走 `immd()` / `constant_at()`。
+    #[test]
+    fn malformed_bytecode_returns_an_internal_error() {
+        let jump = make_module(
+            vec![
+                Instr::Jump {
+                    offset: crate::bytecode::RelPc::new(Operand::Register(Register::R0)),
+                },
+                Instr::Halt {},
+            ],
+            vec![],
+        );
+        let mut vm = VM::new();
+        let err = vm.run(&jump).expect_err("非立即数的跳转偏移必须报错");
+        assert!(matches!(err, RuntimeError::InternalError(_)), "{err}");
+
+        let const_index = make_module(
+            vec![
+                Instr::LoadConst {
+                    dst: Operand::Register(Register::Rv),
+                    index: Operand::Immd(7),
+                },
+                Instr::Halt {},
+            ],
+            vec![],
+        );
+        let err = vm
+            .run(&const_index)
+            .expect_err("越界常量索引必须报错");
+        assert!(matches!(err, RuntimeError::InternalError(_)), "{err}");
     }
 
     #[test]

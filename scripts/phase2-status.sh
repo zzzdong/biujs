@@ -141,7 +141,9 @@ if ! cargo test --release --test test262_runner --no-run >/tmp/biujs-runner-buil
   tail -20 /tmp/biujs-runner-build.log >&2
   exit 3
 fi
-RUNNER_BIN="$(ls -t target/release/deps/test262_runner-* 2>/dev/null | grep -v '\.d$' | head -1)"
+# Windows/MSVC 还会产出 `.pdb`（符号文件），时间戳比 `.exe` 还新；不排除它
+# 就会把二进制符号表当脚本执行，分片直接崩掉。
+RUNNER_BIN="$(ls -t target/release/deps/test262_runner-* 2>/dev/null | grep -v -e '\.d$' -e '\.pdb$' | head -1)"
 if [ -z "$RUNNER_BIN" ]; then
   echo "找不到 test262_runner 二进制（先 cargo test --release --test test262_runner --no-run）。" >&2
   exit 1

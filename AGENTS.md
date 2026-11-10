@@ -41,6 +41,14 @@ cargo test --release --test bytecode_dump  # 字节码 golden（UPDATE_GOLDEN=1 
 bash scripts/doc-numbers.sh              # 单独重算 README / PROJECT 的通过率（数字不手改）
 ```
 
+Windows 上用 PowerShell 版（不依赖 bash / Git Bash，功能等价）：
+
+```powershell
+pwsh -File scripts/phase2-status.ps1           # 三级 + 全量 + 逐套件对比
+pwsh -File scripts/phase2-status.ps1 -Quick    # 只跑三级
+pwsh -File scripts/phase2-status.ps1 -Update   # 刷新基线快照并同步文档数字
+```
+
 test262 是 git submodule（约 245 MB），首次需要：
 
 ```sh

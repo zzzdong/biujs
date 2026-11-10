@@ -46,12 +46,16 @@ fn bytecode_dump_matches_golden_files() {
                 .unwrap_or_else(|err| panic!("cannot write {}: {err}", golden_path.display()));
         }
 
-        let expected = fs::read_to_string(&golden_path).unwrap_or_else(|err| {
-            panic!(
-                "missing golden file {} ({err}); run with UPDATE_GOLDEN=1",
-                golden_path.display()
-            )
-        });
+        let expected = fs::read_to_string(&golden_path)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "missing golden file {} ({err}); run with UPDATE_GOLDEN=1",
+                    golden_path.display()
+                )
+            })
+            // Windows 检出（`core.autocrlf`）会让 golden 变成 CRLF，而 dumper
+            // 一律输出 `\n`。只归一化行尾，内容仍逐字符比较。
+            .replace("\r\n", "\n");
         assert_eq!(
             actual,
             expected,

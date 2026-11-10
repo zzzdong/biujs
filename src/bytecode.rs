@@ -545,9 +545,16 @@ impl RelPc {
         Self(Operand::Immd(offset))
     }
 
-    /// 偏移值。VM 读它、回填也算它。
+    /// 运行期读取：非立即数交给 VM 变成 `InternalError`，不能在 release
+    /// （`panic = "abort"`）下把整个进程带走。
+    pub fn try_immd(&self) -> Option<isize> {
+        self.0.try_immd()
+    }
+
+    /// 偏移值。**仅编译期**用：这里的操作数由 codegen 保证是立即数。
     pub fn as_immd(&self) -> isize {
-        self.0.as_immd()
+        self.try_immd()
+            .unwrap_or_else(|| panic!("{self:?} not an immediate"))
     }
 
     /// 回填：改写偏移。
@@ -577,9 +584,15 @@ impl AbsPc {
         Self(Operand::Immd(pc))
     }
 
-    /// pc 值。
+    /// 运行期读取（见 [`RelPc::try_immd`]）。
+    pub fn try_immd(&self) -> Option<isize> {
+        self.0.try_immd()
+    }
+
+    /// pc 值。**仅编译期**用。
     pub fn as_immd(&self) -> isize {
-        self.0.as_immd()
+        self.try_immd()
+            .unwrap_or_else(|| panic!("{self:?} not an immediate"))
     }
 
     /// 回填：改写 pc。

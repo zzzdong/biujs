@@ -1,6 +1,6 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
-# 最近更新：2026-10-26
+# 最近更新：2026-11-10
 # guards: timeout 0 step-limit 0 memory 14 (TEST262_TIMEOUT_MS=15000 TEST262_STEP_LIMIT=0 TEST262_MEMORY_MB=384)
 language/statements/for-of	605	52	94
 language/statements/for-in	72	28	15
@@ -20,7 +20,7 @@ language/expressions/this	2	4	0
 language/expressions/unsigned-right-shift	24	8	13
 language/statements/break	18	2	0
 language/statements/do-while	26	10	0
-language/statements/function	318	115	18
+language/statements/function	319	115	17
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	55	18	0
@@ -28,8 +28,8 @@ built-ins/Array	2344	187	550
 built-ins/JSON	123	29	13
 built-ins/WeakSet	81	1	3
 built-ins/Number	197	38	105
-built-ins/Proxy	218	49	44
-language/statements/generators	229	21	16
+built-ins/Proxy	219	49	43
+language/statements/generators	230	21	15
 language/destructuring	17	1	1
 built-ins/String/prototype/Symbol.iterator	4	0	2
 language/expressions/bitwise-not	11	3	2
@@ -54,9 +54,9 @@ language/computed-property-names	40	0	8
 built-ins/Boolean	29	3	19
 built-ins/Map	187	5	12
 built-ins/TypedArray	303	513	630
-built-ins/Object	3081	32	298
+built-ins/Object	3095	32	284
 built-ins/String	793	72	358
-language/expressions/generators	241	30	19
+language/expressions/generators	242	30	18
 language/expressions/assignment/destructuring	3	1	4
 language/expressions/addition	35	8	5
 language/expressions/bitwise-or	19	8	3
