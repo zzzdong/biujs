@@ -617,6 +617,25 @@ fn regular_expressions_work_for_everyday_patterns() {
 }
 
 #[test]
+fn boolean_and_number_prototypes_have_their_es_internal_slots() {
+    // ES 19.3.3 / 20.1.3：`Boolean.prototype` / `Number.prototype` 是带内部槽的
+    // 包装对象（false / +0），不是普通对象；以前它们返回 "[object Object]"。
+    eval_js(
+        "'use strict';
+         if (Boolean.prototype.toString() !== 'false') throw new Error('Boolean.prototype.toString');
+         if (Boolean.prototype.valueOf() !== false) throw new Error('Boolean.prototype.valueOf');
+         if (Boolean.prototype != false) throw new Error('Boolean.prototype == false');
+         if (Number.prototype.toString() !== '0') throw new Error('Number.prototype.toString');
+         if (Number.prototype.valueOf() !== 0) throw new Error('Number.prototype.valueOf');
+         if ((new Boolean(false)).toString() !== 'false') throw new Error('new Boolean(false).toString');
+         if ((new Number(-1)).toString() !== '-1') throw new Error('new Number(-1).toString');
+         if (Number.isSafeInteger('1') !== false) throw new Error('isSafeInteger must reject strings');
+         if (Number.isSafeInteger(1) !== true) throw new Error('isSafeInteger(1)');",
+    )
+    .unwrap();
+}
+
+#[test]
 fn objects_take_part_in_arithmetic_and_arrays_flat_map() {
     // Binary arithmetic runs ToNumeric, which starts with ToPrimitive(hint
     // number) — without it every object operand collapses to NaN.

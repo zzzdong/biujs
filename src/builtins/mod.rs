@@ -480,8 +480,17 @@ impl Builtins {
         let uri_error_proto = new_proto(heap, Some(error_proto), "URIError");
         let eval_error_proto = new_proto(heap, Some(error_proto), "EvalError");
         let syntax_error_proto = new_proto(heap, Some(error_proto), "SyntaxError");
-        let boolean_proto = new_proto(heap, Some(object_proto), "Boolean");
-        let number_proto = new_proto(heap, Some(object_proto), "Number");
+        // ES 19.3.3 / 20.1.3：`Boolean.prototype` / `Number.prototype` **本身**
+        // 就是带内部槽的包装对象（[[BooleanData]] = false / [[NumberData]] = +0）。
+        // 以前用普通 `ProtoObject`，于是 `Boolean.prototype.toString()` 落到
+        // `Object.prototype.toString` 变成 "[object Object]"，整族用例失败。
+        // `String.prototype` 有虚拟索引/length 的额外语义，暂留到单独一片。
+        let boolean_proto = heap.alloc(Object::PrimitiveWrapper(
+            crate::vm::object::PrimitiveWrapperObject::new(Value::Bool(false), Some(object_proto)),
+        ));
+        let number_proto = heap.alloc(Object::PrimitiveWrapper(
+            crate::vm::object::PrimitiveWrapperObject::new(Value::Number(0.0), Some(object_proto)),
+        ));
         let string_proto = new_proto(heap, Some(object_proto), "String");
         let function_proto = new_proto(heap, Some(object_proto), "Function");
         let symbol_proto = new_proto(heap, Some(object_proto), "Symbol");
@@ -1255,14 +1264,13 @@ pub fn call_static_method(
         "Number.isNaN" => number::number_is_nan(args),
         "Number.isFinite" => number::number_is_finite(args),
         "Number.isInteger" => number::number_is_integer(args),
-        "Number.isSafeInteger" => Ok(Value::Bool(
-            args.first()
-                .map(|v| {
-                    let n = v.to_number();
-                    n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0
-                })
-                .unwrap_or(false),
-        )),
+        // ES 20.1.2.5：非 Number 值直接 false，不做 ToNumber（"1" 不是安全整数）。
+        "Number.isSafeInteger" => Ok(Value::Bool(match args.first() {
+            Some(Value::Number(n)) => {
+                n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0
+            }
+            _ => false,
+        })),
         "Number.parseInt" => global_parse_int(args),
         "Number.parseFloat" => Ok(Value::Number(
             args.first()

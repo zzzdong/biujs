@@ -749,6 +749,29 @@ getter 的 accessor 由同一套 `attrs` 保管、冻结/密封正确标注属�
 | P4-13 | RegExp 引擎（lookaround/backref）| +40…+80（String）+ 可选 RegExp 套件 | 决策 |
 | P4-14 | modules | 未知（755 文件） | 决策 |
 
+### Phase 4 首批（2026-11-10）：内建原型的内部槽
+
+按「先量后改」：定向跑 `built-ins/Number,built-ins/Boolean` 的失败明细，
+35 条 `Number.prototype.toString(N)` 与 Boolean 的 `toString`/`valueOf` 一族都
+报 "[object Object]" —— 根因是 `Boolean.prototype` / `Number.prototype` 被建成
+普通 `ProtoObject`，没有 ES 19.3.3 / 20.1.3 规定的
+[[BooleanData]] = false / [[NumberData]] = +0。现在两者在 `Builtins::new` 里建成
+`PrimitiveWrapperObject`（原型为 `Object.prototype`），于是 `toString` /
+`valueOf` / `== false` 都走共享的包装对象路径；`Object.prototype.toString` 的
+通用分派没有动（同名方法不能按 `this` 猜归属，那是 1D 的债）。
+`String.prototype` 有虚拟索引与 `length` 的额外语义，留到下一片。
+顺带修 `Number.isSafeInteger` 对非 Number 参数误做 `ToNumber`（"1" 被判成安全整数）。
+
+**验收**：三级 270 / 640 / 7 + 字节码 golden；全量 **17,329 → 17,376 / 20,504
+（84.52% → 84.74%，+47）**，无逐套件回退，护栏 0/0/14 与跳过 8577 不变，
+墙钟 107.3s。`built-ins/Number` 197 → 240（失败 105 → 62）、
+`built-ins/Boolean` 29 → 33。
+
+`Number` 剩余 62 条里可直接继续的：数值格式化方法对非法参数抛出的错误类型
+（`e instanceof TypeError` 10 条 / RangeError 2 条）、
+`Number.parseFloat === parseFloat` 的函数同一性（2 条）、
+`Object.prototype.toString.call(Number.prototype)` 的 `[[Class]]`（2 条）。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；

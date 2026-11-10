@@ -83,14 +83,13 @@ pub fn register_number_statics(number_fn: &Value, _proto: &Gc<Object>, heap: &mu
     set_static_method(number_fn, "isFinite", heap, |args| number_is_finite(args));
     set_static_method(number_fn, "isInteger", heap, |args| number_is_integer(args));
     set_static_method(number_fn, "isSafeInteger", heap, |args| {
-        Ok(Value::Bool(
-            args.first()
-                .map(|v| {
-                    let n = v.to_number();
-                    n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0
-                })
-                .unwrap_or(false),
-        ))
+        // ES 20.1.2.5：非 Number 值直接 false，不做 ToNumber（"1" 不是安全整数）。
+        Ok(Value::Bool(match args.first() {
+            Some(Value::Number(n)) => {
+                n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0
+            }
+            _ => false,
+        }))
     });
     set_static_method(number_fn, "parseInt", heap, |args| {
         super::global_parse_int(args)
