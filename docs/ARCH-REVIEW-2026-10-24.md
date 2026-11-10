@@ -825,6 +825,28 @@ helper）：静态方法在 `call_native_by_name` 转换第二个参数，`hasOw
 （84.98% → 85.05%，+14）**，无逐套件回退，护栏 0/0/14 与跳过 8577 不变，
 墙钟 106.7s。
 
+### Phase 4 第五批（2026-11-11）：补齐 `Date.prototype` 缺失的 get/set 一族
+
+`built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-135` 与 `141..151`
+共 12 条只检查一件事：`Object.getOwnPropertyDescriptor(Date.prototype, name)`
+要返回 data 描述符，且 `desc.value === Date.prototype[name]`。实测这些名字
+（`getUTCMilliseconds`、`setHours` / `setMinutes` / `setSeconds` /
+`setMilliseconds` 与七个 `setUTC*`）在原型上**根本没有属性** —— 既没注册，
+也不在按名字分派表里。这是 1D 名字分派债的一个具体缺口。
+
+现在在 `register_date_prototype` 里注册这 12 个方法，并在
+`call_prototype_method` 接入分派。实现复用 `parts` / `time_from_components`，
+新增 `date_set_parts(this, args, start, count, utc)`：从 `start` 分量起用最多
+`count` 个实参覆盖，其余保留，UTC 变体按 UTC 拆分与重建（越界值沿用既有
+进位规则）。`getUTCMilliseconds` 直接走 `date_component(obj, 7, true)`。
+feature 断言同时钉住描述符与 `setUTCHours(1,2,3,4)` 的实际结果。
+
+**验收**：三级 270 / 644 / 7 + 字节码 golden；`built-ins/Object`
+3121 → 3133（失败 258 → 246）；全量 **17,439 → 17,452 / 20,504
+（85.05% → 85.12%，+13）**，无逐套件回退
+（`language/expressions/property-accessors` 顺带 +1），护栏 0/0/14 与
+跳过 8577 不变，墙钟 106.9s。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；

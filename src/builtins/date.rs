@@ -333,6 +333,30 @@ pub fn register_date_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     set_prototype_method(proto, heap, "setFullYear", |this, args| date_set_full_year(this, args));
     set_prototype_method(proto, heap, "setMonth", |this, args| date_set_month(this, args));
     set_prototype_method(proto, heap, "setDate", |this, args| date_set_date(this, args));
+
+    // 之前这一组只存在于按名字分派的设想里，原型上根本没有属性，于是
+    // `Date.prototype.setHours` 是 undefined、`Object.getOwnPropertyDescriptor`
+    // 也查不到（test262 `15.2.3.3-4-135/141..151`）。补注册并给出真实实现。
+    set_prototype_method(proto, heap, "getUTCMilliseconds", |this, _| {
+        component(this, "getUTCMilliseconds", 7, true)
+    });
+    for (name, start, count, utc) in [
+        ("setHours", 3, 4, false),
+        ("setMinutes", 4, 3, false),
+        ("setSeconds", 5, 2, false),
+        ("setMilliseconds", 6, 1, false),
+        ("setUTCFullYear", 0, 3, true),
+        ("setUTCMonth", 1, 2, true),
+        ("setUTCDate", 2, 1, true),
+        ("setUTCHours", 3, 4, true),
+        ("setUTCMinutes", 4, 3, true),
+        ("setUTCSeconds", 5, 2, true),
+        ("setUTCMilliseconds", 6, 1, true),
+    ] {
+        set_prototype_method(proto, heap, name, move |this, args| {
+            date_set_parts(this, name, args, start, count, utc)
+        });
+    }
 }
 
 pub fn register_date_statics(ctor: &Value, heap: &mut Heap) {
@@ -498,6 +522,39 @@ pub fn date_set_month(this: &Value, args: &[Value]) -> Result<Value, RuntimeErro
 
 pub fn date_set_date(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     set_one_component(this, "setDate", args, 2)
+}
+
+/// 其余 `set*` 的共用实现：从 `start` 这个分量起，用最多 `count` 个实参依次
+/// 覆盖，剩下的分量保持原值；`utc` 决定按 UTC 还是本地时间拆分/重建。
+///
+/// 分量数组顺序与 [`time_from_components`] 一致：
+/// `[year, month(0-based), date, hours, minutes, seconds, ms]`。
+/// 越界值由 `time_from_components` 按 ES 的进位规则处理（`setHours(25)` 是次日 1 点）。
+pub fn date_set_parts(
+    this: &Value,
+    method: &str,
+    args: &[Value],
+    start: usize,
+    count: usize,
+    utc: bool,
+) -> Result<Value, RuntimeError> {
+    let mut date = as_date(this, method)?;
+    let current = date.time_value;
+    if current.is_nan() {
+        return Ok(Value::Number(f64::NAN));
+    }
+    let (year, month, day, _, hour, min, sec, ms) =
+        parts(current as i64, utc).unwrap_or((1970, 0, 1, 0, 0, 0, 0, 0));
+    let mut components = [
+        year as f64, month as f64, day as f64, hour as f64, min as f64, sec as f64, ms as f64,
+    ];
+    for (offset, value) in args.iter().take(count).enumerate() {
+        components[start + offset] = value.to_number();
+    }
+    let values: Vec<Value> = components.iter().map(|n| Value::Number(*n)).collect();
+    let new = time_from_components(&values, utc);
+    date.time_value = new;
+    Ok(Value::Number(new))
 }
 
 /// Replace one calendar component, keeping the rest (an out-of-range value rolls

@@ -636,6 +636,37 @@ fn boolean_and_number_prototypes_have_their_es_internal_slots() {
 }
 
 #[test]
+fn date_prototype_exposes_all_es6_setters_and_utc_getter() {
+    // 这一族方法以前只活在「按名字分派」的设想里，原型上没有属性：
+    // `Date.prototype.setHours` 是 undefined，反射 API 也查不到。
+    eval_js(
+        "'use strict';
+         var names = ['getUTCMilliseconds','setHours','setMinutes','setSeconds','setMilliseconds',
+                      'setUTCFullYear','setUTCMonth','setUTCDate','setUTCHours','setUTCMinutes',
+                      'setUTCSeconds','setUTCMilliseconds'];
+         for (var i = 0; i < names.length; i++) {
+           var d = Object.getOwnPropertyDescriptor(Date.prototype, names[i]);
+           if (!d) throw new Error('missing ' + names[i]);
+           if (typeof d.value !== 'function' || d.value !== Date.prototype[names[i]]) {
+             throw new Error('descriptor value ' + names[i]);
+           }
+           if (d.writable !== true || d.enumerable !== false || d.configurable !== true) {
+             throw new Error('attributes ' + names[i]);
+           }
+         }
+         var d = new Date(0);
+         if (d.getUTCMilliseconds() !== 0) throw new Error('getUTCMilliseconds');
+         var t = d.setUTCHours(1, 2, 3, 4);
+         if (t !== 3723004) throw new Error('setUTCHours result ' + t);
+         if (d.getUTCHours() !== 1 || d.getUTCMinutes() !== 2 ||
+             d.getUTCSeconds() !== 3 || d.getUTCMilliseconds() !== 4) {
+           throw new Error('setUTCHours did not set every field');
+         }",
+    )
+    .unwrap();
+}
+
+#[test]
 fn objects_take_part_in_arithmetic_and_arrays_flat_map() {
     // Binary arithmetic runs ToNumeric, which starts with ToPrimitive(hint
     // number) — without it every object operand collapses to NaN.

@@ -1493,10 +1493,25 @@ pub fn call_prototype_method(
         "getUTCHours" => date::date_component(obj, 4, true),
         "getUTCMinutes" => date::date_component(obj, 5, true),
         "getUTCSeconds" => date::date_component(obj, 6, true),
+        "getUTCMilliseconds" => date::date_component(obj, 7, true),
         "setTime" => date::date_set_time(obj, args),
         "setFullYear" => date::date_set_full_year(obj, args),
         "setMonth" => date::date_set_month(obj, args),
         "setDate" => date::date_set_date(obj, args),
+        // 同一族 set*：start 是首个被覆盖的分量，count 是规范允许的可选参数个数。
+        "setHours" => date::date_set_parts(obj, "setHours", args, 3, 4, false),
+        "setMinutes" => date::date_set_parts(obj, "setMinutes", args, 4, 3, false),
+        "setSeconds" => date::date_set_parts(obj, "setSeconds", args, 5, 2, false),
+        "setMilliseconds" => date::date_set_parts(obj, "setMilliseconds", args, 6, 1, false),
+        "setUTCFullYear" => date::date_set_parts(obj, "setUTCFullYear", args, 0, 3, true),
+        "setUTCMonth" => date::date_set_parts(obj, "setUTCMonth", args, 1, 2, true),
+        "setUTCDate" => date::date_set_parts(obj, "setUTCDate", args, 2, 1, true),
+        "setUTCHours" => date::date_set_parts(obj, "setUTCHours", args, 3, 4, true),
+        "setUTCMinutes" => date::date_set_parts(obj, "setUTCMinutes", args, 4, 3, true),
+        "setUTCSeconds" => date::date_set_parts(obj, "setUTCSeconds", args, 5, 2, true),
+        "setUTCMilliseconds" => {
+            date::date_set_parts(obj, "setUTCMilliseconds", args, 6, 1, true)
+        }
         // Map / Set prototype methods are deliberately *not* in this table:
         // `get`, `has`, `delete`, … are ordinary property names on any other
         // object (`{ get: function () { … } }`), and `Map.prototype.has` is not
