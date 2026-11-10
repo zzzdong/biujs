@@ -458,3 +458,22 @@ fn class_static_accessor_descriptor_survives_shape_storage() {
         true
     );
 }
+
+#[test]
+fn strict_functions_reject_caller_and_arguments() {
+    // ES 9.2.7：Function.prototype 上的 caller / arguments 是 %ThrowTypeError%
+    // 访问器，严格模式函数读到就抛 TypeError；描述符不可枚举、不可配置。
+    assert_eq!(
+        eval_bool(
+            "'use strict';
+             function f() {}
+             var threw = 0;
+             try { f.caller; } catch (e) { if (e instanceof TypeError) threw++; }
+             try { f.arguments; } catch (e) { if (e instanceof TypeError) threw++; }
+             var d = Object.getOwnPropertyDescriptor(Function.prototype, 'caller');
+             threw === 2 && !!d && typeof d.get === 'function' &&
+             typeof d.set === 'function' && !d.enumerable && !d.configurable"
+        ),
+        true
+    );
+}

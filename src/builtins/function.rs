@@ -1,8 +1,12 @@
 use crate::RuntimeError;
 use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{JSObject, NativeFunctionObject};
-use crate::vm::property::PropertyKey;
+use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
+
+/// `%ThrowTypeError%`：严格模式函数的 `caller` / `arguments` 访问器（ES 9.2.7）。
+/// 读写这个访问器都必须抛 TypeError，所以 getter 与 setter 指向同一个内建。
+pub const FUNCTION_THROW_TYPE_ERROR_NATIVE: &str = "__throw_type_error__";
 
 /// Function constructor
 /// In ES6 without eval, calling `new Function(str)` throws a SyntaxError
@@ -67,5 +71,24 @@ pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
             Object::NativeFunction(NativeFunctionObject::new(name)),
         )));
         p.define_property(heap, key, value).ok();
+    }
+
+    // ES 9.2.7 / 16.2：严格模式函数继承 `Function.prototype` 上的
+    // `caller` / `arguments` 访问器，其 [[Get]] / [[Set]] 都是 %ThrowTypeError%。
+    // 没有它时 `fn.caller` 只是 undefined，一整族 strict-mode 用例不抛错。
+    let thrower = Value::Object(heap.alloc(Object::NativeFunction(
+        NativeFunctionObject::new(FUNCTION_THROW_TYPE_ERROR_NATIVE),
+    )));
+    for name in ["caller", "arguments"] {
+        let key = PropertyKey::intern(heap, name);
+        let desc = PropertyDescriptor {
+            value: Value::Undefined,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            getter: Some(thrower.clone()),
+            setter: Some(thrower.clone()),
+        };
+        p.define_property(heap, key, desc).ok();
     }
 }

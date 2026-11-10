@@ -772,6 +772,20 @@ getter 的 accessor 由同一套 `attrs` 保管、冻结/密封正确标注属�
 `Number.parseFloat === parseFloat` 的函数同一性（2 条）、
 `Object.prototype.toString.call(Number.prototype)` 的 `[[Class]]`（2 条）。
 
+### Phase 4 第二批（2026-11-10）：严格模式的 `%ThrowTypeError%`
+
+定向明细里 `built-ins/Function` 的 28 条 `15.3.5-*gs.js` 都只断言「读
+`fn.caller` 应抛 TypeError」，根因是 `Function.prototype` 缺 ES 9.2.7 的
+`caller` / `arguments` 访问器。现在两者注册为 `%ThrowTypeError%`（getter/setter
+同一个内建，非枚举、不可配置），按名字分派加一条 TypeError 返回；feature
+断言同时钉住描述符形状。
+
+**验收**：三级 270 / 641 / 7 + 字节码 golden；`built-ins/Function`
+141 → 170（失败 128 → 99）；全量 **17,376 → 17,413 / 20,504
+（84.74% → 84.92%，+37）**，无逐套件回退，护栏 0/0/14 与跳过 8577 不变，
+墙钟 107.2s。除 Function 外还带动 `language/statements/function` +4、
+两处 class +3、generators +1 —— 同一族 strict-mode 探针散落在多个套件里。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；

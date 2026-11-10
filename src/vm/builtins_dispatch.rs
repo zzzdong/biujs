@@ -95,6 +95,14 @@ impl VM {
         if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
             return self.object_prototype_to_string(&this, args, module);
         }
+        // %ThrowTypeError%：`Function.prototype.caller` / `arguments` 的
+        // getter 与 setter（ES 9.2.7）。严格模式函数读这两个属性必须抛。
+        if name == crate::builtins::FUNCTION_THROW_TYPE_ERROR_NATIVE {
+            return Err(RuntimeError::TypeError(
+                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions"
+                    .to_string(),
+            ));
+        }
         // `Symbol.prototype.description` getter: unwrap the receiver.
         if name == crate::builtins::SYMBOL_DESCRIPTION_NATIVE {
             return crate::builtins::symbol_description(&this);

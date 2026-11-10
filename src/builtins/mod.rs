@@ -42,7 +42,9 @@ pub use error::{
     ErrorType, create_error_object, error_constructor, runtime_error_to_js_error,
     setup_error_prototype, setup_native_error_prototype,
 };
-pub use function::{function_constructor, setup_function_prototype};
+pub use function::{
+    FUNCTION_THROW_TYPE_ERROR_NATIVE, function_constructor, setup_function_prototype,
+};
 pub use json::{
     json_number, json_parse, json_stringify, own_enumerable_string_keys, quote_json_string,
     register_json,
