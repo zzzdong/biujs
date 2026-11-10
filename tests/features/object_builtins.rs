@@ -553,6 +553,31 @@ fn array_length_descriptor_value_goes_through_to_number() {
 }
 
 #[test]
+fn property_keys_and_object_is_follow_es_conversions() {
+    // ToPropertyKey 会跑用户的 toString / Symbol.toPrimitive；Object.is 的
+    // 缺失参数按 undefined 参与 SameValue。
+    eval_js(
+        "'use strict';
+         var o = { abc: 1 };
+         var d = Object.getOwnPropertyDescriptor(o, { toString: function () { return 'abc'; } });
+         if (!d || d.value !== 1) throw new Error('getOwnPropertyDescriptor ToPropertyKey');
+
+         var sym = Symbol('s');
+         var boxed = {};
+         boxed[Symbol.toPrimitive] = function () { return sym; };
+         var target = {};
+         target[sym] = 7;
+         if (Object.hasOwn(target, boxed) !== true) throw new Error('Object.hasOwn symbol key');
+         if (target.hasOwnProperty(boxed) !== true) throw new Error('hasOwnProperty symbol key');
+
+         if (Object.is() !== true) throw new Error('Object.is()');
+         if (Object.is(1) !== false) throw new Error('Object.is(1)');
+         if (Object.is(NaN, NaN) !== true) throw new Error('Object.is NaN');",
+    )
+    .unwrap();
+}
+
+#[test]
 fn set_prototype_of_rejects_frozen_targets_and_cycles() {
     eval_js(
         "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }

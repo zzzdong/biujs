@@ -2979,7 +2979,8 @@ impl VM {
                             | "Object.setPrototypeOf"
                             | "Object.isExtensible"
                             | "Object.preventExtensions"
-                            | "Object.getOwnPropertyDescriptor"
+                            |                         "Object.getOwnPropertyDescriptor"
+                            | "Object.hasOwn"
                             | "Object.keys"
                             | "Object.getOwnPropertyNames"
                             | "Object.getOwnPropertySymbols"
@@ -3026,11 +3027,24 @@ impl VM {
 
                 // Try built-in prototype method dispatch. As above: only
                 // "no such method" may fall through.
+                // `Object.prototype.hasOwnProperty(P)` 的 P 走 ToPropertyKey：
+                // 带 `Symbol.toPrimitive` / `toString` 的 key 只有 VM 能转换。
+                // 只影响这次内建分派，用户方法回退仍用原参数。
+                let converted_args;
+                let dispatch_args: &[Value] =
+                    if method_name == "hasOwnProperty" && !args.is_empty() {
+                        let mut v = args.clone();
+                        v[0] = self.to_property_key_value(&args[0], module)?;
+                        converted_args = v;
+                        &converted_args
+                    } else {
+                        &args
+                    };
                 match crate::builtins::call_prototype_method(
                     &mut self.heap,
                     &obj_val,
                     &method_name,
-                    &args,
+                    dispatch_args,
                 ) {
                     Ok(result) => {
                         self.state.set_register(Register::Rv, result)?;

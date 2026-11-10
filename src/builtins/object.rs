@@ -654,13 +654,12 @@ pub fn object_has_own(heap: &mut super::Heap, args: &[Value]) -> Result<Value, R
 }
 
 pub fn object_is(args: &[Value]) -> Result<Value, RuntimeError> {
-    if args.len() < 2 {
-        return Err(RuntimeError::TypeError(
-            "Object.is requires at least 2 arguments".to_string(),
-        ));
-    }
+    // ES 19.1.2.10：缺失的参数就是 undefined —— `Object.is()` 返回 true，
+    // 不是 TypeError。`length` 是 2 只描述形参个数，不限制调用实参。
+    let a = args.first().cloned().unwrap_or(Value::Undefined);
+    let b = args.get(1).cloned().unwrap_or(Value::Undefined);
     // SameValue algorithm: NaN === NaN, +0 !== -0
-    let result = match (&args[0], &args[1]) {
+    let result = match (&a, &b) {
         (Value::Number(a), Value::Number(b)) => {
             if a.is_nan() && b.is_nan() {
                 true

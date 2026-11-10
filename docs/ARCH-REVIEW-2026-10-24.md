@@ -806,6 +806,25 @@ VM 层读过字段（含用户 getter），这里只补 ES 10.4.2.4 的 ToNumber
 （84.92% → 84.98%，+12）**，无逐套件回退，护栏 0/0/14 与跳过 8577 不变，
 墙钟 104.4s。
 
+### Phase 4 第四批（2026-11-10）：`ToPropertyKey` 走 VM 层 + `Object.is` 缺省参数
+
+Object 剩余 272 条里最大的一族是 22 条 `Cannot read properties of undefined
+(reading 'value')`：`Object.getOwnPropertyDescriptor(obj, {toString(){…}})`
+的 key 在 builtins 层用 Rust 层 `to_js_string()` 转换，不跑用户 `toString`，
+于是查不到属性、返回 undefined。同类还有 `Object.hasOwn` /
+`Object.prototype.hasOwnProperty` 用 `Symbol.toPrimitive` 返回 Symbol 键的 6 条。
+
+现在三者都在 VM 层过 `to_property_key_value`（复用 `reflect_key_args` 的既有
+helper）：静态方法在 `call_native_by_name` 转换第二个参数，`hasOwnProperty`
+在 `CallMethod` 分派前转换第一个参数；builtins 层只接收 String / Symbol。
+另外 `Object.is()` / `Object.is(x)` 的缺失参数按 undefined 参与 SameValue
+（原来直接抛 TypeError，4 条）。
+
+**验收**：三级 270 / 643 / 7 + 字节码 golden；`built-ins/Object`
+3107 → 3121（失败 272 → 258）；全量 **17,425 → 17,439 / 20,504
+（84.98% → 85.05%，+14）**，无逐套件回退，护栏 0/0/14 与跳过 8577 不变，
+墙钟 106.7s。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；

@@ -413,8 +413,13 @@ impl VM {
                     | "Reflect.set"
                     | "Reflect.has"
                     | "Reflect.deleteProperty"
-                    | "Reflect.defineProperty"
+                    |                 "Reflect.defineProperty"
                     | "Reflect.getOwnPropertyDescriptor"
+                    // `Object.getOwnPropertyDescriptor(obj, {toString(){…}})`
+                    // 与 `Object.hasOwn(obj, {[Symbol.toPrimitive](){…}})` 同样
+                    // 要求 key 走 ToPropertyKey（可跑用户代码）。
+                    | "Object.getOwnPropertyDescriptor"
+                    | "Object.hasOwn"
             ) {
                 converted_args = self.reflect_key_args(args, module)?;
                 &converted_args
