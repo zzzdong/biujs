@@ -786,6 +786,26 @@ getter 的 accessor 由同一套 `attrs` 保管、冻结/密封正确标注属�
 墙钟 107.2s。除 Function 外还带动 `language/statements/function` +4、
 两处 class +3、generators +1 —— 同一族 strict-mode 探针散落在多个套件里。
 
+### Phase 4 第三批（2026-11-10）：数组 length 描述符的 ToNumber
+
+`built-ins/Object/defineProperty` / `defineProperties` 的 14 条
+`15.2.3.6-4-1xx` / `15.2.3.7-6-a-1xx` 把 `length` 的 [[Value]] 设成带
+`toString` 的对象，期望 `arr.length` 变成对应数字；实际抛
+`RangeError: Invalid array length`。根因是 `ArrayObject::define_property`
+用 Rust 层的 `Value::to_number()`，不会调用用户 `valueOf` / `toString`，得到 NaN。
+
+修法不改 `ArrayObject` 的接口：在 `Object.defineProperty` /
+`defineProperties` 的 VM 分支（`vm/builtins_dispatch.rs`）里，对 Array +
+`length` 的描述符先用 `VM::to_primitive(..., "number")` + `to_number_throwing`
+把 `value` 字段换成 Number，再交给 builtins 层。`ToPropertyDescriptor` 本来就在
+VM 层读过字段（含用户 getter），这里只补 ES 10.4.2.4 的 ToNumber 前置步骤，
+其余对象/键的路径一字未动。
+
+**验收**：三级 270 / 642 / 7 + 字节码 golden；`built-ins/Object`
+3095 → 3107（失败 284 → 272）；全量 **17,413 → 17,425 / 20,504
+（84.92% → 84.98%，+12）**，无逐套件回退，护栏 0/0/14 与跳过 8577 不变，
+墙钟 104.4s。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；

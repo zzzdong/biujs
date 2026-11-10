@@ -20,6 +20,44 @@ use crate::vm::{
 };
 
 impl VM {
+    /// Array `length` 的 [[Value]] 必须先走 ES `ToNumber`：描述符里可以是一个带
+    /// `valueOf` / `toString` / `Symbol.toPrimitive` 的对象，而
+    /// `ArrayObject::define_property` 只有 Rust 层的 `to_number()`（不跑用户代码，
+    /// 得到 NaN 之后变成 `RangeError: Invalid array length`）。
+    ///
+    /// 这里在把描述符交给 builtins 之前，把 `value` 换成转换后的 Number。
+    /// 只对 Array 的 `length` 生效，其余对象/键的行为一字不改。
+    fn normalize_array_length_value(
+        &mut self,
+        target: &Value,
+        descriptor: &Value,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        let Value::Object(target_ref) = target else {
+            return Ok(());
+        };
+        if target_ref.borrow().kind() != ObjectKind::Array {
+            return Ok(());
+        }
+        let Value::Object(desc_ref) = descriptor else {
+            return Ok(());
+        };
+        let value_key = PropertyKey::intern(&mut self.heap, "value");
+        let raw = {
+            let borrowed = desc_ref.borrow();
+            match borrowed.property_get(&value_key) {
+                Some(d) => d.value,
+                None => return Ok(()),
+            }
+        };
+        let prim = self.to_primitive(&raw, "number", module)?;
+        let n = crate::builtins::to_number_throwing(&prim)?;
+        let _ = desc_ref
+            .borrow_mut()
+            .property_set(&mut self.heap, value_key, Value::Number(n));
+        Ok(())
+    }
+
     /// Dispatch a built-in by name, honouring prototype methods.
     ///
     /// `set_prototype_method` registers prototype methods under the synthetic
@@ -427,6 +465,11 @@ impl VM {
             // only the VM can do (their fields may be accessors).
             if name == "Object.defineProperty" && args.len() >= 3 {
                 let descriptor = self.to_property_descriptor(&args[2], module)?;
+                // Array `length` 的 [[Value]] 要走 ES ToNumber（可能跑用户的
+                // valueOf / toString），builtins 层做不到，只能在 VM 层先转换。
+                if matches!(&args[1], Value::String(s) if s.as_str() == "length") {
+                    self.normalize_array_length_value(&args[0], &descriptor, module)?;
+                }
                 return crate::builtins::call_static_method(
                     name,
                     &[args[0].clone(), args[1].clone(), descriptor],
@@ -435,6 +478,18 @@ impl VM {
             }
             if name == "Object.defineProperties" && args.len() >= 2 {
                 let props = self.to_property_descriptors(&args[1], module)?;
+                let length_key = PropertyKey::intern(&mut self.heap, "length");
+                let length_desc = if let Value::Object(props_ref) = &props {
+                    props_ref
+                        .borrow()
+                        .property_get(&length_key)
+                        .map(|d| d.value)
+                } else {
+                    None
+                };
+                if let Some(descriptor) = length_desc {
+                    self.normalize_array_length_value(&args[0], &descriptor, module)?;
+                }
                 return crate::builtins::call_static_method(
                     name,
                     &[args[0].clone(), props],

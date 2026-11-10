@@ -525,6 +525,34 @@ fn primitive_wrapper_own_properties_use_the_shared_storage() {
 }
 
 #[test]
+fn array_length_descriptor_value_goes_through_to_number() {
+    // ES 10.4.2.4：定义数组 length 时 [[Value]] 要走 ToNumber，用户对象的
+    // valueOf / toString 必须真的被调用（以前直接得到 NaN → RangeError）。
+    eval_js(
+        "'use strict';
+         var a = [];
+         Object.defineProperty(a, 'length', { value: { toString: function () { return '2'; } } });
+         if (a.length !== 2) throw new Error('defineProperty length: ' + a.length);
+
+         var b = [];
+         Object.defineProperties(b, { length: { value: { toString: function () { return '3'; } } } });
+         if (b.length !== 3) throw new Error('defineProperties length: ' + b.length);
+
+         var called = 0;
+         var c = [];
+         Object.defineProperty(c, 'length', { value: { valueOf: function () { called++; return 1; } } });
+         if (c.length !== 1 || called !== 1) throw new Error('valueOf was not called exactly once');
+
+         var d = [0, 1];
+         Object.defineProperty(d, '1', { value: 1, configurable: false });
+         var threw = 'no';
+         try { Object.defineProperty(d, 'length', { value: 1 }); } catch (e) { threw = e.name; }
+         if (threw !== 'TypeError') throw new Error('shrinking past non-configurable index: ' + threw);",
+    )
+    .unwrap();
+}
+
+#[test]
 fn set_prototype_of_rejects_frozen_targets_and_cycles() {
     eval_js(
         "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
