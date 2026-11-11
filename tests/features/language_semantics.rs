@@ -669,3 +669,33 @@ fn the_builtin_iterator_factory_is_generic() {
     )
     .unwrap();
 }
+
+/// ES 12.5.4.1：`[[Delete]]` 答 false 时，**严格模式**抛 TypeError，sloppy 只
+/// 求值为 false。以前两种模式都静默返回 false，`"use strict";
+/// delete Object.freeze(o).x` 因此不抛。
+#[test]
+fn strict_delete_of_a_non_configurable_property_throws() {
+    eval_js(
+        "'use strict';
+         function name_of(fn) { try { fn(); return 'none'; } catch (e) { return e.name; } }
+         var frozen = Object.freeze({ x: 1 });
+         if (name_of(function () { delete frozen.x; }) !== 'TypeError') throw new Error('frozen delete');
+         var o = {};
+         Object.defineProperty(o, 'y', { value: 1, configurable: false });
+         if (name_of(function () { delete o.y; }) !== 'TypeError') throw new Error('non-configurable delete');
+         // 不存在的属性：删除成功，两种模式都不抛。
+         if (name_of(function () { delete o.missing; }) !== 'none') throw new Error('missing');
+         if (delete o.missing !== true) throw new Error('missing value');",
+    )
+    .unwrap();
+}
+
+/// sloppy 模式下同样的删除只求值为 false（不抛）。
+#[test]
+fn sloppy_delete_answers_false_instead_of_throwing() {
+    eval_js(
+        "var frozen = Object.freeze({ x: 1 });
+         if (delete frozen.x !== false) throw new Error('sloppy delete');",
+    )
+    .unwrap();
+}

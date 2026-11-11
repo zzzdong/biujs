@@ -2681,6 +2681,16 @@ impl VM {
                 let key = self.resolve_property_key(a2, module)?;
                 let obj = self.as_object_value(&obj);
                 let removed = self.delete_member(&obj, &key, module)?;
+                // ES 12.5.4.1：`[[Delete]]` 答 false 时，**严格模式**抛 TypeError，
+                // sloppy 模式只是求值为 false。以前两种模式都静默返回 false，
+                // `"use strict"; delete Object.freeze(o).x` 因此不抛。
+                if !removed && module.strict {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Cannot delete property '{}' of {}",
+                        key.display(&self.heap),
+                        obj.type_of()
+                    )));
+                }
                 self.set_value(a0, Value::Bool(removed))?;
             }
             Instr::Arguments { dst } => {
