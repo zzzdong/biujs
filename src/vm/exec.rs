@@ -312,6 +312,22 @@ impl VM {
     /// Returns the primitive value of `val`. An object with
     /// `Symbol.toPrimitive` converts through it; otherwise `valueOf()` and
     /// `toString()` are tried in hint order and the first primitive wins.
+    /// ES `ToNumeric`（无 BigInt 的简化版）：先 `ToPrimitive(hint number)`，
+    /// 再把 Symbol 拒成 TypeError。
+    ///
+    /// `Value::to_number` 对 Symbol 答 NaN —— 它不知道"这里该抛"。所有 ToNumeric
+    /// 的位置（`+ - * / % **`、位运算、一元 `-` / `~`）都要先过这里：
+    /// `{valueOf(){return Symbol()}} | 0` 必须是 TypeError 而不是 0。
+    fn to_numeric(&mut self, val: &Value, module: &Module) -> Result<f64, RuntimeError> {
+        let prim = self.to_primitive(val, "number", module)?;
+        if matches!(prim, Value::Symbol(_)) {
+            return Err(RuntimeError::TypeError(
+                "Cannot convert a Symbol value to a number".to_string(),
+            ));
+        }
+        Ok(prim.to_number())
+    }
+
     pub fn to_primitive(
         &mut self,
         val: &Value,
@@ -321,6 +337,20 @@ impl VM {
         if !val.is_object() {
             return Ok(val.clone());
         }
+
+        // ES 20.3.4.2 `Date.prototype[@@toPrimitive]`：hint 是 "default" 时按
+        // "string" 走（`date + date` 是字符串拼接，`date == str` 比日期串）。
+        // 那个内建方法本体要实现 OrdinaryToPrimitive（调 valueOf/toString），
+        // 只有 VM 能做，所以在这里折算 hint —— 可观察结果与规范一致。
+        let is_date = matches!(
+            val,
+            Value::Object(obj_ref) if matches!(&*obj_ref.borrow(), crate::vm::gc::Object::Date(_))
+        );
+        let hint = if hint == "default" && is_date {
+            "string"
+        } else {
+            hint
+        };
 
         // ES 7.1.1 ToPrimitive step 2: an object with `Symbol.toPrimitive`
         // converts through that method instead of OrdinaryToPrimitive, and a
@@ -2026,60 +2056,57 @@ impl VM {
                 // is a string, otherwise numeric addition.
                 let lprim = self.to_primitive(&lhs, "default", module)?;
                 let rprim = self.to_primitive(&rhs, "default", module)?;
+                // Symbol 在两个分支里都是 TypeError：隐式 `ToString(Symbol)`
+                // 不行（只有显式 `String(sym)` 可以），`ToNumeric(Symbol)` 也不行。
+                let has_symbol = matches!(lprim, Value::Symbol(_)) || matches!(rprim, Value::Symbol(_));
                 let value = if lprim.is_string() || rprim.is_string() {
+                    if has_symbol {
+                        return Err(RuntimeError::TypeError(
+                            "Cannot convert a Symbol value to a string".to_string(),
+                        ));
+                    }
                     Value::String(Rc::new(format!(
                         "{}{}",
                         lprim.to_js_string(),
                         rprim.to_js_string()
                     )))
+                } else if has_symbol {
+                    return Err(RuntimeError::TypeError(
+                        "Cannot convert a Symbol value to a number".to_string(),
+                    ));
                 } else {
-                    lprim + rprim
+                    Value::Number(lprim.to_number() + rprim.to_number())
                 };
                 self.set_value(dst, value)?;
             }
             Instr::Subx { dst, lhs, rhs } => {
-                // ToNumeric starts with ToPrimitive(hint number), as `Pow`
-                // already did: without it an object operand (`date1 - date2`, a
-                // boxed Number) collapses to NaN.
+                // ToNumeric（含 ToPrimitive 与 Symbol 检查）在 `to_numeric` 里。
                 let lhs = self.get_value(lhs)?;
                 let rhs = self.get_value(rhs)?;
-                let lprim = self.to_primitive(&lhs, "number", module)?;
-                let rprim = self.to_primitive(&rhs, "number", module)?;
-                let value = lprim - rprim;
-                self.set_value(dst, value)?;
+                let lnum = self.to_numeric(&lhs, module)?;
+                let rnum = self.to_numeric(&rhs, module)?;
+                self.set_value(dst, Value::Number(lnum - rnum))?;
             }
             Instr::Mulx { dst, lhs, rhs } => {
-                // ToNumeric starts with ToPrimitive(hint number), as `Pow`
-                // already did: without it an object operand (`date1 - date2`, a
-                // boxed Number) collapses to NaN.
                 let lhs = self.get_value(lhs)?;
                 let rhs = self.get_value(rhs)?;
-                let lprim = self.to_primitive(&lhs, "number", module)?;
-                let rprim = self.to_primitive(&rhs, "number", module)?;
-                let value = lprim * rprim;
-                self.set_value(dst, value)?;
+                let lnum = self.to_numeric(&lhs, module)?;
+                let rnum = self.to_numeric(&rhs, module)?;
+                self.set_value(dst, Value::Number(lnum * rnum))?;
             }
             Instr::Divx { dst, lhs, rhs } => {
-                // ToNumeric starts with ToPrimitive(hint number), as `Pow`
-                // already did: without it an object operand (`date1 - date2`, a
-                // boxed Number) collapses to NaN.
                 let lhs = self.get_value(lhs)?;
                 let rhs = self.get_value(rhs)?;
-                let lprim = self.to_primitive(&lhs, "number", module)?;
-                let rprim = self.to_primitive(&rhs, "number", module)?;
-                let value = lprim / rprim;
-                self.set_value(dst, value)?;
+                let lnum = self.to_numeric(&lhs, module)?;
+                let rnum = self.to_numeric(&rhs, module)?;
+                self.set_value(dst, Value::Number(lnum / rnum))?;
             }
             Instr::Remx { dst, lhs, rhs } => {
-                // ToNumeric starts with ToPrimitive(hint number), as `Pow`
-                // already did: without it an object operand (`date1 - date2`, a
-                // boxed Number) collapses to NaN.
                 let lhs = self.get_value(lhs)?;
                 let rhs = self.get_value(rhs)?;
-                let lprim = self.to_primitive(&lhs, "number", module)?;
-                let rprim = self.to_primitive(&rhs, "number", module)?;
-                let value = lprim % rprim;
-                self.set_value(dst, value)?;
+                let lnum = self.to_numeric(&lhs, module)?;
+                let rnum = self.to_numeric(&rhs, module)?;
+                self.set_value(dst, Value::Number(lnum % rnum))?;
             }
             Instr::Pow { dst, lhs, rhs } => {
                 // ES `ExponentiationExpression`: ToNumeric on both operands,
@@ -2087,10 +2114,9 @@ impl VM {
                 // model the BigInt case (the engine has no BigInt).
                 let lhs = self.get_value(lhs)?;
                 let rhs = self.get_value(rhs)?;
-                let lprim = self.to_primitive(&lhs, "number", module)?;
-                let rprim = self.to_primitive(&rhs, "number", module)?;
-                let value = Value::Number(lprim.to_number().powf(rprim.to_number()));
-                self.set_value(dst, value)?;
+                let lnum = self.to_numeric(&lhs, module)?;
+                let rnum = self.to_numeric(&rhs, module)?;
+                self.set_value(dst, Value::Number(lnum.powf(rnum)))?;
             }
 
             // ===== Unary =====
@@ -2102,7 +2128,7 @@ impl VM {
             Instr::BitNot { dst, src } => {
                 // Bitwise NOT: convert to 32-bit signed integer, flip bits
                 let value = self.get_value(src)?;
-                let num = to_int32(value.to_number());
+                let num = to_int32(self.to_numeric(&value, module)?);
                 let result = Value::Number((!num) as f64);
                 self.set_value(dst, result)?;
             }
@@ -2112,8 +2138,9 @@ impl VM {
                 let opcode = inst.opcode();
                 let lhs = self.get_value(a1)?;
                 let rhs = self.get_value(a2)?;
-                let a = to_int32(lhs.to_number());
-                let b = to_int32(rhs.to_number());
+                // 同 `>>>`：位运算的 ToNumeric 也要先做 ToPrimitive，并拒绝 Symbol。
+                let a = to_int32(self.to_numeric(&lhs, module)?);
+                let b = to_int32(self.to_numeric(&rhs, module)?);
                 let result = match opcode {
                     Opcode::BitAnd => a & b,
                     Opcode::BitOr => a | b,
@@ -2127,18 +2154,27 @@ impl VM {
                 let opcode = inst.opcode();
                 let lhs = self.get_value(a1)?;
                 let rhs = self.get_value(a2)?;
-                let shift_count = (to_uint32(rhs.to_number()) & 0x1F) as u32;
+                // ToNumeric：对象操作数（`{valueOf(){return -4}} >>> 1`）必须先跑
+                // valueOf，Symbol 必须抛 TypeError。
+                let lnum = self.to_numeric(&lhs, module)?;
+                let rnum = self.to_numeric(&rhs, module)?;
+                let shift_count = (to_uint32(rnum) & 0x1F) as u32;
                 let result = match opcode {
-                    Opcode::Shl => to_int32(lhs.to_number()).wrapping_shl(shift_count),
-                    Opcode::Shr => to_int32(lhs.to_number()).wrapping_shr(shift_count),
-                    _ => (to_uint32(lhs.to_number()).wrapping_shr(shift_count)) as i32,
+                    Opcode::Shl => to_int32(lnum).wrapping_shl(shift_count) as f64,
+                    // `>>` 是**算术**右移（保留符号位）。
+                    Opcode::Shr => to_int32(lnum).wrapping_shr(shift_count) as f64,
+                    // `>>>` 的结果是 **u32**：`-1 >>> 0` 是 4294967295，不是 -1。
+                    // 以前这里 `as i32` 把它折回有符号，整条无符号右移语义都错了。
+                    _ => to_uint32(lnum).wrapping_shr(shift_count) as f64,
                 };
-                self.set_value(a0, Value::Number(result as f64))?;
+                self.set_value(a0, Value::Number(result))?;
             }
             Instr::Neg { dst, src } => {
+                // 一元 `-` 是 ToNumeric（先 ToPrimitive）：`-{valueOf(){return 2}}`
+                // 是 -2，而不是 NaN。
                 let value = self.get_value(src)?;
-                let result = -value;
-                self.set_value(dst, result)?;
+                let num = self.to_numeric(&value, module)?;
+                self.set_value(dst, Value::Number(-num))?;
             }
             _ => return Ok(false),
         }

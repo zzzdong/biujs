@@ -782,6 +782,27 @@ ES 12.5.4.1：`[[Delete]]` 答 false 时严格模式抛 TypeError，sloppy 只�
 不变式用例）、`built-ins/Object` +2、`built-ins/Boolean` +1；lib 272 /
 features 654 / guards 7 全绿，护栏 0/0/14 不变。
 
+**第十五片已落地（2026-11-12）：运算符的 `ToNumeric` 与 `Date` 的 `default` hint。**
+
+三处都在"运算符直接读 `Value::to_number()`"上：
+
+- `>>>` 的结果被 `as i32` 折回有符号：`-1 >>> 0` 得到 -1、`2147483648 >>> 0`
+  得到负值 —— 整条无符号右移语义都是错的。现在按 u32 → f64。
+- 位运算（`& | ^ << >> >>> ~`）与一元 `-` 直接调 `Value::to_number()`：对象操作数
+  跳过 `ToPrimitive`（`{valueOf(){return -4}} >>> 1` 得到 0），Symbol 折成 NaN 而
+  不抛。新增 `VM::to_numeric`（`ToPrimitive(hint number)`，Symbol ⇒ TypeError），
+  `+ - * / % **`、位运算、一元 `-` / `~` 全部改走它。
+- `Date` 的 `ToPrimitive` 在 `"default"` hint 下按 `"string"` 走（ES 20.3.4.2）：
+  `date + date` 是字符串拼接而不是数值相加。`Date.prototype[@@toPrimitive]` 本体
+  要实现 OrdinaryToPrimitive（调 valueOf/toString），内建层装不了，所以在
+  `VM::to_primitive` 里折算 hint，可观察结果与规范一致。
+
+**验收：全量 17,499 → 17,539 / 20,504（85.34% → 85.54%），无逐套件回退。**
+提升：`unsigned-right-shift` 24→37、`bitwise-and/or/xor` 19→22、
+`bitwise-not` 11→13、`unary-minus` 10→11、`left-shift` 34→37、
+`right-shift` 26→29、`addition` 35→39、`multiplication` 32→33、`division` 35→36、
+`modulus` 31→32、`subtraction` 30→31、`exponentiation` 34→35。
+
 剩余（按序）：
 - descriptor 惰性物化：`Map` / `Set` 也换到槽位（`NativeFunction` 已完成），
   把 `PropertyTable` 收成"只有字典模式用"。`Map` / `Set` 牵动 `WeakMap` /
