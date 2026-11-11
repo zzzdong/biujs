@@ -758,11 +758,34 @@ ES 的 `[[HasProperty]]` 沿原型链，而对象层的这个方法只查自有 
 条目 —— accessor 索引同时是 hole 与 properties 条目，`delete arr[0]` 留下删不掉
 的 getter，全量 -45（Array -10、Object -35）。
 
+**第十三片已落地（2026-11-12）：`NativeFunctionObject` 接入 `OrdinaryObject`。**
+
+它是最后一个自带 `ObjectHeader` + `PropertyTable` 并手写 15 个 `JSObject` 方法的
+变体。迁到 `base: OrdinaryObject` 之后：
+
+- 手写实现缩成一行 `delegate_js_object!`；
+- `length` / `name` 由新增的 `OrdinaryObject::install_descriptors` 安装 ——
+  构造期拿不到 `&mut Heap`（形状 root 在堆上），所以直接进**字典模式**。内建函数
+  对象本来就只有个位数属性，且它们在这之前就常年是 `PropertyTable`，没有退化；
+- 顺手修掉手写 `property_set` 覆盖只读位的偏差（`Array.isArray.length = 9`）；
+- 删掉失去调用者的 `freeze_property_table` / `seal_property_table`。
+
+**第十四片已落地（2026-11-12）：严格模式的 `delete`。**
+
+ES 12.5.4.1：`[[Delete]]` 答 false 时严格模式抛 TypeError，sloppy 只求值为 false。
+`PropDelete` / `IndexDelete` 以前两种模式都静默写回 false，
+`"use strict"; delete Object.freeze({x:1}).x` 因此不抛（`Reflect.deleteProperty`
+按规范返回布尔，走的是另一条路，不受影响）。
+
+**验收：全量 17,488 → 17,499 / 20,504（85.29% → 85.34%）**，无逐套件回退：
+`language/expressions/delete` +6、`built-ins/Proxy` +2（`deleteProperty` trap 的
+不变式用例）、`built-ins/Object` +2、`built-ins/Boolean` +1；lib 272 /
+features 654 / guards 7 全绿，护栏 0/0/14 不变。
+
 剩余（按序）：
-- descriptor 惰性物化：`NativeFunction` / `Map` / `Set` 也换到槽位，
-  把 `PropertyTable` 收成"只有字典模式用"。`NativeFunction::new` 构造期直接写属性表
-  且还没有堆参数，要先改构造签名；`Map` / `Set` 牵动 `WeakMap` / `WeakSet` 的
-  ephemeron trace；`Array` 与 1C 耦合，留到那时。
+- descriptor 惰性物化：`Map` / `Set` 也换到槽位（`NativeFunction` 已完成），
+  把 `PropertyTable` 收成"只有字典模式用"。`Map` / `Set` 牵动 `WeakMap` /
+  `WeakSet` 的 ephemeron trace；`Array` 与 1C 耦合，留到那时。
 - `Realm` / `EnvRecord`；对象尺寸断言仍过。
 
 **1C 数组 + 函数（8–12 人日）**
