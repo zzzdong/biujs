@@ -101,7 +101,7 @@ language/expressions/unary-plus	13	3	1
 language/statements/block	13	6	2
 language/statements/continue	21	3	0
 language/statements/for	350	21	14
-language/statements/return	5	1	10
+language/statements/return	15	1	0
 language/statements/variable	142	25	11
 language/literals/numeric	91	66	0
 language/types	95	16	2

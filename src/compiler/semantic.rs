@@ -45,6 +45,11 @@ impl Scope {
 pub struct SemanticAnalyzer {
     scopes: Vec<Scope>,
     errors: Vec<CompileError>,
+    /// 当前嵌套的函数体深度。`return` 只允许出现在函数体里（ES 12.9：
+    /// `ReturnStatement` 不在 FunctionBody / 箭头函数体 / 方法体里就是
+    /// **Early Error**）。oxc 的 parser 与 semantic builder 都不报这一条，
+    /// 所以在 lowering 之前补上 —— 否则 `return 1;` 在脚本顶层能跑通。
+    function_depth: usize,
 }
 
 impl SemanticAnalyzer {
@@ -52,6 +57,7 @@ impl SemanticAnalyzer {
         Self {
             scopes: vec![Scope::new()],
             errors: Vec::new(),
+            function_depth: 0,
         }
     }
 
@@ -131,6 +137,7 @@ impl SemanticAnalyzer {
                 }
 
                 self.enter_scope();
+                self.function_depth += 1;
 
                 if let Some(body) = &func.body {
                     for stmt in &body.statements {
@@ -138,6 +145,7 @@ impl SemanticAnalyzer {
                     }
                 }
 
+                self.function_depth -= 1;
                 self.leave_scope();
             }
             Statement::IfStatement(if_stmt) => {
@@ -150,6 +158,10 @@ impl SemanticAnalyzer {
             Statement::WhileStatement(while_stmt) => {
                 self.visit_expression(&while_stmt.test);
                 self.visit_statement(&while_stmt.body);
+            }
+            Statement::DoWhileStatement(do_while) => {
+                self.visit_statement(&do_while.body);
+                self.visit_expression(&do_while.test);
             }
             Statement::ForStatement(for_stmt) => {
                 self.enter_scope();
@@ -205,6 +217,12 @@ impl SemanticAnalyzer {
                 }
             }
             Statement::ReturnStatement(ret) => {
+                // ES 12.9：函数体之外的 `return` 是 Early Error（V8 的消息是
+                // "Illegal return statement"）。oxc 不报，这就是 `S12.9_A1_T*`
+                // 整组（`return;` 在顶层 / 块 / 循环里）一直通过不了的原因。
+                if self.function_depth == 0 {
+                    self.add_error("SyntaxError: Illegal return statement", ret.span);
+                }
                 if let Some(arg) = &ret.argument {
                     self.visit_expression(arg);
                 }
@@ -257,6 +275,29 @@ impl SemanticAnalyzer {
                         self.visit_expression(&prop.value);
                     }
                 }
+            }
+            // 函数表达式 / 箭头函数的体也是"函数体"：里面的 `return` 合法。
+            // 不遍历它们的体会漏掉里面的 const 检查，但**不能**漏掉深度 ——
+            // 否则 `var f = function () { return 1; }` 会被误报。
+            Expression::FunctionExpression(func) => {
+                self.enter_scope();
+                self.function_depth += 1;
+                if let Some(body) = &func.body {
+                    for stmt in &body.statements {
+                        self.visit_statement(stmt);
+                    }
+                }
+                self.function_depth -= 1;
+                self.leave_scope();
+            }
+            Expression::ArrowFunctionExpression(arrow) => {
+                self.enter_scope();
+                self.function_depth += 1;
+                for stmt in &arrow.body.statements {
+                    self.visit_statement(stmt);
+                }
+                self.function_depth -= 1;
+                self.leave_scope();
             }
             // Member expressions and arrays need no recursion for const checks.
             _ => {}

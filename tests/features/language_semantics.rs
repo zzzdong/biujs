@@ -4,6 +4,7 @@
 //! property access, `this` frames and array-length validation.
 
 use crate::helpers::{eval_bool, eval_js, eval_number, eval_string};
+use biujs::Compiler;
 
 // ─────────────────────────────────────────────────────────
 // Bitwise operators
@@ -698,4 +699,35 @@ fn sloppy_delete_answers_false_instead_of_throwing() {
          if (delete frozen.x !== false) throw new Error('sloppy delete');",
     )
     .unwrap();
+}
+
+/// ES 12.9：函数体之外的 `return` 是 Early Error（SyntaxError）。
+///
+/// oxc 的 parser 与 semantic builder 都不报这一条，所以由 `semantic.rs` 在
+/// lowering 之前补上 —— 以前 `return 1;` 在脚本顶层能跑通并返回 1。
+#[test]
+fn return_outside_a_function_is_a_syntax_error() {
+    for source in [
+        "return;",
+        "return 1;",
+        "{ return; }",
+        "do { return; } while (0);",
+        "while (true) { return; }",
+    ] {
+        assert!(
+            Compiler::new().compile(source).is_err(),
+            "expected a compile error for {source:?}"
+        );
+    }
+    // 函数体里的 `return` 必须仍然合法（声明、函数表达式、箭头函数）。
+    for source in [
+        "function f() { return 1; }",
+        "var f = function () { return 1; };",
+        "var f = () => { return 1; };",
+    ] {
+        assert!(
+            Compiler::new().compile(source).is_ok(),
+            "unexpected compile error for {source:?}"
+        );
+    }
 }

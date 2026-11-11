@@ -803,6 +803,21 @@ features 654 / guards 7 全绿，护栏 0/0/14 不变。
 `right-shift` 26→29、`addition` 35→39、`multiplication` 32→33、`division` 35→36、
 `modulus` 31→32、`subtraction` 30→31、`exponentiation` 34→35。
 
+**第十六片已落地（2026-11-12）：函数体之外的 `return` 是 Early Error。**
+
+ES 12.9：`ReturnStatement` 不在 FunctionBody / 箭头函数体 / 方法体里就是
+SyntaxError。oxc 的 parser 与 semantic builder 都不报这一条，于是
+`return 1;` 在脚本顶层能跑通并返回 1（`language/statements/return` 整组失败）。
+
+`semantic.rs` 新增 `function_depth`：函数声明 / 函数表达式 / 箭头函数体的遍历
+`+1`，`ReturnStatement` 在深度 0 时记 CompileError；顺带补上
+`DoWhileStatement` 的遍历（`do { return; } while (0)` 以前整条被 visitor 跳过）。
+已知边界：类方法体、`switch` 的 case 体仍未遍历 —— 这是**漏报**（不误报），
+按"先不把合法代码判错"的顺序留着。
+
+**验收：全量 17,539 → 17,549 / 20,504（85.54% → 85.59%），无逐套件回退**
+（`language/statements/return` 5 → 15）。
+
 剩余（按序）：
 - descriptor 惰性物化：`Map` / `Set` 也换到槽位（`NativeFunction` 已完成），
   把 `PropertyTable` 收成"只有字典模式用"。`Map` / `Set` 牵动 `WeakMap` /
