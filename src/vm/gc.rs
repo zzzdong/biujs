@@ -558,34 +558,43 @@ impl Trace for crate::vm::EnvCell {
     }
 }
 
+/// `Object` 变体清单的**唯一来源**：`forward!`（18 个 `JSObject` 方法）和
+/// `Trace for Object` 都从这里展开。新增一个变体只需在这里加一行，不必再
+/// 同步 18 个转发方法和 GC 分派 —— 以前这两份 20-arm 表是分开手写的。
+macro_rules! for_each_variant {
+    ($this:expr, |$v:ident| $body:expr) => {
+        match $this {
+            Object::Ordinary($v) => $body,
+            Object::Array($v) => $body,
+            Object::Function($v) => $body,
+            Object::NativeFunction($v) => $body,
+            Object::PrimitiveWrapper($v) => $body,
+            Object::Date($v) => $body,
+            Object::RegExp($v) => $body,
+            Object::Promise($v) => $body,
+            Object::Global($v) => $body,
+            Object::ArrayBuffer($v) => $body,
+            Object::TypedArray($v) => $body,
+            Object::DataView($v) => $body,
+            Object::Proxy($v) => $body,
+            Object::Map($v) => $body,
+            Object::WeakMap($v) => $body,
+            Object::WeakSet($v) => $body,
+            Object::Set($v) => $body,
+            Object::Generator($v) => $body,
+            Object::NativeIterator($v) => $body,
+            Object::Proto($v) => $body,
+        }
+    };
+}
+
 /// 对象的**子引用** —— mark 阶段由它把可达性传播下去。
 ///
 /// 各变体的具体字段实现见 `object.rs` / `iterator.rs` / `builtins/mod.rs`
 /// （字段多为私有，所以实现必须写在各自的结构体所在模块）。
 impl Trace for Object {
     fn trace(&self, out: &mut Worklist) {
-        match self {
-            Object::Ordinary(o) => o.trace(out),
-            Object::Array(o) => o.trace(out),
-            Object::Function(o) => o.trace(out),
-            Object::NativeFunction(o) => o.trace(out),
-            Object::PrimitiveWrapper(o) => o.trace(out),
-            Object::Date(o) => o.trace(out),
-            Object::RegExp(o) => o.trace(out),
-            Object::Promise(o) => o.trace(out),
-            Object::Global(o) => o.trace(out),
-            Object::ArrayBuffer(o) => o.trace(out),
-            Object::TypedArray(o) => o.trace(out),
-            Object::DataView(o) => o.trace(out),
-            Object::Proxy(o) => o.trace(out),
-            Object::Map(o) => o.trace(out),
-            Object::WeakMap(o) => o.trace(out),
-            Object::WeakSet(o) => o.trace(out),
-            Object::Set(o) => o.trace(out),
-            Object::Generator(o) => o.trace(out),
-            Object::NativeIterator(o) => o.trace(out),
-            Object::Proto(o) => o.trace(out),
-        }
+        for_each_variant!(self, |o| o.trace(out))
     }
 }
 
@@ -787,28 +796,7 @@ pub enum Object {
 /// 只读/可变接收者都适用：`&mut T` 会按需降级为 `&T`。
 macro_rules! forward {
     ($this:expr, $method:ident $(, $arg:expr)*) => {
-        match $this {
-            Object::Ordinary(o) => JSObject::$method(o $(, $arg)*),
-            Object::Array(o) => JSObject::$method(o $(, $arg)*),
-            Object::Function(o) => JSObject::$method(o $(, $arg)*),
-            Object::NativeFunction(o) => JSObject::$method(o $(, $arg)*),
-            Object::PrimitiveWrapper(o) => JSObject::$method(o $(, $arg)*),
-            Object::Date(o) => JSObject::$method(o $(, $arg)*),
-            Object::RegExp(o) => JSObject::$method(o $(, $arg)*),
-            Object::Promise(o) => JSObject::$method(o $(, $arg)*),
-            Object::Global(o) => JSObject::$method(o $(, $arg)*),
-            Object::ArrayBuffer(o) => JSObject::$method(o $(, $arg)*),
-            Object::TypedArray(o) => JSObject::$method(o $(, $arg)*),
-            Object::DataView(o) => JSObject::$method(o $(, $arg)*),
-            Object::Proxy(o) => JSObject::$method(o $(, $arg)*),
-            Object::Map(o) => JSObject::$method(o $(, $arg)*),
-            Object::WeakMap(o) => JSObject::$method(o $(, $arg)*),
-            Object::WeakSet(o) => JSObject::$method(o $(, $arg)*),
-            Object::Set(o) => JSObject::$method(o $(, $arg)*),
-            Object::Generator(o) => JSObject::$method(o $(, $arg)*),
-            Object::NativeIterator(o) => JSObject::$method(o $(, $arg)*),
-            Object::Proto(o) => JSObject::$method(o $(, $arg)*),
-        }
+        for_each_variant!($this, |o| JSObject::$method(o $(, $arg)*))
     };
 }
 

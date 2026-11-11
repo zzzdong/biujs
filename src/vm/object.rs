@@ -131,6 +131,85 @@ pub trait JSObject: fmt::Debug + Any {
     }
 }
 
+/// 为「内嵌一个 `OrdinaryObject`（或另一个已实现 `JSObject` 的 base）」的变体
+/// 生成整套委托实现。新增普通变体只需一行：
+/// `delegate_js_object!(Ty, base, ObjectKind::X, "X", "object");`
+///
+/// 只有真正需要 exotic 行为的变体（Array 索引、String 包装虚拟属性、Proxy、
+/// Global…）才手写 `impl JSObject`；15 个存储方法只在这一处维护。
+/// `to_primitive` 用 trait 默认实现（需要函数重入的走 VM）。
+macro_rules! delegate_js_object {
+    // 绝大多数内建对象 `typeof` 都是 "object"。
+    ($ty:ty, $base:ident, $kind:expr, $class:expr) => {
+        delegate_js_object!($ty, $base, $kind, $class, "object");
+    };
+    ($ty:ty, $base:ident, $kind:expr, $class:expr, $type_of:expr) => {
+        impl JSObject for $ty {
+            fn kind(&self) -> ObjectKind {
+                $kind
+            }
+            fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+                self.$base.property_get(key)
+            }
+            fn property_set(
+                &mut self,
+                heap: &mut Heap,
+                key: PropertyKey,
+                value: Value,
+            ) -> Result<bool, String> {
+                self.$base.property_set(heap, key, value)
+            }
+            fn define_property(
+                &mut self,
+                heap: &mut Heap,
+                key: PropertyKey,
+                desc: PropertyDescriptor,
+            ) -> Result<bool, String> {
+                self.$base.define_property(heap, key, desc)
+            }
+            fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+                self.$base.property_delete(heap, key)
+            }
+            fn has_property(&self, key: &PropertyKey) -> bool {
+                self.$base.has_property(key)
+            }
+            fn own_keys(&self) -> Vec<PropertyKey> {
+                self.$base.own_keys()
+            }
+            fn get_prototype(&self) -> Option<Gc<Object>> {
+                self.$base.get_prototype()
+            }
+            fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
+                self.$base.set_prototype(proto);
+            }
+            fn is_extensible(&self) -> bool {
+                self.$base.is_extensible()
+            }
+            fn prevent_extensions(&mut self) {
+                self.$base.prevent_extensions();
+            }
+            fn is_frozen(&self) -> bool {
+                self.$base.is_frozen()
+            }
+            fn freeze(&mut self) {
+                self.$base.freeze();
+            }
+            fn is_sealed(&self) -> bool {
+                self.$base.is_sealed()
+            }
+            fn seal(&mut self) {
+                self.$base.seal();
+            }
+            fn type_of(&self) -> &'static str {
+                $type_of
+            }
+            fn class_name(&self) -> &'static str {
+                $class
+            }
+        }
+    };
+}
+
 // ─────────────────────────────────────────────────────────
 // PropertyTable — own properties with a spec-ordered key list
 // ─────────────────────────────────────────────────────────
@@ -1619,89 +1698,9 @@ impl FunctionObject {
     }
 }
 
-impl JSObject for FunctionObject {
-    fn kind(&self) -> ObjectKind {
-        ObjectKind::Function
-    }
-
-
-    // Everything below is ordinary object behaviour, delegated: a function's
-    // `length` / `name` / `prototype` (and class static members) are plain own
-    // properties, so they belong in the shared shape/slots/attrs storage.
-    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        self.base.property_get(key)
-    }
-
-    fn property_set(
-        &mut self,
-        heap: &mut Heap,
-        key: PropertyKey,
-        value: Value,
-    ) -> Result<bool, String> {
-        self.base.property_set(heap, key, value)
-    }
-
-    fn define_property(
-        &mut self,
-        heap: &mut Heap,
-        key: PropertyKey,
-        desc: PropertyDescriptor,
-    ) -> Result<bool, String> {
-        self.base.define_property(heap, key, desc)
-    }
-
-    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
-        self.base.property_delete(heap, key)
-    }
-
-    fn has_property(&self, key: &PropertyKey) -> bool {
-        self.base.has_property(key)
-    }
-
-    fn own_keys(&self) -> Vec<PropertyKey> {
-        self.base.own_keys()
-    }
-
-    fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.base.get_prototype()
-    }
-
-    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.base.set_prototype(proto);
-    }
-
-    fn is_extensible(&self) -> bool {
-        self.base.is_extensible()
-    }
-
-    fn prevent_extensions(&mut self) {
-        self.base.prevent_extensions();
-    }
-
-    fn is_frozen(&self) -> bool {
-        self.base.is_frozen()
-    }
-
-    fn freeze(&mut self) {
-        self.base.freeze();
-    }
-
-    fn is_sealed(&self) -> bool {
-        self.base.is_sealed()
-    }
-
-    fn seal(&mut self) {
-        self.base.seal();
-    }
-
-    fn type_of(&self) -> &'static str {
-        "function"
-    }
-
-    fn class_name(&self) -> &'static str {
-        "Function"
-    }
-}
+// 函数对象只保留 `func_id` / 捕获环境这些内部槽；`length` / `name` /
+// `prototype` 和类静态成员都是普通自有属性，统一走 shape 槽位 / attrs / 字典。
+delegate_js_object!(FunctionObject, base, ObjectKind::Function, "Function", "function");
 
 /// Create a `Value::Object` wrapping a FunctionObject with a prototype property
 ///
@@ -3801,97 +3800,9 @@ impl WeakMapObject {
     }
 }
 
-macro_rules! delegate_collection_object {
-    ($ty:ty, $inner:ident, $kind:expr, $class:expr) => {
-        impl JSObject for $ty {
-            fn kind(&self) -> ObjectKind {
-                $kind
-            }
-
-
-            fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-                self.$inner.property_get(key)
-            }
-
-            fn property_set(
-        &mut self,
-        heap: &mut Heap,
-        key: PropertyKey,
-        value: Value,
-    ) -> Result<bool, String> {
-                self.$inner.property_set(heap, key, value)
-            }
-
-            fn define_property(
-                &mut self,
-                heap: &mut Heap,
-                key: PropertyKey,
-                desc: PropertyDescriptor,
-            ) -> Result<bool, String> {
-                self.$inner.define_property(heap, key, desc)
-            }
-
-            fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
-                self.$inner.property_delete(heap, key)
-            }
-
-            fn has_property(&self, key: &PropertyKey) -> bool {
-                self.$inner.has_property(key)
-            }
-
-            fn own_keys(&self) -> Vec<PropertyKey> {
-                self.$inner.own_keys()
-            }
-
-            fn get_prototype(&self) -> Option<Gc<Object>> {
-                self.$inner.get_prototype()
-            }
-
-            fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-                self.$inner.set_prototype(proto);
-            }
-
-            fn is_extensible(&self) -> bool {
-                self.$inner.is_extensible()
-            }
-
-            fn prevent_extensions(&mut self) {
-                self.$inner.prevent_extensions();
-            }
-
-            fn is_frozen(&self) -> bool {
-                self.$inner.is_frozen()
-            }
-
-            fn freeze(&mut self) {
-                self.$inner.freeze();
-            }
-
-            fn is_sealed(&self) -> bool {
-                self.$inner.is_sealed()
-            }
-
-            fn seal(&mut self) {
-                self.$inner.seal();
-            }
-
-            fn type_of(&self) -> &'static str {
-                "object"
-            }
-
-            fn class_name(&self) -> &'static str {
-                $class
-            }
-        }
-    };
-}
-
-delegate_collection_object!(
-    WeakMapObject,
-    inner,
-    ObjectKind::WeakMap,
-    "WeakMap"
-);
+// WeakMap / WeakSet 的委托实现复用文件开头的 `delegate_js_object!`：
+// `inner` 是 MapObject / SetObject，它们自己已经委托到 `OrdinaryObject`。
+delegate_js_object!(WeakMapObject, inner, ObjectKind::WeakMap, "WeakMap");
 
 /// `WeakSet` instance — 弱语义同 [`WeakMapObject`]（值即键，故只需"死了就删"）。
 #[derive(Debug)]
@@ -3926,12 +3837,7 @@ impl WeakSetObject {
     }
 }
 
-delegate_collection_object!(
-    WeakSetObject,
-    inner,
-    ObjectKind::WeakSet,
-    "WeakSet"
-);
+delegate_js_object!(WeakSetObject, inner, ObjectKind::WeakSet, "WeakSet");
 
 // ─────────────────────────────────────────────────────────
 // SetObject — `Set` instances (ES 23.2)

@@ -931,6 +931,35 @@ Phase 2 / 3 / 4 / 5。
 `forward!` 收敛；Array / Global / NativeFunction 存储收编；原型表从
 `thread_local` 改挂 Realm；对象字面量 `__proto__: p` 仍创建自有属性而非设置原型。
 
+### 对象模型重构片 2（2026-11-11）：分派表与委托样板单一化
+
+片 1 统一了 accessor 语义；片 2 收敛「新增一个变体要同步多张表」的问题，
+**零运行时语义变化**：
+
+1. `gc.rs` 新增 `for_each_variant!`：20 个 arm 的变体清单成为唯一来源，
+   `forward!`（18 个 `JSObject` 方法）与 `impl Trace for Object` 都从它展开。
+   以前这两份 20-arm 表是分开手写的，新增变体要各改一次。
+2. `object.rs` 新增 `delegate_js_object!`（放在 trait 定义之后、所有变体之前）：
+   为内嵌 `OrdinaryObject` 的变体生成整套 15 个存储方法 +
+   `kind`/`type_of`/`class_name`；四参数简写把 `typeof` 默认成 `"object"`，
+   五参数供函数对象传 `"function"`。`FunctionObject` 的 83 行手写委托、
+   旧的 `delegate_collection_object!`（91 行，WeakMap / WeakSet 使用）全部
+   换成一行宏调用。
+
+结果：新增一个普通变体只需「`for_each_variant!` 加一行 arm + 一行
+`delegate_js_object!` + `ObjectKind` / 原型注册」；`forward!` 与 GC 分派不再
+需要同步。两文件净删除 106 行重复代码（118 插入 / 224 删除）。
+
+**验收（统一验证）**：三级 272 / 649 / 7 + 字节码 golden；全量
+**17,481 / 20,504（85.26%）与基线逐位一致**，无逐套件回退，护栏 0/0/14、
+跳过 8577 不变，墙钟 115.8s —— 正是纯重构应有的结果。头条未变，基线快照
+无需刷新。
+
+**片 2 未做**：其余纯委托变体（Date / RegExp / Promise / ArrayBuffer /
+TypedArray / DataView / Proxy / Map / Set）仍是手写委托，可机械换成宏；
+`ObjectKind` 降级、exotic 变体存储收编（Array / Global / NativeFunction）、
+原型表 Realm 化留到片 3 / 4。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；
