@@ -3534,19 +3534,23 @@ impl JSObject for ProxyObject {
     }
 }
 
+/// 自有属性委托 [`OrdinaryObject`]（shape 槽位 / `attrs` / 字典模式）；
+/// Map 特有的 `entries` 保持不变，ephemeron 支持仍读这份数据。
 #[derive(Debug)]
 pub struct MapObject {
-    header: ObjectHeader,
+    base: OrdinaryObject,
     entries: Vec<Option<(Value, Value)>>,
-    properties: PropertyTable,
 }
 
 impl MapObject {
     pub fn new(prototype: Option<Gc<Object>>) -> Self {
+        let mut base = OrdinaryObject::new();
+        if let Some(proto) = prototype {
+            base.set_prototype(Some(proto));
+        }
         Self {
             entries: Vec::new(),
-            properties: PropertyTable::new(),
-            header: ObjectHeader::with_optional_prototype(prototype),
+            base,
         }
     }
 
@@ -3614,8 +3618,9 @@ impl MapObject {
 
     /// 只 trace 原型与自身属性 —— **不含条目**。
     pub(crate) fn trace_shallow(&self, out: &mut Worklist) {
-        self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // base 覆盖原型、快速模式槽位 / `attrs` 与字典模式的表；`entries`
+        // 不在这里追，交给收集器的 ephemeron 阶段。
+        self.base.trace(out);
     }
 
     /// 把**键存活**的条目的值追加到 `out`，供收集器继续标记。
@@ -3665,101 +3670,72 @@ impl JSObject for MapObject {
     }
 
 
+    // 以下全部委托：只读 / accessor / frozen / extensible / 删除降级
+    // 与普通对象共用同一套规则（旧实现只动 header，属性位从不改）。
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        self.properties.get(key).cloned()
+        self.base.property_get(key)
     }
 
     fn property_set(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         value: Value,
     ) -> Result<bool, String> {
-        if self.header.is_frozen() {
-            return Err("Cannot set property on frozen object".to_string());
-        }
-        if let Some(existing) = self.properties.get(&key) {
-            if !existing.writable {
-                return Err("Cannot assign to read-only property".to_string());
-            }
-        } else if !self.header.is_extensible() {
-            return Err("Cannot add property to non-extensible object".to_string());
-        }
-        self.properties
-            .insert(key, PropertyDescriptor::data_descriptor(value));
-        Ok(true)
+        self.base.property_set(heap, key, value)
     }
 
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        match self.properties.get(&key).cloned() {
-            Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.header.is_extensible() => {
-                return Err("Cannot add property to non-extensible object".to_string());
-            }
-            None => {}
-        }
-        self.properties.insert(key, desc);
-        Ok(true)
+        self.base.define_property(heap, key, desc)
     }
 
-    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
-        if self.header.is_frozen() || self.header.is_sealed() {
-            return false;
-        }
-        if let Some(desc) = self.properties.get(key) {
-            if !desc.configurable {
-                return false;
-            }
-        }
-        self.properties.remove(key).is_some()
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        self.properties.contains_key(key)
+        self.base.has_property(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys()
+        self.base.own_keys()
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.header.prototype()
+        self.base.get_prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        // 头部的 `set_prototype` 自己会拒绝冻结对象（ES 10.1.2.1）。
-        self.header.set_prototype(proto);
+        self.base.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.header.is_extensible()
+        self.base.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.header.prevent_extensions();
+        self.base.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
-        is_frozen_desc_set(self)
+        self.base.is_frozen()
     }
 
     fn freeze(&mut self) {
-        self.header.freeze();
-        freeze_property_table(&mut self.properties);
+        self.base.freeze();
     }
 
     fn is_sealed(&self) -> bool {
-        is_sealed_desc_set(self)
+        self.base.is_sealed()
     }
 
     fn seal(&mut self) {
-        self.header.prevent_extensions();
-        seal_property_table(&mut self.properties);
+        self.base.seal();
     }
 
     fn type_of(&self) -> &'static str {
@@ -3966,19 +3942,22 @@ delegate_collection_object!(
 /// Same storage discipline as [`MapObject`] — tombstones instead of splicing,
 /// because Set iterators are live (`delete` during iteration must not make the
 /// walk skip the entry that shifts into the freed slot).
+/// 自有属性委托 [`OrdinaryObject`]，Set 特有的 `entries` 保持不变。
 #[derive(Debug)]
 pub struct SetObject {
-    header: ObjectHeader,
+    base: OrdinaryObject,
     entries: Vec<Option<Value>>,
-    properties: PropertyTable,
 }
 
 impl SetObject {
     pub fn new(prototype: Option<Gc<Object>>) -> Self {
+        let mut base = OrdinaryObject::new();
+        if let Some(proto) = prototype {
+            base.set_prototype(Some(proto));
+        }
         Self {
             entries: Vec::new(),
-            properties: PropertyTable::new(),
-            header: ObjectHeader::with_optional_prototype(prototype),
+            base,
         }
     }
 
@@ -4027,8 +4006,9 @@ impl SetObject {
 
     /// 只 trace 原型与自身属性 —— **不含条目**。
     pub(crate) fn trace_shallow(&self, out: &mut Worklist) {
-        self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // base 覆盖原型、快速模式槽位 / `attrs` 与字典模式的表；`entries`
+        // 不在这里追，交给收集器的 ephemeron 阶段。
+        self.base.trace(out);
     }
 
     /// 删掉**不存活**的条目（留墓碑，与 `delete` 一致），返回删掉的条数。
@@ -4061,101 +4041,72 @@ impl JSObject for SetObject {
     }
 
 
+    // 以下全部委托：只读 / accessor / frozen / extensible / 删除降级
+    // 与普通对象共用同一套规则（旧实现只动 header，属性位从不改）。
     fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        self.properties.get(key).cloned()
+        self.base.property_get(key)
     }
 
     fn property_set(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         value: Value,
     ) -> Result<bool, String> {
-        if self.header.is_frozen() {
-            return Err("Cannot set property on frozen object".to_string());
-        }
-        if let Some(existing) = self.properties.get(&key) {
-            if !existing.writable {
-                return Err("Cannot assign to read-only property".to_string());
-            }
-        } else if !self.header.is_extensible() {
-            return Err("Cannot add property to non-extensible object".to_string());
-        }
-        self.properties
-            .insert(key, PropertyDescriptor::data_descriptor(value));
-        Ok(true)
+        self.base.property_set(heap, key, value)
     }
 
     fn define_property(
         &mut self,
-        _heap: &mut Heap,
+        heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        match self.properties.get(&key).cloned() {
-            Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.header.is_extensible() => {
-                return Err("Cannot add property to non-extensible object".to_string());
-            }
-            None => {}
-        }
-        self.properties.insert(key, desc);
-        Ok(true)
+        self.base.define_property(heap, key, desc)
     }
 
-    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
-        if self.header.is_frozen() || self.header.is_sealed() {
-            return false;
-        }
-        if let Some(desc) = self.properties.get(key) {
-            if !desc.configurable {
-                return false;
-            }
-        }
-        self.properties.remove(key).is_some()
+    fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
 
     fn has_property(&self, key: &PropertyKey) -> bool {
-        self.properties.contains_key(key)
+        self.base.has_property(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys()
+        self.base.own_keys()
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.header.prototype()
+        self.base.get_prototype()
     }
 
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        // 头部的 `set_prototype` 自己会拒绝冻结对象（ES 10.1.2.1）。
-        self.header.set_prototype(proto);
+        self.base.set_prototype(proto);
     }
 
     fn is_extensible(&self) -> bool {
-        self.header.is_extensible()
+        self.base.is_extensible()
     }
 
     fn prevent_extensions(&mut self) {
-        self.header.prevent_extensions();
+        self.base.prevent_extensions();
     }
 
     fn is_frozen(&self) -> bool {
-        is_frozen_desc_set(self)
+        self.base.is_frozen()
     }
 
     fn freeze(&mut self) {
-        self.header.freeze();
-        freeze_property_table(&mut self.properties);
+        self.base.freeze();
     }
 
     fn is_sealed(&self) -> bool {
-        is_sealed_desc_set(self)
+        self.base.is_sealed()
     }
 
     fn seal(&mut self) {
-        self.header.prevent_extensions();
-        seal_property_table(&mut self.properties);
+        self.base.seal();
     }
 
     fn type_of(&self) -> &'static str {
@@ -4531,8 +4482,8 @@ impl Trace for ProxyObject {
 
 impl Trace for MapObject {
     fn trace(&self, out: &mut Worklist) {
-        self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // base 覆盖原型、快速模式槽位 / `attrs` 与字典模式那张表。
+        self.base.trace(out);
         // `Vec<Option<(Value, Value)>>`
         for entry in &self.entries {
             if let Some((k, v)) = entry {
@@ -4545,8 +4496,8 @@ impl Trace for MapObject {
 
 impl Trace for SetObject {
     fn trace(&self, out: &mut Worklist) {
-        self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // base 覆盖原型、快速模式槽位 / `attrs` 与字典模式那张表。
+        self.base.trace(out);
         for entry in &self.entries {
             entry.trace(out);
         }
@@ -4841,5 +4792,39 @@ mod shape_tests {
         w.freeze();
         assert!(w.is_frozen());
         assert!(!w.property_delete(&mut heap, &key));
+    }
+
+    /// Map / Set 的自有属性也进 shape 槽位：非默认描述符、冻结与删除降级
+    /// 都由共享存储给出，而 `entries` 完全不受影响。
+    #[test]
+    fn map_and_set_own_properties_live_in_shape_slots() {
+        let mut heap = Heap::new();
+        let mut m = MapObject::new(None);
+        let mut s = SetObject::new(None);
+        let key = PropertyKey::intern(&mut heap, "x");
+        let mut desc = plain(Value::Number(1.0));
+        desc.writable = false;
+        desc.enumerable = false;
+        m.define_property(&mut heap, key, desc.clone()).unwrap();
+        s.define_property(&mut heap, key, desc).unwrap();
+
+        assert!(m.base.shape.is_some(), "Map 自有属性应占形状槽位");
+        assert!(s.base.shape.is_some(), "Set 自有属性应占形状槽位");
+        assert!(!m.property_get(&key).expect("还在").writable);
+        assert!(!s.property_get(&key).expect("还在").enumerable);
+
+        m.freeze();
+        s.freeze();
+        assert!(m.is_frozen());
+        assert!(s.is_frozen());
+        assert!(!m.property_delete(&mut heap, &key));
+        assert!(!s.property_delete(&mut heap, &key));
+
+        // 集合条目是另一份存储，委托属性不影响它。
+        m.set(Value::Number(1.0), Value::Number(2.0));
+        s.add(Value::Number(3.0));
+        assert_eq!(m.size(), 1);
+        assert_eq!(s.size(), 1);
+        assert!(s.has(&Value::Number(3.0)));
     }
 }

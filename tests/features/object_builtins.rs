@@ -630,6 +630,58 @@ fn builtin_prototype_objects_use_shared_property_storage() {
 }
 
 #[test]
+fn define_property_key_goes_through_to_property_key() {
+    // `Object.defineProperty` 的 P 与 getOwnPropertyDescriptor / hasOwn 一样，
+    // 必须跑用户的 toString / Symbol.toPrimitive。
+    eval_js(
+        "'use strict';
+         var o = {};
+         var key = { toString: function () { return 'abc'; } };
+         Object.defineProperty(o, key, {
+           value: 1, writable: true, enumerable: true, configurable: true
+         });
+         if (o.hasOwnProperty('abc') !== true || o.abc !== 1) throw new Error('ToPropertyKey');
+         var sym = Symbol('k');
+         var boxed = {};
+         boxed[Symbol.toPrimitive] = function () { return sym; };
+         Object.defineProperty(o, boxed, {
+           value: 2, writable: true, enumerable: true, configurable: true
+         });
+         if (o[sym] !== 2) throw new Error('symbol key');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn map_and_set_properties_use_shared_storage() {
+    // Map / Set 委托 OrdinaryObject：非默认描述符、只读、删除降级都要成立，
+    // 且不能影响集合条目。
+    eval_js(
+        "'use strict';
+         var m = new Map();
+         Object.defineProperty(m, 'x', {
+           value: 1, writable: false, enumerable: false, configurable: false
+         });
+         var d = Object.getOwnPropertyDescriptor(m, 'x');
+         if (!d || d.value !== 1 || d.writable !== false || d.enumerable !== false ||
+             d.configurable !== false) throw new Error('Map descriptor');
+         var threw = 'no';
+         try { m.x = 2; } catch (e) { threw = e.name; }
+         if (m.x !== 1 || threw !== 'TypeError') throw new Error('read-only Map property');
+         m.set('k', 'v');
+         if (m.size !== 1 || m.get('k') !== 'v') throw new Error('Map entries');
+
+         var s = new Set();
+         s.y = 1;
+         if (delete s.y !== true) throw new Error('Set delete');
+         if (s.hasOwnProperty('y')) throw new Error('Set key remained');
+         s.add(3);
+         if (s.size !== 1 || !s.has(3)) throw new Error('Set entries survived dictionary mode');",
+    )
+    .unwrap();
+}
+
+#[test]
 fn set_prototype_of_rejects_frozen_targets_and_cycles() {
     eval_js(
         "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }

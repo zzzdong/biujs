@@ -424,6 +424,10 @@ impl VM {
                     // 要求 key 走 ToPropertyKey（可跑用户代码）。
                     | "Object.getOwnPropertyDescriptor"
                     | "Object.hasOwn"
+                    // `Object.defineProperty(obj, {toString(){…}}, desc)` 的 P
+                    // 同样要走 ToPropertyKey；`defineProperties` 的第二参数是
+                    // props 对象，**不能**放进这个名单。
+                    | "Object.defineProperty"
             ) {
                 converted_args = self.reflect_key_args(args, module)?;
                 &converted_args

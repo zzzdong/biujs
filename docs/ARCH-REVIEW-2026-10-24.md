@@ -879,6 +879,29 @@ feature 断言同时钉住描述符与 `setUTCHours(1,2,3,4)` 的实际结果。
 `NativeFunction`（`new` 无堆参数，需改约 50 处调用点）/ `Map` / `Set`
 （牵动 `WeakMap` / `WeakSet` 的 ephemeron trace）、1C / 1D / Phase 2 / 3 / 4 / 5。
 
+### Phase 4 第七批（2026-11-11）：1B Map/Set 委托 + `defineProperty` 的 `ToPropertyKey`
+
+1. **1B 第十 / 十一片**：`MapObject` / `SetObject` 的 `header + PropertyTable`
+   换成 `OrdinaryObject` 委托（14 个 `JSObject` 方法 + `Trace` + ephemeron 的
+   `trace_shallow`），集合 `entries` 完全不动，因此 `WeakMap` / `WeakSet` 的
+   ephemeron 语义不受影响。顺带收掉赋值冲掉描述符、`delete` 不看
+   `configurable`、`freeze/seal` 只动头部的偏差。
+2. **`Object.defineProperty` 的属性键**：与 `getOwnPropertyDescriptor` /
+   `hasOwn` 同族 —— `Object.defineProperty(obj, {toString(){…}}, desc)` 以前
+   用 Rust 层 `to_js_string()`，不跑用户转换（`15.2.3.6-2-43..48`）。现在把
+   它加进 VM 层 `reflect_key_args` 名单；`defineProperties` 的第二参数是
+   props 对象，刻意**不**加。
+
+**验收（统一验证）**：三级 272 / 648 / 7 + 字节码 golden 全绿；全量
+**17,462 → 17,475 / 20,504（85.16% → 85.23%，+13）**，无逐套件回退
+（`built-ins/Object` +6、两处 `class` 各 +2、`computed-property-names` +2、
+`language/expressions/object` +1），护栏 0/0/14 与跳过 8577 不变。
+
+仍未做（硬前置，见 §6.1）：`NativeFunctionObject`（56 处构造调用点，
+`new` 无堆参数）、0.4 完整几何断言（Phase 2 帧模型）、S0#4 `Gc` 代次
+（`Value == 16 B`）、`invoke_boundaries` 闸门、`rsp` 单写者、1C / 1D 及
+Phase 2 / 3 / 4 / 5。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；
@@ -907,9 +930,9 @@ feature 断言同时钉住描述符与 `setUTCHours(1,2,3,4)` 的实际结果。
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 **1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
-**1B 九片**（…；`Shape` 结构与迁移表；`OrdinaryObject` 接入形状 + 字典模式降级；
+**1B 十一片**（…；`Shape` 结构与迁移表；`OrdinaryObject` 接入形状 + 字典模式降级；
 第七片 `FunctionObject` 委托、第八片 `PrimitiveWrapperObject` 委托、
-第九片内建原型 `ProtoObject` 委托）。
+第九片内建原型 `ProtoObject` 委托、第十/十一片 `MapObject` / `SetObject` 委托）。
 
 ### 6.1 对账（2026-11-10，按代码逐项核对）
 
@@ -933,8 +956,8 @@ Phase 2（`FunctionCode` / `OpInfo` / 单层 match）都还是原样。
 剩余（按顺序）—— Phase 0 主体已收口（0.2 已收尾），1A 也收口，下面是：
     0.4 收尾（`rbp == frames.last().base` 的完整断言，前置是 Phase 2 修生成器挂起几何）→
     S0#4 第二档（GC 句柄代次 —— 先解决 `Value::String` 的表示才有空间）→
-    1B 剩余（NativeFunction / Map / Set 换到槽位；Array 与 1C 耦合；
-            之后 Realm / EnvRecord）→
+    1B 剩余（NativeFunction 换到槽位 —— `new` 无堆参数，约 56 处调用点；
+            Array 与 1C 耦合；之后 Realm / EnvRecord）→
     1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→
     Phase 2（帧几何/GC/字节码 v2）→ Phase 3（编译器简化）。
 
