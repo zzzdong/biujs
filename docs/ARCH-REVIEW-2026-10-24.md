@@ -733,6 +733,31 @@ getter 的 accessor 由同一套 `attrs` 保管、冻结/密封正确标注属�
 **验收：三级 272 / 651 / 7 全绿；全量 17,488 / 20,504（85.29%）与改前**
 **逐位相同**（纯类型重构，语义零变化），无逐套件回退，护栏计数不变。
 
+**第十一片已落地（2026-11-11）：`has_property` → `has_own_property`。**
+
+ES 的 `[[HasProperty]]` 沿原型链，而对象层的这个方法只查自有 —— 同名不同义。
+上一片修的"链上 Proxy 不触发 trap"有一半根源就是这条边界没写进名字
+（`internal_has_property` 与 `has_property` 看起来都是 "has property"）。
+改名后调用点自解释；链式查询只保留 `VM::object_has_property` 与
+`prototype::internal_has_property`。**全量逐位不变。**
+
+**第十二片已落地（2026-11-11）：判别点收敛 + `[[Delete]]` 语义。**
+
+- `ObjectKind` 与 `Object` 变体对齐：删 `Error` / `Arguments`（没有任何对象
+  返回它们），`Buffer` → `ArrayBuffer`（前者是 Node 语义）。`kind()` 被当类型
+  判别用了约 50 处，永不返回的值等于永不匹配的分支。
+- `kind() == ObjectKind::Proxy` 的 8 处散写收敛为 `Object::is_proxy()`。
+- `[[Delete]]`（ES 10.1.9.2）：`OrdinaryObject` / `NativeFunctionObject` 在属性
+  不存在时返回 false，且先无条件 `to_dict()` —— `delete o.missing` 会把对象永久
+  打成字典模式；`NativeFunctionObject` 还完全没检查冻结/密封。这些以前被
+  `internal_delete` 入口的提前判断掩盖。同时把 `is_frozen_desc_set` /
+  `is_sealed_desc_set` 从 `&dyn JSObject` 改成泛型。
+
+**验收：全量 17,488 / 20,504（85.29%）逐位不变，无逐套件回退。**
+**踩坑**：给 Array 的 hole 情形加 `return true` 早退时忘了删 `properties` 里的
+条目 —— accessor 索引同时是 hole 与 properties 条目，`delete arr[0]` 留下删不掉
+的 getter，全量 -45（Array -10、Object -35）。
+
 剩余（按序）：
 - descriptor 惰性物化：`NativeFunction` / `Map` / `Set` 也换到槽位，
   把 `PropertyTable` 收成"只有字典模式用"。`NativeFunction::new` 构造期直接写属性表
