@@ -446,7 +446,7 @@ fn seal_property_table(properties: &mut PropertyTable) {
 /// non-configurable (and non-writable when it is data) and the object itself
 /// is non-extensible. An object with *no* own properties therefore inherits
 /// the answer from its extensibility alone.
-fn is_frozen_desc_set(obj: &dyn JSObject) -> bool {
+fn is_frozen_desc_set<T: JSObject + ?Sized>(obj: &T) -> bool {
     if obj.is_extensible() {
         return false;
     }
@@ -458,7 +458,7 @@ fn is_frozen_desc_set(obj: &dyn JSObject) -> bool {
 
 /// `TestIntegrityLevel(O, "sealed")`: every own property is non-configurable
 /// and the object is non-extensible.
-fn is_sealed_desc_set(obj: &dyn JSObject) -> bool {
+fn is_sealed_desc_set<T: JSObject + ?Sized>(obj: &T) -> bool {
     if obj.is_extensible() {
         return false;
     }
@@ -898,17 +898,23 @@ impl JSObject for OrdinaryObject {
         if self.header.is_frozen() || self.header.is_sealed() {
             return false;
         }
+        // ES 10.1.9.2 步骤 1–2：自有属性本来就不存在 ⇒ `[[Delete]]` **成功**。
+        //
+        // 顺便：不存在的键不该触发 `to_dict()`。删除是"打乱布局"的操作，删一个
+        // 没有的名字却把对象永久打成字典模式，是把 `delete o.missing` 当成了
+        // 布局变更 —— 这个分支以前在 `internal_delete` 里被提前挡掉，所以从 JS
+        // 看不见，但任何直接调 `property_delete` 的地方都会拿到错误的 false。
+        let Some(desc) = self.property_get(key) else {
+            return true;
+        };
+        if !desc.configurable {
+            return false;
+        }
         // 删除打乱布局 ⇒ 转字典模式，之后所有属性都在一张表里。
         self.to_dict();
         let dict = self.dict.as_mut().expect("刚转过字典模式");
-        // ES6 [[Delete]]: an own property whose [[Configurable]] is false cannot
-        // be removed — the request reports failure instead.
-        if let Some(desc) = dict.get(key) {
-            if !desc.configurable {
-                return false;
-            }
-        }
-        dict.remove(key).is_some()
+        dict.remove(key);
+        true
     }
 
     fn has_own_property(&self, key: &PropertyKey) -> bool {
@@ -1507,19 +1513,26 @@ impl JSObject for ArrayObject {
             }
             if idx < self.elements.len() {
                 // Deleting an element leaves a hole; the length is unchanged.
+                // 注意 `properties` 里的条目必须一起删：accessor 形式的索引就存在
+                // 那里，而它的 `elements` 槽位同时也是 hole —— 只 early-return
+                // 会留下一个删不掉的 getter。
                 self.properties.remove(key);
                 self.elements[idx] = Value::Undefined;
                 self.holes.insert(idx);
                 return true;
             }
-            return self.properties.remove(key).is_some();
+            // 越界索引：只可能以非默认描述符的形式存在 —— 不存在也算删除成功
+            // （ES 10.1.9.2 步骤 2）。
+            self.properties.remove(key);
+            return true;
         }
         if let Some(desc) = self.properties.get(key) {
             if !desc.configurable {
                 return false;
             }
         }
-        self.properties.remove(key).is_some()
+        self.properties.remove(key);
+        true
     }
 
     fn has_own_property(&self, key: &PropertyKey) -> bool {
@@ -2024,12 +2037,18 @@ impl JSObject for NativeFunctionObject {
     }
 
     fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
-        if let Some(desc) = self.properties.get(key) {
-            if !desc.configurable {
-                return false;
-            }
+        if self.header.is_frozen() || self.header.is_sealed() {
+            return false;
         }
-        self.properties.remove(key).is_some()
+        // 不存在 ⇒ 删除成功（ES 10.1.9.2 步骤 2），与 `OrdinaryObject` 同一口径。
+        let Some(desc) = self.properties.get(key) else {
+            return true;
+        };
+        if !desc.configurable {
+            return false;
+        }
+        self.properties.remove(key);
+        true
     }
 
     fn has_own_property(&self, key: &PropertyKey) -> bool {
