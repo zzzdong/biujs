@@ -145,6 +145,16 @@ fn reflect_shape_and_the_two_remaining_failures_answers() {
          if (Object.getPrototypeOf(o) !== Object.prototype) throw new Error('unchanged');
          if (Reflect.setPrototypeOf(o, null) !== true) throw new Error('null proto');
          if (Object.getPrototypeOf(o) !== null) throw new Error('now null');
+         // 不可扩展之后：换成别的原型是 false，但设成\"本来就是的那个\"仍是 true
+         //（ES 10.1.2.1 step 2：先比较，再检查可扩展性）。两条入口共用
+         // `ObjectHeader` 的同一份判定。
+         var locked = {};
+         Object.preventExtensions(locked);
+         if (Reflect.setPrototypeOf(locked, {}) !== false) throw new Error('non-extensible change');
+         if (Reflect.setPrototypeOf(locked, Object.prototype) !== true) throw new Error('non-extensible same');
+         if (Object.setPrototypeOf(locked, Object.prototype) !== locked) throw new Error('non-extensible same, Object');
+         try { Object.setPrototypeOf(locked, {}); throw new Error('non-extensible change did not throw'); }
+         catch (e) { if (e.name !== 'TypeError') throw e; }
          // Reflecting a proxy asks its traps.
          var trapped = new Proxy({}, { has: function () { return true; } });
          if (Reflect.has(trapped, 'anything') !== true) throw new Error('has trap');",

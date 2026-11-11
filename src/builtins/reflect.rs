@@ -138,35 +138,17 @@ pub fn reflect_set_prototype_of(_heap: &mut Heap, args: &[Value]) -> Result<Valu
             )))
         }
     };
-    // Replacing the prototype of a non-extensible object is refused, not thrown
-    // (ES 10.1.2.1 step 4).
-    let changed = {
-        let borrowed = target.borrow();
-        let current = borrowed.get_prototype();
-        let same = match (&current, &new_proto) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Gc::ptr_eq(a, b),
-            _ => false,
-        };
-        borrowed.is_extensible() || same
-    };
-    if !changed {
-        return Ok(Value::Bool(false));
-    }
     // A prototype chain that reaches the object itself would loop forever on
     // every later lookup. `[[SetPrototypeOf]]` *refuses* it (ES 10.1.2.1 step 6),
     // which `Reflect` reports as `false` and `Object.setPrototypeOf` throws.
-    if let Some(proto) = &new_proto {
-        let mut chain = Some(*proto);
-        while let Some(link) = chain {
-            if Gc::ptr_eq(&link, &target) {
-                return Ok(Value::Bool(false));
-            }
-            chain = link.borrow().get_prototype();
-        }
+    // 两个入口共用同一份判定（`Object.setPrototypeOf` 那边是同一行）。
+    if new_proto.is_some_and(|proto| {
+        crate::vm::prototype::prototype_chain_contains(proto, target)
+    }) {
+        return Ok(Value::Bool(false));
     }
-    target.borrow_mut().set_prototype(new_proto);
-    Ok(Value::Bool(true))
+    // "相同 ⇒ true / 不可扩展 ⇒ false" 只在 `ObjectHeader` 里实现一次。
+    Ok(Value::Bool(target.borrow_mut().set_prototype(new_proto)))
 }
 
 /// `Reflect.isExtensible(target)` (ES 28.1.7).

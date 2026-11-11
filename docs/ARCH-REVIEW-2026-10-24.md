@@ -681,8 +681,60 @@ getter 的 accessor 由同一套 `attrs` 保管、冻结/密封正确标注属�
 （84.45% → 84.52%，+13）**，无逐套件回退，护栏 0/0/14 与跳过 8577 均不变，
 墙钟 108.3s。提升：`built-ins/Object` +12、`built-ins/Proxy` +1。
 
+**第九片已落地（2026-11-11）：对象层的三条边界收口。**
+
+三件事都属于"trait 的签名或职责说不清，于是规则被迫散落在调用方"：
+
+1. **链上 Proxy**：`[[Get]]` / `[[Set]]` / `[[HasProperty]]` 的链式遍历原来用
+   `prototype::find_descriptor` / `internal_has_property`（纯描述符 walk），只检查
+   **起点**是不是 Proxy。于是链上任意一跳是 Proxy 时 trap 根本不跑：
+   `Object.create(new Proxy({foo:1},{get(){return 42}})).foo` 得到 `1`，
+   `('zzz' in Object.create(new Proxy({},{has(){return true}})))` 得到 `false`。
+   现在三条操作各有 VM 侧链式实现（`object_get_chain` / `set_member` /
+   `object_has_property`），**每一跳都先问 Proxy**；`Reflect.has` 也改走 VM
+   （builtins 层没有 VM，原来直接落到纯 walk）。`proxy_has` 的无 trap 分支同样
+   回到链式实现，嵌套 Proxy（target 也是 Proxy）因此正确。
+2. **String 包装的索引键按码元**：`own_keys` 用 `chars().count()`（码点），而
+   `[[GetOwnProperty]]` / `has_property` 用 UTF-16 码元 —— `new String("😀")`
+   的 `Reflect.ownKeys` 只报 `0`，但 `hasOwnProperty("1")` 是 true。
+3. **`[[SetPrototypeOf]]` 返回 bool**：`JSObject::set_prototype` 从 `()` 改回
+   `bool`，判定收进 `ObjectHeader`（相同 ⇒ true；不可扩展 ⇒ false），
+   `Object.setPrototypeOf` 只负责把 false 变成 TypeError、
+   `Reflect.setPrototypeOf` 原样返回，环检测抽成
+   `prototype::prototype_chain_contains`（原来两处各写一份 while 循环）。
+   顺带删掉 `JSObject: Any`（`as_any` 早已不存在）。
+
+同批还合并了一个冗余变体：`Object::Proto` 与 `Object::Ordinary` 的差别只有
+`class_name`，而 `OrdinaryObject` 的默认值就是 `"Object"` —— 内建原型对象现在
+直接是 `Object::Ordinary`，20 个变体收敛到 19 个，少了一整套手写的
+`impl JSObject` + `impl Trace`。
+
+**验收**：三级 272 / 651 / 7 全绿；全量 **17,481 → 17,488 / 20,504
+（85.25% → 85.29%）**，无逐套件回退（唯一变化 `built-ins/Proxy`
+**219 → 226，失败 43 → 36**），护栏计数不变。新增回归：`proxy.rs`
+`traps_fire_on_the_prototype_chain`、`string_utf16.rs`
+`string_wrapper_own_keys_are_code_units`、`reflect.rs` 的不可扩展同原型断言。
+
+**第十片已落地（2026-11-11）：属性错误通道类型化。**
+
+`JSObject::property_set` / `define_property` 的错误从 `String` 换成
+`PropertyError { kind: Type | Range, message }`（`vm/property.rs`）：
+
+- 唯一的 RangeError 来源是 `ArraySetLength`（ES 10.4.2.4）。以前它靠
+  `PROPERTY_ERROR_RANGE_PREFIX = "RangeError: "` 穿过对象层，再由
+  `RuntimeError::from_property_error` 剥前缀 —— 任何一次 `format!` 拼接都会让
+  `Object.defineProperty([], "length", {value: -1})` 静默变成 TypeError。
+- 现在两个方向都是 `From`：`From<PropertyError> for RuntimeError` 是唯一还原点，
+  `From<RuntimeError> for PropertyError` 供 `validate_array_length` 这类"校验用
+  RuntimeError"的辅助函数折回属性通道。
+- 37 处 `Err("…".to_string())` 与 29 处签名机械迁移；`PropertyError` 的
+  `kind()` / `message()` 取代了"看字符串前缀"的推断。
+
+**验收：三级 272 / 651 / 7 全绿；全量 17,488 / 20,504（85.29%）与改前**
+**逐位相同**（纯类型重构，语义零变化），无逐套件回退，护栏计数不变。
+
 剩余（按序）：
-- descriptor 惰性物化：`NativeFunction` / `Map` / `Set` / `ProtoObject` 也换到槽位，
+- descriptor 惰性物化：`NativeFunction` / `Map` / `Set` 也换到槽位，
   把 `PropertyTable` 收成"只有字典模式用"。`NativeFunction::new` 构造期直接写属性表
   且还没有堆参数，要先改构造签名；`Map` / `Set` 牵动 `WeakMap` / `WeakSet` 的
   ephemeron trace；`Array` 与 1C 耦合，留到那时。
@@ -959,6 +1011,28 @@ Phase 2 / 3 / 4 / 5。
 TypedArray / DataView / Proxy / Map / Set）仍是手写委托，可机械换成宏；
 `ObjectKind` 降级、exotic 变体存储收编（Array / Global / NativeFunction）、
 原型表 Realm 化留到片 3 / 4。
+
+### 对象模型重构片 3 前半（2026-11-11）：6 个纯委托变体宏化
+
+片 2 的 `delegate_js_object!` 现在覆盖剩余 6 个纯委托变体：
+`DateObject` / `PromiseObject` / `ArrayBufferObject` / `DataViewObject` /
+`MapObject` / `SetObject` —— 它们只有内部槽不同，`JSObject` 的 15 个方法
+全是 `self.base.xxx()`。逐个 impl（59–82 行）换成一行宏调用，
+`src/vm/object.rs` 净删 402 行（6 插入 / 408 删除），零运行时语义变化。
+
+仍保留手写 impl 的 3 个 exotic 变体（宏覆盖不了）：`RegExpObject`
+（`lastIndex` / `source` / `flags` 虚拟属性）、`TypedArrayObject`（整数索引
+元素）、`ProxyObject`（动态 `type_of` + target 转发）。加上
+`PrimitiveWrapper` 的 String 虚拟索引与 Array / Global / NativeFunction 的
+自定义存储，「共享实现负责普通属性、exotic 只覆写必要钩子」的边界至此清楚。
+
+**验收（统一验证）**：三级 272 / 649 / 7 + 字节码 golden；全量
+**17,481 / 20,504（85.26%）与基线逐位一致**，无逐套件回退，护栏 0/0/14、
+跳过 8577 不变，墙钟 115.4s。头条未变，基线快照无需刷新。
+
+**下一步**：`ObjectKind` 降级（消除 `kind()` 与 `as_*` 的双重判定、约 117 处
+`kind` 分支）；exotic 存储收编（Array / Global / NativeFunction）；原型表从
+`thread_local` 改挂 Realm。
 
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 

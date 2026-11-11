@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::{JSObject, NativeFunctionObject};
-use crate::vm::property::{ObjectKind, PropertyDescriptor, PropertyKey};
+use crate::vm::property::{ObjectKind, PropertyDescriptor, PropertyError, PropertyKey};
 use crate::vm::value::{SymbolData, Value};
 
 /// Reserved id for the well-known `Symbol.iterator`.
@@ -209,8 +209,8 @@ impl JSObject for NativeIteratorObject {
         _heap: &mut crate::vm::gc::Heap,
         _key: PropertyKey,
         _value: Value,
-    ) -> Result<bool, String> {
-        Err("Cannot add properties to an iterator".to_string())
+    ) -> Result<bool, PropertyError> {
+        Err(PropertyError::type_error("Cannot add properties to an iterator"))
     }
 
     fn define_property(
@@ -218,8 +218,8 @@ impl JSObject for NativeIteratorObject {
         _heap: &mut crate::vm::gc::Heap,
         _key: PropertyKey,
         _desc: PropertyDescriptor,
-    ) -> Result<bool, String> {
-        Err("Cannot add properties to an iterator".to_string())
+    ) -> Result<bool, PropertyError> {
+        Err(PropertyError::type_error("Cannot add properties to an iterator"))
     }
 
     fn property_delete(
@@ -246,8 +246,8 @@ impl JSObject for NativeIteratorObject {
         self.header.prototype()
     }
 
-    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.header.set_prototype(proto);
+    fn set_prototype(&mut self, proto: Option<Gc<Object>>) -> bool {
+        self.header.set_prototype(proto)
     }
 
     fn is_extensible(&self) -> bool {

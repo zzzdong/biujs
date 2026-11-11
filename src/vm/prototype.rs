@@ -3,7 +3,35 @@ use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
-const MAX_PROTO_DEPTH: usize = 1000;
+/// 原型链遍历的深度上限。
+///
+/// VM 侧的 `[[Get]]` / `[[HasProperty]]` / `[[Set]]` 也要用它 —— 那几处的 walk
+/// 必须逐跳检查 Proxy（纯描述符 walk 做不到），所以深度检查跟着一起搬到了
+/// 调用方手里。
+pub(crate) const MAX_PROTO_DEPTH: usize = 1000;
+
+/// `start` 的原型链上是否出现 `needle`（含 `start` 自己）。
+///
+/// ES 10.1.2.1 step 6：`[[SetPrototypeOf]]` 必须拒绝"把对象的原型设成它自己的
+/// 后代"，否则之后每一次属性查找都会绕成死循环。`Object.setPrototypeOf` 与
+/// `Reflect.setPrototypeOf` 都要做这条判定，所以放在这里共用一份 —— 以前是
+/// 两份手写的 while 循环。
+pub fn prototype_chain_contains(start: Gc<Object>, needle: Gc<Object>) -> bool {
+    let mut current = Some(start);
+    let mut depth = 0usize;
+    while let Some(obj) = current {
+        if Gc::ptr_eq(&obj, &needle) {
+            return true;
+        }
+        if depth > MAX_PROTO_DEPTH {
+            // 过深的链按"有环"处理：继续走既无意义也可能不终止。
+            return true;
+        }
+        current = obj.borrow().get_prototype();
+        depth += 1;
+    }
+    false
+}
 
 /// Options for prototype chain traversal
 #[derive(Debug, Clone)]

@@ -749,9 +749,10 @@ fn get_prototype_of_needs_an_object() {
 #[test]
 fn array_length_errors_are_range_errors() {
     // `ArraySetLength` (ES 10.4.2.4) throws a *RangeError* for a length that is
-    // not a valid array index. The engine's `[[DefineOwnProperty]]` reports
-    // failure through a `String` channel, which used to flatten every failure
-    // into a TypeError — see `RuntimeError::from_property_error`.
+    // not a valid array index. The failure travels out of `[[DefineOwnProperty]]`
+    // as a `PropertyError` whose kind is `Range` — before that type existed it
+    // was a `String` with a magic prefix, and every failure reaching the VM
+    // became a TypeError.
     eval_js(
         "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
          var out = [

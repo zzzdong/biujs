@@ -215,16 +215,13 @@ impl VM {
         module: &Module,
     ) -> Result<Option<bool>, RuntimeError> {
         let Some((target, handler, trap)) = self.proxy_trap(proxy, "has", module)? else {
-            // No trap: `[[HasProperty]]` on the target, which may be a proxy.
+            // No trap: `[[HasProperty]]` on the target — 必须重新做**完整的**
+            // `[[HasProperty]]`（target 自身可能还是 Proxy，且它的原型链上也
+            // 可能挂着 Proxy），所以这里回到 VM 的链式实现而不是
+            // `internal_has_property` 的纯描述符 walk。
             let target = self.proxy_parts(proxy, "has")?.0;
-            if Self::is_proxy(&target) {
-                return self.proxy_has(&target, key, module);
-            }
             return match &target {
-                Value::Object(obj_ref) => Ok(Some(
-                    crate::vm::prototype::internal_has_property(*obj_ref, key)
-                        .map_err(RuntimeError::TypeError)?,
-                )),
+                Value::Object(obj_ref) => Ok(Some(self.object_has_property(*obj_ref, key, module)?)),
                 _ => Ok(Some(false)),
             };
         };

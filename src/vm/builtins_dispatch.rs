@@ -448,6 +448,25 @@ impl VM {
             if let Some(result) = self.proxy_static_trap(name, args, module)? {
                 return Ok(result);
             }
+            // `Reflect.has` 的 `[[HasProperty]]` 要走原型链，而链上每一跳都可能
+            // 是 Proxy（`has` trap 必须生效）—— builtins 层没有 VM，故在这里做。
+            // receiver 本身是 Proxy 的情况已在上面的 `proxy_static_trap` 处理。
+            if name == "Reflect.has" {
+                let target = args.first().cloned().unwrap_or(Value::Undefined);
+                let Value::Object(obj_ref) = target else {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Reflect.has called on {}",
+                        target.type_of()
+                    )));
+                };
+                let key = crate::builtins::reflect::to_key(
+                    &mut self.heap,
+                    args.get(1).unwrap_or(&Value::Undefined),
+                );
+                return Ok(Value::Bool(
+                    self.object_has_property(obj_ref, &key, module)?,
+                ));
+            }
             // `Object.assign` reads through real `[[Get]]` and writes through
             // real `[[Set]]` (own or prototype accessors may run), which only
             // the VM can do.

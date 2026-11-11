@@ -22,6 +22,24 @@ fn length_counts_code_units() {
     );
 }
 
+/// String 包装对象的**索引键**也按码元算（ES 10.4.3 的 String exotic）。
+///
+/// `own_keys` 曾经用 `chars().count()`（码点数）：`new String("\u{1F600}")` 只
+/// 报出 `0`，而 `hasOwnProperty('1')` 是 `true`、`s[1]` 也能读到半个代理对 ——
+/// `[[OwnPropertyKeys]]` 与 `[[GetOwnProperty]]` 就自相矛盾了。
+#[test]
+fn string_wrapper_own_keys_are_code_units() {
+    assert_eq!(
+        eval_string(
+            r#"
+            var s = new String('\u{1F600}');
+            Reflect.ownKeys(s).join(',')
+            "#
+        ),
+        "0,1,length"
+    );
+}
+
 #[test]
 fn char_code_at_splits_the_pair() {
     assert_eq!(

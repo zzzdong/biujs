@@ -98,9 +98,32 @@ pub enum Value {
 }
 ```
 
-- **对象：`Object` 是具体枚举**（20 个变体，对应原 `JSObject` 的 20 个实现体；
+- **对象：`Object` 是具体枚举**（19 个变体，对应原 `JSObject` 的实现体；
   `dyn` 已消失、`Sized`）。`ObjectKind` 保留供 `kind()` 使用。
   多数具体对象内部包一个 `OrdinaryObject` 做属性存储。
+  内建原型对象（`Object.prototype` / `Array.prototype` / …）不再有独立变体：
+  它与 `Ordinary` 的差别只有 `class_name`，而默认值就是 `"Object"`。
+- **对象层只做 own 属性描述符**：`JSObject` 的 15 个方法（`property_get` /
+  `define_property` / `own_keys` / `get_prototype` / …）都只看"这一个对象"，
+  不执行用户代码。ES 的抽象操作（`[[Get]]` / `[[Set]]` / `[[HasProperty]]` /
+  `[[Delete]]`）在 VM 侧，因为 accessor 与 Proxy trap 需要重入调用。
+  `[[Get]]` / `[[Set]]` / `[[HasProperty]]` 的链式实现是
+  `VM::object_get_chain` / `set_member` / `object_has_property`，**每一跳都先检查
+  Proxy**（链上任意位置是 Proxy，它的 trap 就接管整个操作）。`prototype.rs` 里的
+  `internal_get` / `find_descriptor` / `internal_has_property` 是纯描述符 walk，
+  只给"不需要执行用户代码"的内部读取用 —— 拿它做 JS 可见的 `[[Get]]` 会漏掉链上
+  的 trap。
+- **`[[SetPrototypeOf]]` 只有一份判定**：`ObjectHeader::set_prototype` 返回 bool
+  （相同 ⇒ true；不可扩展 / 冻结 ⇒ false），`Object.setPrototypeOf` 把 false 变成
+  TypeError、`Reflect.setPrototypeOf` 原样返回；环检测在
+  `prototype::prototype_chain_contains`。
+- **属性操作的错误是类型化的**：`property_set` / `define_property` 返回
+  `Result<bool, PropertyError>`（`PropertyErrorKind::{Type, Range}`），不是
+  `String`。绝大多数违规是 TypeError，唯一的 RangeError 来自 `ArraySetLength`
+  （`arr.length = -1`、`Object.defineProperty([], "length", {value: -1})`）。
+  以前这条分类靠 `"RangeError: "` 前缀穿过 20 个 `impl JSObject`，任何一次
+  `format!` 拼接都会静默丢掉它；现在 `From<PropertyError> for RuntimeError`
+  是唯一还原点。
 - `Value` = **16 B**（原 24 B），`Gc<Object>` = 8 B。
 
 ### 3.1 堆与句柄（`src/vm/gc.rs`，P1）

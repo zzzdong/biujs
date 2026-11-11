@@ -2341,21 +2341,9 @@ impl VM {
                 let obj = self.get_value(rhs)?;
                 let obj = self.as_object_value(&obj);
                 let result = match obj {
-                    Value::Object(obj_ref) => {
-                        // A `has` trap answers the `in` operator outright
-                        // (ES 10.5.7); with no trap the lookup is the target's.
-                        if obj_ref.borrow().kind() == ObjectKind::Proxy {
-                            let proxy_val = Value::Object(obj_ref);
-                            match self.proxy_has(&proxy_val, &key, module)? {
-                                Some(has) => has,
-                                None => crate::vm::prototype::internal_has_property(obj_ref, &key)
-                                    .map_err(RuntimeError::TypeError)?,
-                            }
-                        } else {
-                            crate::vm::prototype::internal_has_property(obj_ref, &key)
-                                .map_err(RuntimeError::TypeError)?
-                        }
-                    }
+                    // `[[HasProperty]]` 的链式实现：链上每一跳都会检查 Proxy，
+                    // 让 `has` trap 能接管（ES 10.5.7）。
+                    Value::Object(obj_ref) => self.object_has_property(obj_ref, &key, module)?,
                     _ => {
                         return Err(RuntimeError::TypeError(
                             "Cannot use 'in' operator on non-object".to_string(),

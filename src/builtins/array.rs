@@ -336,7 +336,7 @@ fn generic_set(heap: &mut Heap, obj: &Value, index: u64, value: Value) -> Result
             o.borrow_mut()
                 .property_set(heap, key, value)
                 .map(|_| ())
-                .map_err(RuntimeError::TypeError)
+                .map_err(RuntimeError::from)
         }
         _ => Ok(()),
     }
@@ -373,7 +373,7 @@ fn generic_set_length(heap: &mut Heap, obj: &Value, len: u64) -> Result<(), Runt
             .borrow_mut()
             .property_set(heap, PropertyKey::well_known("length").expect("well-known name"), Value::Number(len as f64))
             .map(|_| ())
-            .map_err(RuntimeError::TypeError),
+            .map_err(RuntimeError::from),
         _ => Ok(()),
     }
 }

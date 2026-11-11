@@ -3296,11 +3296,94 @@ impl VM {
             }
             Value::Object(obj_ref) => {
                 let key = PropertyKey::intern(heap, prop);
+                // `internal_get` 的错误通道仍是 `String`（纯描述符 walk，不涉及
+                // `[[Set]]` 的错误分类）。
                 crate::vm::prototype::internal_get(obj_ref.clone(), &key, None)
-                    .map_err(RuntimeError::from_property_error)
+                    .map_err(RuntimeError::TypeError)
             }
             _ => Ok(Value::Undefined),
         }
+    }
+
+    /// ES `[[Get]]` 的**链式**实现：读 `start` 及其原型链上的属性。
+    ///
+    /// 每一跳都先问“这是不是一个 Proxy”。链上任意位置是 Proxy，它的 `get` trap
+    /// 就接管整个操作（ES 10.5.8）—— 这正是 `prototype::find_descriptor` 做不到
+    /// 的事：那是**纯描述符 walk**，遇到 Proxy 只能看到 `property_get` 转发给
+    /// target 的结果，trap 不会触发，于是 `Object.create(proxy).x` 读到的是 target
+    /// 上的值而不是 trap 的返回值。
+    ///
+    /// `receiver` 是**最初**被读的那个值，getter 的 `this` 用它（ES 10.1.8），
+    /// 而不是"碰巧持有这个描述符的对象"。
+    fn object_get_chain(
+        &mut self,
+        start: Gc<Object>,
+        key: &PropertyKey,
+        receiver: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let mut current = Some(start);
+        let mut depth = 0usize;
+        while let Some(obj_ref) = current {
+            if depth > crate::vm::prototype::MAX_PROTO_DEPTH {
+                return Err(RuntimeError::TypeError(
+                    "Maximum prototype chain depth exceeded".to_string(),
+                ));
+            }
+            if obj_ref.borrow().kind() == ObjectKind::Proxy {
+                // `proxy_get` 本身就是完整的 `[[Get]]`：有 trap 用 trap 的返回值，
+                // 无 trap 则对 target 重新做一次 `[[Get]]`（target 可能还是 Proxy）。
+                let proxy_val = Value::Object(obj_ref);
+                return Ok(self
+                    .proxy_get(&proxy_val, key, receiver, module)?
+                    .unwrap_or(Value::Undefined));
+            }
+            let desc = obj_ref.borrow().property_get(key);
+            if let Some(desc) = desc {
+                if desc.is_accessor_descriptor() {
+                    return match desc.invoked_getter() {
+                        Some(getter) => self.invoke(getter, receiver.clone(), &[], module),
+                        None => Ok(Value::Undefined),
+                    };
+                }
+                return Ok(desc.value);
+            }
+            current = obj_ref.borrow().get_prototype();
+            depth += 1;
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// ES `[[HasProperty]]` 的链式实现（`in` 与 `Reflect.has`）。
+    ///
+    /// 与 `prototype::internal_has_property` 的唯一区别是**每一跳都检查 Proxy**：
+    /// 链上任意位置是 Proxy，`has` trap 就接管（ES 10.5.7）。内部读取仍走
+    /// `internal_has_property` —— 那是纯 walk，不执行用户代码。
+    fn object_has_property(
+        &mut self,
+        start: Gc<Object>,
+        key: &PropertyKey,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
+        let mut current = Some(start);
+        let mut depth = 0usize;
+        while let Some(obj_ref) = current {
+            if depth > crate::vm::prototype::MAX_PROTO_DEPTH {
+                return Err(RuntimeError::TypeError(
+                    "Maximum prototype chain depth exceeded".to_string(),
+                ));
+            }
+            if obj_ref.borrow().kind() == ObjectKind::Proxy {
+                let proxy_val = Value::Object(obj_ref);
+                return Ok(self.proxy_has(&proxy_val, key, module)?.unwrap_or(false));
+            }
+            if obj_ref.borrow().has_property(key) {
+                return Ok(true);
+            }
+            current = obj_ref.borrow().get_prototype();
+            depth += 1;
+        }
+        Ok(false)
     }
 
     /// Resolve the prototype object that backs a primitive's wrapper type.
@@ -3326,39 +3409,8 @@ impl VM {
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         match obj {
-            Value::Object(obj_ref) => {
-                // A proxy's `get` trap is JavaScript, so it has to run *before*
-                // the descriptor search — and only the VM can run it. No trap
-                // (or no `get` on the handler) falls through, and the search
-                // below then answers the target's property: `ProxyObject`
-                // forwards `property_get` to the target.
-                if obj_ref.borrow().kind() == ObjectKind::Proxy {
-                    let proxy_val = Value::Object(*obj_ref);
-                    if let Some(value) = self.proxy_get(&proxy_val, key, &proxy_val, module)? {
-                        return Ok(value);
-                    }
-                }
-                // Accessor properties have to invoke their getter, which needs a
-                // re-entrant call — hence the descriptor search here.
-                if let Some((owner, desc)) =
-                    crate::vm::prototype::find_descriptor(*obj_ref, key)
-                        .map_err(RuntimeError::TypeError)?
-                {
-                    if desc.is_accessor_descriptor() {
-                        // `this` is the *receiver* (the object the property was
-                        // read from), not the object that happens to hold the
-                        // descriptor — class accessors live on the prototype.
-                        let receiver = Value::Object(*obj_ref);
-                        let _ = owner;
-                        return match desc.invoked_getter() {
-                            Some(getter) => self.invoke(getter, receiver, &[], module),
-                            None => Ok(Value::Undefined),
-                        };
-                    }
-                    return Ok(desc.value);
-                }
-                Ok(Value::Undefined)
-            }
+            // The receiver is the object itself for an ordinary read.
+            Value::Object(obj_ref) => self.object_get_chain(*obj_ref, key, obj, module),
             Value::Function(id) => {
                 let boxed = self.materialize_function(*id);
                 self.get_member(&boxed, key, module)
@@ -3406,22 +3458,12 @@ impl VM {
         key: &PropertyKey,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
-        let Some(proto_ref) = proto else {
-            return Ok(Value::Undefined);
-        };
-        if let Some((_owner, desc)) =
-            crate::vm::prototype::find_descriptor(*proto_ref, key)
-                .map_err(RuntimeError::TypeError)?
-        {
-            if desc.is_accessor_descriptor() {
-                return match desc.invoked_getter() {
-                    Some(getter) => self.invoke(getter, receiver.clone(), &[], module),
-                    None => Ok(Value::Undefined),
-                };
-            }
-            return Ok(desc.value);
+        match proto {
+            // 链式读取（而不是 `find_descriptor`）：包装对象的原型链上也可能
+            // 挂着一个 Proxy，它的 `get` trap 同样必须生效。
+            Some(proto_ref) => self.object_get_chain(*proto_ref, key, receiver, module),
+            None => Ok(Value::Undefined),
         }
-        Ok(Value::Undefined)
     }
 
     /// ES `[[Get]]` with an explicit **receiver** (ES 10.1.8).
@@ -3440,24 +3482,8 @@ impl VM {
         let Value::Object(obj_ref) = obj else {
             return self.get_member(obj, key, module);
         };
-        if obj_ref.borrow().kind() == ObjectKind::Proxy {
-            let proxy_val = Value::Object(*obj_ref);
-            if let Some(value) = self.proxy_get(&proxy_val, key, receiver, module)? {
-                return Ok(value);
-            }
-        }
-        if let Some((_owner, desc)) = crate::vm::prototype::find_descriptor(*obj_ref, key)
-            .map_err(RuntimeError::TypeError)?
-        {
-            if desc.is_accessor_descriptor() {
-                return match desc.invoked_getter() {
-                    Some(getter) => self.invoke(getter, receiver.clone(), &[], module),
-                    None => Ok(Value::Undefined),
-                };
-            }
-            return Ok(desc.value);
-        }
-        Ok(Value::Undefined)
+        // 同 `object_get_chain`：Proxy 的 `get` trap 与链上每一跳都由它处理。
+        self.object_get_chain(*obj_ref, key, receiver, module)
     }
 
     /// ES `[[Set]]` with an explicit **receiver** (ES 10.1.9), answering whether
@@ -3571,30 +3597,44 @@ impl VM {
     ) -> Result<(), RuntimeError> {
         match obj {
             Value::Object(obj_ref) => {
-                // A `set` trap replaces the whole assignment: it decides both
-                // the value and whether the write succeeded (ES 10.5.9).
-                if obj_ref.borrow().kind() == ObjectKind::Proxy {
-                    let proxy_val = Value::Object(*obj_ref);
-                    if self.proxy_set(&proxy_val, &key, &value, &proxy_val, module)? {
-                        return Ok(());
+                let receiver = Value::Object(*obj_ref);
+                // 沿链找第一个描述符。**每一跳都检查 Proxy**：链上任意位置是
+                // Proxy，它的 `set` trap 就接管整个赋值（ES 10.5.9）——
+                // `find_descriptor` 是纯 walk，遇到 Proxy 只会看到转发给 target
+                // 的 `property_get`，trap 不触发。
+                let mut current = Some(*obj_ref);
+                let mut found: Option<PropertyDescriptor> = None;
+                let mut depth = 0usize;
+                while let Some(owner) = current {
+                    if depth > crate::vm::prototype::MAX_PROTO_DEPTH {
+                        return Err(RuntimeError::TypeError(
+                            "Maximum prototype chain depth exceeded".to_string(),
+                        ));
                     }
-                    // A trap that answered falsish is a failed assignment,
-                    // which strict mode reports as a TypeError.
-                    return Err(RuntimeError::TypeError(format!(
-                        "'set' on proxy: trap returned falsish for property '{}'",
-                        key.display(&self.heap)
-                    )));
+                    if owner.borrow().kind() == ObjectKind::Proxy {
+                        let proxy_val = Value::Object(owner);
+                        if self.proxy_set(&proxy_val, &key, &value, &receiver, module)? {
+                            return Ok(());
+                        }
+                        // A trap that answered falsish is a failed assignment,
+                        // which strict mode reports as a TypeError.
+                        return Err(RuntimeError::TypeError(format!(
+                            "'set' on proxy: trap returned falsish for property '{}'",
+                            key.display(&self.heap)
+                        )));
+                    }
+                    if let Some(desc) = owner.borrow().property_get(&key) {
+                        found = Some(desc);
+                        break;
+                    }
+                    current = owner.borrow().get_prototype();
+                    depth += 1;
                 }
                 // An accessor anywhere on the chain intercepts the assignment
                 // and routes it to the setter (which needs a re-entrant call).
-                if let Some((owner, desc)) =
-                    crate::vm::prototype::find_descriptor(*obj_ref, &key)
-                        .map_err(RuntimeError::TypeError)?
-                {
+                if let Some(desc) = found {
                     if desc.is_accessor_descriptor() {
-                        // Same receiver rule as `get_member` above.
-                        let receiver = Value::Object(*obj_ref);
-                        let _ = owner;
+                        // Same receiver rule as `object_get_chain`.
                         return match desc.invoked_setter() {
                             Some(setter) => {
                                 self.invoke(setter, receiver, &[value], module)?;
@@ -3617,13 +3657,13 @@ impl VM {
                     let mut borrowed = obj_ref.borrow_mut();
                     borrowed
                         .property_set(&mut self.heap, key, value)
-                        .map_err(RuntimeError::from_property_error)?;
+                        .map_err(RuntimeError::from)?;
                     return Ok(());
                 }
                 let mut borrowed = obj_ref.borrow_mut();
                 borrowed
                     .property_set(&mut self.heap, key, value)
-                    .map_err(RuntimeError::from_property_error)?;
+                    .map_err(RuntimeError::from)?;
                 Ok(())
             }
             Value::Function(id) => {
@@ -3691,28 +3731,8 @@ impl VM {
         match obj {
             Value::Object(obj_ref) => {
                 let key = PropertyKey::intern(&mut self.heap, prop_name);
-                if obj_ref.borrow().kind() == ObjectKind::Proxy {
-                    let proxy_val = Value::Object(*obj_ref);
-                    if let Some(value) = self.proxy_get(&proxy_val, &key, &proxy_val, module)? {
-                        return Ok(value);
-                    }
-                }
-                // 与 `get_member` 同语义：accessor 必须真正调用 getter。
-                // Proxy trap 已在上面处理，这里只做描述符 walk，不会重复触发。
-                let Some((_, desc)) = crate::vm::prototype::find_descriptor(*obj_ref, &key)
-                    .map_err(RuntimeError::TypeError)?
-                else {
-                    return Ok(Value::Undefined);
-                };
-                if desc.is_accessor_descriptor() {
-                    return match desc.invoked_getter() {
-                        Some(getter) => {
-                            self.invoke(getter, Value::Object(*obj_ref), &[], module)
-                        }
-                        None => Ok(Value::Undefined),
-                    };
-                }
-                Ok(desc.value)
+                // 与 `get_member` 完全同一条路径（含链上 Proxy 的 trap）。
+                self.object_get_chain(*obj_ref, &key, obj, module)
             }
             Value::String(s) => {
                 if prop_name == "length" {
@@ -3792,7 +3812,7 @@ impl VM {
             strings_ref
                 .borrow_mut()
                 .define_property(&mut self.heap, PropertyKey::well_known("raw").expect("well-known name"), raw_desc)
-                .map_err(RuntimeError::TypeError)?;
+                .map_err(RuntimeError::from)?;
             strings_ref.borrow_mut().freeze();
         }
 
@@ -5390,8 +5410,13 @@ impl VM {
         let reparent = new_target.is_some_and(|nt| !nt.strict_eq_obj(constructor_val));
         let mut this_obj = crate::vm::object::OrdinaryObject::new();
         match &proto {
-            Some(Value::Object(p)) => this_obj.set_prototype(Some(*p)),
-            _ => this_obj.set_prototype(Some(self.builtins.object_prototype)),
+            // 刚建的对象，可扩展 ⇒ 设置一定成立；这里只需要副作用。
+            Some(Value::Object(p)) => {
+                let _ = this_obj.set_prototype(Some(*p));
+            }
+            _ => {
+                let _ = this_obj.set_prototype(Some(self.builtins.object_prototype));
+            }
         }
         let this_val = Value::Object(self.heap.alloc(Object::Ordinary(this_obj)));
 
@@ -5468,7 +5493,7 @@ impl VM {
                     let key = PropertyKey::intern(&mut self.heap, method_name);
                     match crate::vm::prototype::internal_get(obj_ref.clone(), &key, None) {
                         Ok(v) => Ok(v),
-                        Err(e) => Err(RuntimeError::from_property_error(e)),
+                        Err(e) => Err(RuntimeError::TypeError(e)),
                     }
                 } else {
                     Ok(Value::Undefined)
@@ -6326,31 +6351,32 @@ pub enum RuntimeError {
     Thrown(Value),
 }
 
-/// `[[DefineOwnProperty]]` reports failure as a plain `String`, which cannot
-/// carry the error *kind* — every failure out of that channel used to become a
-/// TypeError. One case genuinely needs a `RangeError` to survive: writing an
-/// array's `length` (ES 10.4.2.4 `ArraySetLength` throws RangeError, and
-/// `Object.defineProperty([], "length", {value: -1})` must not report a
-/// TypeError). The array's own `define_property` prefixes such messages with
-/// `RANGE_ERROR_PREFIX` and this is where they are turned back.
-pub const PROPERTY_ERROR_RANGE_PREFIX: &str = "RangeError: ";
-
-impl RuntimeError {
-    /// Turn a `[[DefineOwnProperty]]` failure message back into an error,
-    /// preserving the one kind that the `String` channel has to carry.
-    pub fn from_property_error(msg: String) -> Self {
-        match msg.strip_prefix(PROPERTY_ERROR_RANGE_PREFIX) {
-            Some(rest) => RuntimeError::RangeError(rest.to_string()),
-            None => RuntimeError::TypeError(msg),
+/// 对象层的 `PropertyError` 是 `RuntimeError` 的**两个变体**：属性操作只会抛
+/// `TypeError`，唯一的例外是 `ArraySetLength` 的 `RangeError`（ES 10.4.2.4）。
+///
+/// 这条 `From` 是唯一的还原点 —— 以前它是一段"把 `"RangeError: "` 前缀剥掉"
+/// 的字符串解析（`PROPERTY_ERROR_RANGE_PREFIX`），而在那之前，任何一次
+/// `format!` 拼接都会让 `Object.defineProperty([], "length", {value: -1})`
+/// 悄悄变成 TypeError。
+impl From<crate::vm::property::PropertyError> for RuntimeError {
+    fn from(e: crate::vm::property::PropertyError) -> Self {
+        use crate::vm::property::PropertyErrorKind;
+        match e.kind() {
+            PropertyErrorKind::Type => RuntimeError::TypeError(e.into_message()),
+            PropertyErrorKind::Range => RuntimeError::RangeError(e.into_message()),
         }
     }
+}
 
-    /// Render an error for the `[[DefineOwnProperty]]` `String` channel,
-    /// preserving `RangeError` through [`PROPERTY_ERROR_RANGE_PREFIX`].
-    pub fn into_property_error(self) -> String {
-        match self {
-            RuntimeError::RangeError(msg) => format!("{PROPERTY_ERROR_RANGE_PREFIX}{msg}"),
-            other => other.to_string(),
+/// 反向：把 `RuntimeError` 折进属性通道（`ArraySetLength` 校验用的是
+/// `RuntimeError`，而 `property_set` 的错误通道是 `PropertyError`）。
+impl From<RuntimeError> for crate::vm::property::PropertyError {
+    fn from(e: RuntimeError) -> Self {
+        match e {
+            RuntimeError::RangeError(msg) => crate::vm::property::PropertyError::range_error(msg),
+            // 非 Range 一律按 TypeError 走，且保留 `RuntimeError` 的 Display
+            // 形状（"TypeError: …"）—— 这是改动前的行为，消息不变。
+            other => crate::vm::property::PropertyError::type_error(other.to_string()),
         }
     }
 }

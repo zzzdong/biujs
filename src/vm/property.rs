@@ -247,6 +247,68 @@ pub enum ObjectKind {
 // The actual definition is in value.rs. This type alias bridges the crate-level import.
 use crate::vm::Value;
 
+// ─────────────────────────────────────────────────────────
+// PropertyError — 对象层属性操作的失败原因
+// ─────────────────────────────────────────────────────────
+
+/// `[[Set]]` / `[[DefineOwnProperty]]` / `[[Delete]]` 失败的原因。
+///
+/// 只有两种：绝大多数违规是 `TypeError`（只读、不可扩展、非可配置、冻结…），
+/// 但 `ArraySetLength` 抛的是 `RangeError`（`arr.length = -1`、
+/// `Object.defineProperty([], "length", {value: -1})`）。
+///
+/// **为什么不是 `String`**：用字符串时这条分类只能靠一个前缀
+/// （`"RangeError: "`）穿过 20 个 `impl JSObject`，任何一次 `format!` 拼接都会
+/// 静默丢掉它 —— 而 `Object.defineProperty([], "length", …)` 必须答 RangeError。
+/// 改成类型之后，`From<PropertyError> for RuntimeError` 是唯一还原点，前缀消失。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyError {
+    kind: PropertyErrorKind,
+    message: String,
+}
+
+/// `PropertyError` 的两种 JS 错误种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyErrorKind {
+    Type,
+    Range,
+}
+
+impl PropertyError {
+    pub fn type_error(message: impl Into<String>) -> Self {
+        Self {
+            kind: PropertyErrorKind::Type,
+            message: message.into(),
+        }
+    }
+
+    pub fn range_error(message: impl Into<String>) -> Self {
+        Self {
+            kind: PropertyErrorKind::Range,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> PropertyErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// 取出消息（`From<PropertyError> for RuntimeError` 用它构造变体）。
+    pub fn into_message(self) -> String {
+        self.message
+    }
+}
+
+impl std::fmt::Display for PropertyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

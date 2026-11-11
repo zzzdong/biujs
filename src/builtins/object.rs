@@ -399,40 +399,21 @@ pub fn object_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
             ));
         }
     };
-    // Never observable as changed: ES 20.1.2.10 step 5 returns true before any
-    // work when the prototype is already what was asked for, even on a
-    // non-extensible target.
-    {
-        let borrowed = obj.borrow();
-        let same = match (&proto, borrowed.get_prototype()) {
-            (None, None) => true,
-            (Some(p), Some(c)) => Gc::ptr_eq(p, &c),
-            _ => false,
-        };
-        if same {
-            return Ok(Value::Object(*obj));
-        }
+    // A prototype chain that reaches the object itself would loop forever on
+    // every subsequent lookup, so it is rejected up front (ES 20.1.2.10 step 6).
+    // 判定与 `Reflect.setPrototypeOf` 共用 `prototype_chain_contains`。
+    if proto.is_some_and(|new_proto| {
+        crate::vm::prototype::prototype_chain_contains(new_proto, *obj)
+    }) {
+        return Err(RuntimeError::TypeError("Cyclic __proto__ value".to_string()));
     }
-    if !obj.borrow().is_extensible() {
+    // 一条规则：`ObjectHeader::set_prototype` 负责"相同 ⇒ 成功 / 不可扩展 ⇒
+    // 失败"（ES 20.1.2.10 step 5），这里只把 `false` 变成 TypeError。
+    if !obj.borrow_mut().set_prototype(proto) {
         return Err(RuntimeError::TypeError(
             "Object.setPrototypeOf called on a non-extensible object".to_string(),
         ));
     }
-    // A prototype chain that reaches the object itself would loop forever on
-    // every subsequent lookup, so it is rejected up front (ES 20.1.2.10 step 6
-    // reaches the same conclusion by recursing).
-    if let Some(new_proto) = &proto {
-        let mut chain = Some(*new_proto);
-        while let Some(link) = chain {
-            if Gc::ptr_eq(&link, obj) {
-                return Err(RuntimeError::TypeError(
-                    "Cyclic __proto__ value".to_string(),
-                ));
-            }
-            chain = link.borrow().get_prototype();
-        }
-    }
-    obj.borrow_mut().set_prototype(proto);
     Ok(Value::Object(*obj))
 }
 
@@ -630,7 +611,7 @@ pub fn apply_property_descriptor(
             .unwrap_or_else(|| current(|d| d.configurable));
         return obj
             .define_property(heap, key.clone(), descriptor)
-            .map_err(RuntimeError::from_property_error);
+            .map_err(RuntimeError::from);
     }
 
     let value = match read(heap, "value") {
@@ -648,7 +629,7 @@ pub fn apply_property_descriptor(
         .map(|v| v.to_boolean())
         .unwrap_or_else(|| current(|d| d.configurable));
     obj.define_property(heap, key.clone(), descriptor)
-        .map_err(RuntimeError::from_property_error)
+        .map_err(RuntimeError::from)
 }
 
 pub fn object_has_own(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {

@@ -274,6 +274,43 @@ fn the_object_and_reflect_traps() {
          // The `isExtensible` trap must agree with the target.
          var lying = new Proxy(Object.freeze({{}}), {{ isExtensible: function () {{ return true; }} }});
          if (name_of(function () {{ Object.isExtensible(lying); }}) !== 'TypeError') throw new Error('isExtensible lie');"
-    ))
-    .unwrap();
-}
+         ))
+         .unwrap();
+         }
+
+         /// 链上任意一跳是 Proxy，它的 trap 就必须接管。
+         ///
+         /// 这一条以前是漏的：`[[Get]]` / `[[HasProperty]]` / `[[Set]]` 的链式遍历用的是
+         /// 纯描述符 walk（`prototype::find_descriptor` / `internal_has_property`），
+         /// 遇到 Proxy 只看到 `property_get` 转发给 target 的结果，trap 不触发 —— 于是
+         /// `Object.create(proxy).x` 读到 target 上的值，`in` 也看不到 `has` trap。
+         #[test]
+         fn traps_fire_on_the_prototype_chain() {
+         eval_js(
+         "var p = new Proxy({ foo: 1 }, { get: function () { return 42; } });
+          var o = Object.create(p);
+          if (o.foo !== 42) throw new Error('chain get: ' + o.foo);
+          // `in` 与 `Reflect.has` 都走 [[HasProperty]]，都要经过 has trap。
+          var h = new Proxy({}, { has: function () { return true; } });
+          var o2 = Object.create(h);
+          if (!('zzz' in o2)) throw new Error('chain has: operator');
+          if (!Reflect.has(o2, 'zzz')) throw new Error('chain has: Reflect.has');
+          // 无 trap 的 Proxy 转发给 target；target 自身也可以还是 Proxy。
+          var inner = new Proxy({ v: 1 }, { get: function () { return 'inner'; } });
+          var o3 = Object.create(new Proxy(inner, {}));
+          if (o3.v !== 'inner') throw new Error('nested: ' + o3.v);
+          // set 同理：trap 决定这次写入，属性不会落在接收者上。
+          var log = [];
+          var s = new Proxy({}, { set: function (t, k, v) { log.push(k + '=' + v); return true; } });
+          var o4 = Object.create(s);
+          o4.bar = 7;
+          if (log.join(',') !== 'bar=7') throw new Error('chain set: ' + log.join(','));
+          if (Object.prototype.hasOwnProperty.call(o4, 'bar')) throw new Error('chain set landed on the receiver');
+          // 链上的 getter 仍然拿到**最初的** receiver 作为 this。
+          var proto = {};
+          Object.defineProperty(proto, 'who', { get: function () { return this === o5; } });
+          var o5 = Object.create(proto);
+          if (o5.who !== true) throw new Error('chain getter receiver');",
+         )
+         .unwrap();
+         }

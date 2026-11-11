@@ -468,13 +468,6 @@ impl crate::vm::gc::Trace for Builtins {
     }
 }
 
-impl crate::vm::gc::Trace for ProtoObject {
-    fn trace(&self, out: &mut crate::vm::gc::Worklist) {
-        // base 覆盖原型、快速模式槽位 / `attrs` 与字典模式那张表。
-        self.base.trace(out);
-    }
-}
-
 impl Builtins {
     pub fn new(heap: &mut Heap) -> Self {
         let object_proto = new_proto(heap, None, "Object");
@@ -1870,88 +1863,17 @@ fn dispatch_value_of(obj: &Value) -> Result<Value, RuntimeError> {
 // Prototype object backing
 // ─────────────────────────────────────────────────────────
 
+/// 内建原型对象就是**普通对象**：`class_name` 是默认的 `"Object"`，自有属性走
+/// shape / `attrs` / 字典模式。
+///
+/// 它以前是一个独立变体（`Object::Proto`）外加一整套手写的 `impl JSObject` +
+/// `impl Trace`，但与 `Ordinary` 的差别只有 `class_name` —— 而那恰好是
+/// `OrdinaryObject` 的默认值，所以这里直接建普通对象。20 个变体因此收敛到 19 个，
+/// 也少了一条"新增变体要记得手写 15 个方法"的路径。
 fn new_proto(heap: &mut Heap, parent: Option<Gc<Object>>, _class_name: &str) -> Gc<Object> {
-    heap.alloc(Object::Proto(ProtoObject::new(parent)))
-}
-
-/// 内建原型对象（`Object.prototype` / `Array.prototype` / …）的自有属性与其它
-/// 变体共用 shape 槽位 / `attrs` / 字典模式；这里只保留 `class_name` 的 ES
-/// 口径（一律 `"Object"`），不再自带一份 `PropertyTable`。
-#[derive(Debug)]
-pub(crate) struct ProtoObject {
-    base: crate::vm::object::OrdinaryObject,
-}
-
-impl ProtoObject {
-    pub(crate) fn new(prototype: Option<Gc<Object>>) -> Self {
-        let mut base = crate::vm::object::OrdinaryObject::new();
-        if let Some(proto) = prototype {
-            base.set_prototype(Some(proto));
-        }
-        Self { base }
-    }
-}
-
-impl JSObject for ProtoObject {
-    fn kind(&self) -> ObjectKind {
-        ObjectKind::Ordinary
-    }
-    // 注册内建方法、描述符位、删除降级与冻结密封全部走共享实现。
-    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        self.base.property_get(key)
-    }
-    fn property_set(
-        &mut self,
-        heap: &mut crate::vm::gc::Heap,
-        key: PropertyKey,
-        value: Value,
-    ) -> Result<bool, String> {
-        self.base.property_set(heap, key, value)
-    }
-    fn define_property(
-        &mut self,
-        heap: &mut crate::vm::gc::Heap,
-        key: PropertyKey,
-        desc: PropertyDescriptor,
-    ) -> Result<bool, String> {
-        self.base.define_property(heap, key, desc)
-    }
-    fn property_delete(&mut self, heap: &mut crate::vm::gc::Heap, key: &PropertyKey) -> bool {
-        self.base.property_delete(heap, key)
-    }
-    fn has_property(&self, key: &PropertyKey) -> bool {
-        self.base.has_property(key)
-    }
-    fn own_keys(&self) -> Vec<PropertyKey> {
-        self.base.own_keys()
-    }
-    fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.base.get_prototype()
-    }
-    fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.base.set_prototype(proto);
-    }
-    fn is_extensible(&self) -> bool {
-        self.base.is_extensible()
-    }
-    fn prevent_extensions(&mut self) {
-        self.base.prevent_extensions();
-    }
-    fn is_frozen(&self) -> bool {
-        self.base.is_frozen()
-    }
-    fn freeze(&mut self) {
-        self.base.freeze();
-    }
-    fn is_sealed(&self) -> bool {
-        self.base.is_sealed()
-    }
-    fn seal(&mut self) {
-        self.base.seal();
-    }
-    fn class_name(&self) -> &'static str {
-        "Object"
-    }
+    heap.alloc(Object::Ordinary(
+        crate::vm::object::OrdinaryObject::with_optional_prototype(parent),
+    ))
 }
 
 // ─────────────────────────────────────────────────────────

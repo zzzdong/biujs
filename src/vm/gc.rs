@@ -18,7 +18,6 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use crate::builtins::ProtoObject;
 use crate::vm::iterator::NativeIteratorObject;
 use crate::vm::object::{
     ArrayBufferObject, ArrayObject, DataViewObject, DateObject, FunctionObject, GeneratorObject,
@@ -26,7 +25,7 @@ use crate::vm::object::{
     PrimitiveWrapperObject, PromiseObject, ProxyObject, RegExpObject, SetObject, TypedArrayObject,
     WeakMapObject, WeakSetObject,
 };
-use crate::vm::property::{ObjectKind, PropertyDescriptor, PropertyKey};
+use crate::vm::property::{ObjectKind, PropertyDescriptor, PropertyError, PropertyKey};
 use crate::vm::value::Value;
 
 /// 每块的目标字节数。块内只 push、到满即换新块，**永不 realloc**，
@@ -560,7 +559,7 @@ impl Trace for crate::vm::EnvCell {
 
 /// `Object` 变体清单的**唯一来源**：`forward!`（18 个 `JSObject` 方法）和
 /// `Trace for Object` 都从这里展开。新增一个变体只需在这里加一行，不必再
-/// 同步 18 个转发方法和 GC 分派 —— 以前这两份 20-arm 表是分开手写的。
+/// 同步 18 个转发方法和 GC 分派 —— 以前这两份按变体展开的表是分开手写的。
 macro_rules! for_each_variant {
     ($this:expr, |$v:ident| $body:expr) => {
         match $this {
@@ -583,7 +582,6 @@ macro_rules! for_each_variant {
             Object::Set($v) => $body,
             Object::Generator($v) => $body,
             Object::NativeIterator($v) => $body,
-            Object::Proto($v) => $body,
         }
     };
 }
@@ -764,10 +762,13 @@ impl Drop for Roots {
 
 /// 所有 JS 对象的统一具体类型：`dyn` 消失、`Sized`。
 ///
-/// 每个原 `JSObject` 实现体（`object.rs` 的 18 个 struct、`iterator.rs` 的
-/// `NativeIteratorObject`、builtins 的 `ProtoObject`）在这里成为**一个变体**；
-/// 各变体内部字段保持不变。`trait JSObject` 仍然保留，作为内部静态分发接口：
-/// `forward!` 对每个变体调用 `JSObject::$method(o, …)`，靠具体类型在编译期选择实现。
+/// 每个原 `JSObject` 实现体（`object.rs` 的 struct 与 `iterator.rs` 的
+/// `NativeIteratorObject`）在这里成为**一个变体**；各变体内部字段保持不变。
+/// `trait JSObject` 仍然保留，作为内部静态分发接口：`forward!` 对每个变体调用
+/// `JSObject::$method(o, …)`，靠具体类型在编译期选择实现。
+///
+/// 内建原型对象**没有**自己的变体：它们就是 `Ordinary`（`class_name` 默认
+/// `"Object"`）。以前那个 `Proto` 变体只重复了一整份手写的 `impl JSObject`。
 #[derive(Debug)]
 pub enum Object {
     Ordinary(OrdinaryObject),
@@ -789,7 +790,6 @@ pub enum Object {
     Set(SetObject),
     Generator(GeneratorObject),
     NativeIterator(NativeIteratorObject),
-    Proto(ProtoObject),
 }
 
 /// 把 `Object` 上的方法转发到各变体的 `JSObject` 实现。
@@ -830,7 +830,7 @@ impl Object {
         heap: &mut Heap,
         key: PropertyKey,
         value: Value,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, PropertyError> {
         forward!(self, property_set, heap, key, value)
     }
 
@@ -839,7 +839,7 @@ impl Object {
         heap: &mut Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, PropertyError> {
         forward!(self, define_property, heap, key, desc)
     }
 
@@ -859,7 +859,7 @@ impl Object {
         forward!(self, get_prototype)
     }
 
-    pub fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
+    pub fn set_prototype(&mut self, proto: Option<Gc<Object>>) -> bool {
         forward!(self, set_prototype, proto)
     }
 
@@ -1377,7 +1377,10 @@ mod tests {
         assert_eq!(a.borrow().class_name(), "Array");
         assert!(a.borrow().has_property(&key("b")));
 
-        let p = h.alloc(Object::Proto(crate::builtins::ProtoObject::new(None)));
+        // 内建原型对象就是普通对象（`class_name` 默认 "Object"）。
+        let p = h.alloc(Object::Ordinary(OrdinaryObject::with_optional_prototype(
+            None,
+        )));
         p.borrow_mut()
             .property_set(&mut h, key("c"), Value::Number(2.0))
             .unwrap();
