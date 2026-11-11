@@ -3697,8 +3697,22 @@ impl VM {
                         return Ok(value);
                     }
                 }
-                crate::vm::prototype::internal_get(obj_ref.clone(), &key, None)
-                    .map_err(RuntimeError::TypeError)
+                // 与 `get_member` 同语义：accessor 必须真正调用 getter。
+                // Proxy trap 已在上面处理，这里只做描述符 walk，不会重复触发。
+                let Some((_, desc)) = crate::vm::prototype::find_descriptor(*obj_ref, &key)
+                    .map_err(RuntimeError::TypeError)?
+                else {
+                    return Ok(Value::Undefined);
+                };
+                if desc.is_accessor_descriptor() {
+                    return match desc.invoked_getter() {
+                        Some(getter) => {
+                            self.invoke(getter, Value::Object(*obj_ref), &[], module)
+                        }
+                        None => Ok(Value::Undefined),
+                    };
+                }
+                Ok(desc.value)
             }
             Value::String(s) => {
                 if prop_name == "length" {

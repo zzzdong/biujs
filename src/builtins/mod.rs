@@ -58,7 +58,10 @@ pub use number::{
     number_constructor, number_is_finite, number_is_integer, number_is_nan, number_to_exponential,
     number_to_fixed, number_to_precision,
 };
-pub use object::{OBJECT_TO_STRING_NATIVE, object_constructor, object_prototype_to_string};
+pub use object::{
+    OBJECT_PROTO_GET_NATIVE, OBJECT_PROTO_SET_NATIVE, OBJECT_TO_STRING_NATIVE,
+    object_constructor, object_proto_getter, object_proto_setter, object_prototype_to_string,
+};
 pub use promise::PROMISE_SPECIES_NATIVE;
 pub use set::{
     SET_SIZE_NATIVE, SET_SPECIES_NATIVE, register_set_prototype, set_add, set_clear, set_delete,

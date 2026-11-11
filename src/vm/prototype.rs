@@ -27,10 +27,11 @@ impl Default for GetPrototypeChainOptions {
 // [[Get]] — prototype chain property access
 // ─────────────────────────────────────────────────────────
 
-/// ES6 [[Get]](P) — traverse the prototype chain to find a property.
+/// 纯描述符 walk（**不执行用户代码**）：沿原型链找第一个描述符并返回 data 值；
+/// accessor 一律返回 `Undefined`，不会调用 getter。
 ///
-/// Returns the raw property value. If the property is an accessor,
-/// returns `Value::Undefined` and does NOT invoke the getter.
+/// 只给不需要重入调用的内部读取使用。JS 语义的 [[Get]] 是 `VM::get_member`
+/// （`find_descriptor` 之后真正 `invoke` getter）；需要 getter 的调用方不要走这里。
 pub fn internal_get(
     obj: Gc<Object>,
     key: &PropertyKey,
@@ -99,80 +100,15 @@ pub fn find_descriptor(
 }
 
 // ─────────────────────────────────────────────────────────
-// [[Set]] — prototype chain property assignment
+// [[Set]] 的唯一入口是 `VM::set_member`（`vm/mod.rs`）
 // ─────────────────────────────────────────────────────────
-
-/// ES6 [[Set]](P, V) — set a property value, traversing the prototype chain.
-///
-/// Returns Ok(true) if the set succeeded, Ok(false) if strict mode should throw.
-pub fn internal_set(
-    heap: &mut Heap,
-    obj: Gc<Object>,
-    key: PropertyKey,
-    value: Value,
-) -> Result<bool, String> {
-    // Step 1: Find own property
-    let own_desc = {
-        let borrowed = obj.borrow();
-        borrowed.property_get(&key)
-    };
-
-    if let Some(desc) = own_desc {
-        if desc.is_data_descriptor() {
-            if !desc.writable {
-                return Ok(false);
-            }
-            let mut borrowed = obj.borrow_mut();
-            return borrowed.property_set(heap, key, value);
-        } else {
-            // Accessor property — call setter
-            if desc.invoked_setter().is_some() {
-                // TODO: call setter function with value
-                // For now, just store the value directly
-                let mut borrowed = obj.borrow_mut();
-                return borrowed.property_set(heap, key, value);
-            }
-            return Ok(false);
-        }
-    }
-
-    // Step 2: No own property — walk prototype chain
-    let mut current = {
-        let borrowed = obj.borrow();
-        borrowed.get_prototype()
-    };
-
-    while let Some(proto) = current {
-        let proto_desc = {
-            let borrowed = proto.borrow();
-            borrowed.property_get(&key)
-        };
-
-        if let Some(desc) = proto_desc {
-            if desc.is_data_descriptor() {
-                if !desc.writable {
-                    return Ok(false);
-                }
-                let mut borrowed = obj.borrow_mut();
-                return borrowed.property_set(heap, key, value);
-            }
-            // Accessor on prototype — call setter
-            if desc.invoked_setter().is_some() {
-                // TODO: call setter on obj with value
-                let mut borrowed = obj.borrow_mut();
-                return borrowed.property_set(heap, key, value);
-            }
-            return Ok(false);
-        }
-
-        let borrowed = proto.borrow();
-        current = borrowed.get_prototype();
-    }
-
-    // Step 3: No property found anywhere — create on obj
-    let mut borrowed = obj.borrow_mut();
-    borrowed.property_set(heap, key, value)
-}
+//
+// 这里曾经有一份 `internal_set`：遇到 accessor 时是 `TODO: call setter`，
+// 实际用 `property_set` 把 accessor 覆盖成数据描述符 —— 与 `set_member`
+// 真正 `invoke(setter)` 的行为相反。它全仓无调用点（死代码），已删除。
+// 保留两套相反语义只会让后续重构的回归不可信：需要重入执行用户代码的
+// [[Get]]/[[Set]] 一律走 `VM::get_member` / `VM::set_member`；本文件只提供
+// 不执行用户代码的描述符 walk（`internal_get` / `find_descriptor`）。
 
 // ─────────────────────────────────────────────────────────
 // [[HasProperty]] — prototype chain existence check

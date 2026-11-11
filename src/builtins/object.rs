@@ -436,6 +436,29 @@ pub fn object_set_prototype_of(args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Object(*obj))
 }
 
+/// `Object.prototype.__proto__` 的 getter / setter 内建名（ES Annex B.2.2.1）。
+/// 与 `RegExp.prototype` 的 accessor 一样按名字分派，因为 getter 要用堆、
+/// setter 要复用原型循环检测。
+pub const OBJECT_PROTO_GET_NATIVE: &str = "__proto_getter__";
+pub const OBJECT_PROTO_SET_NATIVE: &str = "__proto_setter__";
+
+pub fn object_proto_getter(
+    heap: &mut super::Heap,
+    this: &Value,
+) -> Result<Value, RuntimeError> {
+    object_get_prototype_of(heap, &[this.clone()])
+}
+
+pub fn object_proto_setter(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    // Annex B.2.2.1.2：与 `Object.setPrototypeOf` 不同，`__proto__` setter
+    // 失败时静默返回 `undefined`，不抛 TypeError。
+    let _ = object_set_prototype_of(&[
+        this.clone(),
+        args.first().cloned().unwrap_or(Value::Undefined),
+    ]);
+    Ok(Value::Undefined)
+}
+
 pub fn object_create(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(RuntimeError::TypeError(
@@ -1007,6 +1030,30 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
         heap,
         PropertyKey::well_known("constructor").expect("well-known name"),
         super::method_descriptor(object_fn.clone()),
+    );
+
+    // ES Annex B.2.2.1：`Object.prototype.__proto__` 是 accessor
+    // { enumerable: false, configurable: true }，不是数据属性。以前完全没注册，
+    // `Object.getOwnPropertyDescriptor(Object.prototype, '__proto__')` 返回
+    // undefined（test262 `Object/prototype/__proto__/prop-desc.js`）。
+    let getter = Value::Object(heap.alloc(Object::NativeFunction(
+        crate::vm::object::NativeFunctionObject::new(OBJECT_PROTO_GET_NATIVE),
+    )));
+    let setter = Value::Object(heap.alloc(Object::NativeFunction(
+        crate::vm::object::NativeFunctionObject::new(OBJECT_PROTO_SET_NATIVE),
+    )));
+    let key = PropertyKey::intern(heap, "__proto__");
+    let _ = proto.borrow_mut().define_property(
+        heap,
+        key,
+        PropertyDescriptor {
+            value: Value::Undefined,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            getter: Some(getter),
+            setter: Some(setter),
+        },
     );
 }
 

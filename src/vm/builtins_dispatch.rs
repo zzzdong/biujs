@@ -137,6 +137,14 @@ impl VM {
         if let Some(prop) = name.strip_prefix(crate::builtins::REGEXP_GETTER_PREFIX) {
             return crate::builtins::regexp_prototype_getter(&this, prop);
         }
+        // `Object.prototype.__proto__` 的 Annex B accessor：getter 要用堆做
+        // ToObject，setter 复用 `Object.setPrototypeOf` 的循环检测。
+        if name == crate::builtins::OBJECT_PROTO_GET_NATIVE {
+            return crate::builtins::object_proto_getter(&mut self.heap, &this);
+        }
+        if name == crate::builtins::OBJECT_PROTO_SET_NATIVE {
+            return crate::builtins::object_proto_setter(&this, args);
+        }
         // %ThrowTypeError%：`Function.prototype.caller` / `arguments` 的
         // getter 与 setter（ES 9.2.7）。严格模式函数读这两个属性必须抛。
         if name == crate::builtins::FUNCTION_THROW_TYPE_ERROR_NATIVE {

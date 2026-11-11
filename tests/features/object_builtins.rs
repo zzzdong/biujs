@@ -682,6 +682,30 @@ fn map_and_set_properties_use_shared_storage() {
 }
 
 #[test]
+fn object_prototype_proto_is_a_real_accessor() {
+    // ES Annex B.2.2.1：__proto__ 是 accessor；JSON.parse 创建的同名自有
+    // 数据属性不受影响（CreateDataProperty 不走 setter）。
+    eval_js(
+        "'use strict';
+         var d = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__');
+         if (!d || typeof d.get !== 'function' || typeof d.set !== 'function' ||
+             d.enumerable !== false || d.configurable !== true ||
+             d.hasOwnProperty('writable')) throw new Error('accessor shape');
+         var o = {};
+         if (o.__proto__ !== Object.prototype) throw new Error('getter');
+         var p = { x: 1 };
+         o.__proto__ = p;
+         if (Object.getPrototypeOf(o) !== p || o.x !== 1) throw new Error('setter');
+         o.__proto__ = null;
+         if (Object.getPrototypeOf(o) !== null) throw new Error('set null');
+         var j = JSON.parse('{\"__proto__\": 7}');
+         var own = Object.getOwnPropertyDescriptor(j, '__proto__');
+         if (!own || own.value !== 7) throw new Error('JSON.parse own key');",
+    )
+    .unwrap();
+}
+
+#[test]
 fn set_prototype_of_rejects_frozen_targets_and_cycles() {
     eval_js(
         "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }

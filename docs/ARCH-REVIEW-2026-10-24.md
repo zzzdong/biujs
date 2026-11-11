@@ -902,6 +902,35 @@ feature 断言同时钉住描述符与 `setUTCHours(1,2,3,4)` 的实际结果。
 （`Value == 16 B`）、`invoke_boundaries` 闸门、`rsp` 单写者、1C / 1D 及
 Phase 2 / 3 / 4 / 5。
 
+### 对象模型重构片 1（2026-11-11）：统一 [[Get]]/[[Set]] 的 accessor 语义
+
+按上一轮对 `gc.rs:762-784` 枚举 + `JSObject` 胖接口的设计分析，第一片先修
+「两条路径语义相反」这个会掩盖后续重构回归的前置问题：
+
+1. **删除死路径 `prototype.rs::internal_set`**：它遇到 accessor 是
+   `TODO: call setter`，实际用 `property_set` 把 accessor 覆盖成数据属性，
+   与 `VM::set_member` 真正 `invoke(setter)` 相反；全仓无调用点。文件里写明
+   契约：[[Get]]/[[Set]] 的唯一活入口是 `VM::get_member` / `VM::set_member`，
+   本文件只提供不执行用户代码的描述符 walk（`internal_get` / `find_descriptor`）。
+2. **`lookup_property_on_object` 补 getter 调用**：以前用 `internal_get` 跳过
+   accessor（`vm/mod.rs:845` 曾为同类 bug 打过补丁），现在与 `get_member`
+   一致 —— `find_descriptor` + `invoke(getter)`，且不重复触发 Proxy trap。
+3. **`Object.prototype.__proto__` accessor**（ES Annex B.2.2.1）：以前完全没注册，
+   `Object.getOwnPropertyDescriptor(Object.prototype, '__proto__')` 是 undefined。
+   现在注册 `{get, set, enumerable:false, configurable:true}`；getter 复用
+   `Object.getPrototypeOf`，setter 复用 `Object.setPrototypeOf` 的循环检测但按
+   Annex B 失败静默。`JSON.parse` 创建的同名自有数据属性不受影响。
+
+**验收（统一验证）**：三级 272 / 649 / 7 + 字节码 golden；全量
+**17,475 → 17,481 / 20,504（85.23% → 85.26%，+6）**，无逐套件回退
+（`built-ins/Object` +5、`language/expressions/call` +1），护栏 0/0/14 与
+跳过 8577 不变。
+
+**片 1 未做（留到片 2/3/4）**：`internal_get` 另 3 处调用点仍是 data-only
+（需与 trait 收敛一起改成 VM 读取）；抽 `ObjectLayout`、`JSObject` 瘦化、
+`forward!` 收敛；Array / Global / NativeFunction 存储收编；原型表从
+`thread_local` 改挂 Realm；对象字面量 `__proto__: p` 仍创建自有属性而非设置原型。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；

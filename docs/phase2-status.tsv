@@ -6,7 +6,7 @@ language/statements/for-of	605	52	94
 language/statements/for-in	72	28	15
 built-ins/Array/prototype/Symbol.iterator	0	0	1
 language/expressions/bitwise-and	19	8	3
-language/expressions/call	61	22	9
+language/expressions/call	62	22	8
 language/expressions/complement	0	0	0
 language/expressions/does-not-equals	26	11	1
 language/expressions/greater-than	38	10	1
@@ -54,7 +54,7 @@ language/computed-property-names	42	0	6
 built-ins/Boolean	33	3	15
 built-ins/Map	187	5	12
 built-ins/TypedArray	303	513	630
-built-ins/Object	3145	32	234
+built-ins/Object	3150	32	229
 built-ins/String	793	72	358
 language/expressions/generators	242	30	18
 language/expressions/assignment/destructuring	3	1	4
