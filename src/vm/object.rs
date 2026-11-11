@@ -66,8 +66,14 @@ pub trait JSObject: fmt::Debug {
     /// Delete a property, returns true if the property was successfully deleted
     fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool;
 
-    /// Check if a property exists
-    fn has_property(&self, key: &PropertyKey) -> bool;
+    /// `[[GetOwnProperty]]` 的存在性判定：**只看自有属性，不含原型链**。
+    ///
+    /// 名字里带 `own` 是刻意的。ES 的 `[[HasProperty]]`（`in` / `Reflect.has`）
+    /// 必须沿链走，那是 `VM::object_has_property` 与
+    /// `prototype::internal_has_property` 的事。这个方法以前叫 `has_property`，
+    /// 与 `[[HasProperty]]` 同名却只查自有 —— 新代码很容易把"只查自有"当成
+    /// "包含继承"，而且编译器不会提醒。
+    fn has_own_property(&self, key: &PropertyKey) -> bool;
 
     /// Get all own property keys (not from prototype)
     fn own_keys(&self) -> Vec<PropertyKey>;
@@ -182,8 +188,8 @@ macro_rules! delegate_js_object {
             fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
                 self.$base.property_delete(heap, key)
             }
-            fn has_property(&self, key: &PropertyKey) -> bool {
-                self.$base.has_property(key)
+            fn has_own_property(&self, key: &PropertyKey) -> bool {
+                self.$base.has_own_property(key)
             }
             fn own_keys(&self) -> Vec<PropertyKey> {
                 self.$base.own_keys()
@@ -905,7 +911,7 @@ impl JSObject for OrdinaryObject {
         dict.remove(key).is_some()
     }
 
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         if let Some(dict) = &self.dict {
             return dict.contains_key(key);
         }
@@ -1516,7 +1522,7 @@ impl JSObject for ArrayObject {
         self.properties.remove(key).is_some()
     }
 
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         if key.is("length") {
             return true;
         }
@@ -2026,7 +2032,7 @@ impl JSObject for NativeFunctionObject {
         self.properties.remove(key).is_some()
     }
 
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         self.properties.contains_key(key)
     }
 
@@ -2205,7 +2211,7 @@ impl JSObject for PrimitiveWrapperObject {
         self.base.property_delete(heap, key)
     }
 
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         if matches!(self.primitive, Value::String(_)) {
             if key.is("length") {
                 return true;
@@ -2214,7 +2220,7 @@ impl JSObject for PrimitiveWrapperObject {
                 return (idx as usize) < self.string_len();
             }
         }
-        self.base.has_property(key)
+        self.base.has_own_property(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
@@ -2501,8 +2507,8 @@ impl JSObject for RegExpObject {
     fn property_delete(&mut self, heap: &mut Heap, key: &PropertyKey) -> bool {
         self.base.property_delete(heap, key)
     }
-    fn has_property(&self, key: &PropertyKey) -> bool {
-        self.base.has_property(key)
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
+        self.base.has_own_property(key)
     }
     fn own_keys(&self) -> Vec<PropertyKey> {
         self.base.own_keys()
@@ -2705,7 +2711,7 @@ impl JSObject for GlobalObject {
         }
     }
 
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         self.store.borrow().contains_key(key)
     }
 
@@ -3054,11 +3060,11 @@ impl JSObject for TypedArrayObject {
         }
         self.base.property_delete(heap, key)
     }
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         if let Some(index) = Self::canonical_index(key) {
             return index < self.length;
         }
-        self.base.has_property(key)
+        self.base.has_own_property(key)
     }
     /// The indices, then whatever else the object holds: `Object.keys(new
     /// Uint8Array(2))` is `["0", "1"]`.
@@ -3241,12 +3247,12 @@ impl JSObject for ProxyObject {
             None => false,
         }
     }
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         if self.revoked {
             return false;
         }
         match self.target_object() {
-            Some(target) => target.borrow().has_property(key),
+            Some(target) => target.borrow().has_own_property(key),
             None => false,
         }
     }
@@ -3830,7 +3836,7 @@ impl JSObject for GeneratorObject {
         true
     }
 
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         *key == crate::vm::iterator::iterator_symbol_key()
             || key.is("next") || key.is("return") || key.is("throw")
     }
@@ -4165,8 +4171,8 @@ mod shape_tests {
         assert!(obj.dict.is_none());
         assert!(obj.property_delete(&mut heap, &a));
         assert!(obj.dict.is_some(), "删除之后应转为字典模式");
-        assert!(!obj.has_property(&a));
-        assert!(obj.has_property(&b));
+        assert!(!obj.has_own_property(&a));
+        assert!(obj.has_own_property(&b));
         assert_eq!(obj.property_get(&b).unwrap().value, Value::Number(2.0));
         assert_eq!(obj.own_keys(), vec![b]);
     }
@@ -4263,7 +4269,7 @@ mod shape_tests {
         assert!(f.base.dict.is_none());
         assert!(f.property_delete(&mut heap, &name));
         assert!(f.base.dict.is_some(), "删除之后应转为字典模式");
-        assert!(!f.has_property(&name));
+        assert!(!f.has_own_property(&name));
         assert!(
             !f.property_get(&length).expect("length 还在").enumerable,
             "字典模式要保住非默认描述符"

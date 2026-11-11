@@ -156,7 +156,7 @@ pub fn internal_has_property(
         }
 
         let borrowed = obj_ref.borrow();
-        if borrowed.has_property(key) {
+        if borrowed.has_own_property(key) {
             return Ok(true);
         }
 

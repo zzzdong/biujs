@@ -847,8 +847,8 @@ impl Object {
         forward!(self, property_delete, heap, key)
     }
 
-    pub fn has_property(&self, key: &PropertyKey) -> bool {
-        forward!(self, has_property, key)
+    pub fn has_own_property(&self, key: &PropertyKey) -> bool {
+        forward!(self, has_own_property, key)
     }
 
     pub fn own_keys(&self) -> Vec<PropertyKey> {
@@ -1368,14 +1368,14 @@ mod tests {
         g.borrow_mut()
             .property_set(&mut h, key("a"), Value::Bool(true))
             .unwrap();
-        assert!(g.borrow().has_property(&key("a")));
+        assert!(g.borrow().has_own_property(&key("a")));
 
         let a = h.alloc(Object::Array(ArrayObject::new()));
         a.borrow_mut()
             .property_set(&mut h, key("b"), Value::Number(1.0))
             .unwrap();
         assert_eq!(a.borrow().class_name(), "Array");
-        assert!(a.borrow().has_property(&key("b")));
+        assert!(a.borrow().has_own_property(&key("b")));
 
         // 内建原型对象就是普通对象（`class_name` 默认 "Object"）。
         let p = h.alloc(Object::Ordinary(OrdinaryObject::with_optional_prototype(
@@ -1384,7 +1384,7 @@ mod tests {
         p.borrow_mut()
             .property_set(&mut h, key("c"), Value::Number(2.0))
             .unwrap();
-        assert!(p.borrow().has_property(&key("c")));
+        assert!(p.borrow().has_own_property(&key("c")));
         assert_eq!(p.borrow().class_name(), "Object");
     }
 }

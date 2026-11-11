@@ -695,8 +695,8 @@ getter 的 accessor 由同一套 `attrs` 保管、冻结/密封正确标注属�
    （builtins 层没有 VM，原来直接落到纯 walk）。`proxy_has` 的无 trap 分支同样
    回到链式实现，嵌套 Proxy（target 也是 Proxy）因此正确。
 2. **String 包装的索引键按码元**：`own_keys` 用 `chars().count()`（码点），而
-   `[[GetOwnProperty]]` / `has_property` 用 UTF-16 码元 —— `new String("😀")`
-   的 `Reflect.ownKeys` 只报 `0`，但 `hasOwnProperty("1")` 是 true。
+   `[[GetOwnProperty]]` / `has_own_property` 用 UTF-16 码元 ——
+   `new String("😀")` 的 `Reflect.ownKeys` 只报 `0`，但 `hasOwnProperty("1")` 是 true。
 3. **`[[SetPrototypeOf]]` 返回 bool**：`JSObject::set_prototype` 从 `()` 改回
    `bool`，判定收进 `ObjectHeader`（相同 ⇒ true；不可扩展 ⇒ false），
    `Object.setPrototypeOf` 只负责把 false 变成 TypeError、

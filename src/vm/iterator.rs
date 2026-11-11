@@ -230,7 +230,7 @@ impl JSObject for NativeIteratorObject {
         false
     }
 
-    fn has_property(&self, key: &PropertyKey) -> bool {
+    fn has_own_property(&self, key: &PropertyKey) -> bool {
         *key == crate::vm::iterator::iterator_symbol_key()
             || key.is("next") || key.is("return")
     }

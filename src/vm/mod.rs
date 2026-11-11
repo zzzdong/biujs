@@ -3377,7 +3377,7 @@ impl VM {
                 let proxy_val = Value::Object(obj_ref);
                 return Ok(self.proxy_has(&proxy_val, key, module)?.unwrap_or(false));
             }
-            if obj_ref.borrow().has_property(key) {
+            if obj_ref.borrow().has_own_property(key) {
                 return Ok(true);
             }
             current = obj_ref.borrow().get_prototype();

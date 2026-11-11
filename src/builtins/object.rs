@@ -852,7 +852,7 @@ pub fn object_has_own_property(
         None => return Ok(Value::Bool(false)),
     };
     match obj {
-        Value::Object(obj_ref) => Ok(Value::Bool(obj_ref.borrow().has_property(&key))),
+        Value::Object(obj_ref) => Ok(Value::Bool(obj_ref.borrow().has_own_property(&key))),
         Value::String(s) => {
             // String wrappers expose an own `length` and their index keys.
             let own = match key.resolve(heap) {

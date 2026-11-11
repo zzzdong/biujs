@@ -112,7 +112,8 @@ pub enum Value {
   Proxy**（链上任意位置是 Proxy，它的 trap 就接管整个操作）。`prototype.rs` 里的
   `internal_get` / `find_descriptor` / `internal_has_property` 是纯描述符 walk，
   只给"不需要执行用户代码"的内部读取用 —— 拿它做 JS 可见的 `[[Get]]` 会漏掉链上
-  的 trap。
+  的 trap。`JSObject::has_own_property` 名字里带 `own` 也是同一件事：它只查自有
+  属性，ES 的 `[[HasProperty]]`（含继承）是 `VM::object_has_property`。
 - **`[[SetPrototypeOf]]` 只有一份判定**：`ObjectHeader::set_prototype` 返回 bool
   （相同 ⇒ true；不可扩展 / 冻结 ⇒ false），`Object.setPrototypeOf` 把 false 变成
   TypeError、`Reflect.setPrototypeOf` 原样返回；环检测在
