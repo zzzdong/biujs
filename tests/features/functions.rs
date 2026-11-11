@@ -477,3 +477,32 @@ fn strict_functions_reject_caller_and_arguments() {
         true
     );
 }
+
+/// 内建函数对象（`NativeFunctionObject`）的自有属性走与 `{}` 完全相同的
+/// `[[DefineOwnProperty]]` / `[[Set]]` 语义。
+///
+/// 它以前自带 `ObjectHeader` + `PropertyTable` 并手写 15 个 `JSObject` 方法，
+/// 其中 `property_set` 无条件覆盖成默认数据描述符 —— `Array.isArray.length = 9`
+/// 能把 arity 的只读位冲掉（在严格模式下静默失败，而不是抛 TypeError）。
+/// 现在与 `OrdinaryObject` 共用一套实现（`length` / `name` 走字典模式安装）。
+#[test]
+fn builtin_function_own_properties_keep_their_attributes() {
+    eval_js(
+        "'use strict';
+         var d = Object.getOwnPropertyDescriptor(Array.isArray, 'length');
+         if (d.value !== 1 || d.writable !== false || d.enumerable !== false || d.configurable !== true) {
+           throw new Error('descriptor: ' + JSON.stringify(d));
+         }
+         var threw = false;
+         try { Array.isArray.length = 9; } catch (e) { threw = e.name === 'TypeError'; }
+         if (!threw) throw new Error('assign to read-only length did not throw');
+         if (Array.isArray.length !== 1) throw new Error('length changed');
+         if (Object.getOwnPropertyNames(Array.isArray).join(',') !== 'length,name') {
+           throw new Error('keys: ' + Object.getOwnPropertyNames(Array.isArray).join(','));
+         }
+         var frozen = Object.freeze(Array.isArray);
+         if (Object.isFrozen(frozen) !== true) throw new Error('isFrozen');
+         if (Object.isSealed(frozen) !== true) throw new Error('isSealed');",
+    )
+    .unwrap();
+}

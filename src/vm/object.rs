@@ -417,31 +417,6 @@ pub(crate) fn validate_property_redefinition(
     Ok(())
 }
 
-/// Shared implementations of `[[Freeze]]` / `[[Seal]]` over a plain property
-/// table, and of the matching `TestIntegrityLevel` answers.
-///
-/// Every object kind that keeps a `PropertyTable` (functions, primitive
-/// wrappers, …) uses these so that `Object.freeze(new Number(1))` and
-/// `Object.isSealed(f)` agree with `Object.freeze({})`.
-fn freeze_property_table(properties: &mut PropertyTable) {
-    for key in properties.keys() {
-        if let Some(desc) = properties.get_mut(&key) {
-            desc.configurable = false;
-            if desc.is_data_descriptor() {
-                desc.writable = false;
-            }
-        }
-    }
-}
-
-fn seal_property_table(properties: &mut PropertyTable) {
-    for key in properties.keys() {
-        if let Some(desc) = properties.get_mut(&key) {
-            desc.configurable = false;
-        }
-    }
-}
-
 /// ES `TestIntegrityLevel(O, "frozen")`: every own property is
 /// non-configurable (and non-writable when it is data) and the object itself
 /// is non-extensible. An object with *no* own properties therefore inherits
@@ -667,6 +642,28 @@ impl OrdinaryObject {
         Self {
             dict: Some(properties),
             ..Self::new()
+        }
+    }
+
+    /// 构造期直接安装一批**非默认**描述符，不需要堆。
+    ///
+    /// 内建函数对象的 `length` / `name` 就是这样装的：它们是只读属性
+    /// （`{writable:false, enumerable:false, configurable:true}`），而构造期拿不到
+    /// `&mut Heap`（形状 root 挂在堆上）。这条路径直接进**字典模式** ——
+    /// 字典模式本来就是合法的常驻形态（`delete` 之后也会转进来），代价只是没有
+    /// 槽位快路径，而内建函数对象只有个位数属性。
+    ///
+    /// 之后 `property_set` / `define_property` 全部走字典分支，语义由
+    /// `OrdinaryObject` 统一提供。以前 `NativeFunctionObject` 自己那份
+    /// `property_set` 无条件覆盖成默认描述符，`Array.isArray.length = 9` 能把
+    /// arity 的只读位冲掉。
+    pub(crate) fn install_descriptors(
+        &mut self,
+        entries: impl IntoIterator<Item = (PropertyKey, PropertyDescriptor)>,
+    ) {
+        let dict = self.dict.get_or_insert_with(PropertyTable::new);
+        for (key, desc) in entries {
+            dict.insert(key, desc);
         }
     }
 
@@ -1890,17 +1887,14 @@ pub fn new_arrow_function_object(
 #[derive(Debug)]
 pub struct NativeFunctionObject {
     pub name: String,
-    /// `[[Prototype]]` of the function object itself, plus the extensibility
-    /// flags. Built-in function objects start extensible like any other
-    /// object, so `Object.isExtensible(Object)` reports `true` and
-    /// `Object.freeze` has something to switch off.
-    header: ObjectHeader,
-    /// Own properties (`length`, `name`, `prototype`, static methods, …).
+    /// 自有属性（`length` / `name` / `prototype` / 静态方法…）与头部标志全部
+    /// 委托给 [`OrdinaryObject`]：内建函数对象在 `[[DefineOwnProperty]]` 眼里就是
+    /// 普通对象。
     ///
-    /// `length` / `name` live here like any other own property so that
-    /// `Object.getOwnPropertyDescriptor`, `delete` and redefinition behave
-    /// uniformly instead of going through special cases.
-    properties: PropertyTable,
+    /// 以前它自带 `ObjectHeader` + `PropertyTable` 并手写 15 个 `JSObject` 方法，
+    /// 其中 `property_set` 无条件覆盖成默认数据描述符 —— `Array.isArray.length = 9`
+    /// 能把 arity 的只读位冲掉（`FunctionObject` 在 1B 第七片修过同一个 bug）。
+    base: OrdinaryObject,
 }
 
 impl NativeFunctionObject {
@@ -1910,8 +1904,9 @@ impl NativeFunctionObject {
         // property installed separately (`link_constructor_prototype`).
         let mut obj = Self {
             name: name.to_string(),
-            header: ObjectHeader::with_optional_prototype(crate::builtins::wrapper_prototype("Function")),
-            properties: PropertyTable::new(),
+            base: OrdinaryObject::with_optional_prototype(
+                crate::builtins::wrapper_prototype("Function"),
+            ),
         };
         obj.install_metadata();
         obj
@@ -1964,20 +1959,28 @@ impl NativeFunctionObject {
                 .unwrap_or(&self.name)
                 .to_string()
         };
-        self.set_length(crate::builtins::builtin_arity(&self.name));
-        self.properties.insert(
-            PropertyKey::well_known("name").expect("well-known name"),
-            function_metadata_descriptor(Value::string(&display)),
-        );
+        // 顺序与 ES 一致：先 `length` 后 `name`（`own_keys` 按安装顺序给出）。
+        self.base.install_descriptors([
+            (
+                PropertyKey::well_known("length").expect("well-known name"),
+                function_metadata_descriptor(Value::Number(
+                    crate::builtins::builtin_arity(&self.name) as f64,
+                )),
+            ),
+            (
+                PropertyKey::well_known("name").expect("well-known name"),
+                function_metadata_descriptor(Value::string(&display)),
+            ),
+        ]);
     }
 
     /// Overwrite the `length` own property (used where the arity table cannot
     /// tell two same-named built-ins apart).
     pub fn set_length(&mut self, length: usize) {
-        self.properties.insert(
+        self.base.install_descriptors([(
             PropertyKey::well_known("length").expect("well-known name"),
             function_metadata_descriptor(Value::Number(length as f64)),
-        );
+        )]);
     }
 }
 
@@ -1994,113 +1997,7 @@ pub(crate) fn function_metadata_descriptor(value: Value) -> PropertyDescriptor {
     }
 }
 
-impl JSObject for NativeFunctionObject {
-    fn kind(&self) -> ObjectKind {
-        ObjectKind::NativeFunction
-    }
-
-
-    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        self.properties.get(key).cloned()
-    }
-
-    fn property_set(
-        &mut self,
-        _heap: &mut Heap,
-        key: PropertyKey,
-        value: Value,
-    ) -> Result<bool, PropertyError> {
-        self.properties
-            .insert(key, PropertyDescriptor::data_descriptor(value));
-        Ok(true)
-    }
-
-    fn define_property(
-        &mut self,
-        _heap: &mut Heap,
-        key: PropertyKey,
-        desc: PropertyDescriptor,
-    ) -> Result<bool, PropertyError> {
-        // Built-in function objects are ordinary objects from
-        // `[[DefineOwnProperty]]`'s point of view: `C.prototype` is
-        // non-configurable, so redefining it has to raise instead of silently
-        // replacing it (`built-ins/*/descriptor.js` checks exactly that).
-        match self.properties.get(&key).cloned() {
-            Some(current) => validate_property_redefinition(&current, &desc)?,
-            None if !self.header.is_extensible() => {
-                return Err(PropertyError::type_error("Cannot add property to non-extensible object"));
-            }
-            None => {}
-        }
-        self.properties.insert(key, desc);
-        Ok(true)
-    }
-
-    fn property_delete(&mut self, _heap: &mut Heap, key: &PropertyKey) -> bool {
-        if self.header.is_frozen() || self.header.is_sealed() {
-            return false;
-        }
-        // 不存在 ⇒ 删除成功（ES 10.1.9.2 步骤 2），与 `OrdinaryObject` 同一口径。
-        let Some(desc) = self.properties.get(key) else {
-            return true;
-        };
-        if !desc.configurable {
-            return false;
-        }
-        self.properties.remove(key);
-        true
-    }
-
-    fn has_own_property(&self, key: &PropertyKey) -> bool {
-        self.properties.contains_key(key)
-    }
-
-    fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys()
-    }
-
-    fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.header.prototype()
-    }
-
-    fn set_prototype(&mut self, proto: Option<Gc<Object>>) -> bool {
-        self.header.set_prototype(proto)
-    }
-
-    fn is_extensible(&self) -> bool {
-        self.header.is_extensible()
-    }
-
-    fn prevent_extensions(&mut self) {
-        self.header.prevent_extensions();
-    }
-
-    fn is_frozen(&self) -> bool {
-        is_frozen_desc_set(self)
-    }
-
-    fn freeze(&mut self) {
-        self.header.freeze();
-        freeze_property_table(&mut self.properties);
-    }
-
-    fn is_sealed(&self) -> bool {
-        is_sealed_desc_set(self)
-    }
-
-    fn seal(&mut self) {
-        self.header.prevent_extensions();
-        seal_property_table(&mut self.properties);
-    }
-
-    fn type_of(&self) -> &'static str {
-        "function"
-    }
-
-    fn class_name(&self) -> &'static str {
-        "Function"
-    }
-}
+delegate_js_object!(NativeFunctionObject, base, ObjectKind::NativeFunction, "Function", "function");
 
 // ─────────────────────────────────────────────────────────
 // PrimitiveWrapperObject — boxing wrapper (`Object(value)`, ToObject)
@@ -3972,8 +3869,8 @@ impl Trace for FunctionObject {
 
 impl Trace for NativeFunctionObject {
     fn trace(&self, out: &mut Worklist) {
-        self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // base 覆盖原型、快速模式槽位 / `attrs` 与字典模式那张表。
+        self.base.trace(out);
     }
 }
 
