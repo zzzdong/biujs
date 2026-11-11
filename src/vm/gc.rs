@@ -963,6 +963,17 @@ impl Object {
         }
     }
 
+    /// 这个对象是不是 Proxy。
+    ///
+    /// `kind() == ObjectKind::Proxy` 以前散在 VM 的 8 处（`[[Get]]` / `[[Set]]` /
+    /// `[[Delete]]` / `construct` / `is_callable`…）。散着写意味着"Proxy 要特殊
+    /// 处理"没有单一入口：上一轮那个"链上 Proxy 不触发 trap"的 bug，正是漏了
+    /// 其中一处。收敛到这里之后，将来把 exotic 判别扩成 `Exotic` 钩子
+    /// （Array / TypedArray / StringWrapper / Proxy）也只需要改这一个点。
+    pub fn is_proxy(&self) -> bool {
+        matches!(self, Object::Proxy(_))
+    }
+
     /// 判别谓词（取代 `as_any().is::<T>()`）。
     pub fn is_typed_array(&self) -> bool {
         matches!(self, Object::TypedArray(_))

@@ -3330,7 +3330,7 @@ impl VM {
                     "Maximum prototype chain depth exceeded".to_string(),
                 ));
             }
-            if obj_ref.borrow().kind() == ObjectKind::Proxy {
+            if obj_ref.borrow().is_proxy() {
                 // `proxy_get` 本身就是完整的 `[[Get]]`：有 trap 用 trap 的返回值，
                 // 无 trap 则对 target 重新做一次 `[[Get]]`（target 可能还是 Proxy）。
                 let proxy_val = Value::Object(obj_ref);
@@ -3373,7 +3373,7 @@ impl VM {
                     "Maximum prototype chain depth exceeded".to_string(),
                 ));
             }
-            if obj_ref.borrow().kind() == ObjectKind::Proxy {
+            if obj_ref.borrow().is_proxy() {
                 let proxy_val = Value::Object(obj_ref);
                 return Ok(self.proxy_has(&proxy_val, key, module)?.unwrap_or(false));
             }
@@ -3510,7 +3510,7 @@ impl VM {
             ));
         };
         // A `set` trap answers for the whole operation, receiver included.
-        if obj_ref.borrow().kind() == ObjectKind::Proxy {
+        if obj_ref.borrow().is_proxy() {
             let proxy_val = Value::Object(*obj_ref);
             return self.proxy_set(&proxy_val, key, value, receiver, module);
         }
@@ -3611,7 +3611,7 @@ impl VM {
                             "Maximum prototype chain depth exceeded".to_string(),
                         ));
                     }
-                    if owner.borrow().kind() == ObjectKind::Proxy {
+                    if owner.borrow().is_proxy() {
                         let proxy_val = Value::Object(owner);
                         if self.proxy_set(&proxy_val, &key, &value, &receiver, module)? {
                             return Ok(());
@@ -3695,7 +3695,7 @@ impl VM {
         module: &Module,
     ) -> Result<bool, RuntimeError> {
         match obj {
-            Value::Object(obj_ref) if obj_ref.borrow().kind() == ObjectKind::Proxy => {
+            Value::Object(obj_ref) if obj_ref.borrow().is_proxy() => {
                 // A `deleteProperty` trap answers for the whole operation
                 // (ES 10.5.10); with no trap the delete is the target's.
                 let proxy_val = Value::Object(*obj_ref);

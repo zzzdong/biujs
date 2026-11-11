@@ -2008,7 +2008,6 @@ impl VM {
                 o.borrow().kind(),
                 ObjectKind::Array
                     | ObjectKind::Ordinary
-                    | ObjectKind::Arguments
                     | ObjectKind::Function
                     | ObjectKind::Proxy
             )

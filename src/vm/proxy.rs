@@ -26,7 +26,7 @@ use crate::vm::{ObjectKind, PropertyDescriptor, PropertyKey, REVOKE_PREFIX, Runt
 impl VM {
     pub(crate) fn is_proxy(value: &Value) -> bool {
         match value {
-            Value::Object(obj_ref) => obj_ref.borrow().kind() == ObjectKind::Proxy,
+            Value::Object(obj_ref) => obj_ref.borrow().is_proxy(),
             _ => false,
         }
     }

@@ -3315,7 +3315,7 @@ impl VM {
 
                     Value::Object(obj_ref) => {
                         let borrowed = obj_ref.borrow();
-                        if borrowed.kind() == ObjectKind::Proxy {
+                        if borrowed.is_proxy() {
                             // `new P(...)` on a proxy: the `construct` trap (or,
                             // without one, `[[Construct]]` on the target). Both
                             // can run JavaScript, so neither can happen here.

@@ -214,6 +214,15 @@ impl PropertyDescriptor {
 }
 
 /// ObjectKind — runtime classification of object types
+///
+/// **与 `Object` 变体对齐**：每个变体至少对应一个 `ObjectKind`，且没有
+/// "永远不会被返回"的变体。历史上这里有过三个死值 —— `Error`（没有任何对象
+/// 返回它）、`Arguments`（`arguments` 对象其实是 `Ordinary`）、`Buffer`（Node 语义，
+/// 实际用它的只有 `ArrayBufferObject`）。`kind()` 被当类型判别用了约 50 处，
+/// 一个永不返回的值就等于一条永远走不到的分支。
+///
+/// 唯一的多对一是 `PrimitiveWrapper`：`String` / `Number` / `Boolean` / `Symbol`
+/// 四个 kind 由同一个变体按被包装的原始值给出 —— 这是 JS 可见类型，不是存储类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     Ordinary,
@@ -225,16 +234,15 @@ pub enum ObjectKind {
     Symbol,
     Date,
     RegExp,
-    Error,
     Map,
     Set,
     WeakMap,
     WeakSet,
     Promise,
     Proxy,
-    Arguments,
     Generator,
-    Buffer,
+    /// An `ArrayBuffer`: the byte store behind views.
+    ArrayBuffer,
     /// A TypedArray: an integer-indexed view over an `ArrayBuffer`.
     TypedArray,
     /// A `DataView`: a byte-addressable view over an `ArrayBuffer` (ES 25.3).

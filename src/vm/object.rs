@@ -2782,7 +2782,7 @@ impl ArrayBufferObject {
     }
 }
 
-delegate_js_object!(ArrayBufferObject, base, ObjectKind::Buffer, "ArrayBuffer");
+delegate_js_object!(ArrayBufferObject, base, ObjectKind::ArrayBuffer, "ArrayBuffer");
 
 /// Element type of a TypedArray (ES 23.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
