@@ -133,6 +133,10 @@ impl VM {
         if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
             return self.object_prototype_to_string(&this, args, module);
         }
+        // `RegExp.prototype` 的只读 accessor：名字后缀带属性名。
+        if let Some(prop) = name.strip_prefix(crate::builtins::REGEXP_GETTER_PREFIX) {
+            return crate::builtins::regexp_prototype_getter(&this, prop);
+        }
         // %ThrowTypeError%：`Function.prototype.caller` / `arguments` 的
         // getter 与 setter（ES 9.2.7）。严格模式函数读这两个属性必须抛。
         if name == crate::builtins::FUNCTION_THROW_TYPE_ERROR_NATIVE {

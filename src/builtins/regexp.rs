@@ -19,6 +19,42 @@ use crate::vm::object::{ArrayObject, JSObject, NativeFunctionObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
+/// `RegExp.prototype` 只读访问器的内建函数名前缀；后缀是属性名，
+/// `call_native_by_name` 按前缀分派到 [`regexp_prototype_getter`]。
+pub const REGEXP_GETTER_PREFIX: &str = "__regexp_get__";
+
+/// ES 22.2.5：`source` / `flags` / `global` / … 是 `RegExp.prototype` 上的
+/// accessor，`get` 读取接收者的 [[OriginalSource]] / [[OriginalFlags]]。
+/// `RegExp.prototype` 自身是空正则（source `"(?:)"`、flags `""`）。
+pub fn regexp_prototype_getter(this: &Value, prop: &str) -> Result<Value, RuntimeError> {
+    let (source, flags) = match this {
+        Value::Object(obj_ref) => {
+            let borrowed = obj_ref.borrow();
+            match borrowed.as_regexp() {
+                Some(re) => (re.source.clone(), re.flags.clone()),
+                None => ("(?:)".to_string(), String::new()),
+            }
+        }
+        _ => ("(?:)".to_string(), String::new()),
+    };
+    let has_flag = |c: char| Value::Bool(flags.contains(c));
+    Ok(match prop {
+        "source" => Value::string(&source),
+        "flags" => Value::string(&flags),
+        "global" => has_flag('g'),
+        "ignoreCase" => has_flag('i'),
+        "multiline" => has_flag('m'),
+        "sticky" => has_flag('y'),
+        "unicode" => has_flag('u'),
+        "dotAll" => has_flag('s'),
+        _ => {
+            return Err(RuntimeError::InternalError(format!(
+                "unknown RegExp prototype getter: {prop}"
+            )))
+        }
+    })
+}
+
 /// True when `this` is a `RegExp` instance.
 pub fn is_regexp_receiver(this: &Value) -> bool {
     matches!(this, Value::Object(obj)
@@ -349,6 +385,34 @@ pub fn register_regexp_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     let _ = proto
         .borrow_mut()
         .define_property(heap, PropertyKey::Symbol(MATCH_ALL_SYMBOL_ID), match_all);
+
+    // ES 22.2.5：`source` / `flags` / `global` / … 是 `RegExp.prototype` 上的
+    // 只读 accessor。以前一个都没注册，`RegExp.prototype.source` 是 undefined，
+    // `Object.getOwnPropertyDescriptor` 也查不到（15.2.3.3-4-212..215）。
+    for name in [
+        "source",
+        "flags",
+        "global",
+        "ignoreCase",
+        "multiline",
+        "sticky",
+        "unicode",
+        "dotAll",
+    ] {
+        let getter = Value::Object(heap.alloc(Object::NativeFunction(
+            NativeFunctionObject::new(&format!("{REGEXP_GETTER_PREFIX}{name}")),
+        )));
+        let desc = PropertyDescriptor {
+            value: Value::Undefined,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            getter: Some(getter),
+            setter: None,
+        };
+        let key = PropertyKey::intern(heap, name);
+        let _ = proto.borrow_mut().define_property(heap, key, desc);
+    }
 }
 
 pub fn register_regexp_statics(ctor: &Value, _heap: &mut Heap) {

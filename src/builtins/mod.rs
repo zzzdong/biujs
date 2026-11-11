@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use crate::RuntimeError;
 use crate::vm::gc::{Gc, Heap, Object};
-use crate::vm::object::{JSObject, PropertyTable};
+use crate::vm::object::JSObject;
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
@@ -33,6 +33,7 @@ pub use array::{
 };
 pub use date::date_construct_value;
 pub use regexp::match_all_matches;
+pub use regexp::{REGEXP_GETTER_PREFIX, regexp_prototype_getter};
 pub mod typedarray;
 pub mod reflect;
 pub mod proxy;
@@ -466,8 +467,8 @@ impl crate::vm::gc::Trace for Builtins {
 
 impl crate::vm::gc::Trace for ProtoObject {
     fn trace(&self, out: &mut crate::vm::gc::Worklist) {
-        self.header.prototype().trace(out);
-        self.properties.trace(out);
+        // base 覆盖原型、快速模式槽位 / `attrs` 与字典模式那张表。
+        self.base.trace(out);
     }
 }
 
@@ -1459,6 +1460,13 @@ pub fn call_prototype_method(
                 return date::date_to_string(obj, args);
             }
             require_object_coercible(obj)?;
+            // `Array.prototype.toLocaleString` 逐元素 join，不能落到
+            // `Object.prototype.toString` 的 `[object Array]`。
+            if matches!(obj, Value::Object(obj_ref)
+                if obj_ref.borrow().kind() == ObjectKind::Array)
+            {
+                return Ok(Value::string(&obj.to_js_string()));
+            }
             dispatch_to_string(heap, obj)
         }
         "valueOf" => {
@@ -1863,79 +1871,80 @@ fn new_proto(heap: &mut Heap, parent: Option<Gc<Object>>, _class_name: &str) -> 
     heap.alloc(Object::Proto(ProtoObject::new(parent)))
 }
 
+/// 内建原型对象（`Object.prototype` / `Array.prototype` / …）的自有属性与其它
+/// 变体共用 shape 槽位 / `attrs` / 字典模式；这里只保留 `class_name` 的 ES
+/// 口径（一律 `"Object"`），不再自带一份 `PropertyTable`。
 #[derive(Debug)]
 pub(crate) struct ProtoObject {
-    properties: PropertyTable,
-    /// 与其它变体同一个头部（1B）：原型与可扩展/冻结/密封标记只有一份。
-    header: crate::vm::object::ObjectHeader,
+    base: crate::vm::object::OrdinaryObject,
 }
 
 impl ProtoObject {
     pub(crate) fn new(prototype: Option<Gc<Object>>) -> Self {
-        Self {
-            properties: PropertyTable::new(),
-            header: crate::vm::object::ObjectHeader::with_optional_prototype(prototype),
+        let mut base = crate::vm::object::OrdinaryObject::new();
+        if let Some(proto) = prototype {
+            base.set_prototype(Some(proto));
         }
+        Self { base }
     }
 }
 
 impl JSObject for ProtoObject {
     fn kind(&self) -> ObjectKind {
         ObjectKind::Ordinary
-    }    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
-        self.properties.get(key).cloned()
+    }
+    // 注册内建方法、描述符位、删除降级与冻结密封全部走共享实现。
+    fn property_get(&self, key: &PropertyKey) -> Option<PropertyDescriptor> {
+        self.base.property_get(key)
     }
     fn property_set(
         &mut self,
-        _heap: &mut crate::vm::gc::Heap,
+        heap: &mut crate::vm::gc::Heap,
         key: PropertyKey,
         value: Value,
     ) -> Result<bool, String> {
-        self.properties
-            .insert(key, PropertyDescriptor::data_descriptor(value));
-        Ok(true)
+        self.base.property_set(heap, key, value)
     }
     fn define_property(
         &mut self,
-        _heap: &mut crate::vm::gc::Heap,
+        heap: &mut crate::vm::gc::Heap,
         key: PropertyKey,
         desc: PropertyDescriptor,
     ) -> Result<bool, String> {
-        self.properties.insert(key, desc);
-        Ok(true)
+        self.base.define_property(heap, key, desc)
     }
-    fn property_delete(&mut self, _heap: &mut crate::vm::gc::Heap, key: &PropertyKey) -> bool {
-        self.properties.remove(key).is_some()
+    fn property_delete(&mut self, heap: &mut crate::vm::gc::Heap, key: &PropertyKey) -> bool {
+        self.base.property_delete(heap, key)
     }
     fn has_property(&self, key: &PropertyKey) -> bool {
-        self.properties.contains_key(key)
+        self.base.has_property(key)
     }
     fn own_keys(&self) -> Vec<PropertyKey> {
-        self.properties.keys()
+        self.base.own_keys()
     }
     fn get_prototype(&self) -> Option<Gc<Object>> {
-        self.header.prototype()
+        self.base.get_prototype()
     }
     fn set_prototype(&mut self, proto: Option<Gc<Object>>) {
-        self.header.set_prototype(proto);
+        self.base.set_prototype(proto);
     }
     fn is_extensible(&self) -> bool {
-        self.header.is_extensible()
+        self.base.is_extensible()
     }
     fn prevent_extensions(&mut self) {
-        self.header.prevent_extensions();
+        self.base.prevent_extensions();
     }
     fn is_frozen(&self) -> bool {
-        self.header.is_frozen()
+        self.base.is_frozen()
     }
     fn freeze(&mut self) {
-        self.header.freeze();
+        self.base.freeze();
     }
     fn is_sealed(&self) -> bool {
-        self.header.is_sealed()
+        self.base.is_sealed()
     }
     fn seal(&mut self) {
-        self.header.seal();
+        self.base.seal();
     }
     fn class_name(&self) -> &'static str {
         "Object"

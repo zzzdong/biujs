@@ -24,10 +24,10 @@ language/statements/function	323	115	13
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	55	18	0
-built-ins/Array	2344	187	550
+built-ins/Array	2345	187	549
 built-ins/JSON	123	29	13
 built-ins/WeakSet	81	1	3
-built-ins/Number	240	38	62
+built-ins/Number	242	38	60
 built-ins/Proxy	219	49	43
 language/statements/generators	231	21	14
 language/destructuring	17	1	1
@@ -54,7 +54,7 @@ language/computed-property-names	40	0	8
 built-ins/Boolean	33	3	15
 built-ins/Map	187	5	12
 built-ins/TypedArray	303	513	630
-built-ins/Object	3133	32	246
+built-ins/Object	3139	32	240
 built-ins/String	793	72	358
 language/expressions/generators	242	30	18
 language/expressions/assignment/destructuring	3	1	4
@@ -85,7 +85,7 @@ built-ins/Promise	245	292	140
 built-ins/Symbol	59	21	18
 language/expressions/yield	42	2	19
 language/rest-parameters	11	0	0
-language/expressions/assignment	345	88	52
+language/expressions/assignment	346	88	51
 language/expressions/bitwise-xor	19	8	3
 language/expressions/comma	4	2	0
 language/expressions/division	35	9	1

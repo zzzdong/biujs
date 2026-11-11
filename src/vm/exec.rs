@@ -887,17 +887,39 @@ impl VM {
         mode: FrameMode,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        // 0.2：边界由 `with_invoke_boundary` 的 Drop 守卫管理，函数体不再
+        // 手动 push/pop —— setup 失败与正常返回都不会漏弹。
+        let boundary = self.state.frames.len();
+        self.with_invoke_boundary(boundary, |vm| {
+            vm.drive_bytecode_frame_inner(
+                boundary,
+                func_id,
+                callee,
+                args,
+                captured_vars,
+                mode,
+                module,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_bytecode_frame_inner(
+        &mut self,
+        boundary: usize,
+        func_id: u32,
+        callee: &Value,
+        args: &[Value],
+        captured_vars: &[(String, crate::vm::EnvCell)],
+        mode: FrameMode,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
         let saved_rsp = self.state.rsp;
         let saved_closure = self.state.closure_var_stack.len();
         let saved_pending = self.state.pending_captured.len();
         let saved_seh = self.state.seh_stack.len();
-        // **边界 = 调用方的帧深度**，一个值同时回答两个问题：
-        // 1. 嵌套循环什么时候停（`frames.len() <= boundary`）；
-        // 2. 哪些 SEH 记录属于外层帧、必须让异常穿出去（`handle_throw`）。
-        // 切片 1b 之前这是**两个数**（控制栈深度 / 帧深度），
-        // 而它们必须保持一致 —— 那就是"两条知识"的来源。
-        let boundary = self.state.frames.len();
-        self.invoke_boundaries.push(boundary);
+        // `boundary` = 调用方的帧深度：既决定嵌套循环何时停，也告诉
+        // `handle_throw` 哪些 SEH 记录属于外层帧。
         // Setup is fallible (`push` can hit the stack cap, `open_frame` the call
         // depth cap). Running it in a closure means the `?`s below cannot skip
         // the `invoke_boundaries.pop()` and leave GC disabled for the rest of
@@ -969,7 +991,6 @@ impl VM {
         // A failed setup still has to restore the caller's geometry: `open_frame`
         // may have pushed a partial frame before returning `Err`.
         if let Err(err) = setup {
-            self.invoke_boundaries.pop();
             self.unwind_frames_to(boundary, saved_closure, saved_seh);
             self.state.pending_captured.truncate(saved_pending);
             self.state.rsp = saved_rsp;
@@ -991,8 +1012,6 @@ impl VM {
             }
             Ok(())
         })();
-
-        self.invoke_boundaries.pop();
 
         // Restore the caller's execution context *before* propagating: the
         // callee frame is gone either way, whether it returned or was unwound

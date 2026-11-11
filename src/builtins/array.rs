@@ -29,6 +29,9 @@ pub fn register_array_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     set_prototype_method(proto, heap, "lastIndexOf", |this, args| array_last_index_of(this, args));
     set_prototype_method(proto, heap, "fill", |_this, _args| Ok(Value::Undefined));
     set_prototype_method(proto, heap, "toString", |this, _args| array_to_string(this));
+    set_prototype_method(proto, heap, "toLocaleString", |this, _args| {
+        array_to_string(this)
+    });
     set_prototype_method(proto, heap, "at", |_this, _args| Ok(Value::Undefined));
     set_prototype_method(proto, heap, "flat", |_this, _args| Ok(Value::Undefined));
     // `flatMap` needs to call back into JS, so the VM dispatches it (next to

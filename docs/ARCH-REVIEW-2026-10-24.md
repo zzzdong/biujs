@@ -847,6 +847,38 @@ feature 断言同时钉住描述符与 `setUTCHours(1,2,3,4)` 的实际结果。
 （`language/expressions/property-accessors` 顺带 +1），护栏 0/0/14 与
 跳过 8577 不变，墙钟 106.9s。
 
+### Phase 4 第六批（2026-11-11）：内建原型属性收口 + 0.2 / 1B 收尾（批量）
+
+按「批量修改、统一验证」一次落地三组：
+
+1. **`RegExp.prototype` 的只读 accessor**（ES 22.2.5）：`source` / `flags` /
+   `global` / `ignoreCase` / `multiline` / `sticky` / `unicode` / `dotAll`
+   以前一个都没注册，`RegExp.prototype.source` 是 undefined，反射 API 也查不到
+   （`15.2.3.3-4-212..215`）。现在注册为 accessor：getter 是带
+   `__regexp_get__` 前缀的内建，按名字分派到 `regexp_prototype_getter`，从
+   `RegExpObject` 读 source/flags；`RegExp.prototype` 自身按空正则返回
+   `"(?:)"` / 空 flags。顺带把 `Array/Number.prototype.toLocaleString` 注册成
+   自有属性，并让 Array 的 `toLocaleString` 走 join 而不是 `[object Array]`。
+2. **0.2 收尾**：`with_invoke_boundary` 内定义 Drop 型 `BoundaryGuard`（弹出 +
+   嵌套深度互校）；`drive_bytecode_frame` 拆成 RAII wrapper + `inner`，三处手动
+   push/pop 全部移除。补一条嵌套守卫单测（原有两条泄漏回归继续覆盖 setup 失败路径）。
+3. **1B 第九片**：内建原型 `ProtoObject` 的 `header + PropertyTable` 换成
+   `OrdinaryObject` 委托（14 个 `JSObject` 方法 + `Trace`），与函数 / 包装对象
+   共用 shape 槽位 / `attrs` / 字典降级；顺带收掉原型对象 `property_set`
+   无条件覆盖描述符、`delete` 不看 `configurable`、`freeze/seal` 只动头部的偏差。
+
+**验收（一次统一验证）**：三级 271 / 646 / 7 + 字节码 golden 全绿；全量
+**17,452 → 17,462 / 20,504（85.12% → 85.16%，+10）**，无逐套件回退
+（`built-ins/Object` +6、`built-ins/Number` +2、`built-ins/Array` +1、
+`language/expressions/assignment` +1），护栏 0/0/14 与跳过 8577 不变，
+墙钟 116.7s。
+
+**仍未做（有硬前置，不塞进本批）**：0.4 完整几何断言（生成器挂起路径的帧模型
+属 Phase 2）、S0#4 的 `Gc` 句柄代次（`Value == 16 B`）、`invoke_boundaries`
+收集闸门（原生回调完整入根之前不能撤）、`rsp` 单写者（2A 前置）、1B 剩余
+`NativeFunction`（`new` 无堆参数，需改约 50 处调用点）/ `Map` / `Set`
+（牵动 `WeakMap` / `WeakSet` 的 ephemeron trace）、1C / 1D / Phase 2 / 3 / 4 / 5。
+
 ### Phase 5 — 宿主/模块（可选，15–25 人日）
 
 - `Engine` / `Context` / `JsValue` 公共 API；原生函数注册；宿主对象；错误栈；
@@ -867,7 +899,7 @@ feature 断言同时钉住描述符与 `setUTCHours(1,2,3,4)` 的实际结果。
 
 ## 6. 接下来 10 个具体动作（按顺序）
 
-已完成：1（boundary 泄漏修复，闭包式）、2（pending_captured 入根）、
+已完成：1（boundary Drop 守卫，2026-11-11 收尾）、2（pending_captured 入根）、
 3（guard 配置+预算 384MB）、4（`rbp <= rsp` 几何断言）、
 5（运行时立即数/常量检查，2026-11-10 收尾）、7（scope 表收口 + 基线刷新）、
 8（strict 运行时收口）、9（字节码 dumper + 16 组 golden，删除 IR 克隆）、
@@ -875,8 +907,9 @@ feature 断言同时钉住描述符与 `setUTCHours(1,2,3,4)` 的实际结果。
 0.10（文档数字由 `doc-numbers.sh` 从快照生成）、0.9（CI：PR 门禁 + 周度全量）、
 S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 **1A 两步**（`Index(u32)` + 单一索引判定；`Str(Atom)` 驻留 + 存储按 `PropertyKey` 建键）、
-**1B 八片**（…；`Shape` 结构与迁移表；`OrdinaryObject` 接入形状 + 字典模式降级；
-第七片 `FunctionObject` 委托、第八片 `PrimitiveWrapperObject` 委托）。
+**1B 九片**（…；`Shape` 结构与迁移表；`OrdinaryObject` 接入形状 + 字典模式降级；
+第七片 `FunctionObject` 委托、第八片 `PrimitiveWrapperObject` 委托、
+第九片内建原型 `ProtoObject` 委托）。
 
 ### 6.1 对账（2026-11-10，按代码逐项核对）
 
@@ -884,7 +917,7 @@ S0#4 第一档（`borrow` 族对已释放槽的访问 abort）、
 
 | 项 | 真实状态 | 证据 |
 |---|---|---|
-| 0.2 | 部分：`with_invoke_boundary` 闭包式守卫 + 2 条泄漏回归已落地，但 `drive_bytecode_frame` 仍手动 push/pop，没有 Drop 型 `BoundaryGuard` | `vm/mod.rs`、`vm/exec.rs` |
+| 0.2 | **2026-11-11 已完成**：`with_invoke_boundary` 内定义 Drop 型 `BoundaryGuard`（弹出 + 嵌套深度互校），`drive_bytecode_frame` 拆成 RAII wrapper + inner，手动 push/pop 全部移除；3 条泄漏回归 | `vm/mod.rs`、`vm/exec.rs` |
 | 0.4 | 部分：`step` 里只有 `debug_assert!(rbp <= rsp)`；`rbp == frames.last().base` 在生成器挂起路径尚不成立，frame 深度断言未加 | `vm/exec.rs` `step` |
 | 0.5 | **本轮收尾**：`try_immd` / `immd` / `constant_at` 早已有，但 `RelPc`/`AbsPc` 上 6 处运行期 `as_immd()` 仍会 abort；现补 `try_immd` + `pc_immd` + 坏模块回归 | `bytecode.rs`、`vm/mod.rs`、`vm/exec.rs` |
 | 0.1 / 0.3 / 0.6–0.10 | 已完成 | 见 §5 表格 |
@@ -897,10 +930,10 @@ M2/M3/M4 未开始。Phase 3 只有 3A（删 `BIUJS_REG_VARS`）落地，IR/SSA 
 1C（`MAX_DENSE_ELEMENTS`、三处数组存储、`Value::Function`）、1D（名字字符串分派）、
 Phase 2（`FunctionCode` / `OpInfo` / 单层 match）都还是原样。
 
-剩余（按顺序）—— Phase 0 主体已收口，1A 也收口，下面是：
-    0.2 / 0.4 收尾（Drop 守卫、完整几何断言）→
+剩余（按顺序）—— Phase 0 主体已收口（0.2 已收尾），1A 也收口，下面是：
+    0.4 收尾（`rbp == frames.last().base` 的完整断言，前置是 Phase 2 修生成器挂起几何）→
     S0#4 第二档（GC 句柄代次 —— 先解决 `Value::String` 的表示才有空间）→
-    1B 剩余（NativeFunction / Map / Set / ProtoObject 换到槽位；Array 与 1C 耦合；
+    1B 剩余（NativeFunction / Map / Set 换到槽位；Array 与 1C 耦合；
             之后 Realm / EnvRecord）→
     1C（数组存储 + 删 `Value::Function`）→ 1D（NativeId + HostOps）→
     Phase 2（帧几何/GC/字节码 v2）→ Phase 3（编译器简化）。

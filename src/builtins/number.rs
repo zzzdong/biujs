@@ -17,6 +17,9 @@ use super::set_static_method;
 
 pub fn register_number_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     set_prototype_method(proto, heap, "valueOf", |this, _args| number_value_of(this));
+    set_prototype_method(proto, heap, "toLocaleString", |this, _args| {
+        number_to_string_proto(this)
+    });
     // `Number.prototype.toString.length` is 1 (radix counts despite the
     // brackets in the heading); every other `toString` is 0.
     super::set_prototype_method_arity(proto, heap, "toString", 1, |this, args| {

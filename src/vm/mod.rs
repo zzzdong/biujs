@@ -322,10 +322,29 @@ impl VM {
     /// The pop runs for both `Ok` and `Err`. A panic still aborts in release
     /// (`panic = "abort"`), so it cannot leak a half-collected heap.
     fn with_invoke_boundary<R>(&mut self, boundary: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        // 0.2 收尾：真正的 Drop 型守卫。闭包里的 `?` / 早退 / panic unwind
+        // 都绕不过 `drop`；深度互校顺带抓嵌套调用里多推少推一层。
+        struct BoundaryGuard<'a> {
+            vm: &'a mut VM,
+            depth: usize,
+        }
+        impl Drop for BoundaryGuard<'_> {
+            fn drop(&mut self) {
+                debug_assert_eq!(
+                    self.vm.invoke_boundaries.len(),
+                    self.depth,
+                    "invoke_boundaries 嵌套失衡"
+                );
+                self.vm.invoke_boundaries.pop();
+            }
+        }
         self.invoke_boundaries.push(boundary);
-        let result = f(self);
-        self.invoke_boundaries.pop();
-        result
+        let guard = BoundaryGuard {
+            depth: self.invoke_boundaries.len(),
+            vm: self,
+        };
+        // 通过守卫重新借用 VM，避免把 `&mut VM` 从守卫里移走。
+        f(&mut *guard.vm)
     }
 
     /// 把一个 `Value` 登记为**宿主侧根**，返回 RAII 守卫。
@@ -6450,6 +6469,17 @@ mod tests {
             "invoke boundary leaked: {:?}",
             vm.invoke_boundaries
         );
+    }
+
+    #[test]
+    fn nested_invoke_boundaries_unwind_in_order() {
+        // Drop 守卫支持嵌套：内层弹出后外层仍是栈顶，最后一层不剩。
+        let mut vm = VM::new();
+        let result: Result<usize, RuntimeError> = vm.with_invoke_boundary(1, |outer| {
+            outer.with_invoke_boundary(2, |inner| Ok(inner.invoke_boundary().unwrap_or(0)))
+        });
+        assert_eq!(result.unwrap(), 2);
+        assert!(vm.invoke_boundaries.is_empty());
     }
 
     #[test]

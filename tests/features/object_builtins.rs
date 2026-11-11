@@ -578,6 +578,58 @@ fn property_keys_and_object_is_follow_es_conversions() {
 }
 
 #[test]
+fn regexp_prototype_accessors_and_locale_string_are_registered() {
+    // ES 22.2.5 的只读 accessor + Array/Number.prototype.toLocaleString。
+    eval_js(
+        "'use strict';
+         var names = ['source','flags','global','ignoreCase','multiline','sticky','unicode','dotAll'];
+         for (var i = 0; i < names.length; i++) {
+           var d = Object.getOwnPropertyDescriptor(RegExp.prototype, names[i]);
+           if (!d) throw new Error('missing accessor ' + names[i]);
+           if (typeof d.get !== 'function' || d.set !== undefined ||
+               d.enumerable !== false || d.configurable !== true ||
+               d.hasOwnProperty('writable')) throw new Error('accessor shape ' + names[i]);
+         }
+         if (RegExp.prototype.source !== '(?:)') throw new Error('empty source');
+         if (RegExp.prototype.global !== false) throw new Error('empty flags');
+         var re = /ab/gi;
+         if (re.global !== true || re.ignoreCase !== true || re.multiline !== false) {
+           throw new Error('instance flags');
+         }
+         var a = Object.getOwnPropertyDescriptor(Array.prototype, 'toLocaleString');
+         var n = Object.getOwnPropertyDescriptor(Number.prototype, 'toLocaleString');
+         if (!a || typeof a.value !== 'function' || a.value !== Array.prototype.toLocaleString ||
+             !n || typeof n.value !== 'function' || n.value !== Number.prototype.toLocaleString) {
+           throw new Error('toLocaleString descriptor');
+         }
+         if ([1,2].toLocaleString() !== '1,2') throw new Error('Array.prototype.toLocaleString');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn builtin_prototype_objects_use_shared_property_storage() {
+    // 内建原型对象委托 `OrdinaryObject`：新属性进槽位，删除降级字典，
+    // 已有方法的描述符位不丢。
+    eval_js(
+        "'use strict';
+         var p = Array.prototype;
+         var before = p.join;
+         var d = Object.getOwnPropertyDescriptor(p, 'join');
+         if (!d || typeof d.value !== 'function' || d.writable !== true ||
+             d.enumerable !== false || d.configurable !== true) throw new Error('method descriptor');
+         p.extra = 7;
+         if (p.extra !== 7) throw new Error('new own property');
+         if (delete p.extra !== true) throw new Error('delete');
+         if (Object.getOwnPropertyDescriptor(p, 'join').value !== before) {
+           throw new Error('descriptor lost in dictionary mode');
+         }
+         if (Object.getOwnPropertyNames(p).indexOf('extra') !== -1) throw new Error('key remained');",
+    )
+    .unwrap();
+}
+
+#[test]
 fn set_prototype_of_rejects_frozen_targets_and_cycles() {
     eval_js(
         "function name_of(fn) { try { fn(); return 'no-throw'; } catch (e) { return e.name; } }
