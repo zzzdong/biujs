@@ -1,1 +1,7 @@
 /target
+# test262 失败清单 / 临时探针（跑全量时落盘用，不进仓库）
+f*-shard*.txt
+f*-array.txt
+fail*.txt
+tmp-*.js
+tmp-*.txt
