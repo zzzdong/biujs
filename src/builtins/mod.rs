@@ -84,6 +84,16 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+/// `Function.prototype` 自身的分派名。
+///
+/// ES 19.2.3：`Function.prototype` **本身是一个函数对象** —— `typeof` 是
+/// "function"、调用它返回 undefined、`length` 是 0、`name` 是空字符串。
+/// 这决定了两件可观察的事：`Object.prototype.toString.call(Function.prototype)`
+/// 是 "[object Function]"，以及 `[] instanceof Function.prototype` 能走
+/// OrdinaryHasInstance（RHS 可调用）—— 以前它是普通对象，那类用例一律
+/// "Right-hand side of 'instanceof' is not callable"。
+pub const FUNCTION_PROTO_NATIVE: &str = "__function_proto__";
+
 /// Make `proto` the prototype of wrappers created by `to_object` for the
 /// constructor `name` (`"Number"`, `"String"`, `"Boolean"`, `"Symbol"`,
 /// `"Object"`).
@@ -490,8 +500,12 @@ impl Builtins {
         let number_proto = heap.alloc(Object::PrimitiveWrapper(
             crate::vm::object::PrimitiveWrapperObject::new(Value::Number(0.0), Some(object_proto)),
         ));
+        // ES 19.2.3：`Function.prototype` 本身是一个**函数**，不是普通对象。
+        let function_proto = heap.alloc(Object::NativeFunction(
+            crate::vm::object::NativeFunctionObject::new(FUNCTION_PROTO_NATIVE),
+        ));
+        let _ = function_proto.borrow_mut().set_prototype(Some(object_proto));
         let string_proto = new_proto(heap, Some(object_proto), "String");
-        let function_proto = new_proto(heap, Some(object_proto), "Function");
         let symbol_proto = new_proto(heap, Some(object_proto), "Symbol");
         let map_proto = new_proto(heap, Some(object_proto), "Map");
         let set_proto = new_proto(heap, Some(object_proto), "Set");

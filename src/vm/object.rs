@@ -1921,8 +1921,10 @@ impl NativeFunctionObject {
     /// dispatch are stripped (`Object.keys.name` is `"keys"`, not
     /// `"Object.keys"`), while `self.name` keeps the dispatch name intact.
     fn install_metadata(&mut self) {
-        let display = if let Some(method) = self.name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX)
-        {
+        let display = if self.name == crate::builtins::FUNCTION_PROTO_NATIVE {
+            // ES 19.2.3：`Function.prototype.name` 是空字符串。
+            String::new()
+        } else if let Some(method) = self.name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
             method.to_string()
         } else if let Some(method) = self.name.strip_prefix(crate::builtins::MAP_METHOD_PREFIX) {
             method.to_string()

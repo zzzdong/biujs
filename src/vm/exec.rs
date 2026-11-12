@@ -2298,8 +2298,11 @@ impl VM {
             Instr::InstanceOf { dst, lhs, rhs } => {
                 let obj = self.get_value(lhs)?;
                 let ctor = self.get_value(rhs)?;
-                // A bare `Value::Function(id)` must be boxed first so its
-                // (single, stable) `prototype` object is reachable.
+                // **两侧**都可能是裸函数引用（`Value::Function(id)`）：物化之后
+                // 才有 `[[Prototype]]` 可走。以前只物化了 ctor，于是
+                // `function MyFunct(){}; MyFunct instanceof Function` 得到 false
+                //（lhs 不是 `Value::Object`，链遍历的起点直接是 `None`）。
+                let obj = self.as_object_value(&obj);
                 let ctor = self.as_object_value(&ctor);
 
                 // ES 12.10.4: a callable `@@hasInstance` on the right-hand side
@@ -2338,20 +2341,29 @@ impl VM {
                                     "Right-hand side of 'instanceof' is not callable".to_string(),
                                 ));
                             }
-                            let ctor_proto = ctor_ref
-                                .borrow()
-                                .property_get(&PropertyKey::well_known("prototype").expect("well-known name"));
-                            match ctor_proto {
-                                Some(desc) => {
-                                    let target_proto = desc.value;
-                                    // Walk the object's prototype chain
-                                    let mut current = match &obj {
-                                        Value::Object(obj_ref) => obj_ref.borrow().get_prototype(),
-                                        _ => None,
+                            match &obj {
+                                Value::Object(obj_ref) => {
+                                    // ES 7.3.19 步骤 4–6：`prototype` 走 **Get**
+                                    //（可以是 accessor，getter 必须执行），且结果必须
+                                    // 是对象，否则 TypeError。以前用 own-only 的
+                                    // `property_get`（getter 不跑）且把"取不到"当 false。
+                                    let prototype_key = PropertyKey::well_known("prototype")
+                                        .expect("well-known name");
+                                    let proto_value = {
+                                        let ctor_val = Value::Object(ctor_ref);
+                                        self.get_member(&ctor_val, &prototype_key, module)?
                                     };
+                                    let Value::Object(target_proto) = proto_value else {
+                                        return Err(RuntimeError::TypeError(format!(
+                                            "Function has non-object prototype '{}' in instanceof check",
+                                            proto_value.to_js_string()
+                                        )));
+                                    };
+                                    // Walk the object's prototype chain.
+                                    let mut current = obj_ref.borrow().get_prototype();
                                     let mut found = false;
                                     while let Some(proto_ref) = current {
-                                        if Value::Object(proto_ref) == target_proto {
+                                        if Value::Object(proto_ref) == Value::Object(target_proto) {
                                             found = true;
                                             break;
                                         }
@@ -2359,7 +2371,11 @@ impl VM {
                                     }
                                     found
                                 }
-                                None => false,
+                                // ES 7.3.19 步骤 3：左侧不是对象 ⇒ **false**，而且
+                                // 在 `Get(C, "prototype")` **之前** —— getter 不跑、
+                                // 也不会因为 prototype 是 primitive 而抛错
+                                //（`0 instanceof Function.prototype`）。
+                                _ => false,
                             }
                         }
                         _ => {

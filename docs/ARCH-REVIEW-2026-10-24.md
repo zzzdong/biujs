@@ -818,6 +818,25 @@ SyntaxError。oxc 的 parser 与 semantic builder 都不报这一条，于是
 **验收：全量 17,539 → 17,549 / 20,504（85.54% → 85.59%），无逐套件回退**
 （`language/statements/return` 5 → 15）。
 
+**第十七片已落地（2026-11-12）：`instanceof` 与 `Function.prototype`。**
+
+`instanceof` 按 ES 12.9.4 / 7.3.19 归位：
+
+- 两侧都物化。以前只物化 RHS，而函数声明产生的 LHS 是裸 `Value::Function(id)`，
+  链遍历起点直接是 `None` —— `function f(){}; f instanceof Function` 得到 false。
+- `prototype` 走 **Get**（accessor 会执行），且结果必须是对象，否则 TypeError。
+  以前用 own-only 的 `property_get`（getter 不跑）并把"取不到"当 false。
+- 左侧不是对象 ⇒ false，且发生在 `Get(C, "prototype")` **之前**
+  （`0 instanceof Function.prototype` 既不跑 getter 也不抛）。
+
+`Function.prototype` 改成真正的**函数对象**（ES 19.2.3）：`typeof` 是 "function"、
+调用返回 undefined、`length` 0、`name` ""、`[[Prototype]]` 是 `Object.prototype`。
+以前它是普通对象，`[] instanceof Function.prototype` 一律 "not callable"。
+
+**验收：全量 17,549 → 17,563 / 20,504（85.59% → 85.66%）**，无逐套件回退：
+`language/expressions/instanceof` 22→27、`built-ins/Function` 170→178、
+`language/expressions/property-accessors` 15→16。
+
 剩余（按序）：
 - descriptor 惰性物化：`Map` / `Set` 也换到槽位（`NativeFunction` 已完成），
   把 `PropertyTable` 收成"只有字典模式用"。`Map` / `Set` 牵动 `WeakMap` /

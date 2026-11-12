@@ -10,7 +10,7 @@ language/expressions/call	62	22	8
 language/expressions/complement	0	0	0
 language/expressions/does-not-equals	26	11	1
 language/expressions/greater-than	38	10	1
-language/expressions/instanceof	22	12	9
+language/expressions/instanceof	27	12	4
 language/expressions/logical-and	15	3	0
 language/expressions/modulus	32	8	0
 language/expressions/object	677	434	59
@@ -41,7 +41,7 @@ language/expressions/left-shift	37	8	0
 language/expressions/logical-not	15	4	0
 language/expressions/multiplication	33	7	0
 language/expressions/postfix-decrement	26	8	3
-language/expressions/property-accessors	15	2	4
+language/expressions/property-accessors	16	2	3
 language/expressions/subtraction	31	7	0
 language/expressions/typeof	12	3	1
 language/expressions/void	8	1	0
@@ -105,7 +105,7 @@ language/statements/return	15	1	0
 language/statements/variable	142	25	11
 language/literals/numeric	91	66	0
 language/types	95	16	2
-built-ins/Function	170	240	99
+built-ins/Function	178	240	91
 built-ins/WeakMap	133	2	6
 built-ins/NativeErrors	80	6	8
 built-ins/Reflect	152	1	0

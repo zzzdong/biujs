@@ -478,6 +478,44 @@ fn strict_functions_reject_caller_and_arguments() {
     );
 }
 
+/// `Function.prototype` **本身是函数对象**（ES 19.2.3）。
+///
+/// 它以前是普通 `ProtoObject`，于是 `typeof Function.prototype` 是 "object"、
+/// `[] instanceof Function.prototype` 一律 "Right-hand side is not callable"。
+#[test]
+fn function_prototype_is_a_function_object() {
+    eval_js(
+        "if (typeof Function.prototype !== 'function') throw new Error('typeof');
+         if (Function.prototype.name !== '') throw new Error('name: ' + Function.prototype.name);
+         if (Function.prototype.length !== 0) throw new Error('length');
+         if (Object.prototype.toString.call(Function.prototype) !== '[object Function]') throw new Error('tag');
+         if (Function.prototype() !== undefined) throw new Error('call');
+         if (Object.getPrototypeOf(Function.prototype) !== Object.prototype) throw new Error('proto');",
+    )
+    .unwrap();
+}
+
+/// `instanceof` 的三条规范细节（ES 12.9.4 / 7.3.19）。
+#[test]
+fn instanceof_follows_ordinary_has_instance() {
+    eval_js(
+        "function MyFunct() { return 0; }
+         // 左侧是裸函数引用时也要先物化成对象（以前只有 RHS 物化）。
+         if ((MyFunct instanceof Function) !== true) throw new Error('MyFunct instanceof Function');
+         // 左侧不是对象 ⇒ false，且在 `Get(C, 'prototype')` **之前**。
+         if ((0 instanceof Function.prototype) !== false) throw new Error('primitive lhs');
+         // `prototype` 是 Get：getter 会跑，结果必须是对象。
+         var target = {};
+         Object.defineProperty(Function.prototype, 'prototype', {
+           get: function () { return target; }
+         });
+         if ((Object.create(target) instanceof Function.prototype) !== true) {
+           throw new Error('prototype getter');
+         }",
+    )
+    .unwrap();
+}
+
 /// 内建函数对象（`NativeFunctionObject`）的自有属性走与 `{}` 完全相同的
 /// `[[DefineOwnProperty]]` / `[[Set]]` 语义。
 ///

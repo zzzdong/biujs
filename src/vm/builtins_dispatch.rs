@@ -70,6 +70,11 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        // ES 19.2.3：`Function.prototype` 是可以调用的，调用它返回 undefined
+        //（它没有函数体）。
+        if name == crate::builtins::FUNCTION_PROTO_NATIVE {
+            return Ok(Value::Undefined);
+        }
         // Box bare `Value::Function(id)` arguments (and the receiver) into their
         // memoized function objects before handing them to the builtin layer.
         // The builtin layer matches on `Value::Object` — `Object.keys(fn)`,
