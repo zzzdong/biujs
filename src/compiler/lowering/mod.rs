@@ -363,6 +363,13 @@ fn is_iteration_statement(stmt: &Statement<'_>) -> bool {
 /// else is left alone.
 fn is_anonymous_function_expression(expr: &Expression<'_>) -> bool {
     match expr {
+        // Parentheses are transparent for `IsAnonymousFunctionDefinition`:
+        // `[f = (function () {})] = []` still names the function `f`. The parser
+        // keeps them in the AST (`preserve_parens`), so unwrap first — without
+        // this the function kept the empty name it was created with.
+        Expression::ParenthesizedExpression(paren) => {
+            is_anonymous_function_expression(&paren.expression)
+        }
         Expression::FunctionExpression(func) => func.id.is_none(),
         Expression::ArrowFunctionExpression(_) => true,
         Expression::ClassExpression(class) => class.id.is_none(),
@@ -416,10 +423,25 @@ fn statement_calls_super(stmt: &Statement<'_>) -> bool {
 }
 
 /// Debug name for a class member function (`C.m`, `C.[computed]`).
-fn member_display_name(class_name: &str, key: &MemberKey) -> String {
+/// The `name` a class member's function is created with (ES 19.2.4.2
+/// `SetFunctionName`): the property key, with `get ` / `set ` in front of an
+/// accessor.
+///
+/// The qualified `Class.member` form used to be passed here as a debug label and
+/// leaked into `Function.prototype.name`; spec name is the bare key.
+/// `None` means the key is only known at run time (computed), so the caller has
+/// to emit `SetFunctionName` with the evaluated key instead.
+fn static_member_name(key: &MemberKey, accessor: Option<bool>) -> Option<String> {
     match key {
-        MemberKey::Static(name) => format!("{class_name}.{name}"),
-        MemberKey::Dynamic(_) => format!("{class_name}.[computed]"),
+        MemberKey::Static(name) => {
+            let prefix = match accessor {
+                Some(true) => "get ",
+                Some(false) => "set ",
+                None => "",
+            };
+            Some(format!("{prefix}{name}"))
+        }
+        MemberKey::Dynamic(_) => None,
     }
 }
 
@@ -1176,10 +1198,10 @@ impl<'a> JSASTLower<'a> {
             match member {
                 Member::Constructor(_) => {}
                 Member::Method { key, func } => {
-                    let name = member_display_name(&class_name, key);
+                    let name = static_member_name(key, None);
                     let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
-                        Some(name),
+                        name,
                         &func.params,
                         func.body.as_ref().unwrap(),
                         None,
@@ -1193,14 +1215,15 @@ impl<'a> JSASTLower<'a> {
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
+                    self.rename_member_function(func_val.clone(), key, None);
                     let desc = self.method_descriptor(func_val);
                     self.define_member(proto, key, desc);
                 }
                 Member::StaticMethod { key, func } => {
-                    let name = member_display_name(&class_name, key);
+                    let name = static_member_name(key, None);
                     let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
-                        Some(name),
+                        name,
                         &func.params,
                         func.body.as_ref().unwrap(),
                         None,
@@ -1214,14 +1237,15 @@ impl<'a> JSASTLower<'a> {
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
+                    self.rename_member_function(func_val.clone(), key, None);
                     let desc = self.method_descriptor(func_val);
                     self.define_member(func_obj, key, desc);
                 }
                 Member::Accessor { key, is_get, func } => {
-                    let name = member_display_name(&class_name, key);
+                    let name = static_member_name(key, Some(*is_get));
                     let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
-                        Some(name),
+                        name,
                         &func.params,
                         func.body.as_ref().unwrap(),
                         None,
@@ -1244,10 +1268,10 @@ impl<'a> JSASTLower<'a> {
                     self.define_member(proto, key, desc);
                 }
                 Member::StaticAccessor { key, is_get, func } => {
-                    let name = member_display_name(&class_name, key);
+                    let name = static_member_name(key, Some(*is_get));
                     let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
-                        Some(name),
+                        name,
                         &func.params,
                         func.body.as_ref().unwrap(),
                         None,
@@ -3216,6 +3240,22 @@ impl<'a> JSASTLower<'a> {
         );
     }
 
+    /// Computed class keys: the spec name is the *evaluated* property key, which
+    /// only exists at run time, so the freshly created function is renamed.
+    ///
+    /// Accessor prefixes are not applied on this path: `"get " + key` is string
+    /// concatenation, and a symbol key would need its description instead, so a
+    /// missing name beats a `TypeError` thrown while defining the member. The
+    /// static-key path (the overwhelmingly common one) is exact.
+    fn rename_member_function(&mut self, func_val: Value, key: &MemberKey, accessor: Option<bool>) {
+        if accessor.is_some() {
+            return;
+        }
+        if let MemberKey::Dynamic(key_value) = key {
+            self.builder.set_function_name(func_val, key_value.clone());
+        }
+    }
+
     /// `Object.defineProperty` descriptor for a method-like member.
     ///
     /// Matches `CreateMethodProperty`: writable and configurable, and
@@ -3280,7 +3320,12 @@ impl<'a> JSASTLower<'a> {
                     let home = p.method.then(|| self.get_prototype_of(object));
                     match p.kind {
                         PropertyKind::Get => {
-                            let getter = self.lower_expression(&p.value);
+                            // `{ get id() {} }` names the function `get id`
+                            // (ES 19.2.4.2). Computed keys keep the placeholder
+                            // name for the same reason as class accessors.
+                            let name = static_member_name(&key, Some(true));
+                            let hint = self.name_hint(name);
+                            let getter = self.lower_expression_named(&p.value, hint);
                             let getter = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(getter, super_proto.clone())
@@ -3291,7 +3336,9 @@ impl<'a> JSASTLower<'a> {
                             self.define_member(object, &key, desc);
                         }
                         PropertyKind::Set => {
-                            let setter = self.lower_expression(&p.value);
+                            let name = static_member_name(&key, Some(false));
+                            let hint = self.name_hint(name);
+                            let setter = self.lower_expression_named(&p.value, hint);
                             let setter = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(setter, super_proto.clone())
@@ -4563,7 +4610,26 @@ impl<'a> JSASTLower<'a> {
     }
 
     /// Copy every own enumerable key of `src` onto `target` (`{...src}`).
+    ///
+    /// ES 2018 `CopyDataProperties` (7.3.23) step 1: `undefined` and `null`
+    /// copy nothing and are **not** an error (`{...null}` is `{}`). `Object.keys`
+    /// throws for them, so the guard has to come before the key collection.
     fn emit_object_spread(&mut self, target: Value, src: Value) {
+        let null = Value::Primitive(Primitive::Null);
+        let undefined = Value::Primitive(Primitive::Undefined);
+        let is_null = self
+            .builder
+            .binop(Opcode::StrictEqual, src.clone(), null);
+        let is_undef = self
+            .builder
+            .binop(Opcode::StrictEqual, src.clone(), undefined);
+        let empty_source = self.builder.binop(Opcode::BitOr, is_null, is_undef);
+
+        let keys_blk = self.create_block("ospr_keys");
+        let after_blk = self.create_block("ospr_after");
+        self.builder.br_if(empty_source, after_blk, keys_blk);
+
+        self.builder.switch_to_block(keys_blk);
         let obj_fn = self.builder.load_external_variable("Object".to_string());
         let keys = self
             .builder
@@ -4572,7 +4638,6 @@ impl<'a> JSASTLower<'a> {
 
         let cond_blk = self.create_block("ospr_cond");
         let body_blk = self.create_block("ospr_body");
-        let after_blk = self.create_block("ospr_after");
 
         self.builder.jump(cond_blk);
         self.builder.switch_to_block(cond_blk);

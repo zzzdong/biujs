@@ -1,12 +1,19 @@
 use crate::RuntimeError;
 use crate::vm::gc::{Gc, Heap, Object};
-use crate::vm::object::{JSObject, NativeFunctionObject};
-use crate::vm::property::{PropertyDescriptor, PropertyKey};
+use crate::vm::object::NativeFunctionObject;
+use crate::vm::property::{ObjectKind, PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
 /// `%ThrowTypeError%`：严格模式函数的 `caller` / `arguments` 访问器（ES 9.2.7）。
 /// 读写这个访问器都必须抛 TypeError，所以 getter 与 setter 指向同一个内建。
 pub const FUNCTION_THROW_TYPE_ERROR_NATIVE: &str = "__throw_type_error__";
+
+/// `Function.prototype.toString` 的内建名。
+///
+/// 它**必须**是独立的名字，不能沿用属性名 `toString`：分派是按内建名做的，
+/// `Object.prototype.toString` 与它同名，两者会被混成一件事（这正是本方法
+/// 长时间未接线、`f.toString()` 返回 `"[object Function]"` 的原因）。
+pub const FUNCTION_PROTO_TO_STRING_NATIVE: &str = "Function.prototype.toString";
 
 /// Function constructor
 /// In ES6 without eval, calling `new Function(str)` throws a SyntaxError
@@ -16,32 +23,68 @@ pub fn function_constructor(_heap: &mut Heap, _args: &[Value]) -> Result<Value, 
     ))
 }
 
-/// `Function.prototype.toString()`
+/// `Function.prototype.toString()` (ES 19.2.3.5).
+///
+/// 引擎不保留源码文本，所以答案取规范允许的**实现自定义**形式：
+/// `function name(...) { [native code] }`。test262 的
+/// `assertToStringOrNativeFunction` 明确接受这种形式；要点是它必须是**函数语法**
+/// 且带上函数自己的 `name`，而不是 `Object.prototype.toString` 的
+/// `"[object Function]"`。
+///
+/// `name` 只有在能原样写成 `IdentifierName`（访问器是 `get `/`set ` + 名字）
+/// 时才内联，否则省略名字 —— 例如 bound function 的 `"bound f"` 是合法 `name`
+/// 但不是合法标识符，直接拼接会产出非函数语法的字符串。
 pub fn function_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> {
-    let name = match obj {
-        Value::Function(_) => "anonymous".to_string(),
-        Value::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            if borrowed.kind() == crate::vm::property::ObjectKind::NativeFunction {
-                if let Some(nf) = borrowed.as_native_function() {
-                    nf.name.clone()
-                } else {
-                    "anonymous".to_string()
-                }
-            } else {
-                "anonymous".to_string()
-            }
-        }
-        _ => {
+    let Value::Object(obj_ref) = obj else {
+        return Err(RuntimeError::TypeError(
+            "Function.prototype.toString called on non-function".to_string(),
+        ));
+    };
+    let name = {
+        let borrowed = obj_ref.borrow();
+        if !matches!(
+            borrowed.kind(),
+            ObjectKind::Function | ObjectKind::NativeFunction
+        ) {
             return Err(RuntimeError::TypeError(
                 "Function.prototype.toString called on non-function".to_string(),
             ));
         }
+        borrowed
+            .property_get(&PropertyKey::well_known("name").expect("well-known name"))
+            .map(|desc| desc.value.to_js_string())
+            .unwrap_or_default()
     };
     Ok(Value::string(&format!(
         "function {}() {{ [native code] }}",
-        name
+        function_source_name(&name)
     )))
+}
+
+/// `name` → 可以紧跟在 `function ` 后面的文本（含访问器前缀）。
+fn function_source_name(name: &str) -> &str {
+    for prefix in ["get ", "set "] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if is_identifier_name(rest) {
+                return name;
+            }
+        }
+    }
+    if is_identifier_name(name) {
+        name
+    } else {
+        ""
+    }
+}
+
+/// 够用的 `IdentifierName` 判定：首字符是字母/`_`/`$`，其余是字母数字/`_`/`$`。
+fn is_identifier_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) if first.is_alphabetic() || first == '_' || first == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
 /// Register static methods on the Function constructor
@@ -64,12 +107,22 @@ pub fn register_function_statics(
 pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     let mut p = proto.borrow_mut();
 
-    // These are placeholder prototypes — actual implementation requires this-aware calling
-    for name in ["call", "apply", "bind", "toString"] {
+    // `call` / `apply` / `bind` 的实现住 VM（要拿 frame 与 `this`），这里只放
+    // 名字与描述符。
+    for name in ["call", "apply", "bind"] {
         let key = PropertyKey::intern(heap, name);
         let value = super::method_descriptor(Value::Object(heap.alloc(
             Object::NativeFunction(NativeFunctionObject::new(name)),
         )));
+        p.define_property(heap, key, value).ok();
+    }
+
+    // `Function.prototype.toString` —— 独立的**内建名**（见常量注释）。
+    {
+        let key = PropertyKey::intern(heap, "toString");
+        let value = super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
+            NativeFunctionObject::new(FUNCTION_PROTO_TO_STRING_NATIVE),
+        ))));
         p.define_property(heap, key, value).ok();
     }
 

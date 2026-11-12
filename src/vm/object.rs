@@ -1724,7 +1724,7 @@ impl FunctionObject {
         Self {
             func_id,
             name: name.to_string(),
-            base: OrdinaryObject::new(),
+            base: function_base(),
             captured_this: None,
             captured_new_target: None,
             captured_vars: Vec::new(),
@@ -1741,12 +1741,25 @@ impl FunctionObject {
         Self {
             func_id,
             name: name.to_string(),
-            base: OrdinaryObject::new(),
+            base: function_base(),
             captured_this: Some(captured_this),
             captured_new_target: None,
             captured_vars,
         }
     }
+}
+
+/// `[[Prototype]]` every function object starts with (ES `FunctionCreate` step 1:
+/// `%Function.prototype%`) — arrows included: they have no own `prototype`
+/// *property*, but they still inherit `call` / `bind` / `toString` /
+/// `@@hasInstance` from the prototype.
+///
+/// Leaving it empty is not a small blemish: an arrow function used as a computed
+/// property key (`c[() => {}]`) or converted to a string had no `toString` to
+/// reach at all, so `ToPropertyKey` failed with "cannot convert object to
+/// primitive value".
+fn function_base() -> OrdinaryObject {
+    OrdinaryObject::with_optional_prototype(crate::builtins::wrapper_prototype("Function"))
 }
 
 // 函数对象只保留 `func_id` / 捕获环境这些内部槽；`length` / `name` /

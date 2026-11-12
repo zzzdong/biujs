@@ -406,10 +406,12 @@ impl VM {
                 // User-defined valueOf/toString: invoke it re-entrantly.
                 self.call_reentrant(&method, val.clone(), module)?
             } else {
-                // Native prototype method (Array/Number/Error/...). call_builtin_method
-                // dispatches on the object type; for ordinary objects it returns the
-                // default `[object Class]` string.
-                self.call_builtin_method(val, name, &[])?
+                // 原生方法：调**解析出来的那个函数**，不要再按属性名分派一次 ——
+                // `name` 认不出具体实现（函数接收者的 `toString` 是
+                // `Function.prototype.toString`，而按名字分派会落到
+                // `Object.prototype.toString`，于是 `fn + 1` 得到
+                // `"[object Function]"` 而不是函数源码形式）。
+                self.invoke(&method, val.clone(), &[], module)?
             };
             if result.is_primitive() && !result.is_object() {
                 return Ok(result);
@@ -3200,38 +3202,62 @@ impl VM {
                     return Ok(true);
                 }
 
-                // Try built-in prototype method dispatch. As above: only
-                // "no such method" may fall through.
-                // `Object.prototype.hasOwnProperty(P)` 的 P 走 ToPropertyKey：
-                // 带 `Symbol.toPrimitive` / `toString` 的 key 只有 VM 能转换。
-                // 只影响这次内建分派，用户方法回退仍用原参数。
-                let converted_args;
-                let dispatch_args: &[Value] =
-                    if method_name == "hasOwnProperty" && !args.is_empty() {
-                        let mut v = args.clone();
-                        v[0] = self.to_property_key_value(&args[0], module)?;
-                        converted_args = v;
-                        &converted_args
-                    } else {
-                        &args
+                // 先解析方法，再决定用哪条路调它。
+                //
+                // 以前是"按**属性名**打内建分派，失败才查用户方法"，于是
+                // `({ toString() { return "mine" } }).toString()` 返回
+                // `"[object Object]"`：接收者自己的方法被同名内建吃掉了。
+                // 现在按规范顺序走一次 `[[Get]]`：
+                //
+                // * 拿到**原生函数** ⇒ 按它的**内建名**分派。属性名不足以定位
+                //   实现（`Function.prototype.toString` 与
+                //   `Object.prototype.toString` 同名不同义），内建名可以。
+                // * 拿到**用户函数** ⇒ 跳过内建分派，直接调用。
+                // * 没有（原语接收者、真的缺方法）⇒ 保持原来的按名分派，
+                //   内建原型方法只有这条路能到。
+                let receiver = self.as_object_value(&obj_val);
+                let method_val = self.lookup_property_on_object(&receiver, &method_name, module)?;
+                let native_method = crate::builtins::native_function_name(&method_val);
+                // 用户（或 Proxy/访问器）提供的可调用值：内建分派无权插手。
+                let user_method = !matches!(method_val, Value::Undefined) && native_method.is_none();
+                if !user_method {
+                    // `Object.prototype.hasOwnProperty(P)` 的 P 走 ToPropertyKey：
+                    // 带 `Symbol.toPrimitive` / `toString` 的 key 只有 VM 能转换。
+                    // 只影响这次内建分派，用户方法回退仍用原参数。
+                    let converted_args;
+                    let dispatch_args: &[Value] =
+                        if method_name == "hasOwnProperty" && !args.is_empty() {
+                            let mut v = args.clone();
+                            v[0] = self.to_property_key_value(&args[0], module)?;
+                            converted_args = v;
+                            &converted_args
+                        } else {
+                            &args
+                        };
+                    let dispatched = match &native_method {
+                        Some(native) => self.call_native_by_name(
+                            native,
+                            receiver.clone(),
+                            dispatch_args,
+                            module,
+                        ),
+                        None => crate::builtins::call_prototype_method(
+                            &mut self.heap,
+                            &receiver,
+                            &method_name,
+                            dispatch_args,
+                        ),
                     };
-                match crate::builtins::call_prototype_method(
-                    &mut self.heap,
-                    &obj_val,
-                    &method_name,
-                    dispatch_args,
-                ) {
-                    Ok(result) => {
-                        self.state.set_register(Register::Rv, result)?;
-                        self.state.jump_offset(1);
-                        return Ok(true);
+                    match dispatched {
+                        Ok(result) => {
+                            self.state.set_register(Register::Rv, result)?;
+                            self.state.jump_offset(1);
+                            return Ok(true);
+                        }
+                        Err(err) if crate::builtins::is_unknown_builtin(&err) => {}
+                        Err(err) => return Err(err),
                     }
-                    Err(err) if crate::builtins::is_unknown_builtin(&err) => {}
-                    Err(err) => return Err(err),
                 }
-
-                // Look up user-defined method on the object's prototype chain
-                let method_val = self.lookup_property_on_object(&obj_val, &method_name, module)?;
 
                 // 方法没找到（或找到的是 `undefined`）：`obj.missing()` 必须抛
                 // TypeError（ES 的 CallMethod：`IsCallable(func)` 为假即抛）。

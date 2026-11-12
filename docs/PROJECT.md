@@ -20,15 +20,15 @@
 | 已入册的 test262 套件 | `language/expressions`、`language/statements`、`built-ins/{Array,Boolean,Error,Object,String,Symbol}` 等（见 `docs/es6-conformance-phase2.md` §2.2） |
 | 未入册但已实现 | `TypedArray` 视图族、`DataView`、`Proxy`、`Reflect` |
 
-## 3. 当前数字（2026-10-11，基线）
+## 3. 当前数字（2026-11-12，基线）
 
 | 指标 | 值 |
 |---|---|
-| test262 执行 / 通过 / 跳过 / 失败 | 20771 / **17328** / 8310 / 3443 |
-| 通过率 | <!-- doc-numbers -->**86.48%**（17731 / 执行 20504；跳过 8577；2026-11-12 基线，TEST262_MEMORY_MB=384）<!-- /doc-numbers --> |
-| 单元 / feature / 护栏 | 238 / 616（4 ignored）/ 7 |
-| 护栏计数 | timeout 7、step-limit 0、memory 22（`TEST262_MEMORY_MB=384`，见 §5.7；**2026-10-24 更新**：默认预算维持 384MB —— 256MB 会误伤 `built-ins/Array` 的 5 条边界用例，不是语义回退） |
-| 全量墙钟 | 约 450s（串行 4 分片，单片 `ulimit -v` 4 GB） |
+| test262 执行 / 通过 / 跳过 / 失败 | 20504 / **17959** / 8577 / 2545 |
+| 通过率 | <!-- doc-numbers -->**87.59%**（17959 / 执行 20504；跳过 8577；2026-11-12 基线，TEST262_MEMORY_MB=384）<!-- /doc-numbers --> |
+| 单元 / feature / 护栏 | 272 / 668（0 ignored）/ 7 |
+| 护栏计数 | timeout 0、step-limit 0、memory 14（`TEST262_MEMORY_MB=384`，见 §5.7；**2026-10-24 更新**：默认预算维持 384MB —— 256MB 会误伤 `built-ins/Array` 的 5 条边界用例，不是语义回退） |
+| 全量墙钟 | 约 128s（串行 4 分片，单片 `ulimit -v` 4 GB） |
 | 源码规模 | 50 个 `.rs`，约 44k 行 |
 
 ## 4. 怎么跑

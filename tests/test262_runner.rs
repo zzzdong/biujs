@@ -429,6 +429,12 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
 "WeakRef",
 "u180e",
 "well-formed-json-stringify",
+// 2026-11-12：ES2017+ 的一批标签（resizable-arraybuffer / array-grouping /
+// Object.fromEntries / iterator-helpers / Float16Array …）**没有**登记为范围外。
+// 实测它们会连带跳过已经在通过用例（`array-grouping` 就带走了 14 条
+// `Map.groupBy` 的绿灯 —— `Map.groupBy` 是实现了的），而"跳过"必须只用于
+// 永远不可能通过的用例。要收，得先逐标签量出"tagged 且当前通过"的条数，
+// 只收这一数为 0 的标签，作为单独一批。
 ];
 
 /// In scope (§1.2), not implemented yet. Sizes as of 2026-09-25 (test262 files):

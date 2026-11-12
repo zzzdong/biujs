@@ -44,7 +44,8 @@ pub use error::{
     setup_error_prototype, setup_native_error_prototype,
 };
 pub use function::{
-    FUNCTION_THROW_TYPE_ERROR_NATIVE, function_constructor, setup_function_prototype,
+    FUNCTION_PROTO_TO_STRING_NATIVE, FUNCTION_THROW_TYPE_ERROR_NATIVE, function_constructor,
+    function_prototype_to_string, setup_function_prototype,
 };
 pub use json::{
     json_number, json_parse, json_stringify, own_enumerable_string_keys, quote_json_string,

@@ -717,8 +717,6 @@ impl VM {
         obj
     }
 
-    /// Coerce a value that is about to be used as an object into a `Value::Object`
-    /// where possible (currently: bare function references).
     /// ES `SetFunctionName(fn, name)` — redefine the `name` own property
     /// `{ writable: false, enumerable: false, configurable: true }`.
     ///
@@ -729,13 +727,34 @@ impl VM {
     fn set_function_name(&mut self, func: &Value, name: &str) {
         let obj_val = self.as_object_value(func);
         if let Value::Object(obj_ref) = obj_val {
-            let mut borrowed = obj_ref.borrow_mut();
-            if borrowed.kind() != ObjectKind::Function {
-                return;
+            let key = PropertyKey::well_known("name").expect("well-known name");
+            // ES 19.2.4.2 step 5–6: an own `name` that the object already
+            // carries wins over the inferred one — `class { static name() {} }`
+            // keeps the method, it is *not* renamed to the binding it lands in.
+            //
+            // Every function/class is created with an own `name` of `""` (the
+            // placeholder an anonymous form shows until `NamedEvaluation` runs),
+            // so "own property present" alone cannot be the test; that empty
+            // placeholder is exactly what this instruction exists to replace.
+            {
+                let borrowed = obj_ref.borrow();
+                if borrowed.kind() != ObjectKind::Function {
+                    return;
+                }
+                if let Some(desc) = borrowed.property_get(&key) {
+                    let is_placeholder =
+                        matches!(&desc.value, Value::String(text) if text.is_empty());
+                    if !is_placeholder {
+                        return;
+                    }
+                }
             }
-            borrowed
-                .define_property(&mut self.heap, crate::vm::property::PropertyKey::well_known("name").expect("well-known name"),
-                    crate::vm::property::PropertyDescriptor {
+            obj_ref
+                .borrow_mut()
+                .define_property(
+                    &mut self.heap,
+                    key,
+                    PropertyDescriptor {
                         value: Value::string(name),
                         writable: false,
                         enumerable: false,
@@ -748,6 +767,8 @@ impl VM {
         }
     }
 
+    /// Coerce a value that is about to be used as an object into a `Value::Object`
+    /// where possible (currently: bare function references).
     fn as_object_value(&mut self, val: &Value) -> Value {
         match val {
             Value::Function(id) => self.materialize_function(*id),

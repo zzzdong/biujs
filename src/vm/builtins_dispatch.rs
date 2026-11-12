@@ -148,6 +148,12 @@ impl VM {
         if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
             return self.object_prototype_to_string(&this, args, module);
         }
+        // `Function.prototype.toString`：与 `Object.prototype.toString` 同名但
+        // 语义完全不同（前者要函数源码形式，后者是 `"[object X]"`），所以它
+        // 在 `Function.prototype` 上挂的是独立内建名。
+        if name == crate::builtins::FUNCTION_PROTO_TO_STRING_NATIVE {
+            return crate::builtins::function_prototype_to_string(&this);
+        }
         // `RegExp.prototype` 的只读 accessor：名字后缀带属性名。
         if let Some(prop) = name.strip_prefix(crate::builtins::REGEXP_GETTER_PREFIX) {
             return crate::builtins::regexp_prototype_getter(&this, prop);

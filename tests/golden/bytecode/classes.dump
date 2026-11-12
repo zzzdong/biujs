@@ -259,7 +259,7 @@ functions 5:
     235: prop_set [rbp+3], 2, [rbp+0]
     236: mov rv, undefined
     237: ret
-  fn 2: start=238 end=245 exit=244 name="Base.value" arity=0 flags=-
+  fn 2: start=238 end=245 exit=244 name="value" arity=0 flags=-
     238: addc rsp, rsp, 4
     239: arguments [rbp+0]
     240: mov [rbp+1], sym_2
@@ -280,7 +280,7 @@ functions 5:
     254: mov [rbp+6], rv
     255: mov rv, undefined
     256: ret
-  fn 4: start=257 end=271 exit=270 name="Derived.value" arity=0 flags=-
+  fn 4: start=257 end=271 exit=270 name="value" arity=0 flags=-
     257: addc rsp, rsp, 8
     258: arguments [rbp+0]
     259: mov [rbp+1], sym_4

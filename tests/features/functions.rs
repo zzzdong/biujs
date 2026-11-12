@@ -611,3 +611,91 @@ fn builtin_function_own_properties_keep_their_attributes() {
     )
     .unwrap();
 }
+
+
+// ============================================================
+// NamedEvaluation / Function.prototype.name
+// ============================================================
+
+#[test]
+fn anonymous_function_takes_the_binding_name() {
+    // 括号对 IsAnonymousFunctionDefinition 是透明的；序列表达式不是匿名函数
+    // 定义（`(0, function () {})` 不得被命名）。以前括号内的函数保留 `""`。
+    let js = r#"
+        var f = (function () {});
+        var g = (0, function () {});
+        f.name + "|" + g.name
+    "#;
+    assert_eq!(eval_string(js), "f|");
+}
+
+#[test]
+fn class_static_name_method_wins_over_named_evaluation() {
+    // ES 19.2.4.2：对象自己已有 `name` 时 SetFunctionName 不再改名。
+    let js = r#"
+        var x = class { static name() { return "keep"; } };
+        var y = class {};
+        x.name() + "|" + y.name
+    "#;
+    assert_eq!(eval_string(js), "keep|y");
+}
+
+#[test]
+fn accessors_and_class_methods_use_the_spec_name() {
+    // 方法名是属性键本身，访问器带 `get ` / `set ` 前缀；`Class.member` 形式
+    // 不是规范名（它曾经泄漏到 Function.prototype.name）。
+    let js = r#"
+        var o = { get id() { return 1; }, m() {} };
+        var d = Object.getOwnPropertyDescriptor(o, "id");
+        class C { static s() {} get g() { return 1; } m() {} }
+        [
+          d.get.name,
+          o.m.name,
+          C.s.name,
+          C.prototype.m.name,
+          Object.getOwnPropertyDescriptor(C.prototype, "g").get.name
+        ].join(",")
+    "#;
+    assert_eq!(eval_string(js), "get id,m,s,m,get g");
+}
+
+#[test]
+fn function_to_string_is_function_syntax() {
+    // 引擎不保留源码，取规范允许的 NativeFunction 形式：它必须是**函数语法**
+    // 且带上自己的 name，而不是 `[object Function]`。
+    let js = r#"
+        function f(a) {}
+        f.toString()
+    "#;
+    assert_eq!(eval_string(js), "function f() { [native code] }");
+}
+
+#[test]
+fn function_to_string_rejects_non_callable_receivers() {
+    let js = r#"
+        var threw = false;
+        try { Function.prototype.toString.call({}); } catch (e) { threw = e.name === "TypeError"; }
+        threw
+    "#;
+    assert_eq!(eval_bool(js), true);
+}
+
+#[test]
+fn a_user_method_shadows_the_builtin_of_the_same_name() {
+    // 按名字打内建分派会吃掉接收者自己的同名方法。
+    let js = r#"
+        var o = { toString() { return "mine"; }, hasOwnProperty() { return 42; } };
+        o.toString() + "|" + o.hasOwnProperty("x")
+    "#;
+    assert_eq!(eval_string(js), "mine|42");
+}
+
+#[test]
+fn object_spread_of_null_and_undefined_is_a_no_op() {
+    // ES 2018 CopyDataProperties 第 1 步：`{...null}` 不是错误。
+    let js = r#"
+        var a = { ...null, ...undefined, x: 1 };
+        Object.keys(a).join(",")
+    "#;
+    assert_eq!(eval_string(js), "x");
+}
