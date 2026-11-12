@@ -34,67 +34,67 @@ pub fn is_js_whitespace(c: char) -> bool {
 }
 
 pub fn register_string_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method;
+    use super::set_prototype_method_owned;
 
-    set_prototype_method(proto, heap, "valueOf", |this, _args| string_value_of(this));
-    set_prototype_method(proto, heap, "toString", |this, _args| string_to_string(this));
-    set_prototype_method(proto, heap, "charAt", |this, args| string_char_at(this, args));
-    set_prototype_method(proto, heap, "charCodeAt", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "valueOf", |this, _args| string_value_of(this));
+    super::set_prototype_method_owned("String", proto, heap, "toString", |this, _args| string_to_string(this));
+    super::set_prototype_method_owned("String", proto, heap, "charAt", |this, args| string_char_at(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "charCodeAt", |this, args| {
         string_char_code_at(this, args)
     });
-    set_prototype_method(proto, heap, "concat", |this, args| string_concat(this, args));
-    set_prototype_method(proto, heap, "includes", |this, args| string_includes(this, args));
-    set_prototype_method(proto, heap, "indexOf", |this, args| string_index_of(this, args));
-    set_prototype_method(proto, heap, "slice", |this, args| string_slice(this, args));
-    set_prototype_method(proto, heap, "substring", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "concat", |this, args| string_concat(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "includes", |this, args| string_includes(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "indexOf", |this, args| string_index_of(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "slice", |this, args| string_slice(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "substring", |this, args| {
         string_substring(this, args)
     });
-    set_prototype_method(proto, heap, "toUpperCase", |this, _args| string_to_upper(this));
-    set_prototype_method(proto, heap, "toLowerCase", |this, _args| string_to_lower(this));
-    set_prototype_method(proto, heap, "trim", |this, _args| string_trim_both(this));
-    set_prototype_method(proto, heap, "split", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "match", |_this, _args| Ok(Value::Undefined));
+    super::set_prototype_method_owned("String", proto, heap, "toUpperCase", |this, _args| string_to_upper(this));
+    super::set_prototype_method_owned("String", proto, heap, "toLowerCase", |this, _args| string_to_lower(this));
+    super::set_prototype_method_owned("String", proto, heap, "trim", |this, _args| string_trim_both(this));
+    super::set_prototype_method_owned("String", proto, heap, "split", |_this, _args| Ok(Value::Undefined));
+    super::set_prototype_method_owned("String", proto, heap, "match", |_this, _args| Ok(Value::Undefined));
     // `matchAll` answers an *iterator*, which only the VM can mint (iterators
     // live in its registry so `next()` can find its state), so the method is
     // marked for the VM rather than implemented here.
     super::mark_prototype_method(proto, heap, "matchAll");
-    set_prototype_method(proto, heap, "search", |_this, _args| Ok(Value::Undefined));
+    super::set_prototype_method_owned("String", proto, heap, "search", |_this, _args| Ok(Value::Undefined));
     // A RegExp argument is routed to the regex-aware implementation in the
     // dispatch (`call_prototype_method`), not here — the closure is not what runs.
-    set_prototype_method(proto, heap, "replace", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "replace", |this, args| {
         string_replace(this, args, false)
     });
-    set_prototype_method(proto, heap, "replaceAll", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "replaceAll", |this, args| {
         string_replace(this, args, true)
     });
-    set_prototype_method(proto, heap, "startsWith", |this, args| string_starts_with(this, args));
-    set_prototype_method(proto, heap, "endsWith", |this, args| string_ends_with(this, args));
-    set_prototype_method(proto, heap, "repeat", |this, args| string_repeat(this, args));
-    set_prototype_method(proto, heap, "trimStart", |this, _args| {
+    super::set_prototype_method_owned("String", proto, heap, "startsWith", |this, args| string_starts_with(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "endsWith", |this, args| string_ends_with(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "repeat", |this, args| string_repeat(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "trimStart", |this, _args| {
         string_trim(this, true)
     });
-    set_prototype_method(proto, heap, "trimEnd", |this, _args| {
+    super::set_prototype_method_owned("String", proto, heap, "trimEnd", |this, _args| {
         string_trim(this, false)
     });
-    set_prototype_method(proto, heap, "codePointAt", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "codePointAt", |this, args| {
         string_code_point_at(this, args)
     });
-    set_prototype_method(proto, heap, "at", |this, args| string_at(this, args));
-    set_prototype_method(proto, heap, "normalize", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "at", |this, args| string_at(this, args));
+    super::set_prototype_method_owned("String", proto, heap, "normalize", |this, args| {
         string_normalize(this, args)
     });
-    set_prototype_method(proto, heap, "toLocaleLowerCase", |this, _args| string_to_lower(this));
-    set_prototype_method(proto, heap, "toLocaleUpperCase", |this, _args| string_to_upper(this));
-    set_prototype_method(proto, heap, "localeCompare", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "toLocaleLowerCase", |this, _args| string_to_lower(this));
+    super::set_prototype_method_owned("String", proto, heap, "toLocaleUpperCase", |this, _args| string_to_upper(this));
+    super::set_prototype_method_owned("String", proto, heap, "localeCompare", |this, args| {
         string_locale_compare(this, args)
     });
-    set_prototype_method(proto, heap, "padStart", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "padStart", |this, args| {
         string_pad(this, args, true)
     });
-    set_prototype_method(proto, heap, "padEnd", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "padEnd", |this, args| {
         string_pad(this, args, false)
     });
-    set_prototype_method(proto, heap, "lastIndexOf", |this, args| {
+    super::set_prototype_method_owned("String", proto, heap, "lastIndexOf", |this, args| {
         string_last_index_of(this, args)
     });
 }
@@ -235,12 +235,14 @@ pub fn string_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, Runtim
     Ok(Value::Number(-1.0))
 }
 
+/// `String.prototype.valueOf` / `toString` (ES 21.1.3.26 / .27) return
+/// `[[StringData]]` and reject any other receiver — no `ToString` coercion.
 fn string_value_of(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&super::string_receiver(obj)?))
+    Ok(Value::string(&super::require_string(obj)?))
 }
 
 fn string_to_string(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&super::string_receiver(obj)?))
+    Ok(Value::string(&super::require_string(obj)?))
 }
 
 // ─────────────────────────────────────────────────────────

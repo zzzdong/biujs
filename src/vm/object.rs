@@ -2110,6 +2110,10 @@ impl NativeFunctionObject {
         } else if self.name == crate::builtins::FUNCTION_HAS_INSTANCE_NATIVE {
             // ES 20.2.3.6：`Function.prototype[@@hasInstance].name`。
             "[Symbol.hasInstance]".to_string()
+        } else if let Some(idx) = self.name.find(".prototype.") {
+            // 带归属的原型方法（`"String.prototype.slice"`）：函数对象的 `name`
+            // 是属性键本身（ES 21.1.3.x），不是带归属的分派名。
+            self.name[idx + ".prototype.".len()..].to_string()
         } else if let Some(method) = self.name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
             method.to_string()
         } else if let Some(method) = self.name.strip_prefix(crate::builtins::MAP_METHOD_PREFIX) {
@@ -2214,6 +2218,15 @@ impl PrimitiveWrapperObject {
             base.set_prototype(Some(proto));
         }
         Self { primitive, base }
+    }
+
+    /// The wrapped primitive — `[[StringData]]` / `[[NumberData]]` / … .
+    ///
+    /// Needed by the `RequireString(this)` prologue of
+    /// `String.prototype.{toString,valueOf}` (ES 21.1.3.26/27), which accept a
+    /// String *object* but must reject a Number/Bool wrapper.
+    pub fn wrapped(&self) -> &Value {
+        &self.primitive
     }
 
     /// `String.prototype.length` 的口径：**UTF-16 码元**（不是码点）。

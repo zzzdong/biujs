@@ -106,4 +106,4 @@ built-ins/Boolean	38	3	10
 built-ins/Map	153	51	0
 built-ins/TypedArray	292	772	382
 built-ins/Object	3108	143	160
-built-ins/String	802	168	253
+built-ins/String	852	168	203

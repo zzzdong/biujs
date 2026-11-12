@@ -233,6 +233,33 @@ pub fn string_receiver(value: &Value) -> Result<String, RuntimeError> {
     to_string_throwing(value)
 }
 
+/// `RequireString(this)` — ES 21.1.3.26 / 21.1.3.27.
+///
+/// `String.prototype.toString` / `valueOf` take the receiver's `[[StringData]]`
+/// and **reject** everything else: `String.prototype.valueOf.call(123)` is a
+/// `TypeError`, it does not coerce (that is what `string_receiver` does, and
+/// why these two cannot share it).
+pub fn require_string(value: &Value) -> Result<String, RuntimeError> {
+    let incompatible = || {
+        RuntimeError::TypeError(
+            "String.prototype.toString/valueOf called on an incompatible receiver".to_string(),
+        )
+    };
+    match value {
+        Value::String(text) => Ok(text.to_string()),
+        Value::Object(obj_ref) => {
+            let borrowed = obj_ref.borrow();
+            if let crate::vm::gc::Object::PrimitiveWrapper(wrapper) = &*borrowed
+                && let Value::String(text) = wrapper.wrapped()
+            {
+                return Ok(text.to_string());
+            }
+            Err(incompatible())
+        }
+        _ => Err(incompatible()),
+    }
+}
+
 /// ES `ToIntegerOrInfinity` (7.1.5) that propagates `ToNumber`'s abrupt
 /// completion, saturating `±Infinity` to `i64` bounds.
 pub fn to_integer_or_infinity_throwing(value: Option<&Value>) -> Result<i64, RuntimeError> {
@@ -2029,6 +2056,11 @@ pub fn builtin_arity(registered_name: &str) -> usize {
     let name = name.strip_prefix(SET_METHOD_PREFIX).unwrap_or(name);
     let name = name.strip_prefix(WEAKMAP_METHOD_PREFIX).unwrap_or(name);
     let name = name.strip_prefix(WEAKSET_METHOD_PREFIX).unwrap_or(name);
+    // 带归属的原型方法（`"String.prototype.codePointAt"`）：arity 仍按裸方法名查。
+    let name = match name.find(".prototype.") {
+        Some(idx) => &name[idx + ".prototype.".len()..],
+        None => name,
+    };
     match name {
         // ── Constructors ──
         "Object" | "Array" | "Boolean" | "Number" | "String" | "Function" | "Error"
@@ -2135,6 +2167,31 @@ where
     let key = PropertyKey::intern(heap, name);
     let method_val = Value::Object(heap.alloc(Object::NativeFunction(
         crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}")),
+    )));
+    let _ = proto.borrow_mut().define_property(heap, key, method_descriptor(method_val));
+}
+
+/// Like [`set_prototype_method`], but the native name records the **owning
+/// constructor** (`"String.prototype.slice"`).
+///
+/// Two families share method names (`Array.prototype.slice` /
+/// `String.prototype.slice`, `indexOf`, `includes`, `concat`, …) and the shape
+/// of the receiver is *not* the answer: `String.prototype.slice.call({ toString()
+/// { … } })` must run `ToString(this)`, not treat the object as an array-like.
+/// With the bare `__proto_method__slice` name the dispatch site cannot tell the
+/// two apart, so the owner travels in the name.
+pub fn set_prototype_method_owned<F>(
+    owner: &str,
+    proto: &Gc<Object>,
+    heap: &mut Heap,
+    name: &str,
+    _f: F,
+) where
+    F: Fn(&Value, &[Value]) -> Result<Value, RuntimeError> + 'static,
+{
+    let key = PropertyKey::intern(heap, name);
+    let method_val = Value::Object(heap.alloc(Object::NativeFunction(
+        crate::vm::object::NativeFunctionObject::new(&format!("{owner}.prototype.{name}")),
     )));
     let _ = proto.borrow_mut().define_property(heap, key, method_descriptor(method_val));
 }

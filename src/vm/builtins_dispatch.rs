@@ -353,6 +353,35 @@ impl VM {
             all.extend(args.iter().cloned());
             return self.invoke(&target, this_arg, &all, module);
         }
+        // `String.prototype.<name>`：内建名带着**归属**，所以不必再按接收者
+        // 形状猜是 Array 还是 String 的同名方法。规范要求这些方法先把 `this`
+        // 转成字符串（ES 21.1.3.x 的 `Let S be ? ToString(O)`），而 `ToString`
+        // 可以跑用户代码（`String.prototype.slice.call({toString(){…}}, 1)`），
+        // 所以转换在这里做 —— 内建层没有 `module`。
+        if let Some(method) = name.strip_prefix("String.prototype.") {
+            // `RequireObjectCoercible(this)`：`String.prototype.trim.call(null)`
+            // 是 TypeError，不能因为 `ToString(null)` 恰好是 "null" 就放过去。
+            crate::builtins::require_object_coercible(&this)?;
+            // `toString` / `valueOf` 例外：它们要求接收者**本身**是字符串
+            // （21.1.3.26 / 21.1.3.27），不能把 `123` 悄悄转成 `"123"`。
+            let text = if matches!(method, "toString" | "valueOf") {
+                crate::builtins::require_string(&this)?
+            } else {
+                let primitive = match &this {
+                    Value::Object(_) | Value::Function(_) => {
+                        self.to_primitive(&this, "string", module)?
+                    }
+                    other => other.clone(),
+                };
+                crate::builtins::to_string_throwing(&primitive)?
+            };
+            return crate::builtins::call_prototype_method(
+                &mut self.heap,
+                &Value::string(&text),
+                method,
+                args,
+            );
+        }
         if let Some(method) = name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
             // `f.call` / `f.apply` / `f.bind` are the same operations as the
             // `CallMethod` opcode path handles; they must work identically when
