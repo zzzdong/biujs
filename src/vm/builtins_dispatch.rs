@@ -158,6 +158,14 @@ impl VM {
         if let Some(prop) = name.strip_prefix(crate::builtins::REGEXP_GETTER_PREFIX) {
             return crate::builtins::regexp_prototype_getter(&this, prop);
         }
+        // `RegExp.prototype[@@match/@@replace/@@search/@@split]`：四个
+        // `String.prototype` 方法的协议入口。住在 VM，因为函数式 replacer
+        // 要回调 JS（内建层做不到）。
+        if let Some(symbol) = name.strip_prefix("Symbol.") {
+            if matches!(symbol, "match" | "replace" | "search" | "split") {
+                return self.regexp_symbol_method(symbol, &this, args, module);
+            }
+        }
         // `Object.prototype.__proto__` 的 Annex B accessor：getter 要用堆做
         // ToObject，setter 复用 `Object.setPrototypeOf` 的循环检测。
         if name == crate::builtins::OBJECT_PROTO_GET_NATIVE {
@@ -720,11 +728,55 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Option<Value>, RuntimeError> {
+        // ── 第一步：`@@match` / `@@replace` / `@@search` / `@@split` 协议 ──
+        //
+        // ES 21.1.3.x 的第 2 步：参数上若有对应的方法就**由它接管**，
+        // `"ab".replace({ [Symbol.replace](s, r) { … } }, "x")` 与
+        // `"ab".replace(/a/, "x")` 走的是同一条路（后者由
+        // `RegExp.prototype[@@replace]` 实现）。以前四个方法都是"看参数形状"
+        // 直接强转字符串，自定义对象上的 `@@replace` 完全看不到。
+        let symbol = match method {
+            "match" => Some(crate::builtins::match_symbol_key()),
+            "search" => Some(crate::builtins::search_symbol_key()),
+            "split" => Some(crate::builtins::split_symbol_key()),
+            "replace" | "replaceAll" => Some(crate::builtins::replace_symbol_key()),
+            _ => None,
+        };
+        let Some(symbol_key) = symbol else {
+            return Ok(None);
+        };
+        let search = args.first().cloned().unwrap_or(Value::Undefined);
+        // GetMethod only applies to an **object** argument (ES 2024 text:
+        // "If regexp is not Object, then […]"). A primitive goes straight to
+        // `ToString` / `RegExpCreate`, so a `Symbol.match` getter planted on
+        // `String.prototype` must not be consulted for `"a,b".match(",")`.
+        if matches!(search, Value::Object(_) | Value::Function(_)) {
+            let protocol = self.get_member(&search, &symbol_key, module)?;
+            if protocol.is_callable() || matches!(protocol, Value::Function(_)) {
+                let mut call_args = vec![this.clone()];
+                call_args.extend(args.iter().skip(1).cloned());
+                return Ok(Some(self.invoke(&protocol, search, &call_args, module)?));
+            }
+        }
+        // `match` / `search` 在参数没有对应方法时按规范 `RegExpCreate(参数)`
+        // 再走一次（`"abc".match("b")` 等价于 `"abc".match(/b/)`）。
+        if matches!(method, "match" | "search") {
+            let created =
+                crate::builtins::regexp_construct_value(&mut self.heap, &[search], None)?;
+            let protocol = self.get_member(&created, &symbol_key, module)?;
+            let mut call_args = vec![this.clone()];
+            call_args.extend(args.iter().skip(1).cloned());
+            return Ok(Some(self.invoke(&protocol, created, &call_args, module)?));
+        }
         if !matches!(method, "replace" | "replaceAll") {
             return Ok(None);
         }
-        let Value::String(text) = this else {
-            return Ok(None);
+        // 走到这里说明 `replace` / `replaceAll` 的参数是没有 `@@replace` 的
+        // 普通值 → 按字符串字面量替换（`split` 的字面量路径则由 builtins 里
+        // 的实现处理）。
+        let text = match crate::builtins::string_receiver(this) {
+            Ok(text) => text,
+            Err(_) => return Ok(None),
         };
         let replacer = match args.get(1) {
             // A bare `Value::Function(id)` is callable too; `is_callable()` only
@@ -815,6 +867,122 @@ impl VM {
         }
         out.push_str(&text.as_str()[last..]);
         Ok(Some(Value::string(&out)))
+    }
+
+    /// `RegExp.prototype[@@match/@@replace/@@search/@@split]` (ES 22.2.5.6 …
+    /// 22.2.5.11), reached both from `String.prototype.{match,replace,search,split}`
+    /// (which dispatch through these symbols) and from an explicit
+    /// `re[Symbol.split](s)`.
+    ///
+    /// `this` is the regexp, `args[0]` the string (`ToString`, which can run
+    /// user code). The pure parts are delegated to the shape-based builtins
+    /// (`regexp_match` / `regexp_replace` / …, which take the string as the
+    /// receiver and the regexp as the first argument); only the callable
+    /// replacement needs the VM, because it has to invoke user code per match.
+    fn regexp_symbol_method(
+        &mut self,
+        symbol: &str,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let is_regexp = matches!(this, Value::Object(o)
+            if matches!(o.borrow().kind(), crate::vm::property::ObjectKind::RegExp));
+        if !is_regexp {
+            return Err(RuntimeError::TypeError(format!(
+                "RegExp.prototype[Symbol.{symbol}] called on a non-RegExp receiver"
+            )));
+        }
+        let string_arg = args.first().cloned().unwrap_or(Value::Undefined);
+        // `ToString(S)` — a user `toString` runs here.
+        let text = match &string_arg {
+            Value::Object(_) | Value::Function(_) => {
+                self.to_primitive(&string_arg, "string", module)?.to_js_string()
+            }
+            other => other.to_js_string(),
+        };
+        let receiver = Value::string(&text);
+        match symbol {
+            "match" => {
+                crate::builtins::regexp_match(&mut self.heap, &receiver, std::slice::from_ref(this))
+            }
+            "search" => {
+                crate::builtins::regexp_search(&mut self.heap, &receiver, std::slice::from_ref(this))
+            }
+            "split" => {
+                let mut call_args = vec![this.clone()];
+                if let Some(limit) = args.get(1) {
+                    call_args.push(limit.clone());
+                }
+                crate::builtins::regexp_split(&mut self.heap, &receiver, &call_args)
+            }
+            _ => self.regexp_symbol_replace(this, &text, args.get(1), module),
+        }
+    }
+
+    /// `RegExp.prototype[@@replace](string, replaceValue)` (ES 22.2.5.8): the
+    /// callable-replacement half needs this frame, the string half is
+    /// `regexp_replace`'s `$` substitution.
+    fn regexp_symbol_replace(
+        &mut self,
+        this: &Value,
+        text: &str,
+        replace_value: Option<&Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let replace_value = replace_value.cloned().unwrap_or(Value::Undefined);
+        if !(replace_value.is_callable() || matches!(replace_value, Value::Function(_))) {
+            return crate::builtins::regexp_replace(
+                &mut self.heap,
+                &Value::string(text),
+                &[this.clone(), replace_value],
+            );
+        }
+        // 函数式 replacer：逐个匹配回调，参数是
+        // (matched, ...captures, position, string)（ES 22.2.5.8 step 14.c）。
+        let (matcher, global) = {
+            let Value::Object(obj_ref) = this else {
+                return Err(RuntimeError::TypeError("not a RegExp".to_string()));
+            };
+            let borrowed = obj_ref.borrow();
+            let re = borrowed
+                .as_regexp()
+                .ok_or_else(|| RuntimeError::TypeError("not a RegExp".to_string()))?;
+            let Some(compiled) = re.compiled.clone() else {
+                return Err(RuntimeError::TypeError(format!(
+                    "pattern {:?} is not supported by this engine",
+                    re.source
+                )));
+            };
+            (compiled, re.flags.contains('g'))
+        };
+        let _root_replacer = self.root(&replace_value);
+        let _root_receiver = self.root(this);
+        let mut out = String::new();
+        let mut last = 0usize;
+        for captures in matcher.captures_iter(text) {
+            let whole = captures.get(0).expect("a match implies group 0");
+            out.push_str(&text[last..whole.start()]);
+            let mut call_args: Vec<Value> = vec![Value::string(whole.as_str())];
+            for i in 1..captures.len() {
+                call_args.push(match captures.get(i) {
+                    Some(m) => Value::string(m.as_str()),
+                    None => Value::Undefined,
+                });
+            }
+            call_args.push(Value::Number(whole.start() as f64));
+            call_args.push(Value::string(text));
+            let replacement = self
+                .invoke(&replace_value, Value::Undefined, &call_args, module)?
+                .to_js_string();
+            out.push_str(&replacement);
+            last = whole.end();
+            if !global {
+                break;
+            }
+        }
+        out.push_str(&text[last..]);
+        Ok(Value::string(&out))
     }
 
     /// `then` / `catch` / `finally`, when the receiver is a promise.

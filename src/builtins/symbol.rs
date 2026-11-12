@@ -35,6 +35,33 @@ pub const IS_CONCAT_SPREADABLE_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0003;
 pub const TO_PRIMITIVE_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0004;
 pub const TO_STRING_TAG_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0005;
 pub const SPECIES_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0006;
+/// `Symbol.match` / `Symbol.replace` / `Symbol.search` / `Symbol.split`
+/// (`0x…0009` 是 `Symbol.matchAll`，定义在 `regexp.rs`)。
+///
+/// The four are the protocol `String.prototype.{match,replace,search,split}`
+/// dispatch through (ES 21.1.3.x step 2): a user object may carry them to take
+/// over the operation, and `RegExp.prototype` carries the built-in versions.
+pub const MATCH_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_0008;
+pub const REPLACE_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_000A;
+pub const SEARCH_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_000B;
+pub const SPLIT_SYMBOL_ID: u64 = 0xFFFF_FFFF_FFFF_000C;
+
+/// `Symbol.match` 等四个协议符号作为属性键。
+pub fn match_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(MATCH_SYMBOL_ID)
+}
+
+pub fn replace_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(REPLACE_SYMBOL_ID)
+}
+
+pub fn search_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(SEARCH_SYMBOL_ID)
+}
+
+pub fn split_symbol_key() -> PropertyKey {
+    PropertyKey::Symbol(SPLIT_SYMBOL_ID)
+}
 
 /// `Symbol.toPrimitive` as a property key.
 pub fn to_primitive_symbol_key() -> PropertyKey {

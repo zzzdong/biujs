@@ -105,7 +105,15 @@ fn normalise_flags(flags: &str) -> Result<String, RuntimeError> {
 /// which is the ES behaviour and what makes `new RegExp(re, 'g')` work.
 pub fn regexp_construct_value(heap: &mut Heap, args: &[Value], proto: Option<Value>) -> Result<Value, RuntimeError> {
     let (source, flags) = match args.first() {
-        None => (String::new(), String::new()),
+        // `new RegExp(undefined)` / `RegExpCreate(undefined)` is the empty
+        // pattern (`/(?:)/`), not the literal text "undefined".
+        None | Some(Value::Undefined) => (
+            String::new(),
+            match args.get(1) {
+                Some(f) if !f.is_undefined() => normalise_flags(&f.to_js_string())?,
+                _ => String::new(),
+            },
+        ),
         Some(Value::Object(obj))
             if obj.borrow().kind() == crate::vm::property::ObjectKind::RegExp =>
         {
@@ -130,9 +138,14 @@ pub fn regexp_construct_value(heap: &mut Heap, args: &[Value], proto: Option<Val
             },
         ),
     };
+    // `RegExpCreate` uses `%RegExp.prototype%` when no explicit prototype is
+    // given (ES 22.2.1.1 step 4 / `OrdinaryCreateFromConstructor` default). A
+    // regexp with a null `[[Prototype]]` has no `test` / `exec` / `@@match` at
+    // all — `"abc".match("b")` builds one through this path and then dispatches
+    // `@@match` on it, which found nothing.
     let proto = match proto {
         Some(Value::Object(p)) => Some(p),
-        _ => None,
+        _ => super::wrapper_prototype("RegExp"),
     };
     Ok(Value::Object(heap.alloc(Object::RegExp(
         crate::vm::object::RegExpObject::new(source, flags, proto),
@@ -385,6 +398,28 @@ pub fn register_regexp_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     let _ = proto
         .borrow_mut()
         .define_property(heap, PropertyKey::Symbol(MATCH_ALL_SYMBOL_ID), match_all);
+
+    // `RegExp.prototype[Symbol.match]` / `[Symbol.replace]` / `[Symbol.search]` /
+    // `[Symbol.split]` (ES 22.2.5.x). These are what the four `String.prototype`
+    // methods dispatch through, so a **user** object carrying e.g.
+    // `[Symbol.replace]` takes over the operation instead of being coerced to a
+    // string. The implementations live in the VM (`call_native_by_name`): a
+    // function replacer has to call back into JS, which a builtin cannot do.
+    //
+    // The native name is the symbol's own name (`"Symbol.replace"`), not the
+    // property name: `RegExp.prototype.replace` does not exist, and dispatch is
+    // by native name.
+    for (key, native) in [
+        (super::match_symbol_key(), "Symbol.match"),
+        (super::replace_symbol_key(), "Symbol.replace"),
+        (super::search_symbol_key(), "Symbol.search"),
+        (super::split_symbol_key(), "Symbol.split"),
+    ] {
+        let desc = super::method_descriptor(Value::Object(
+            heap.alloc(Object::NativeFunction(NativeFunctionObject::new(native))),
+        ));
+        let _ = proto.borrow_mut().define_property(heap, key, desc);
+    }
 
     // ES 22.2.5：`source` / `flags` / `global` / … 是 `RegExp.prototype` 上的
     // 只读 accessor。以前一个都没注册，`RegExp.prototype.source` 是 undefined，

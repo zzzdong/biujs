@@ -33,7 +33,10 @@ pub use array::{
 };
 pub use date::date_construct_value;
 pub use regexp::match_all_matches;
-pub use regexp::{REGEXP_GETTER_PREFIX, regexp_prototype_getter};
+pub use regexp::{
+    REGEXP_GETTER_PREFIX, regexp_match, regexp_prototype_getter, regexp_replace, regexp_search,
+    regexp_split,
+};
 pub mod typedarray;
 pub mod reflect;
 pub mod proxy;
@@ -416,9 +419,11 @@ pub fn global_parse_float(args: &[Value]) -> Result<Value, RuntimeError> {
 pub use string::string_constructor;
 pub use symbol::symbol_constructor;
 pub use symbol::{
-    HAS_INSTANCE_SYMBOL_ID, SPECIES_SYMBOL_ID, SYMBOL_DESCRIPTION_NATIVE, TO_PRIMITIVE_SYMBOL_ID,
+    HAS_INSTANCE_SYMBOL_ID, MATCH_SYMBOL_ID, REPLACE_SYMBOL_ID, SEARCH_SYMBOL_ID,
+    SPECIES_SYMBOL_ID, SPLIT_SYMBOL_ID, SYMBOL_DESCRIPTION_NATIVE, TO_PRIMITIVE_SYMBOL_ID,
     TO_STRING_TAG_SYMBOL_ID, has_instance_symbol_key, is_concat_spreadable_symbol_key,
-    register_symbol_value, species_symbol_key, symbol_description, symbol_value_by_id,
+    match_symbol_key, register_symbol_value, replace_symbol_key, search_symbol_key,
+    species_symbol_key, split_symbol_key, symbol_description, symbol_value_by_id,
     to_primitive_symbol_key, to_string_tag_symbol_key,
 };
 
@@ -993,11 +998,11 @@ impl Builtins {
             ("toStringTag", symbol::TO_STRING_TAG_SYMBOL_ID, "Symbol.toStringTag"),
             ("species", symbol::SPECIES_SYMBOL_ID, "Symbol.species"),
             ("unscopables", 0xFFFF_FFFF_FFFF_0007, "Symbol.unscopables"),
-            ("match", 0xFFFF_FFFF_FFFF_0008, "Symbol.match"),
+            ("match", symbol::MATCH_SYMBOL_ID, "Symbol.match"),
             ("matchAll", 0xFFFF_FFFF_FFFF_0009, "Symbol.matchAll"),
-            ("replace", 0xFFFF_FFFF_FFFF_000A, "Symbol.replace"),
-            ("search", 0xFFFF_FFFF_FFFF_000B, "Symbol.search"),
-            ("split", 0xFFFF_FFFF_FFFF_000C, "Symbol.split"),
+            ("replace", symbol::REPLACE_SYMBOL_ID, "Symbol.replace"),
+            ("search", symbol::SEARCH_SYMBOL_ID, "Symbol.search"),
+            ("split", symbol::SPLIT_SYMBOL_ID, "Symbol.split"),
             ("dispose", 0xFFFF_FFFF_FFFF_000D, "Symbol.dispose"),
             ("asyncDispose", 0xFFFF_FFFF_FFFF_000E, "Symbol.asyncDispose"),
         ];
