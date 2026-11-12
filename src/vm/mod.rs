@@ -5198,17 +5198,19 @@ impl VM {
                             .ok();
                         matches!(target, Some(target) if self.is_constructor(&target, module))
                     }
-                    ObjectKind::NativeFunction => {
-                        let name = obj_ref
-                            .borrow().as_native_function()
-                            .map(|f| f.name.clone())
-                            .unwrap_or_default();
-                        // A qualified name is a static or prototype method, and
-                        // none of those is a constructor (ES 17); `Symbol` is
-                        // callable but explicitly not new-able.
-                        !name.contains('.') && name != "Symbol"
-                    }
-                    ObjectKind::Function => true,
+                    // 内建函数只有构造器有 `[[Construct]]`（`NativeFunctionObject`
+                    // 的 `constructible` 标志，由构造器注册点设置）。以前靠名字
+                    // 猜（"含 `.` 的是方法"），`Function.prototype.apply` 这种
+                    // 不带点的内建方法因此被误判成构造器。
+                    ObjectKind::NativeFunction => obj_ref
+                        .borrow()
+                        .as_native_function()
+                        .is_some_and(|f| f.is_constructible()),
+                    // 箭头函数没有 `[[Construct]]`；普通函数有。
+                    ObjectKind::Function => obj_ref
+                        .borrow()
+                        .as_function()
+                        .is_some_and(|f| f.captured_this.is_none()),
                     _ => false,
                 }
             }
@@ -5329,6 +5331,20 @@ impl VM {
             };
             all.extend(args.iter().cloned());
             return self.construct(&target, &all, module);
+        }
+        // ES 9.1.13：内建函数只有构造器才有 `[[Construct]]`。
+        // `new Math.max()` / `new (function(){}).call()` / `new Symbol()` 都是
+        // TypeError —— 以前这里对所有 native 一视同仁地放行，于是每个内建目录
+        // 里的 `not-a-constructor.js` 全失败。bound function 走上面的分支，
+        // 它的可构造性由 target 决定。
+        if let Value::Object(obj_ref) = constructor_val {
+            if let Object::NativeFunction(nf) = &*obj_ref.borrow() {
+                if !nf.is_constructible() {
+                    return Err(RuntimeError::TypeError(format!(
+                        "{name} is not a constructor"
+                    )));
+                }
+            }
         }
         if name == "Symbol" {
             // `Symbol` is callable but not a constructor (ES 19.4.1.1).

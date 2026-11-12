@@ -478,6 +478,37 @@ fn strict_functions_reject_caller_and_arguments() {
     );
 }
 
+/// `IsConstructor` 与 `new` 的边界（ES 7.3.20 / 9.1.13）。
+///
+/// 内建函数里只有构造器有 `[[Construct]]`：`new Math.max()`、`new (f.call)()`、
+/// `new Symbol()` 都是 TypeError；`Reflect.construct` 的 newTarget 也按同一判据。
+/// 以前 `is_constructor` 靠"名字里有没有点"猜，`Function.prototype.apply` 这种
+/// 不带点的内建方法因此被当成构造器（每个内建目录的 `not-a-constructor.js`）。
+#[test]
+fn only_constructors_have_construct() {
+    eval_js(
+        "function name_of(fn) { try { fn(); return 'none'; } catch (e) { return e.name; } }
+         if (name_of(function () { new Math.max(); }) !== 'TypeError') throw new Error('Math.max');
+         if (name_of(function () { new (function () {}).call(); }) !== 'TypeError') throw new Error('call');
+         if (name_of(function () { new Symbol(); }) !== 'TypeError') throw new Error('Symbol');
+         if (name_of(function () { Reflect.construct(function () {}, [], Function.prototype.apply); }) !== 'TypeError') {
+           throw new Error('newTarget');
+         }
+         // 构造器仍然可以 new。
+         if (name_of(function () { new Array(2); }) !== 'none') throw new Error('Array');
+         if (name_of(function () { new Map(); }) !== 'none') throw new Error('Map');
+         if (name_of(function () { new (function () {})(); }) !== 'none') throw new Error('user function');
+         // bound function 的可构造性跟 target 走，`instanceof` 也走 target。
+         function F(a) { this.a = a; }
+         var b = F.bind(null, 7);
+         var x = new b();
+         if (x.a !== 7) throw new Error('bound args: ' + x.a);
+         if (!(x instanceof F) || !(x instanceof b)) throw new Error('bound instanceof');
+         if (name_of(function () { new (Math.max.bind(null))(); }) !== 'TypeError') throw new Error('bound non-ctor');",
+    )
+    .unwrap();
+}
+
 /// `Function.prototype` **本身是函数对象**（ES 19.2.3）。
 ///
 /// 它以前是普通 `ProtoObject`，于是 `typeof Function.prototype` 是 "object"、

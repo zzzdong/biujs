@@ -74,6 +74,13 @@ pub fn proxy_construct(
 /// `Function.prototype.bind` uses for its wrapper).
 pub fn create_proxy_constructor(heap: &mut Heap) -> Value {
     let ctor = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new("Proxy"))));
+    // `Proxy` 没有 `prototype` 属性（实例继承自 target），所以不走
+    // `link_constructor_prototype` —— 但它是构造器（`new Proxy(t, h)`）。
+    if let Value::Object(obj_ref) = &ctor {
+        if let Object::NativeFunction(nf) = &mut *obj_ref.borrow_mut() {
+            nf.set_constructible(true);
+        }
+    }
     crate::builtins::set_static_method(&ctor, "revocable", heap, |_args: &[Value]| {
         Err(RuntimeError::InternalError(
             "Proxy.revocable is dispatched by the VM".to_string(),

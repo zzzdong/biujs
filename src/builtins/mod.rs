@@ -564,11 +564,17 @@ impl Builtins {
     fn link_constructor_prototype(heap: &mut Heap, fn_val: &Value, proto: &Gc<Object>) {
         if let Value::Object(obj_ref) = fn_val {
             let desc = constructor_prototype_descriptor(Value::Object(*proto));
-            let _ = obj_ref.borrow_mut().define_property(
+            let mut borrowed = obj_ref.borrow_mut();
+            let _ = borrowed.define_property(
                 heap,
                 PropertyKey::well_known("prototype").expect("well-known name"),
                 desc,
             );
+            // 走到这里的都是构造器，标记 [[Construct]]。`Symbol` 是唯一例外
+            // （它也有 `prototype` 属性却不是构造器），注册处会显式取消。
+            if let Object::NativeFunction(nf) = &mut *borrowed {
+                nf.set_constructible(true);
+            }
         }
         let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("constructor").expect("well-known name"),
             method_descriptor(fn_val.clone()),
@@ -714,6 +720,13 @@ impl Builtins {
         symbol::register_symbol_statics(&symbol_fn_val, &self.symbol_prototype, heap);
         symbol::register_symbol_prototype(&self.symbol_prototype, heap);
         Self::link_constructor_prototype(heap, &symbol_fn_val, &self.symbol_prototype);
+        // ES 19.4.1：`Symbol` **不是构造器**（`new Symbol()` 是 TypeError），
+        // 但它有 `Symbol.prototype`。
+        if let Value::Object(obj_ref) = &symbol_fn_val {
+            if let Object::NativeFunction(nf) = &mut *obj_ref.borrow_mut() {
+                nf.set_constructible(false);
+            }
+        }
 
         // `ArrayBuffer` and the TypedArray views (ES 25.1 / 23.2). The
         // constructors are dispatched by the VM: `new Uint8Array(buf)` builds a

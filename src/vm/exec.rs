@@ -2361,94 +2361,7 @@ impl VM {
             Instr::InstanceOf { dst, lhs, rhs } => {
                 let obj = self.get_value(lhs)?;
                 let ctor = self.get_value(rhs)?;
-                // **两侧**都可能是裸函数引用（`Value::Function(id)`）：物化之后
-                // 才有 `[[Prototype]]` 可走。以前只物化了 ctor，于是
-                // `function MyFunct(){}; MyFunct instanceof Function` 得到 false
-                //（lhs 不是 `Value::Object`，链遍历的起点直接是 `None`）。
-                let obj = self.as_object_value(&obj);
-                let ctor = self.as_object_value(&ctor);
-
-                // ES 12.10.4: a callable `@@hasInstance` on the right-hand side
-                // replaces the ordinary prototype-chain check. The arm must not
-                // return early — `run_instruction` advances the PC at its end.
-                let mut exotic_result: Option<bool> = None;
-                if ctor.is_object() {
-                    let has_instance = self.get_member(
-                        &ctor,
-                        &crate::builtins::has_instance_symbol_key(),
-                        module,
-                    )?;
-                    if !has_instance.is_undefined() {
-                        if !has_instance.is_callable() {
-                            return Err(RuntimeError::TypeError(
-                                "Symbol.hasInstance is not a function".to_string(),
-                            ));
-                        }
-                        let result =
-                            self.invoke(&has_instance, ctor.clone(), &[obj.clone()], module)?;
-                        exotic_result = Some(result.to_boolean());
-                    }
-                }
-
-                let result = match exotic_result {
-                    Some(found) => found,
-                    None => match ctor {
-                        Value::Object(ctor_ref) => {
-                            // ES 12.10.4 step 4: an object that is not callable
-                            // throws, it does not fall back to the prototype
-                            // walk. (`({}) instanceof this` at the top level is
-                            // how this surfaced: `this` used to be `undefined`,
-                            // which threw for the "not an object" reason.)
-                            if !ctor.is_callable() {
-                                return Err(RuntimeError::TypeError(
-                                    "Right-hand side of 'instanceof' is not callable".to_string(),
-                                ));
-                            }
-                            match &obj {
-                                Value::Object(obj_ref) => {
-                                    // ES 7.3.19 步骤 4–6：`prototype` 走 **Get**
-                                    //（可以是 accessor，getter 必须执行），且结果必须
-                                    // 是对象，否则 TypeError。以前用 own-only 的
-                                    // `property_get`（getter 不跑）且把"取不到"当 false。
-                                    let prototype_key = PropertyKey::well_known("prototype")
-                                        .expect("well-known name");
-                                    let proto_value = {
-                                        let ctor_val = Value::Object(ctor_ref);
-                                        self.get_member(&ctor_val, &prototype_key, module)?
-                                    };
-                                    let Value::Object(target_proto) = proto_value else {
-                                        return Err(RuntimeError::TypeError(format!(
-                                            "Function has non-object prototype '{}' in instanceof check",
-                                            proto_value.to_js_string()
-                                        )));
-                                    };
-                                    // Walk the object's prototype chain.
-                                    let mut current = obj_ref.borrow().get_prototype();
-                                    let mut found = false;
-                                    while let Some(proto_ref) = current {
-                                        if Value::Object(proto_ref) == Value::Object(target_proto) {
-                                            found = true;
-                                            break;
-                                        }
-                                        current = proto_ref.borrow().get_prototype();
-                                    }
-                                    found
-                                }
-                                // ES 7.3.19 步骤 3：左侧不是对象 ⇒ **false**，而且
-                                // 在 `Get(C, "prototype")` **之前** —— getter 不跑、
-                                // 也不会因为 prototype 是 primitive 而抛错
-                                //（`0 instanceof Function.prototype`）。
-                                _ => false,
-                            }
-                        }
-                        _ => {
-                            return Err(RuntimeError::TypeError(
-                                "Right-hand side of 'instanceof' is not callable".to_string(),
-                            ));
-                        }
-                    },
-                };
-
+                let result = self.instanceof_operator(&obj, &ctor, module)?;
                 self.set_value(dst, Value::Bool(result))?;
             }
             Instr::In { dst, lhs, rhs } => {
@@ -2471,6 +2384,89 @@ impl VM {
         }
         self.state.jump_offset(1);
         Ok(true)
+    }
+
+    /// ES 12.9.4 `InstanceofOperator(O, C)` → 7.3.19 `OrdinaryHasInstance`。
+    ///
+    /// 单独成一个函数是为了**递归**：C 是 bound function 时规范要求对它的
+    /// target 重新做一次（step 2）—— bound function 自己没有 `prototype`
+    /// 属性，直接走 step 4 会拿到 `undefined` 然后抛 TypeError
+    ///（`new (F.bind(null))() instanceof F.bind(null)` 就这样失败）。
+    fn instanceof_operator(
+        &mut self,
+        obj_value: &Value,
+        ctor_value: &Value,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
+        // 两侧都可能是裸函数引用（`Value::Function(id)`）：物化之后才有
+        // `[[Prototype]]` 可走。以前只物化了 RHS，于是
+        // `function MyFunct(){}; MyFunct instanceof Function` 得到 false。
+        let obj = self.as_object_value(obj_value);
+        let ctor = self.as_object_value(ctor_value);
+
+        // 12.9.4 step 4：可调用的 `@@hasInstance` 取代整条判断。
+        if ctor.is_object() {
+            let has_instance = self.get_member(
+                &ctor,
+                &crate::builtins::has_instance_symbol_key(),
+                module,
+            )?;
+            if !has_instance.is_undefined() {
+                if !has_instance.is_callable() {
+                    return Err(RuntimeError::TypeError(
+                        "Symbol.hasInstance is not a function".to_string(),
+                    ));
+                }
+                let result = self.invoke(&has_instance, ctor.clone(), &[obj.clone()], module)?;
+                return Ok(result.to_boolean());
+            }
+        }
+
+        // 12.10.4 step 4：不可调用的对象是 TypeError，不回落到原型链。
+        if !matches!(&ctor, Value::Object(_)) || !ctor.is_callable() {
+            return Err(RuntimeError::TypeError(
+                "Right-hand side of 'instanceof' is not callable".to_string(),
+            ));
+        }
+
+        // 7.3.19 step 2：bound function ⇒ 对 target 递归。
+        if let Some(target) = self.bound_function_target(&ctor) {
+            return self.instanceof_operator(&obj, &target, module);
+        }
+
+        // 7.3.19 step 3：左侧不是对象 ⇒ false，**在** `Get(C, "prototype")` 之前
+        // （getter 不跑，也不会因为 prototype 是 primitive 而抛 ——
+        // `0 instanceof Function.prototype`）。
+        let Value::Object(obj_ref) = &obj else {
+            return Ok(false);
+        };
+
+        // 7.3.19 step 4–6：`prototype` 走 **Get**（accessor 会执行），且结果必须
+        // 是对象，否则 TypeError。以前用 own-only 的 `property_get`。
+        let prototype_key = PropertyKey::well_known("prototype").expect("well-known name");
+        let proto_value = self.get_member(&ctor, &prototype_key, module)?;
+        let Value::Object(target_proto) = proto_value else {
+            return Err(RuntimeError::TypeError(format!(
+                "Function has non-object prototype '{}' in instanceof check",
+                proto_value.to_js_string()
+            )));
+        };
+
+        let mut current = obj_ref.borrow().get_prototype();
+        while let Some(proto_ref) = current {
+            if Value::Object(proto_ref) == Value::Object(target_proto) {
+                return Ok(true);
+            }
+            current = proto_ref.borrow().get_prototype();
+        }
+        Ok(false)
+    }
+
+    /// bound function 的 target（不是 bound function 时是 `None`）。
+    fn bound_function_target(&self, val: &Value) -> Option<Value> {
+        let name = crate::builtins::native_function_name(val)?;
+        let id: u32 = name.strip_prefix(BOUND_PREFIX)?.parse().ok()?;
+        self.bound_functions.get(&id).map(|b| b.target.clone())
     }
 
     /// `DelegateOpen`/`DelegateClose`/`MakeIter`/`IterNext`/`IterClose`/`RequireObjectCoercible`/`MakeRest`

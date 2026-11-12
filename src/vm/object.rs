@@ -1895,6 +1895,13 @@ pub struct NativeFunctionObject {
     /// 其中 `property_set` 无条件覆盖成默认数据描述符 —— `Array.isArray.length = 9`
     /// 能把 arity 的只读位冲掉（`FunctionObject` 在 1B 第七片修过同一个 bug）。
     base: OrdinaryObject,
+    /// 是否有 `[[Construct]]`（ES 9.1.13）。
+    ///
+    /// 内建函数里**只有构造器**可构造：`new Math.max()`、`new (f.call)()`、
+    /// `new Symbol()` 都必须抛 TypeError，而 `not-a-constructor.js` 在每个内建
+    /// 目录里都有一份。默认 false，构造器注册时（`link_constructor_prototype`
+    /// 与 `Proxy`）显式标 true —— 反过来做（默认可构造、逐个禁）会漏。
+    constructible: bool,
 }
 
 impl NativeFunctionObject {
@@ -1907,9 +1914,23 @@ impl NativeFunctionObject {
             base: OrdinaryObject::with_optional_prototype(
                 crate::builtins::wrapper_prototype("Function"),
             ),
+            constructible: false,
         };
         obj.install_metadata();
         obj
+    }
+
+    /// `[[Construct]]` 是否存在。
+    pub fn is_constructible(&self) -> bool {
+        self.constructible
+    }
+
+    /// 标记这是不是一个构造器。
+    ///
+    /// 只在构造器注册点调用：`Builtins::link_constructor_prototype`（20 处）
+    /// 与 `Proxy` 的构造器（它没有 `prototype` 属性，不走那个函数）。
+    pub fn set_constructible(&mut self, constructible: bool) {
+        self.constructible = constructible;
     }
 
     /// Install the standard `length` / `name` own properties (ES 10.2.9/10.2.10):

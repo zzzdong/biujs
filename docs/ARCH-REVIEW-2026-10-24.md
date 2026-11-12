@@ -837,6 +837,33 @@ SyntaxError。oxc 的 parser 与 semantic builder 都不报这一条，于是
 `language/expressions/instanceof` 22→27、`built-ins/Function` 170→178、
 `language/expressions/property-accessors` 15→16。
 
+**第十八片已落地（2026-11-12）：`IsConstructor` 与构造器注册。**
+
+`NativeFunctionObject` 新增 `constructible` 标志（默认 false），由构造器注册点
+显式标 true：`link_constructor_prototype`（20 处，覆盖 Object/Array/Function/
+Error 家族/Map/Set/Weak*/Promise/Date/RegExp/ArrayBuffer/DataView/TypedArray）
+与 `Proxy`（它没有 `prototype` 属性，不走那个函数），`Symbol` 在注册后显式取消
+（有 `Symbol.prototype` 却不是构造器）。
+
+两处消费它：
+
+- `native_construct` 入口：非构造器的内建函数 `new` 时抛 TypeError ——
+  `new Math.max()`、`new (function(){}).call()`、`new Symbol()`；
+- `is_constructor`（`Reflect.construct` 的 newTarget 检查）：原来靠"名字里有没有
+  `.`"猜，于是 `Function.prototype.apply` 这种不带点的内建方法被当成构造器；
+  箭头函数也改成按 `captured_this` 判定。
+
+顺带把 `instanceof` 抽成 `VM::instanceof_operator`，以支持规范要求的递归：C 是
+bound function 时对它的 target 重新做一次（7.3.19 step 2）—— bound function
+自己没有 `prototype`，`new (F.bind(null))() instanceof F.bind(null)` 以前在
+step 4 拿到 undefined 就抛了。
+
+**验收：全量 17,569 → 17,731 / 20,504（85.69% → 86.48%），无逐套件回退。**
+提升：`Array` +41、`String` +32、`TypedArray` +30、`Set` +15、`Map` +12、
+`Function` +8、`WeakMap` +6、`Number` +6、`Object` +5、`WeakSet` +3、
+`Boolean` +2、`Symbol` +2、`Promise` +2、`Proxy` +1、`Error` +1，两个
+`Symbol.iterator` 子套件各 +1。
+
 剩余（按序）：
 - descriptor 惰性物化：`Map` / `Set` 也换到槽位（`NativeFunction` 已完成），
   把 `PropertyTable` 收成"只有字典模式用"。`Map` / `Set` 牵动 `WeakMap` /
