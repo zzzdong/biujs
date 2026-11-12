@@ -213,15 +213,11 @@ pub fn array_constructor(heap: &mut Heap, args: &[Value]) -> Result<Value, Runti
                 return Err(RuntimeError::RangeError("Invalid array length".to_string()));
             }
             let len = int_len as usize;
-            if len > MAX_MATERIALIZED_LEN {
-                return Err(RuntimeError::RangeError(
-                    "Invalid array length".to_string(),
-                ));
-            }
-            let mut arr = ArrayObject::with_capacity(len);
-            for _ in 0..len {
-                arr.push(Value::Undefined);
-            }
+            // `new Array(n)` is `n` **holes**, not `n` `undefined` elements:
+            // `0 in new Array(3)` is false and `Object.keys` is empty. Only the
+            // length moves, so the `MAX_MATERIALIZED_LEN` guard is no longer
+            // needed on this path — nothing is allocated.
+            let arr = ArrayObject::with_length(len);
             return Ok(Value::Object(heap.alloc(Object::Array(arr))));
         }
     }
@@ -232,11 +228,17 @@ pub fn array_constructor(heap: &mut Heap, args: &[Value]) -> Result<Value, Runti
     Ok(Value::Object(heap.alloc(Object::Array(arr))))
 }
 
-/// Validate an array `length` assignment, returning the materialized length or
-/// `Err` when the spec requires a `RangeError`.
+/// Validate an array `length` assignment, returning the new length or `Err`
+/// when the spec requires a `RangeError` (ES 10.4.2.4: `ToUint32` round-trip).
+///
+/// The old `MAX_MATERIALIZED_LEN` cap is gone from here: `length` is a number
+/// decoupled from the element store now, so `a.length = 2**32 - 1` costs
+/// nothing. The cap still guards the paths that *materialize* a result
+/// (`ArraySpeciesCreate` / `Array.from` / `join`), where a huge length would
+/// mean a huge allocation or loop.
 pub fn validate_array_length(n: f64) -> Result<usize, RuntimeError> {
     let int_len = to_uint32(n) as usize;
-    if n != int_len as f64 || int_len > MAX_MATERIALIZED_LEN {
+    if n != int_len as f64 {
         return Err(RuntimeError::RangeError(
             "Invalid array length".to_string(),
         ));

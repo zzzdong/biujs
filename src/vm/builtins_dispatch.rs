@@ -1953,7 +1953,16 @@ impl VM {
         // an absent argument reads as ToIntegerOf(undefined) = 0.
         let from = match args.get(1) {
             Some(v) if !v.is_undefined() => {
-                crate::builtins::to_integer_or_infinity_throwing(Some(v))?
+                // `ToNumber` runs `ToPrimitive`, i.e. a user `valueOf` /
+                // `toString` on an object argument (`fromIndex` of `{toString() {
+                // toStringAccessed = true; return 1 }}` must be observed).
+                let primitive = match v {
+                    Value::Object(_) | Value::Function(_) => {
+                        self.to_primitive(v, "number", module)?
+                    }
+                    _ => v.clone(),
+                };
+                crate::builtins::to_integer_or_infinity_throwing(Some(&primitive))?
             }
             _ => {
                 if method == "indexOf" {

@@ -1,6 +1,6 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
-# 最近更新：2026-11-12
+# 最近更新：2026-11-13
 # guards: timeout 0 step-limit 0 memory 14 (TEST262_TIMEOUT_MS=15000 TEST262_STEP_LIMIT=0 TEST262_MEMORY_MB=384)
 language/statements/for-of	623	52	76
 language/statements/for-in	72	28	15
@@ -24,11 +24,11 @@ language/statements/function	331	115	5
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	55	18	0
-built-ins/Array	2389	187	505
+built-ins/Array	2518	187	376
 built-ins/JSON	123	29	13
 built-ins/WeakSet	84	1	0
 built-ins/Number	252	38	50
-built-ins/Proxy	229	49	33
+built-ins/Proxy	230	49	32
 language/statements/generators	239	21	6
 language/destructuring	17	1	1
 built-ins/String/prototype/Symbol.iterator	5	0	1
@@ -54,7 +54,7 @@ language/computed-property-names	42	0	6
 built-ins/Boolean	38	3	10
 built-ins/Map	199	5	0
 built-ins/TypedArray	333	513	600
-built-ins/Object	3158	32	221
+built-ins/Object	3177	32	202
 built-ins/String	827	72	324
 language/expressions/generators	250	30	10
 language/expressions/assignment/destructuring	3	1	4
@@ -80,7 +80,7 @@ language/literals/null	3	0	0
 language/identifiers	202	66	0
 built-ins/Error	45	6	42
 built-ins/Set	363	4	16
-built-ins/Math	306	0	21
+built-ins/Math	308	0	19
 built-ins/Promise	247	292	138
 built-ins/Symbol	61	21	16
 language/expressions/yield	42	2	19

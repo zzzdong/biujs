@@ -3,8 +3,8 @@ use std::rc::Rc;
 
 use crate::RuntimeError;
 use crate::vm::gc::{Heap, Object};
-use crate::vm::object::{NativeFunctionObject, OrdinaryObject};
-use crate::vm::property::PropertyKey;
+use crate::vm::object::{JSObject, NativeFunctionObject, OrdinaryObject};
+use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
 
 /// Build the `Math` namespace object.
@@ -14,6 +14,12 @@ use crate::vm::value::Value;
 /// (`"Math.floor"`) which the VM resolves through `call_static_method`.
 pub fn create_math_object(heap: &mut Heap) -> Value {
     let mut math = OrdinaryObject::new();
+    // `Math` inherits from `Object.prototype` like any other object: without
+    // this it had no `hasOwnProperty` / `toString` / `valueOf` at all
+    // (`Math.hasOwnProperty("PI")` was `undefined`).
+    if let Some(object_proto) = super::wrapper_prototype("Object") {
+        math.set_prototype(Some(object_proto));
+    }
 
     let methods: &[&str] = &[
         "abs", "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "ceil", "clz32",
@@ -49,6 +55,22 @@ pub fn create_math_object(heap: &mut Heap) -> Value {
             super::constant_descriptor(Value::Number(value)),
         );
     }
+
+    // `Math[Symbol.toStringTag] === "Math"` (ES 20.2.2.36):
+    // `Object.prototype.toString.call(Math)` must be `"[object Math]"`, which is
+    // what the `Array.prototype` generics assert when they are applied to it.
+    let _ = math.define_property(
+        heap,
+        super::to_string_tag_symbol_key(),
+        PropertyDescriptor {
+            value: Value::string("Math"),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            getter: None,
+            setter: None,
+        },
+    );
 
     Value::Object(heap.alloc(Object::Ordinary(math)))
 }

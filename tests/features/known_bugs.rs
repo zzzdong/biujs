@@ -230,8 +230,9 @@ fn an_executed_inner_catch_does_not_swallow_the_outer_handler() {
 /// `elements.len() <= length`，(len..length) 全是洞；`dense_elements()` 只在
 /// `elements.len() == length && holes.is_empty()` 时给快路径。这样
 /// `new Array(1e9)` 只占一个数字，不再是 1e9 个槽。
+/// **已修**：`ArrayObject` 现在有独立的 `length`（`elements.len() <= length`，
+/// 其后全是洞），`new Array(n)` / `length` 扩展只写这个数字。
 #[test]
-#[ignore = "known bug #5：ArrayObject 没有独立的 length，尾部洞无法表示"]
 fn array_holes_from_new_array_and_length_extension() {
     assert_eq!(eval_string("String(Object.keys(new Array(3)).length)"), "0");
     assert_eq!(eval_bool("0 in new Array(3)"), false);

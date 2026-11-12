@@ -907,7 +907,18 @@ impl VM {
         };
         let target = boxed.as_ref().unwrap_or(receiver);
         let len_value = self.get_member(target, &PropertyKey::well_known("length").expect("well-known name"), module)?;
-        // `ToLength(ToNumber(…))`: a Symbol length is a TypeError, not 0.
+        // `ToLength(ToNumber(…))` and `ToNumber` runs `ToPrimitive(hint number)`,
+        // which is *user code*: `{ length: { toString() { accessed = true; return
+        // "2" } } }` must be observed (`Array.prototype.map - value of 'length' is
+        // an Object which has an own toString method`). `Value::to_number()`
+        // cannot run it, so the conversion happens here, where `module` is.
+        let len_value = match &len_value {
+            Value::Object(_) | Value::Function(_) => {
+                self.to_primitive(&len_value, "number", module)?
+            }
+            _ => len_value,
+        };
+        // A Symbol length is a TypeError, not 0.
         let len = crate::builtins::to_number_throwing(&len_value)?;
         if !len.is_finite() || len <= 0.0 {
             return Ok(0);

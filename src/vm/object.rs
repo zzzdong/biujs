@@ -992,7 +992,17 @@ impl Default for OrdinaryObject {
 #[derive(Debug, Clone)]
 pub struct ArrayObject {
     header: ObjectHeader,
+    /// Slots `0..elements.len()` (sparse: see `holes`).
     elements: Vec<Value>,
+    /// `length` — **decoupled from `elements.len()`**.
+    ///
+    /// Invariant: `elements.len() <= length`, and every index in
+    /// `elements.len()..length` is a hole (absent, `in` false, not in
+    /// `Object.keys`). That is what lets `new Array(3)` / `a.length = 1e9` be a
+    /// single number instead of a billion `undefined` slots: before this field
+    /// existed, `elements.len()` doubled as `length`, so a tail hole could not
+    /// be represented at all and `new Array(3)` produced three *elements*.
+    length: usize,
     /// Non-index own properties (`length` aside): `arr.x = 1`, methods hung
     /// off an instance, symbol keys. Elements *with non-default descriptors or
     /// accessors* also land here, keyed by their index string.
@@ -1007,8 +1017,15 @@ pub struct ArrayObject {
 
 impl ArrayObject {
     pub fn new() -> Self {
+        Self::with_length(0)
+    }
+
+    /// An array of `length` holes: `new Array(n)` / `Array(n)` /
+    /// `ArraySpeciesCreate(O, n)`. No slot is allocated for the tail.
+    pub fn with_length(length: usize) -> Self {
         Self {
             elements: Vec::new(),
+            length,
             properties: PropertyTable::new(),
             holes: std::collections::BTreeSet::new(),
             length_writable: true,
@@ -1030,42 +1047,102 @@ impl ArrayObject {
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            elements: Vec::with_capacity(cap),
-            properties: PropertyTable::new(),
-            holes: std::collections::BTreeSet::new(),
-            length_writable: true,
-            // Arrays created by the engine (literals, `Array(...)`, `map`,
-            // `slice`, …) inherit from `Array.prototype` unconditionally.
-            header: ObjectHeader::with_optional_prototype(crate::builtins::wrapper_prototype("Array")),
-        }
+        let mut array = Self::with_length(0);
+        array.elements.reserve(cap);
+        array
     }
 
     pub fn from_vec(vec: Vec<Value>) -> Self {
-        Self {
-            elements: vec,
-            properties: PropertyTable::new(),
-            holes: std::collections::BTreeSet::new(),
-            length_writable: true,
-            // Arrays created by the engine (literals, `Array(...)`, `map`,
-            // `slice`, …) inherit from `Array.prototype` unconditionally.
-            header: ObjectHeader::with_optional_prototype(crate::builtins::wrapper_prototype("Array")),
+        let length = vec.len();
+        let mut array = Self::with_length(length);
+        array.elements = vec;
+        array
+    }
+
+    /// Build from per-index slots: `None` is a hole. Used by `slice` / `concat`
+    /// / `map`, which must keep the receiver's holes instead of filling them
+    /// with `undefined`.
+    pub fn from_slots(slots: Vec<Option<Value>>) -> Self {
+        let mut array = Self::with_length(slots.len());
+        for (i, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some(value) => array.elements.push(value),
+                None => {
+                    array.elements.push(Value::Undefined);
+                    array.holes.insert(i);
+                }
+            }
+        }
+        array
+    }
+
+    /// `elements.len()..length` are holes; `holes` describes the ones below.
+    fn tail_holes(&self) -> usize {
+        self.length.saturating_sub(self.elements.len())
+    }
+
+    /// Turn the tail holes into real (marked) slots.
+    ///
+    /// Only the operations that *renumber* every index need it (`shift`,
+    /// `unshift`, `splice`, `reverse`, `sort`): they move slots around, and the
+    /// tail would otherwise have to be special-cased at every step. They are
+    /// already O(length) per spec, so materialising costs nothing extra.
+    fn materialize_tail(&mut self) {
+        let old = self.elements.len();
+        if old < self.length {
+            self.elements.resize(self.length, Value::Undefined);
+            for i in old..self.length {
+                self.holes.insert(i);
+            }
+        }
+    }
+
+    /// Make room for index `new_len - 1`, marking the gap as holes.
+    ///
+    /// `var a = []; a[2] = 1` must leave `0 in a` false — the slots before the
+    /// written index are holes, not `undefined` elements.
+    fn grow_dense_to(&mut self, new_len: usize) {
+        let old = self.elements.len();
+        if new_len <= old {
+            return;
+        }
+        self.elements.resize(new_len, Value::Undefined);
+        for i in old..new_len {
+            self.holes.insert(i);
         }
     }
 
     pub fn push(&mut self, value: Value) {
-        self.elements.push(value);
+        let index = self.length;
+        self.length += 1;
+        if index < self.elements.len() {
+            // Cannot happen (`elements.len() <= length`), but stay total.
+            self.elements[index] = value;
+            self.holes.remove(&index);
+        } else if index == self.elements.len() {
+            self.elements.push(value);
+        } else {
+            // Sparse tail: the index has no slot, so it lives in the table.
+            self.properties
+                .insert(Self::index_key(index), PropertyDescriptor::data_descriptor(value));
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.elements.len()
+        self.length
     }
 
     pub fn get(&self, index: usize) -> Option<&Value> {
+        if index >= self.elements.len() || self.holes.contains(&index) {
+            return None;
+        }
         self.elements.get(index)
     }
 
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
+        if index >= self.elements.len() || self.holes.contains(&index) {
+            return None;
+        }
         self.elements.get_mut(index)
     }
 
@@ -1073,12 +1150,12 @@ impl ArrayObject {
     ///
     /// `None` as soon as there is a hole or an accessor element (`holes` covers
     /// both: an accessor definition turns its dense slot into a hole, see
-    /// `define_property`). Read families use this to skip the per-element
-    /// `[[Get]]` walk — without it `join` / `slice` / `concat` / spread on a
-    /// plain array cost two property lookups per element (measured 2× slower on
-    /// a 20k-element loop).
+    /// `define_property`) or the tail is sparse. Read families use this to skip
+    /// the per-element `[[Get]]` walk — without it `join` / `slice` / `concat` /
+    /// spread on a plain array cost two property lookups per element (measured
+    /// 2× slower on a 20k-element loop).
     pub fn dense_elements(&self) -> Option<&[Value]> {
-        if self.holes.is_empty() {
+        if self.holes.is_empty() && self.elements.len() == self.length {
             Some(&self.elements)
         } else {
             None
@@ -1098,9 +1175,9 @@ impl ArrayObject {
     pub fn mark_hole(&mut self, index: usize) {
         if index < self.elements.len() {
             self.elements[index] = Value::Undefined;
+            self.holes.insert(index);
         }
         self.properties.remove(&Self::index_key(index));
-        self.holes.insert(index);
     }
 
     /// Drop every index-keyed entry from the property table (after a dense
@@ -1122,27 +1199,50 @@ impl ArrayObject {
     }
 
     pub fn pop(&mut self) -> Value {
-        self.elements.pop().unwrap_or(Value::Undefined)
+        if self.length == 0 {
+            return Value::Undefined;
+        }
+        let index = self.length - 1;
+        self.length = index;
+        if index < self.elements.len() {
+            let value = self.elements.pop().unwrap_or(Value::Undefined);
+            let was_hole = self.holes.remove(&index) || self.properties.remove(&Self::index_key(index)).is_some();
+            return if was_hole { Value::Undefined } else { value };
+        }
+        // Sparse tail: the value (if any) sits in the property table.
+        self.properties
+            .remove(&Self::index_key(index))
+            .map(|desc| desc.value)
+            .unwrap_or(Value::Undefined)
     }
 
     pub fn shift(&mut self) -> Value {
-        if self.elements.is_empty() {
+        if self.length == 0 {
             return Value::Undefined;
         }
-        let value = Some(self.elements.remove(0)).unwrap_or(Value::Undefined);
+        let first = self
+            .get(0)
+            .cloned()
+            .or_else(|| self.properties.remove(&Self::index_key(0)).map(|d| d.value))
+            .unwrap_or(Value::Undefined);
+        self.materialize_tail();
+        self.elements.remove(0);
+        self.length -= 1;
         self.drop_index_property_entries();
-        value
+        first
     }
 
     pub fn unshift(&mut self, value: Value) -> f64 {
+        self.materialize_tail();
         self.elements.insert(0, value);
+        self.length += 1;
         self.drop_index_property_entries();
-        self.elements.len() as f64
+        self.length as f64
     }
 
     pub fn index_of(&self, needle: &Value, from_index: usize) -> isize {
-        for i in from_index..self.elements.len() {
-            if self.elements[i].strict_eq(needle) {
+        for i in from_index..self.length {
+            if self.get(i).is_some_and(|v| v.strict_eq(needle)) {
                 return i as isize;
             }
         }
@@ -1150,51 +1250,77 @@ impl ArrayObject {
     }
 
     pub fn includes(&self, needle: &Value) -> bool {
-        self.elements.iter().any(|v| v.strict_eq(needle))
+        // Holes read as `undefined` (ES 23.1.3.13 has no `HasProperty` step).
+        (0..self.length).any(|i| {
+            let value = self.get(i).cloned().unwrap_or(Value::Undefined);
+            value.strict_eq(needle)
+                || matches!((&value, needle), (Value::Number(a), Value::Number(b)) if a.is_nan() && b.is_nan())
+        })
     }
 
     /// In-place `Array.prototype.reverse`.
     pub fn reverse(&mut self) {
+        self.materialize_tail();
         self.elements.reverse();
         self.drop_index_property_entries();
     }
 
     /// Replace all elements (used by `Array.prototype.sort`).
     pub fn replace_elements(&mut self, elements: Vec<Value>) {
+        self.length = elements.len();
         self.elements = elements;
         self.drop_index_property_entries();
     }
 
-    /// `Array.prototype.join`: `null` and `undefined` (and holes, which are
-    /// stored as `undefined`) contribute the empty string (ES 23.1.3.15).
+    /// `Array.prototype.join`: `null` and `undefined` (and holes) contribute the
+    /// empty string (ES 23.1.3.15).
     pub fn join(&self, separator: &str) -> String {
-        self.elements
-            .iter()
-            .map(|v| match v {
-                Value::Undefined | Value::Null => String::new(),
-                other => other.to_js_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(separator)
+        let render = |v: &Value| match v {
+            Value::Undefined | Value::Null => String::new(),
+            other => other.to_js_string(),
+        };
+        if let Some(dense) = self.dense_elements() {
+            return dense
+                .iter()
+                .map(render)
+                .collect::<Vec<_>>()
+                .join(separator);
+        }
+        let mut out = String::new();
+        for i in 0..self.length {
+            if i > 0 {
+                out.push_str(separator);
+            }
+            if let Some(value) = self.get(i) {
+                out.push_str(&render(value));
+            }
+        }
+        out
     }
 
     pub fn slice(&self, start: usize, end: usize) -> Self {
-        if start >= self.elements.len() {
-            return Self::new();
-        }
-        let end = end.min(self.elements.len());
+        let end = end.min(self.length);
         // `Array.prototype.slice` allows `end <= start` (e.g. `a.slice(3, 1)`),
         // which must yield an empty array rather than panicking on a bad range.
         if end <= start {
             return Self::new();
         }
-        Self::from_vec(self.elements[start..end].to_vec())
+        let slots = (start..end)
+            .map(|i| {
+                self.get(i)
+                    .cloned()
+                    .or_else(|| self.properties.get(&Self::index_key(i)).map(|d| d.value.clone()))
+            })
+            .collect();
+        Self::from_slots(slots)
     }
 
     pub fn concat(&self, other: &[Value]) -> Self {
-        let mut new_elements = self.elements.clone();
-        new_elements.extend_from_slice(other);
-        Self::from_vec(new_elements)
+        let mut slots: Vec<Option<Value>> = (0..self.length)
+            .map(|i| self.get(i).cloned())
+            .collect();
+        slots.extend(other.iter().cloned().map(Some));
+        Self::from_slots(slots)
     }
 
     pub fn splice(
@@ -1203,6 +1329,7 @@ impl ArrayObject {
         delete_count: usize,
         insert_items: &[Value],
     ) -> Vec<Value> {
+        self.materialize_tail();
         let end = (start + delete_count).min(self.elements.len());
         let removed: Vec<Value> = self.elements.drain(start..end).collect();
         let mut pos = start;
@@ -1210,12 +1337,13 @@ impl ArrayObject {
             self.elements.insert(pos, item.clone());
             pos += 1;
         }
+        self.length = self.elements.len();
         self.drop_index_property_entries();
         removed
     }
 
     pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
+        self.length == 0
     }
 
     /// 密集元素的键。`Index` 而不是 `Str`：索引键不再需要 `Rc<String>` 分配，
@@ -1224,8 +1352,11 @@ impl ArrayObject {
         PropertyKey::from_index(index as u32)
     }
 
-    /// ES 10.4.2.4 `ArraySetLength`: change the dense store's length, deleting
-    /// elements from the top down on the way down.
+    /// ES 10.4.2.4 `ArraySetLength`: change `length`, deleting elements from the
+    /// top down on the way down.
+    ///
+    /// Growing only moves the number — the new range is holes by definition, so
+    /// `new Array(1e9)` costs nothing.
     ///
     /// The first index that refuses deletion (`[[Configurable]] === false`, or
     /// a frozen/sealed array) stops the walk: the length is clamped to just
@@ -1233,25 +1364,38 @@ impl ArrayObject {
     /// the request reports *failure* — the caller turns that into a TypeError.
     /// Returns `false` exactly in that case.
     pub fn resize_length(&mut self, new_len: usize) -> bool {
-        let old_len = self.elements.len();
+        let old_len = self.length;
         if new_len >= old_len {
-            self.elements.resize(new_len, Value::Undefined);
+            self.length = new_len;
             return true;
         }
-        let mut clamped = new_len;
-        let mut idx = old_len;
-        while idx > new_len {
-            idx -= 1;
-            let key = Self::index_key(idx);
-            let undeletable = self.properties.get(&key).is_some_and(|d| !d.configurable)
-                || self.header.is_frozen()
-                || self.header.is_sealed();
-            if undeletable {
-                clamped = idx + 1;
-                break;
+        // Only *existing, non-configurable* indices can block the shrink; the
+        // tail holes between `elements.len()` and `length` are not elements and
+        // must not make the walk O(length) (`a.length = 2**32 - 1` followed by
+        // `a.length = 0` used to be four billion iterations).
+        let mut blocker: Option<usize> = None;
+        for key in self.properties.keys() {
+            let Some(index) = key.array_index() else {
+                continue;
+            };
+            let index = index as usize;
+            if index >= new_len
+                && self
+                    .properties
+                    .get(&key)
+                    .is_some_and(|desc| !desc.configurable)
+            {
+                blocker = Some(blocker.map_or(index, |b| b.max(index)));
             }
         }
-        self.elements.resize(clamped, Value::Undefined);
+        let clamped = match blocker {
+            Some(index) => index + 1,
+            None => new_len,
+        };
+        if self.elements.len() > clamped {
+            self.elements.truncate(clamped);
+        }
+        self.length = clamped;
         self.holes.retain(|&i| i < clamped);
         let stale: Vec<PropertyKey> = self
             .properties
@@ -1277,7 +1421,7 @@ impl JSObject for ArrayObject {
             // Array `length`: writable (until frozen so), non-enumerable,
             // non-configurable (ES 10.4.2.1).
             return Some(PropertyDescriptor {
-                value: Value::Number(self.elements.len() as f64),
+                value: Value::Number(self.length as f64),
                 writable: self.length_writable,
                 enumerable: false,
                 configurable: false,
@@ -1287,21 +1431,17 @@ impl JSObject for ArrayObject {
         }
         // 索引键（`Index` 或规范形式的字符串键）—— 判定只有 `array_index()` 一处。
         if let Some(index) = key.array_index() {
-            let idx = index as usize;
             // An index key with a stored override (non-default attributes or
             // an accessor) is reported from the property table.
             if let Some(desc) = self.properties.get(key) {
                 return Some(desc.clone());
             }
-            // A hole is *absent*, so it must not shadow an inherited
+            // A hole (deleted slot, or an index past the dense store but below
+            // `length`) is *absent*, so it must not shadow an inherited
             // property: after `delete arr[1]`, `arr[1]` still sees
             // `Array.prototype[1]` (and `has_property`/`own_keys` agree).
-            if self.holes.contains(&idx) {
-                return None;
-            }
             return self
-                .elements
-                .get(idx)
+                .get(index as usize)
                 .map(|v| PropertyDescriptor::data_descriptor(v.clone()));
         }
         self.properties.get(key).cloned()
@@ -1350,30 +1490,29 @@ impl JSObject for ArrayObject {
                 }
                 return Ok(true);
             }
-            // Elements are stored densely, so refuse indices that would
-            // require an enormous (or non-representable) backing store.
-            // Without this, `arr[4294967295] = x` tries to allocate
-            // 2**32 slots (≈96 GB) and aborts the process.
-            if idx >= MAX_DENSE_ELEMENTS {
-                return Err(PropertyError::type_error(format!(
-                    "Array index {idx} is out of the supported range"
-                )));
-            }
             // An assignment that would *add* an element goes through
             // `[[DefineOwnProperty]]` (ES 10.4.2.1 step 4.b), which
             // refuses it while `length` is read-only — the same guard
             // as in `define_property`.
-            if idx >= self.elements.len() && !self.length_writable {
+            if idx >= self.length && !self.length_writable {
                 return Err(PropertyError::type_error("Cannot add element to an array with a non-writable length"));
             }
-            if idx >= self.elements.len() {
-                self.elements.resize(idx + 1, Value::Undefined);
+            if idx >= MAX_DENSE_ELEMENTS {
+                // Sparse write: the index gets a table entry and only `length`
+                // moves. `arr[2**32 - 2] = x` used to abort the process on a
+                // 96 GB allocation.
+                self.properties
+                    .insert(key, PropertyDescriptor::data_descriptor(value));
+                self.length = self.length.max(idx + 1);
+                return Ok(true);
             }
+            self.grow_dense_to(idx + 1);
             // Assigning to a hole gives the index a value again, so it
             // stops being absent (`delete arguments[0]` followed by
             // `arguments[0] = x` must be observable).
             self.holes.remove(&idx);
             self.elements[idx] = value;
+            self.length = self.length.max(idx + 1);
             return Ok(true);
         }
 
@@ -1418,7 +1557,7 @@ impl JSObject for ArrayObject {
             // `RuntimeError::from` unpacks it.
             let new_len = crate::builtins::validate_array_length(n)
                 .map_err(crate::vm::property::PropertyError::from)?;
-            if !self.length_writable && new_len != self.elements.len() {
+            if !self.length_writable && new_len != self.length {
                 return Err(PropertyError::type_error("Cannot redefine property: length is non-writable"));
             }
             // The *whole* descriptor takes effect even when the shrink fails
@@ -1436,11 +1575,6 @@ impl JSObject for ArrayObject {
 
         if let Some(index) = key.array_index() {
             let idx = index as usize;
-            if idx >= MAX_DENSE_ELEMENTS {
-                return Err(PropertyError::type_error(format!(
-                    "Array index {idx} is out of the supported range"
-                )));
-            }
             let current = self.property_get(&key);
             match current {
                 Some(current) => validate_property_redefinition(&current, &desc)?,
@@ -1451,26 +1585,31 @@ impl JSObject for ArrayObject {
                 // be *added* while the length itself is writable — a
                 // read-only `length` makes the array behave as if it
                 // were non-extensible for new indices.
-                None if idx >= self.elements.len() && !self.length_writable => {
+                None if idx >= self.length && !self.length_writable => {
                     return Err(PropertyError::type_error("Cannot add element to an array with a non-writable length"));
                 }
                 None => {}
             }
+            if idx >= MAX_DENSE_ELEMENTS {
+                // Sparse index: no slot is allocated, the descriptor lives in
+                // the table and only `length` grows.
+                self.properties.insert(key, desc);
+                self.length = self.length.max(idx + 1);
+                return Ok(true);
+            }
             if desc.is_accessor_descriptor() {
                 // Accessors live in the property table; the dense slot
                 // is turned into a hole so reads find the accessor.
-                if idx >= self.elements.len() {
-                    self.elements.resize(idx + 1, Value::Undefined);
-                }
+                self.grow_dense_to(idx + 1);
                 self.elements[idx] = Value::Undefined;
                 self.holes.insert(idx);
                 self.properties.insert(key, desc);
+                self.length = self.length.max(idx + 1);
                 return Ok(true);
             }
-            if idx >= self.elements.len() {
-                self.elements.resize(idx + 1, Value::Undefined);
-            }
+            self.grow_dense_to(idx + 1);
             self.elements[idx] = desc.value.clone();
+            self.length = self.length.max(idx + 1);
             if desc.writable && desc.enumerable && desc.configurable {
                 // Default data descriptor: no override needed.
                 self.properties.remove(&key);
@@ -1518,8 +1657,8 @@ impl JSObject for ArrayObject {
                 self.holes.insert(idx);
                 return true;
             }
-            // 越界索引：只可能以非默认描述符的形式存在 —— 不存在也算删除成功
-            // （ES 10.1.9.2 步骤 2）。
+            // 尾部 / 稀疏索引：只可能以非默认描述符的形式存在 —— 不存在也算删除
+            // 成功（ES 10.1.9.2 步骤 2）。
             self.properties.remove(key);
             return true;
         }
@@ -1540,28 +1679,38 @@ impl JSObject for ArrayObject {
             if self.properties.contains_key(key) {
                 return true;
             }
-            let idx = index as usize;
-            return idx < self.elements.len() && !self.holes.contains(&idx);
+            return self.get(index as usize).is_some();
         }
         self.properties.contains_key(key)
     }
 
     fn own_keys(&self) -> Vec<PropertyKey> {
-        let mut keys: Vec<PropertyKey> = self
-            .elements
-            .iter()
-            .enumerate()
+        // `OrdinaryOwnPropertyKeys`: ascending indices, then `length`, then the
+        // remaining string keys in creation order, then symbols.
+        //
+        // Indices come from two places — the dense slots and the property table
+        // (sparse tail indices, accessor indices, non-default descriptors) — and
+        // have to be merged *before* the string part, otherwise a sparse
+        // `arr[1e9] = x` would report its index after the string keys.
+        let mut index_keys: Vec<PropertyKey> = (0..self.elements.len())
             // Holes (deleted/accessor slots) have no data element; slots with
             // a table override are reported through the table instead.
-            .filter(|(i, _)| {
-                !self.holes.contains(i)
-                    && !self.properties.contains_key(&Self::index_key(*i))
-            })
-            .map(|(i, _)| Self::index_key(i))
+            .filter(|i| !self.holes.contains(i))
+            .map(Self::index_key)
             .collect();
-        keys.push(PropertyKey::well_known("length").expect("well-known name"));
-        keys.extend(self.properties.keys());
-        keys
+        let mut rest: Vec<PropertyKey> = Vec::new();
+        for key in self.properties.keys() {
+            if key.array_index().is_some() {
+                index_keys.push(key);
+            } else {
+                rest.push(key);
+            }
+        }
+        index_keys.sort_by_key(|key| key.array_index().unwrap_or(u32::MAX));
+        index_keys.dedup();
+        index_keys.push(PropertyKey::well_known("length").expect("well-known name"));
+        index_keys.extend(rest);
+        index_keys
     }
 
     fn get_prototype(&self) -> Option<Gc<Object>> {
