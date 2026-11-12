@@ -15,17 +15,18 @@
 
 | | |
 |---|---|
-| 语言目标 | 严格模式 ES6 |
+| 语言目标 | 严格模式 ES6（**ES2015**） |
 | 明确不做 | `eval`、类 eval 特性、`with` |
+| test262 范围 | **由版本决定，不由实现决定**：后版本（ES2016+）的特性用例一律按 feature 标签移出分母，即使引擎已经顺手实现了（class fields、object spread、`toSorted`、`Set.prototype.union` …）—— 否则通过率既算进了 ES6 没承诺的东西，也被 ES6 之后的缺口拖低。见 `tests/test262_runner.rs` 的 `OUT_OF_SCOPE_FEATURES`（按版本分组）与 `docs/es6-conformance-phase2.md` §2.2 |
 | 已入册的 test262 套件 | `language/expressions`、`language/statements`、`built-ins/{Array,Boolean,Error,Object,String,Symbol}` 等（见 `docs/es6-conformance-phase2.md` §2.2） |
 | 未入册但已实现 | `TypedArray` 视图族、`DataView`、`Proxy`、`Reflect` |
 
-## 3. 当前数字（2026-11-12，基线）
+## 3. 当前数字（2026-11-13，基线 · 严格 ES2015 范围）
 
 | 指标 | 值 |
 |---|---|
-| test262 执行 / 通过 / 跳过 / 失败 | 20504 / **18125** / 8577 / 2379 |
-| 通过率 | <!-- doc-numbers -->**88.40%**（18125 / 执行 20504；跳过 8577；2026-11-13 基线，TEST262_MEMORY_MB=384）<!-- /doc-numbers --> |
+| test262 执行 / 通过 / 跳过 / 失败 | 18547 / **16798** / 10466 / 1749 |
+| 通过率 | <!-- doc-numbers -->**90.57%**（16798 / 执行 18547；跳过 10466；2026-11-13 基线，TEST262_MEMORY_MB=384）<!-- /doc-numbers --> |
 | 单元 / feature / 护栏 | 272 / 669（1 ignored）/ 7 |
 | 护栏计数 | timeout 0、step-limit 0、memory 14（`TEST262_MEMORY_MB=384`，见 §5.7；**2026-10-24 更新**：默认预算维持 384MB —— 256MB 会误伤 `built-ins/Array` 的 5 条边界用例，不是语义回退） |
 | 全量墙钟 | 约 128s（串行 4 分片，单片 `ulimit -v` 4 GB） |

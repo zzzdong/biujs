@@ -32,7 +32,9 @@ Set-StrictMode -Version Latest
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
 $snap = 'docs/phase2-status.tsv'
-$expectedSkipped = 8577
+# 2026-11-13：范围收紧为**严格 ES2015**（后版本的用例按 feature 标签移出分母，
+# 见 tests/test262_runner.rs 的 OUT_OF_SCOPE_FEATURES），跳过数从 8577 涨到 10466。
+$expectedSkipped = 10466
 
 function Get-EnvInt {
     param([string]$Name, [int]$Default)
@@ -322,14 +324,22 @@ try {
 
     $gains = [System.Collections.Generic.List[string]]::new()
     $regressions = [System.Collections.Generic.List[string]]::new()
+    $shrunk = [System.Collections.Generic.List[string]]::new()
     $added = [System.Collections.Generic.List[string]]::new()
     $missing = [System.Collections.Generic.List[string]]::new()
     foreach ($name in $orderedNames) {
         if (-not $old.ContainsKey($name)) { $added.Add($name); continue }
         $o = $old[$name]; $n = $newRows[$name]
-        if ($n.Passed -lt $o.Passed) {
+        # 判据是**失败数**，不是通过数：范围收缩（把后 ES6 的用例移出分母）会让
+        # 通过数与执行数一起下降，那是有意的范围决策，不是回退。失败数变多才是
+        # 真回退 —— 它不受分母变化影响（见 docs/es6-conformance-phase2.md §2.2）。
+        $oldExec = $o.Passed + $o.Failed
+        $newExec = $n.Passed + $n.Failed
+        if ($n.Failed -gt $o.Failed) {
             $regressions.Add(("  回退  {0,-48} {1} -> {2} （失败 {3} -> {4}）" -f $name, $o.Passed, $n.Passed, $o.Failed, $n.Failed))
             $regressed = $true
+        } elseif ($n.Failed -lt $o.Failed -and $n.Passed -lt $o.Passed) {
+            $shrunk.Add(("  范围  {0,-48} 执行 {1} -> {2}，通过 -{3}，失败 -{4}" -f $name, $oldExec, $newExec, ($o.Passed - $n.Passed), ($o.Failed - $n.Failed)))
         } elseif ($n.Passed -gt $o.Passed) {
             $gains.Add(("  提升  {0,-48} {1} -> {2}" -f $name, $o.Passed, $n.Passed))
         }
@@ -352,6 +362,11 @@ try {
         Write-Host ''
         Write-Host '本次新出现的套件：'
         $added | ForEach-Object { Write-Host "  $_" }
+    }
+    if ($shrunk.Count -gt 0) {
+        Write-Host ''
+        Write-Host '范围收缩的套件（分母变小，失败数也下降 —— 不是回退）：'
+        $shrunk | ForEach-Object { Write-Host $_ }
     }
     if ($regressions.Count -gt 0) {
         Write-Host ''

@@ -258,7 +258,10 @@ echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 # 同时删掉 `Date` / `RegExp` / `label:` / `print(` / `$ERROR` / `=>*` 这些**过宽的源码
 # 子串门控** —— 它们把一大批已经能跑的用例挡在池外（Object +166、String +49、
 # Array +28）。净效果：跳过 +173，执行 20,677 → 20,504，通过率 83.97% → 83.92%。
-EXPECTED_SKIPPED=8577
+# 8577 → 10466（2026-11-13，严格 ES2015 批）：范围**由版本决定**，后版本的
+# feature 标签全部登记为范围外（引擎实现了也一样），执行 20,504 → 18,547，
+# 通过率 88.40% → 90.57%。
+EXPECTED_SKIPPED=10466
 if [ "$SKIPPED" != "$EXPECTED_SKIPPED" ]; then
   echo "  !! 跳过数从 $EXPECTED_SKIPPED 变为 $SKIPPED —— 跳过表被改动了。"
   echo "     请确认这是有意的（计划书 §2.2：交付特性时必须同批解锁），并更新本脚本的 EXPECTED_SKIPPED。"
@@ -320,10 +323,17 @@ else
 fi
 : > "$TMP/regress.txt"
 : > "$TMP/gain.txt"
+: > "$TMP/shrunk.txt"
+# 判据是**失败数**，不是通过数：范围收缩（把后 ES6 的用例移出分母）会让通过数
+# 与执行数一起下降，那是有意的范围决策；失败数变多才是真回退。
 while IFS=$'\t' read -r suite old_p old_s old_f new_p new_s new_f; do
-  if [ "$new_p" -lt "$old_p" ]; then
+  old_exec=$((old_p + old_f))
+  new_exec=$((new_p + new_f))
+  if [ "$new_f" -gt "$old_f" ]; then
     printf '  回退  %-48s %s -> %s （失败 %s -> %s）\n' "$suite" "$old_p" "$new_p" "$old_f" "$new_f" >> "$TMP/regress.txt"
     REGRESSED=1
+  elif [ "$new_f" -lt "$old_f" ] && [ "$new_p" -lt "$old_p" ]; then
+    printf '  范围  %-48s 执行 %s -> %s，通过 -%s，失败 -%s\n' "$suite" "$old_exec" "$new_exec" "$((old_p - new_p))" "$((old_f - new_f))" >> "$TMP/shrunk.txt"
   elif [ "$new_p" -gt "$old_p" ]; then
     printf '  提升  %-48s %s -> %s\n' "$suite" "$old_p" "$new_p" >> "$TMP/gain.txt"
   fi
@@ -349,6 +359,12 @@ if [ -s "$TMP/added.txt" ]; then
   echo
   echo "本次新出现的套件："
   cut -f1 "$TMP/added.txt" | sed 's/^/  /'
+fi
+
+if [ -s "$TMP/shrunk.txt" ]; then
+  echo
+  echo "范围收缩的套件（分母变小，失败数也下降 —— 不是回退）："
+  cat "$TMP/shrunk.txt"
 fi
 
 if [ "$REGRESSED" = "1" ]; then

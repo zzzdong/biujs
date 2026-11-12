@@ -124,7 +124,9 @@ docs/                  项目文档与基线快照
    回归、护栏漂移，而通过数完全没变。热路径里不要反复读 env / 全局注册表。
 4. **验证必须同时看三个数**：头条（passed / skipped / failed）、护栏三计数、墙钟。
    只看头条会漏掉"通过数不变但护栏或耗时变坏"的回归。全量还必须看
-   **逐套件无回退**（`phase2-status.sh` 的退出码就是判据）。
+   **逐套件无回退**（`phase2-status.sh` 的退出码就是判据）——
+   判据是**失败数不增**，不是通过数不减：范围收缩会让通过数与执行数一起下降
+   （见 5c），脚本把那种情形单独标成"范围收缩"。
 5. **实现 + 解锁 + 入册三件事同批**。`test262_runner.rs` 有两套特性名单：
    `OUT_OF_SCOPE_FEATURES`（范围外，永久跳过）与 `IN_SCOPE_PENDING`（范围内但未实现）。
    落实现时从 `IN_SCOPE_PENDING` 摘掉特性标签；套件不在 `SUITES` 里就同时加进去，并
@@ -132,6 +134,13 @@ docs/                  项目文档与基线快照
    实现，等于往池里倒垃圾（实测 +1552 条纯失败、通过数零增长）。入册前先定向跑，通过率
    **≥ 50%** 才留下。注意标签匹配是 `starts_with` 或 `contains` 的宽松匹配，增删标签前
    对照整张表检查（`"Array.prototype.flatMap".contains("Map")` 为真，历史上踩过）。
+5c. **test262 范围由版本决定，不由实现决定**（2026-11-13）。目标是 ES2015，
+   所以 `OUT_OF_SCOPE_FEATURES` 按版本分组地收下**所有** ES2016+ 的 feature 标签，
+   即使引擎已经顺手实现了该特性（`class-fields-public` / `object-spread` /
+   `change-array-by-copy` / `set-methods` …）——"实现了"不等于"进了 ES6 承诺面"，
+   把它算进通过率会让数字既不干净也不可比。纯后版本的语法套件直接不进 `SUITES`。
+   新特性落地时先问一句"它在哪个版本"，再决定是摘 `IN_SCOPE_PENDING` 还是
+   登记到 `OUT_OF_SCOPE_FEATURES`。
 5b. **文档里的通过率不手改**。`README.md` / `docs/PROJECT.md` 的数字由
    `scripts/doc-numbers.sh` 从基线快照生成（`phase2-status.sh --update` 会自动调用），
    数字必须带上护栏预算 —— 同一份代码在不同 `TEST262_MEMORY_MB` 下通过数会差几条。

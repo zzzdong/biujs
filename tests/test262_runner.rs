@@ -374,67 +374,140 @@ fn build_source(test: &Test) -> String {
 ///   there yet. Doing only the first step is wasted work — the progress never
 ///   reaches a single number (measured: adding the M5/M6 suites without
 ///   unlocking anything moved 17477 executed / 13211 passed to 19029 / 13211).
+/// The scope is **exactly ES2015** (ES6) plus ES5 semantics. Everything a
+/// later edition introduced is out of scope here, whether or not this engine
+/// happens to implement it — a feature the engine grew for convenience
+/// (`Array.prototype.toSorted`, class fields, object spread) does not make its
+/// tests part of the ES6 target, and counting them would misreport ES6
+/// conformance in both directions (passes that are not ES6, and failures that
+/// ES6 never promised).
+///
+/// Entries are grouped by the edition that introduced the feature, so "why is
+/// this skipped" has one answer per line. When a feature is genuinely
+/// delivered (i.e. moves into the ES6 target) it leaves this table.
+///
+/// The match is `starts_with` **or** `contains` (see `is_unsupported`), so
+/// entries must not be substrings of an in-scope tag:
+/// `scope_table_does_not_accidentally_skip` pins the sharp cases.
 const OUT_OF_SCOPE_FEATURES: &[&str] = &[
-"async-iteration",
-"async-functions",
-"Atomics",
-// ES2024，在 ES6 目标之外。2026-10-18 显式登记：此前这些用例是**假绿**的 ——
-// `Array.fromAsync` 未实现，而 `obj.missing()` 当时静默返回 `undefined`，
-// `await undefined` 直接完成，asyncTest 因此"通过"。`obj.missing()` 修正为
-// 抛 TypeError 之后它们立刻现形，所以这里做一次明确的范围决策而不是留一堆
-// 必然失败的用例在池子里（§2.2：交付特性时同批解锁/锁定）。
-"Array.fromAsync",
-// ES2019 (`Array.prototype.flatMap`), unimplemented and outside the ES6
-// target. It is listed *explicitly* even though the loose matching below used
-// to hide it anyway — `feature.contains("Map")` matched
-// `"Array.prototype.flatMap"`, so dropping `"Map"` from `IN_SCOPE_PENDING`
-// (B2a) silently put 20 unimplemented tests back into the pool. An accidental
-// skip is not a scope decision; this one is.
-"Array.prototype.flatMap",
-"BigInt",
-"class-fields-private",
-"class-methods-private",
-"class-static-methods-private",
-"class-static-fields-private",
-"class-static-block",
-"cross-realm",
-"dynamic-import",
-"import.meta",
-"import-assertions",
-"Intl",
-"json-parse-with-source",
-"logical-assignment",
-"modules",
-"numeric-separator",
-"optional-chaining",
-// ES2018+ Promise surface: implemented so ordinary ES6 programs can use it,
-// but outside the ES6 target, so its own tests stay gated (§B34).
-"Promise.allSettled",
-"Promise.any",
-"Promise.prototype.finally",
-"AggregateError",
-"await-dictionary",
-"Promise.allKeyed",
-"Promise.allSettledKeyed",
-// ES2025 statics, also out of the ES6 target.
-"promise-try",
-"promise-with-resolvers",
-"reflect-metadata",
-"regexp-",
-"SharedArrayBuffer",
-"String.prototype.replaceAll",
-"symbol-description",
-"tail-call-optimization",
-"Temporal",
-"WeakRef",
-"u180e",
-"well-formed-json-stringify",
-// 2026-11-12：ES2017+ 的一批标签（resizable-arraybuffer / array-grouping /
-// Object.fromEntries / iterator-helpers / Float16Array …）**没有**登记为范围外。
-// 实测它们会连带跳过已经在通过用例（`array-grouping` 就带走了 14 条
-// `Map.groupBy` 的绿灯 —— `Map.groupBy` 是实现了的），而"跳过"必须只用于
-// 永远不可能通过的用例。要收，得先逐标签量出"tagged 且当前通过"的条数，
-// 只收这一数为 0 的标签，作为单独一批。
+    // ── ES2016 ──
+    "exponentiation",                    // `**`
+    "Array.prototype.includes",
+    "u180e", // ES2016 把 U+180E 从空白字符里去掉
+    // ── ES2017 ──
+    "async-functions",
+    "Atomics",
+    "SharedArrayBuffer",
+    "await-dictionary",
+    "tail-call-optimization",
+    // ── ES2018 ──
+    "async-iteration",
+    "Symbol.asyncIterator",
+    "object-rest",
+    "object-spread",
+    "Promise.prototype.finally",
+    // regexp-* 覆盖 2018 之后的全部正则扩展：unicode property escapes /
+    // named groups / dotAll / lookbehind / match-indices / v-flag / modifiers /
+    // duplicate-named-groups。ES6 的正则没有 feature 标签。
+    "regexp-",
+    // ── ES2019 ──
+    "json-superset",
+    "well-formed-json-stringify",
+    "String.prototype.trimStart",
+    "String.prototype.trimEnd",
+    "Symbol.prototype.description",
+    "symbol-description", // 同一特性的旧标签名
+    "optional-catch-binding",
+    "Array.prototype.flat",
+    "Array.prototype.flatMap",
+    "Object.fromEntries",
+    "stable-array-sort",
+    "stable-typedarray-sort",
+    // ── ES2020 ──
+    "BigInt",
+    "globalThis",
+    "optional-chaining",
+    "coalesce-expression", // `??`
+    "dynamic-import",
+    "import.meta",
+    "String.prototype.matchAll",
+    "Symbol.matchAll",
+    "Promise.allSettled",
+    // ── ES2021 ──
+    "numeric-separator",
+    "logical-assignment",
+    "WeakRef",
+    "FinalizationRegistry",
+    "Promise.any",
+    "AggregateError",
+    "String.prototype.replaceAll",
+    // ── ES2022 ──
+    "class-fields-public",
+    "class-static-fields-public",
+    "class-fields-private", // 前缀同时覆盖 class-fields-private-in
+    "class-methods-private",
+    "class-static-methods-private",
+    "class-static-fields-private",
+    "class-static-block",
+    "nonextensible-applies-to-private",
+    "error-cause",
+    "Object.hasOwn",
+    "Array.prototype.at",
+    "String.prototype.at",
+    "TypedArray.prototype.at",
+    // ── ES2023 ──
+    "hashbang",
+    "change-array-by-copy", // toSorted / toReversed / toSpliced / with
+    "array-find-from-last",
+    "error-stack-accessor",
+    // ── ES2024 ──
+    "resizable-arraybuffer",
+    "immutable-arraybuffer",
+    "arraybuffer-transfer",
+    "align-detached-buffer-semantics-with-web-reality",
+    "array-grouping",
+    "String.prototype.isWellFormed",
+    "String.prototype.toWellFormed",
+    "Array.fromAsync",
+    "json-parse-with-source",
+    // ── ES2025 / 提案 ──
+    "set-methods",
+    "iterator-helpers",
+    "iterator-sequencing",
+    "joint-iteration",
+    "RegExp.escape",
+    "Float16Array",
+    "uint8array-base64",
+    "Error.isError",
+    "explicit-resource-management",
+    "decorators",
+    "ShadowRealm",
+    "upsert",
+    "symbols-as-weakmap-keys",
+    "Math.sumPrecise",
+    "Temporal",
+    "promise-try",
+    "promise-with-resolvers",
+    "Promise.allKeyed",
+    "Promise.allSettledKeyed",
+    "reflect-metadata",
+    // ── 模块（ES6 语法的一部分，但实现明确不做，§1） ──
+    "modules",
+    "top-level-await",
+    "source-phase-imports",
+    "import-defer",
+    "import-attributes",
+    "import-assertions",
+    "import-text",
+    "import-bytes",
+    "json-modules",
+    "arbitrary-module-namespace-names",
+    "export-star-as-namespace-from-module",
+    // `cross-realm` 不是版本问题，而是**宿主能力**：这些用例要
+    // `$262.createRealm()`，引擎目前只提供单 realm（见 §2.3）。留在范围外表里
+    // 是为了不制造"范围内但永远跳过"的假象；等 `$262` 有了多 realm 再挪走。
+    "cross-realm",
+    "Intl",
 ];
 
 /// In scope (§1.2), not implemented yet. Sizes as of 2026-09-25 (test262 files):
@@ -484,11 +557,24 @@ fn is_unsupported(feature: &str) -> bool {
 /// (§6.1), and it is only correct because the tag is listed explicitly.
 #[test]
 fn scope_table_does_not_accidentally_skip() {
+    // ES2015 特性必须留在池子里。
     assert!(!is_unsupported("Map"));
     assert!(!is_unsupported("Set"));
+    assert!(!is_unsupported("Symbol.iterator"));
+    assert!(!is_unsupported("Symbol.match")); // ES6 的 @@ 协议
+    assert!(!is_unsupported("Symbol.species"));
+    assert!(!is_unsupported("String.prototype.includes"));
+    assert!(!is_unsupported("Reflect.construct"));
+    // 之后的版本一律范围外，**即使引擎已经实现**（范围由版本决定，不由实现决定）。
     assert!(is_unsupported("BigInt"));
     assert!(is_unsupported("class-fields-private"));
+    assert!(is_unsupported("class-fields-public"));
     assert!(is_unsupported("Array.prototype.flatMap"));
+    assert!(is_unsupported("Array.prototype.flat"));
+    assert!(is_unsupported("change-array-by-copy"));
+    assert!(is_unsupported("object-spread"));
+    assert!(is_unsupported("Symbol.matchAll"));
+    assert!(is_unsupported("coalesce-expression"));
 }
 
 /// Source patterns biujs cannot handle at all — **syntax the engine
@@ -836,7 +922,10 @@ const SUITES: &[&str] = &[
     "language/expressions/bitwise-xor",
     "language/expressions/call",
     "language/expressions/class",
-    "language/expressions/coalesce",
+    // `language/expressions/exponentiation`（`**`，ES2016）与
+    // `language/expressions/coalesce`（`??`，ES2020）是范围外的**语法**，所以
+    // 整个套件不在分母里 —— 不靠 feature 标签留一个 0/0/0 的空壳（§1：范围由
+    // ES2015 决定，不由实现决定）。
     "language/expressions/comma",
     "language/expressions/complement",
     "language/expressions/conditional",
@@ -844,7 +933,6 @@ const SUITES: &[&str] = &[
     "language/expressions/division",
     "language/expressions/does-not-equals",
     "language/expressions/equals",
-    "language/expressions/exponentiation",
     "language/expressions/function",
     "language/expressions/greater-than",
     "language/expressions/greater-than-or-equal",
