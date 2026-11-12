@@ -75,6 +75,16 @@ impl VM {
         if name == crate::builtins::FUNCTION_PROTO_NATIVE {
             return Ok(Value::Undefined);
         }
+        if name == crate::builtins::FUNCTION_HAS_INSTANCE_NATIVE {
+            // ES 20.2.3.6：`this` 不可调用 ⇒ false（不抛）；否则
+            // `OrdinaryHasInstance(this, V)` —— 注意参数顺序是 (V, this)。
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            if !this.is_callable() {
+                return Ok(Value::Bool(false));
+            }
+            let result = self.ordinary_has_instance(&value, &this, module)?;
+            return Ok(Value::Bool(result));
+        }
         // Box bare `Value::Function(id)` arguments (and the receiver) into their
         // memoized function objects before handing them to the builtin layer.
         // The builtin layer matches on `Value::Object` — `Object.keys(fn)`,
@@ -304,7 +314,7 @@ impl VM {
         // plain names, so handle them before the static-method lookup.
         if matches!(name, "call" | "apply") && this.is_callable() {
             self.check_class_ctor(&this)?;
-            let call_args = self.call_or_apply_args(name, args)?;
+            let call_args = self.call_or_apply_args(name, args, module)?;
             let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
             return self.invoke(&this, this_arg, &call_args, module);
         }
@@ -341,7 +351,7 @@ impl VM {
             if (method == "call" || method == "apply") && this.is_callable() {
                 // `C.call(...)` must fail for a class constructor, same as `C()`.
                 self.check_class_ctor(&this)?;
-                let call_args = self.call_or_apply_args(method, args)?;
+                let call_args = self.call_or_apply_args(method, args, module)?;
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 return self.invoke(&this, this_arg, &call_args, module);
             }

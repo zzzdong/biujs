@@ -503,19 +503,52 @@ impl VM {
 
     /// Argument list for `f.call(...)` / `f.apply(...)`, minus the `thisArg`.
     pub(crate) fn call_or_apply_args(
-        &self,
+        &mut self,
         method: &str,
         args: &[Value],
+        module: &Module,
     ) -> Result<Vec<Value>, RuntimeError> {
         if method == "call" {
             return Ok(args.iter().skip(1).cloned().collect());
         }
         match args.get(1) {
             None | Some(Value::Undefined) | Some(Value::Null) => Ok(Vec::new()),
-            Some(list) => self.array_like_elements(list).ok_or_else(|| {
-                RuntimeError::TypeError("CreateListFromArrayLike called on non-object".to_string())
-            }),
+            Some(list) => self.create_list_from_array_like(list, module),
         }
+    }
+
+    /// ES 7.3.18 `CreateListFromArrayLike(obj)`。
+    ///
+    /// `length` 与每个索引都走**真 `[[Get]]`**（accessor 会执行、异常会传播），
+    /// 并且 `obj` 必须先是对象 —— `f.apply(null, 1)` 是 TypeError，
+    /// `f.apply(null, { get length() { throw … } })` 要把那个异常原样抛出来。
+    /// 以前这里用非重入的 `array_like_elements`：getter 不跑、异常被吞。
+    fn create_list_from_array_like(
+        &mut self,
+        obj: &Value,
+        module: &Module,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if !matches!(obj, Value::Object(_)) && !matches!(obj, Value::Function(_)) {
+            return Err(RuntimeError::TypeError(
+                "CreateListFromArrayLike called on non-object".to_string(),
+            ));
+        }
+        let length_key = PropertyKey::well_known("length").expect("well-known name");
+        let len_value = self.get_member(obj, &length_key, module)?;
+        // `ToLength`：负数取 0，`NaN` 取 0。上限沿用与数组元素一致的硬报错，
+        // 免得 `apply(null, {length: 2**32})` 把进程拖进无界分配。
+        let len = crate::builtins::to_integer_or_infinity(Some(&len_value)).max(0);
+        if len > crate::vm::object::MAX_DENSE_ELEMENTS as i64 {
+            return Err(RuntimeError::RangeError(format!(
+                "CreateListFromArrayLike: length {len} is out of the supported range"
+            )));
+        }
+        let mut out = Vec::with_capacity(len as usize);
+        for index in 0..len {
+            let key = PropertyKey::from_index(index as u32);
+            out.push(self.get_member(obj, &key, module)?);
+        }
+        Ok(out)
     }
 
     /// Reject a class constructor that is being called without `new`.
@@ -2422,6 +2455,20 @@ impl VM {
             }
         }
 
+        self.ordinary_has_instance(&obj, &ctor, module)
+    }
+
+    /// ES 7.3.19 `OrdinaryHasInstance(C, O)` —— 不含 `@@hasInstance` 的分派
+    /// （`Function.prototype[@@hasInstance]` 就是直接调它，否则会自递归）。
+    pub(crate) fn ordinary_has_instance(
+        &mut self,
+        obj_value: &Value,
+        ctor_value: &Value,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
+        let obj = self.as_object_value(obj_value);
+        let ctor = self.as_object_value(ctor_value);
+
         // 12.10.4 step 4：不可调用的对象是 TypeError，不回落到原型链。
         if !matches!(&ctor, Value::Object(_)) || !ctor.is_callable() {
             return Err(RuntimeError::TypeError(
@@ -2431,7 +2478,7 @@ impl VM {
 
         // 7.3.19 step 2：bound function ⇒ 对 target 递归。
         if let Some(target) = self.bound_function_target(&ctor) {
-            return self.instanceof_operator(&obj, &target, module);
+            return self.ordinary_has_instance(&obj, &target, module);
         }
 
         // 7.3.19 step 3：左侧不是对象 ⇒ false，**在** `Get(C, "prototype")` 之前
@@ -3030,7 +3077,7 @@ impl VM {
                 }
 
                 if (method_name == "call" || method_name == "apply") && obj_val.is_callable() {
-                    let call_args = self.call_or_apply_args(&method_name, &args)?;
+                    let call_args = self.call_or_apply_args(&method_name, &args, module)?;
                     let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                     let result = self.invoke(&obj_val, this_arg, &call_args, module)?;
                     self.state.set_register(Register::Rv, result)?;

@@ -85,10 +85,37 @@ pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
             value: Value::Undefined,
             writable: false,
             enumerable: false,
-            configurable: false,
+            // ES 19.2.3.3 / 19.2.3.4：两个访问器都是 configurable（以前写成
+            // false，`Function.prototype.caller.prop-desc.js` 因此失败）。
+            configurable: true,
             getter: Some(thrower.clone()),
             setter: Some(thrower.clone()),
         };
         p.define_property(heap, key, desc).ok();
     }
+
+    // ES 20.2.3.6：`Function.prototype[@@hasInstance]`。直接调
+    // `OrdinaryHasInstance(this, V)` —— 它不走 `@@hasInstance` 再分派
+    // （那样会自递归），`this` 不可调用时返回 false。
+    let has_instance = Value::Object(heap.alloc(Object::NativeFunction(
+        NativeFunctionObject::new(super::FUNCTION_HAS_INSTANCE_NATIVE),
+    )));
+    if let Value::Object(fn_ref) = &has_instance {
+        if let Object::NativeFunction(nf) = &mut *fn_ref.borrow_mut() {
+            nf.set_length(1);
+        }
+    }
+    p.define_property(
+        heap,
+        super::has_instance_symbol_key(),
+        PropertyDescriptor {
+            value: has_instance,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            getter: None,
+            setter: None,
+        },
+    )
+    .ok();
 }

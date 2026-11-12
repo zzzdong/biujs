@@ -1945,6 +1945,9 @@ impl NativeFunctionObject {
         let display = if self.name == crate::builtins::FUNCTION_PROTO_NATIVE {
             // ES 19.2.3：`Function.prototype.name` 是空字符串。
             String::new()
+        } else if self.name == crate::builtins::FUNCTION_HAS_INSTANCE_NATIVE {
+            // ES 20.2.3.6：`Function.prototype[@@hasInstance].name`。
+            "[Symbol.hasInstance]".to_string()
         } else if let Some(method) = self.name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
             method.to_string()
         } else if let Some(method) = self.name.strip_prefix(crate::builtins::MAP_METHOD_PREFIX) {

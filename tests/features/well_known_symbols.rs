@@ -109,10 +109,15 @@ fn to_primitive_object_result_is_a_type_error() {
 
 #[test]
 fn has_instance_replaces_the_default_instanceof_check() {
+    // `Function.prototype[Symbol.hasInstance]` 是 non-writable 的（ES 20.2.3.6），
+    // 所以 `C[Symbol.hasInstance] = fn` 这个**赋值**会被拒绝（sloppy 静默失败）——
+    // 要装自定义实现必须用 `Object.defineProperty`（或 static 方法定义）。
     assert_eq!(
         eval_string(
             "function C() {}
-             C[Symbol.hasInstance] = function (x) { return x === 42; };
+             Object.defineProperty(C, Symbol.hasInstance, {
+               value: function (x) { return x === 42; }, configurable: true
+             });
              (42 instanceof C) + ',' + (7 instanceof C)"
         ),
         "true,false"

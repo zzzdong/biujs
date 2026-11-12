@@ -5202,10 +5202,34 @@ impl VM {
                     // 的 `constructible` 标志，由构造器注册点设置）。以前靠名字
                     // 猜（"含 `.` 的是方法"），`Function.prototype.apply` 这种
                     // 不带点的内建方法因此被误判成构造器。
-                    ObjectKind::NativeFunction => obj_ref
-                        .borrow()
-                        .as_native_function()
-                        .is_some_and(|f| f.is_constructible()),
+                    //
+                    // bound function 例外：它的构造性跟 target 走
+                    // （`Reflect.construct(f, [], f.bind(null))` 是合法的）。
+                    ObjectKind::NativeFunction => {
+                        let name = {
+                            let borrowed = obj_ref.borrow();
+                            match borrowed.as_native_function() {
+                                Some(f) => f.name.clone(),
+                                None => return false,
+                            }
+                        };
+                        if let Some(id) = name
+                            .strip_prefix(BOUND_PREFIX)
+                            .and_then(|rest| rest.parse::<u32>().ok())
+                        {
+                            return match self.bound_functions.get(&id) {
+                                Some(bound) => {
+                                    let target = bound.target.clone();
+                                    self.is_constructor(&target, module)
+                                }
+                                None => false,
+                            };
+                        }
+                        obj_ref
+                            .borrow()
+                            .as_native_function()
+                            .is_some_and(|f| f.is_constructible())
+                    }
                     // 箭头函数没有 `[[Construct]]`；普通函数有。
                     ObjectKind::Function => obj_ref
                         .borrow()

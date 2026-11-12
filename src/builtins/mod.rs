@@ -94,6 +94,13 @@ thread_local! {
 /// "Right-hand side of 'instanceof' is not callable"。
 pub const FUNCTION_PROTO_NATIVE: &str = "__function_proto__";
 
+/// `Function.prototype[Symbol.hasInstance]` 的分派名（ES 20.2.3.6）。
+///
+/// 它**不是** `instanceof` 的通用路径：规范要求它直接调
+/// `OrdinaryHasInstance(this, V)`（不带 `@@hasInstance` 再分派，否则自递归），
+/// `this` 不可调用时返回 false 而不是抛错。
+pub const FUNCTION_HAS_INSTANCE_NATIVE: &str = "__function_has_instance__";
+
 /// Make `proto` the prototype of wrappers created by `to_object` for the
 /// constructor `name` (`"Number"`, `"String"`, `"Boolean"`, `"Symbol"`,
 /// `"Object"`).

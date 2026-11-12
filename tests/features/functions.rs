@@ -462,7 +462,8 @@ fn class_static_accessor_descriptor_survives_shape_storage() {
 #[test]
 fn strict_functions_reject_caller_and_arguments() {
     // ES 9.2.7：Function.prototype 上的 caller / arguments 是 %ThrowTypeError%
-    // 访问器，严格模式函数读到就抛 TypeError；描述符不可枚举、不可配置。
+    // 访问器，严格模式函数读到就抛 TypeError；描述符**不可枚举但可配置**
+    // （ES 19.2.3.3 / 19.2.3.4 —— 以前这里钉的是 `configurable: false`）。
     assert_eq!(
         eval_bool(
             "'use strict';
@@ -472,10 +473,45 @@ fn strict_functions_reject_caller_and_arguments() {
              try { f.arguments; } catch (e) { if (e instanceof TypeError) threw++; }
              var d = Object.getOwnPropertyDescriptor(Function.prototype, 'caller');
              threw === 2 && !!d && typeof d.get === 'function' &&
-             typeof d.set === 'function' && !d.enumerable && !d.configurable"
+             typeof d.set === 'function' && !d.enumerable && d.configurable"
         ),
         true
     );
+}
+
+/// `Function.prototype` 的三处尾巴：`[@@hasInstance]`、`apply` 的列表转换、
+/// `caller` / `arguments` 访问器的描述符位。
+#[test]
+fn function_prototype_tail_semantics() {
+    eval_js(
+        "function name_of(fn) { try { fn(); return 'none'; } catch (e) { return e.name; } }
+         // `Function.prototype[@@hasInstance]`（ES 20.2.3.6）：直接调
+         // OrdinaryHasInstance；`this` 不可调用时返回 false（不抛）。
+         var hi = Function.prototype[Symbol.hasInstance];
+         if (typeof hi !== 'function' || hi.name !== '[Symbol.hasInstance]' || hi.length !== 1) {
+           throw new Error('hasInstance shape');
+         }
+         function F() {}
+         var o = new F();
+         if (hi.call(F, o) !== true) throw new Error('hasInstance true');
+         if (hi.call(F, {}) !== false) throw new Error('hasInstance false');
+         if (hi.call({}, o) !== false) throw new Error('hasInstance non-callable this');
+         // `caller` / `arguments` 是 configurable 的访问器（ES 19.2.3.3/4）。
+         if (Object.getOwnPropertyDescriptor(Function.prototype, 'caller').configurable !== true) throw new Error('caller');
+         if (Object.getOwnPropertyDescriptor(Function.prototype, 'arguments').configurable !== true) throw new Error('arguments');
+         // `apply` 走 CreateListFromArrayLike：length 与索引都是 Get。
+         function sum() { return Array.prototype.reduce.call(arguments, function (a, b) { return a + b; }, 0); }
+         if (sum.apply(null, { length: 2, 0: 1, 1: 2 }) !== 3) throw new Error('array-like');
+         if (name_of(function () { sum.apply(null, 1); }) !== 'TypeError') throw new Error('non-object');
+         if (name_of(function () { sum.apply(null, { get length() { throw new Error('x'); } }); }) !== 'Error') {
+           throw new Error('length getter');
+         }
+         // bound function 作为 newTarget 是可构造的。
+         if (name_of(function () { Reflect.construct(function () {}, [], F.bind(null)); }) !== 'none') {
+           throw new Error('bound newTarget');
+         }",
+    )
+    .unwrap();
 }
 
 /// `IsConstructor` 与 `new` 的边界（ES 7.3.20 / 9.1.13）。
