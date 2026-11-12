@@ -211,3 +211,60 @@ fn an_executed_inner_catch_does_not_swallow_the_outer_handler() {
         "caught:1"
     );
 }
+
+/// #5 数组的"洞"没有独立表示：`new Array(n)` / `Array(n)` / `length` 扩展都会
+/// 变成 n 个 `undefined` **元素**。
+///
+/// ```js
+/// Object.keys(new Array(3)).length   // node: 0，我们: 3
+/// 0 in new Array(3)                  // node: false，我们: true
+/// var a = []; a.length = 2; 1 in a   // node: false，我们: true
+/// ```
+///
+/// 影响面：`built-ins/Array` 的 505 条失败里很大一部分就断言这几件事
+/// （`Object.keys` / `in` / `map` 跳过洞 / `join` 出空串）。根因是
+/// `ArrayObject` 用 `elements.len()` 兼任 `length`，`holes` 集合只能描述
+/// "已经在 `elements` 里"的洞，尾部洞无处安放。
+///
+/// 真正的修法（下一次批量）：给 `ArrayObject` 加独立的 `length`，约定
+/// `elements.len() <= length`，(len..length) 全是洞；`dense_elements()` 只在
+/// `elements.len() == length && holes.is_empty()` 时给快路径。这样
+/// `new Array(1e9)` 只占一个数字，不再是 1e9 个槽。
+#[test]
+#[ignore = "known bug #5：ArrayObject 没有独立的 length，尾部洞无法表示"]
+fn array_holes_from_new_array_and_length_extension() {
+    assert_eq!(eval_string("String(Object.keys(new Array(3)).length)"), "0");
+    assert_eq!(eval_bool("0 in new Array(3)"), false);
+    assert_eq!(
+        eval_bool("(function () { var a = []; a.length = 2; return 1 in a; })()"),
+        false
+    );
+    assert_eq!(
+        eval_string("(function () { var a = []; a.length = 3; return a.join('|'); })()"),
+        "||"
+    );
+    // 字面量的洞是对的（`[1,,3]` → keys 0,2），差别只在上面两条生成路径。
+    assert_eq!(eval_string("[1,,3].join('|')"), "1||3");
+}
+
+/// #6 `arguments` 被实现成真正的 `Array`。
+///
+/// - node：`Array.isArray(arguments) === false`、`Object.prototype.toString`
+///   给 `[object Arguments]`
+/// - 我们：`true`、`[object Array]`（`Object.getPrototypeOf(arguments)` 就是
+///   `Array.prototype`）
+///
+/// 修法是给 arguments 一个自己的 `ObjectKind::Arguments`（普通对象 + 索引属性
+/// + `length` + 非严格模式的映射语义），不再复用 `ArrayObject`。
+#[test]
+#[ignore = "known bug #6：arguments 复用 ArrayObject"]
+fn arguments_object_is_not_an_array() {
+    assert_eq!(
+        eval_bool("(function () { return Array.isArray(arguments); })()"),
+        false
+    );
+    assert_eq!(
+        eval_string("(function () { return Object.prototype.toString.call(arguments); })()"),
+        "[object Arguments]"
+    );
+}
