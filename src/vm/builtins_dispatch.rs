@@ -311,7 +311,7 @@ impl VM {
         if name == "bind" && this.is_callable() {
             let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
             let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
-            return Ok(self.make_bound(this, this_arg, bound_args));
+            return self.make_bound(this, this_arg, bound_args, module);
         }
         if let Some(id) = name.strip_prefix(BOUND_PREFIX) {
             let id: u32 = id
@@ -336,7 +336,7 @@ impl VM {
             if method == "bind" && this.is_callable() {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
-                return Ok(self.make_bound(this, this_arg, bound_args));
+                return self.make_bound(this, this_arg, bound_args, module);
             }
             if (method == "call" || method == "apply") && this.is_callable() {
                 // `C.call(...)` must fail for a class constructor, same as `C()`.

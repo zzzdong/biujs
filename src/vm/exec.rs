@@ -422,7 +422,40 @@ impl VM {
     }
 
     /// Create the wrapper returned by `Function.prototype.bind`.
-    pub(crate) fn make_bound(&mut self, target: Value, this_arg: Value, bound_args: Vec<Value>) -> Value {
+    pub(crate) fn make_bound(
+        &mut self,
+        target: Value,
+        this_arg: Value,
+        bound_args: Vec<Value>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        // ES 10.2.1.2 步骤 8–10：`length` 是
+        // `max(0, ToIntegerOrInfinity(target.length) - boundArgs.length)`，
+        // `name` 是 `"bound " + target.name`（target.name 不是字符串时是 `"bound "`）。
+        // 两者都是 **Get**（target 上是 accessor 时也要执行，`instance-name-error`
+        // 就是靠它把 getter 的异常传播出来）。以前只有一个合成名 `__bound__<id>`，
+        // `length` 恒为 0。
+        let length_key = PropertyKey::well_known("length").expect("well-known name");
+        let name_key = PropertyKey::well_known("name").expect("well-known name");
+        let target_length = self.get_member(&target, &length_key, module)?;
+        // `ToIntegerOrInfinity` 用 f64 表达：`Infinity` 必须原样保留
+        // （`instance-length-tointeger` 断言 `length` 仍是 Infinity），
+        // 所以不能用 `i64` 的饱和转换。
+        let target_length = {
+            let n = target_length.to_number();
+            if n.is_nan() {
+                0.0
+            } else {
+                n.trunc()
+            }
+        };
+        let target_name = self.get_member(&target, &name_key, module)?;
+        let bound_name = match &target_name {
+            Value::String(s) => format!("bound {s}"),
+            _ => "bound ".to_string(),
+        };
+        let remaining = (target_length - bound_args.len() as f64).max(0.0);
+
         let id = self.next_bound_id;
         self.next_bound_id += 1;
         self.bound_functions.insert(
@@ -433,9 +466,39 @@ impl VM {
                 bound_args,
             },
         );
-        Value::Object(self.heap.alloc(Object::NativeFunction(
+        let bound = Value::Object(self.heap.alloc(Object::NativeFunction(
             crate::vm::object::NativeFunctionObject::new(&format!("{BOUND_PREFIX}{id}")),
-        )))
+        )));
+        // 重定义 `length` / `name`（`NativeFunctionObject::new` 已按合成名装过一份，
+        // 两者都是 `configurable: true`，重定义不改属性顺序）。
+        if let Value::Object(obj_ref) = &bound {
+            let mut borrowed = obj_ref.borrow_mut();
+            let _ = borrowed.define_property(
+                &mut self.heap,
+                length_key,
+                crate::vm::property::PropertyDescriptor {
+                    value: Value::Number(remaining),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: None,
+                    setter: None,
+                },
+            );
+            let _ = borrowed.define_property(
+                &mut self.heap,
+                name_key,
+                crate::vm::property::PropertyDescriptor {
+                    value: Value::string(&bound_name),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: None,
+                    setter: None,
+                },
+            );
+        }
+        Ok(bound)
     }
 
     /// Argument list for `f.call(...)` / `f.apply(...)`, minus the `thisArg`.
@@ -2964,7 +3027,7 @@ impl VM {
                 if method_name == "bind" && obj_val.is_callable() {
                     let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                     let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
-                    let wrapper = self.make_bound(obj_val, this_arg, bound_args);
+                    let wrapper = self.make_bound(obj_val, this_arg, bound_args, module)?;
                     self.state.set_register(Register::Rv, wrapper)?;
                     self.state.jump_offset(1);
                     return Ok(true);
