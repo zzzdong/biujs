@@ -79,7 +79,7 @@ language/literals/string	53	20	0
 built-ins/Array	2392	453	236
 built-ins/JSON	123	29	13
 built-ins/WeakSet	77	8	0
-built-ins/Number	252	38	50
+built-ins/Number	264	38	38
 built-ins/Proxy	229	50	32
 language/expressions/yield	42	2	19
 language/rest-parameters	11	0	0
@@ -102,7 +102,7 @@ language/statements/if	47	22	0
 language/statements/throw	13	1	0
 language/literals/boolean	4	0	0
 language/computed-property-names	42	0	6
-built-ins/Boolean	38	3	10
+built-ins/Boolean	48	3	0
 built-ins/Map	153	51	0
 built-ins/TypedArray	342	772	332
 built-ins/Object	3108	143	160

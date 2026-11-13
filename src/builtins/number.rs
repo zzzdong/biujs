@@ -8,7 +8,7 @@ use crate::vm::value::Value;
 
 use super::number_to_string;
 use super::number_to_string_radix;
-use super::set_prototype_method;
+use super::set_prototype_method_owned;
 use super::set_static_method;
 
 // ─────────────────────────────────────────────────────────
@@ -16,31 +16,31 @@ use super::set_static_method;
 // ─────────────────────────────────────────────────────────
 
 pub fn register_number_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    set_prototype_method(proto, heap, "valueOf", |this, _args| number_value_of(this));
-    set_prototype_method(proto, heap, "toLocaleString", |this, _args| {
+    set_prototype_method_owned("Number", proto, heap, "valueOf", |this, _args| number_value_of(this));
+    set_prototype_method_owned("Number", proto, heap, "toLocaleString", |this, _args| {
         number_to_string_proto(this)
     });
     // `Number.prototype.toString.length` is 1 (radix counts despite the
     // brackets in the heading); every other `toString` is 0.
-    super::set_prototype_method_arity(proto, heap, "toString", 1, |this, args| {
+    super::set_prototype_method_arity_owned("Number", proto, heap, "toString", 1, |this, args| {
         number_to_string_with_radix(this, args)
     });
-    set_prototype_method(proto, heap, "toFixed", |this, args| number_to_fixed(this, args));
-    set_prototype_method(proto, heap, "toExponential", |this, args| {
+    set_prototype_method_owned("Number", proto, heap, "toFixed", |this, args| number_to_fixed(this, args));
+    set_prototype_method_owned("Number", proto, heap, "toExponential", |this, args| {
         number_to_exponential(this, args)
     });
-    set_prototype_method(proto, heap, "toPrecision", |this, args| {
+    set_prototype_method_owned("Number", proto, heap, "toPrecision", |this, args| {
         number_to_precision(this, args)
     });
 }
 
 fn number_value_of(obj: &Value) -> Result<Value, RuntimeError> {
-    // Primitive wrappers (`Object(1.1)`) unwrap via ToPrimitive.
-    Ok(Value::Number(obj.to_primitive("number").to_number()))
+    // `thisNumberValue`：包装对象解包，别的接收者（`{}` / `'1'`）抛 TypeError。
+    Ok(Value::Number(super::require_number(obj)?))
 }
 
 fn number_to_string_proto(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&number_to_string(obj.to_number())))
+    Ok(Value::string(&number_to_string(super::require_number(obj)?)))
 }
 
 /// `Number.prototype.toString([radix])`.
@@ -49,7 +49,7 @@ fn number_to_string_proto(obj: &Value) -> Result<Value, RuntimeError> {
 /// spec requires (`toString` on a number is the only numeric conversion that
 /// honours a radix).
 pub fn number_to_string_with_radix(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let n = obj.to_number();
+    let n = super::require_number(obj)?;
     let radix = match args.first() {
         None | Some(Value::Undefined) => 10,
         Some(v) => {
@@ -162,7 +162,7 @@ pub fn number_is_integer(args: &[Value]) -> Result<Value, RuntimeError> {
 // ─────────────────────────────────────────────────────────
 
 pub fn number_to_fixed(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let n = obj.to_number();
+    let n = super::require_number(obj)?;
     if n.is_nan() {
         return Ok(Value::string("NaN"));
     }
@@ -183,7 +183,7 @@ pub fn number_to_fixed(obj: &Value, args: &[Value]) -> Result<Value, RuntimeErro
 }
 
 pub fn number_to_exponential(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let n = obj.to_number();
+    let n = super::require_number(obj)?;
     if n.is_nan() {
         return Ok(Value::string("NaN"));
     }
@@ -204,7 +204,7 @@ pub fn number_to_exponential(obj: &Value, args: &[Value]) -> Result<Value, Runti
 }
 
 pub fn number_to_precision(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let n = obj.to_number();
+    let n = super::require_number(obj)?;
     if n.is_nan() {
         return Ok(Value::string("NaN"));
     }

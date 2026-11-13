@@ -1540,6 +1540,24 @@ fn call_prototype_method_inner(
         }
     }
     match method_name {
+        // `Number.prototype.*` / `Boolean.prototype.*`：归属已确定，接收者不是对应
+        // 包装值时抛 TypeError（`thisNumberValue` / `thisBooleanValue`），
+        // 不再经由 `dispatch_to_string` 之类"按形状猜"的兜底。
+        "toString" | "valueOf" | "toLocaleString" if owner == Some("Number") => {
+            match method_name {
+                "toString" => number::number_to_string_with_radix(obj, args),
+                "valueOf" => Ok(Value::Number(require_number(obj)?)),
+                _ => Ok(Value::string(&number_to_string(require_number(obj)?))),
+            }
+        }
+        "toString" | "valueOf" if owner == Some("Boolean") => {
+            let b = require_boolean(obj)?;
+            Ok(if method_name == "toString" {
+                Value::string(if b { "true" } else { "false" })
+            } else {
+                Value::Bool(b)
+            })
+        }
         // `Number.prototype.toString([radix])` takes the radix argument.
         "toString" if matches!(obj, Value::Number(_)) => {
             number::number_to_string_with_radix(obj, args)
@@ -2224,6 +2242,73 @@ pub fn set_prototype_method_owned<F>(
         crate::vm::object::NativeFunctionObject::new(&format!("{owner}.prototype.{name}")),
     )));
     let _ = proto.borrow_mut().define_property(heap, key, method_descriptor(method_val));
+}
+
+/// `thisNumberValue` (ES 20.1.3.x): a Number primitive or a Number **wrapper**,
+/// nothing else. `Number.prototype.toString.call({})` / `.call('1')` are
+/// TypeErrors, they do not coerce (that is `ToNumber`, which is a different
+/// operation and needs user `valueOf` anyway).
+pub fn require_number(value: &Value) -> Result<f64, RuntimeError> {
+    let incompatible = || {
+        RuntimeError::TypeError(
+            "Number.prototype method called on an incompatible receiver".to_string(),
+        )
+    };
+    match value {
+        Value::Number(n) => Ok(*n),
+        Value::Object(obj_ref) => {
+            let borrowed = obj_ref.borrow();
+            if let crate::vm::gc::Object::PrimitiveWrapper(wrapper) = &*borrowed
+                && let Value::Number(n) = wrapper.wrapped()
+            {
+                return Ok(*n);
+            }
+            Err(incompatible())
+        }
+        _ => Err(incompatible()),
+    }
+}
+
+/// `thisBooleanValue` — the Boolean twin of [`require_number`].
+pub fn require_boolean(value: &Value) -> Result<bool, RuntimeError> {
+    let incompatible = || {
+        RuntimeError::TypeError(
+            "Boolean.prototype method called on an incompatible receiver".to_string(),
+        )
+    };
+    match value {
+        Value::Bool(b) => Ok(*b),
+        Value::Object(obj_ref) => {
+            let borrowed = obj_ref.borrow();
+            if let crate::vm::gc::Object::PrimitiveWrapper(wrapper) = &*borrowed
+                && let Value::Bool(b) = wrapper.wrapped()
+            {
+                return Ok(*b);
+            }
+            Err(incompatible())
+        }
+        _ => Err(incompatible()),
+    }
+}
+
+/// [`set_prototype_method_owned`] with an explicit `length`.
+pub fn set_prototype_method_arity_owned<F>(
+    owner: &str,
+    proto: &Gc<Object>,
+    heap: &mut Heap,
+    name: &str,
+    arity: usize,
+    _f: F,
+) where
+    F: Fn(&Value, &[Value]) -> Result<Value, RuntimeError> + 'static,
+{
+    let mut method = crate::vm::object::NativeFunctionObject::new(&format!(
+        "{owner}.prototype.{name}"
+    ));
+    method.set_length(arity);
+    let key = PropertyKey::intern(heap, name);
+    let value = method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(method))));
+    let _ = proto.borrow_mut().define_property(heap, key, value);
 }
 
 /// Like [`set_prototype_method`], but with an explicit `length`, for the few

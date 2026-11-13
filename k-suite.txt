@@ -1,0 +1,87 @@
+
+running 1 test
+[built-ins/Boolean                               ] passed   38  skipped    3  failed   10
+
+--- built-ins/Boolean failures ---
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\toString\S15.6.4.2_A2_T1.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\toString\S15.6.4.2_A2_T2.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\toString\S15.6.4.2_A2_T3.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\toString\S15.6.4.2_A2_T4.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\toString\S15.6.4.2_A2_T5.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\valueOf\S15.6.4.3_A2_T1.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\valueOf\S15.6.4.3_A2_T2.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\valueOf\S15.6.4.3_A2_T3.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\valueOf\S15.6.4.3_A2_T4.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Boolean\prototype\valueOf\S15.6.4.3_A2_T5.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+[built-ins/Map                                   ] passed  153  skipped   51  failed    0
+[built-ins/Set                                   ] passed  193  skipped  190  failed    0
+[built-ins/Number                                ] passed  252  skipped   38  failed   50
+
+--- built-ins/Number failures ---
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\parseFloat.js: Error: Expected SameValue(«function parseFloat() { [native code] }», «function parseFloat() { [native code] }») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\parseInt.js: Error: Expected SameValue(«function parseInt() { [native code] }», «function parseInt() { [native code] }») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\range.js: Error: Expected SameValue(«"3e0"», «"3e+0"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\return-abrupt-tointeger-fractiondigits-symbol.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\return-abrupt-tointeger-fractiondigits.js: Error: valueOf Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\return-values.js: Error: Expected SameValue(«"1e2"», «"1e+2"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\this-is-0-fractiondigits-is-0.js: Error: Number.prototype Expected SameValue(«"0e0"», «"0e+0"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\this-is-0-fractiondigits-is-not-0.js: Error: 0 and 1 Expected SameValue(«"0.0e0"», «"0.0e+0"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\this-type-not-number-or-number-object.js: Error: {} Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\tointeger-fractiondigits.js: Error: 0.1 Expected SameValue(«"1e2"», «"1e+2"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toExponential\undefined-fractiondigits.js: Error: undefined Expected SameValue(«"1e2"», «"1.23456e+2"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toFixed\range.js: Error: Expected a RangeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toFixed\S15.7.4.5_A1.3_T01.js: Error: The result of evaluating (e instanceof RangeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toFixed\S15.7.4.5_A1.3_T02.js: Error: The result of evaluating (e instanceof RangeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toFixed\S15.7.4.5_A1.4_T01.js: Error: (new Number(1e21)).toFixed() must return the same value returned by String(1e21) Expected SameValue(«"1000000000000000000000"», «"1e+21"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toFixed\toFixed-tonumber-throws-typeerror-symbol.js: Error: Number.prototype.toFixed must throw a TypeError if _fractionDigits_ is Symbol Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toFixed\toFixed-tonumber-throws-typeerror-toprimitive.js: Error: TypeError is thrown when _fractionDigits_ cannot be converted to a primitive Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\exponential.js: Error: Expected SameValue(«"10.0"», «"1e+1"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\nan.js: Error: NaN is checked after ToInteger(precision) Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\precision-cannot-be-coerced-to-a-number-in-range.js: Error: `function() {}` doesn't coerce into a number in range (1-100) Expected a RangeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\range.js: Error: Expected SameValue(«"3.0"», «"3"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\return-abrupt-tointeger-precision-symbol.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\return-abrupt-tointeger-precision.js: Error: valueOf Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\return-values.js: Error: Expected SameValue(«"7.0"», «"7"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\this-is-0-precision-is-1.js: Error: Number.prototype is 0 Expected SameValue(«"0.0"», «"0"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\this-is-0-precision-is-gter-than-1.js: Error: (0).toPrecision(2) Expected SameValue(«"0.00"», «"0.0"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\this-type-not-number-or-number-object.js: Error: {} Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\tointeger-precision.js: Error: 1.1 Expected SameValue(«"123.5"», «"1e+2"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toPrecision\undefined-precision-arg.js: Error: Expected SameValue(«"7.0"», «"7"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toString\numeric-literal-tostring-radix-poisoned.js: Error: Expected a Test262Error but got a RangeError
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toString\S15.7.4.2_A4_T01.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toString\S15.7.4.2_A4_T02.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toString\S15.7.4.2_A4_T03.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toString\S15.7.4.2_A4_T04.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\toString\S15.7.4.2_A4_T05.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\valueOf\S15.7.4.4_A2_T01.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\valueOf\S15.7.4.4_A2_T02.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\valueOf\S15.7.4.4_A2_T03.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\valueOf\S15.7.4.4_A2_T04.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\prototype\valueOf\S15.7.4.4_A2_T05.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\return-abrupt-tonumber-value-symbol.js: Error: NewTarget is undefined Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\return-abrupt-tonumber-value.js: Error: NewTarget is undefined, {}.valueOf Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\S15.7.1.1_A1.js: Error: Number("INFINITY") returns NaN Expected SameValue(«Infinity», «NaN») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\S8.12.8_A3.js: Error: #1.2: var __obj = {toNumber: function() {return "1"}, valueOf: function() {return new Object();}}; Number(__obj) === 1. Actual: Test262Error: Number("{toString: function() {return "1"}, valueOf: function() {return new Object();}}) must return 1 Expected SameValue(«NaN», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\S8.12.8_A4.js: Error: The result of evaluating (e instanceof TypeError) is expected to be true Expected SameValue(«false», «true») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\S9.1_A1_T1.js: Error: Number({valueOf: function() {return "1"}, toString: function() {return 0}}) must return 1 Expected SameValue(«NaN», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\S9.3_A5_T1.js: Error: Number("{ToNumber: function() {return 12345;}, toString: function() {return "67890";}, valueOf: function() {return "9876543210";}}) must return 9876543210 Expected SameValue(«NaN», «9876543210») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\string-binary-literal-invalid.js: Error: plus sign Expected SameValue(«1», «NaN») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\string-hex-literal-invalid.js: Error: plus sign Expected SameValue(«16», «NaN») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\built-ins/Number\string-octal-literal-invald.js: Error: plus sign Expected SameValue(«8», «NaN») to be true
+
+================ test262 summary ================
+test262 revision: 7e115f46ac64340827d505fa928ad436cb7ba5a6 (pinned baseline)
+suite                                             passed skipped  failed
+built-ins/Boolean                                     38       3      10
+built-ins/Map                                        153      51       0
+built-ins/Set                                        193     190       0
+built-ins/Number                                     252      38      50
+------------------------------------------------
+TOTAL                                                636     282      60
+pass rate over executed tests: 91.38% (636 / 696)
+guards: timeout 0, step-limit 0, memory 0   (TEST262_TIMEOUT_MS / TEST262_STEP_LIMIT / TEST262_MEMORY_MB, 0 = off)
+=================================================
+test test262_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 3.07s
+

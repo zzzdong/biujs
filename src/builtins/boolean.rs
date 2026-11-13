@@ -8,10 +8,10 @@ use crate::vm::value::Value;
 // ─────────────────────────────────────────────────────────
 
 pub fn register_boolean_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method;
+    use super::set_prototype_method_owned;
 
-    set_prototype_method(proto, heap, "valueOf", |this, _args| boolean_value_of(this));
-    set_prototype_method(proto, heap, "toString", |this, _args| boolean_to_string(this));
+    set_prototype_method_owned("Boolean", proto, heap, "valueOf", |this, _args| boolean_value_of(this));
+    set_prototype_method_owned("Boolean", proto, heap, "toString", |this, _args| boolean_to_string(this));
 }
 
 // ─────────────────────────────────────────────────────────
@@ -31,10 +31,11 @@ pub fn boolean_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 // ─────────────────────────────────────────────────────────
 
 pub fn boolean_value_of(obj: &Value) -> Result<Value, RuntimeError> {
-    // Primitive wrappers (`Object(true)`) unwrap via ToPrimitive.
-    Ok(Value::Bool(obj.to_primitive("default").to_boolean()))
+    // `thisBooleanValue`：Boolean 包装对象解包，别的接收者（`{}` / `0`）抛 TypeError。
+    Ok(Value::Bool(super::require_boolean(obj)?))
 }
 
 pub fn boolean_to_string(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&obj.to_boolean().to_string()))
+    let value = super::require_boolean(obj)?;
+    Ok(Value::string(if value { "true" } else { "false" }))
 }

@@ -382,6 +382,27 @@ impl VM {
                 args,
             );
         }
+        // `Number.prototype.*` / `Boolean.prototype.*`：归属决定 `toString` /
+        // `valueOf` 的接收者口径（`Number.prototype.toString.call({})` 是
+        // TypeError，不能落到 `Object.prototype.toString`）。
+        if let Some(method) = name.strip_prefix("Number.prototype.") {
+            return crate::builtins::call_prototype_method_owned(
+                "Number",
+                &mut self.heap,
+                &this,
+                method,
+                args,
+            );
+        }
+        if let Some(method) = name.strip_prefix("Boolean.prototype.") {
+            return crate::builtins::call_prototype_method_owned(
+                "Boolean",
+                &mut self.heap,
+                &this,
+                method,
+                args,
+            );
+        }
         // `Array.prototype.<name>`：共享名（`slice` / `indexOf` / `includes` /
         // `concat` / `join` …）按**归属**走数组口径 —— `Array.prototype.slice.
         // call("abc")` 是 `["a","b","c"]`，即使接收者看起来像字符串。
