@@ -261,7 +261,8 @@ echo "  执行 $EXECUTED = 通过 $PASSED + 失败 $FAILED；跳过 $SKIPPED"
 # 8577 → 10466（2026-11-13，严格 ES2015 批）：范围**由版本决定**，后版本的
 # feature 标签全部登记为范围外（引擎实现了也一样），执行 20,504 → 18,547，
 # 通过率 88.40% → 90.57%。
-EXPECTED_SKIPPED=10466
+# 2026-11-14：`UNSUPPORTED_PATTERNS` 收下 `.call(eval)`，跳过数 10466 → 10470。
+EXPECTED_SKIPPED=10470
 if [ "$SKIPPED" != "$EXPECTED_SKIPPED" ]; then
   echo "  !! 跳过数从 $EXPECTED_SKIPPED 变为 $SKIPPED —— 跳过表被改动了。"
   echo "     请确认这是有意的（计划书 §2.2：交付特性时必须同批解锁），并更新本脚本的 EXPECTED_SKIPPED。"

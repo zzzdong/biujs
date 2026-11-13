@@ -2109,6 +2109,11 @@ pub fn builtin_arity(registered_name: &str) -> usize {
     if registered_name.starts_with("__promise_capability_executor__") {
         return 2;
     }
+    // `Promise[Symbol.species]` 是 accessor，`length` 为 0
+    // （`Symbol.species/length.js`），不是普通内建函数的一元。
+    if registered_name == promise::PROMISE_SPECIES_NATIVE {
+        return 0;
+    }
     if registered_name.starts_with("__promise_") {
         return 1;
     }

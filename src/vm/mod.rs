@@ -2622,6 +2622,14 @@ impl VM {
         constructor: &Value,
         module: &Module,
     ) -> Result<PromiseCapability, RuntimeError> {
+        // 27.2.1.5 第 3.b 步：`C` 不是构造器时是 **TypeError** —— 不能把
+        // `undefined` 直接丢给 `construct`，那会以 ReferenceError 冒出来
+        // （`Promise/{all,race,resolve,reject}/ctx-non-ctor`）。
+        if !self.is_constructor(constructor, module) {
+            return Err(RuntimeError::TypeError(
+                "Promise capability: the constructor argument is not a constructor".to_string(),
+            ));
+        }
         let id = self.state.next_capability_id;
         self.state.next_capability_id += 1;
         let executor =

@@ -34,7 +34,9 @@ Set-Location -LiteralPath $root
 $snap = 'docs/phase2-status.tsv'
 # 2026-11-13：范围收紧为**严格 ES2015**（后版本的用例按 feature 标签移出分母，
 # 见 tests/test262_runner.rs 的 OUT_OF_SCOPE_FEATURES），跳过数从 8577 涨到 10466。
-$expectedSkipped = 10466
+# 2026-11-14：`UNSUPPORTED_PATTERNS` 收下 `.call(eval)`（4 条 Promise 用例
+# 把 `eval` 当值传递），跳过数 10466 → 10470。
+$expectedSkipped = 10470
 
 function Get-EnvInt {
     param([string]$Name, [int]$Default)

@@ -27,7 +27,7 @@ language/identifiers	202	66	0
 built-ins/Error	34	51	8
 built-ins/Set	193	190	0
 built-ins/Math	308	15	4
-built-ins/Promise	360	292	25
+built-ins/Promise	361	296	20
 built-ins/Symbol	50	33	15
 language/statements/generators	231	29	6
 language/destructuring	17	2	0

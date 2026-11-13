@@ -590,6 +590,9 @@ const UNSUPPORTED_PATTERNS: &[&str] = &[
     // `eval` and the `Function` constructor (§1 明确不做).
     "eval(",
     "new Function(",
+    // `eval` 当作**值**传递（`Promise.all.call(eval)`：断言"非构造器 → TypeError"）。
+    // 引擎不提供 `eval`，这些用例只会得到 ReferenceError，属 §1 的政策性范围外。
+    ".call(eval)",
     "Function(\"",
     "Function('",
     // Modules are out of scope for now (§1).
