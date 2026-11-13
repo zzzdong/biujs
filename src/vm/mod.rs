@@ -2550,10 +2550,12 @@ impl VM {
             }
             // Adopt by forwarding: a reaction with no handlers passes the
             // settlement straight through to `promise` (ES 27.2.2.1 step 9).
+            // The forwarding reaction settles `promise` itself, so its capability
+            // is the one built from that promise's id.
             let forwarding = PromiseReaction {
                 on_fulfilled: None,
                 on_rejected: None,
-                target: *promise,
+                capability: self.capability_for_promise(promise),
             };
             let settled = {
                 let borrowed = existing.borrow();
@@ -3031,17 +3033,24 @@ impl VM {
 
     /// `promise.then(onFulfilled, onRejected)` — always asynchronous, so a
     /// settled promise still queues its reaction.
+    ///
+    /// The child is `NewPromiseCapability(SpeciesConstructor(promise, %Promise%))`
+    /// (ES 27.2.2.1 step 3), which is what makes `then` on a subclass answer an
+    /// instance of that subclass — and what makes the subclass constructor run.
     fn promise_then(
         &mut self,
         promise: &Gc<Object>,
         on_fulfilled: Option<Value>,
         on_rejected: Option<Value>,
-    ) -> Value {
-        let child = self.new_promise();
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let species = self.promise_species_constructor(promise, module)?;
+        let capability = self.new_promise_capability(&species, module)?;
+        let child = capability.promise.clone();
         let reaction = PromiseReaction {
             on_fulfilled,
             on_rejected,
-            target: child,
+            capability,
         };
         let settled = {
             let borrowed = promise.borrow();
@@ -3067,10 +3076,64 @@ impl VM {
                 });
             }
         }
-        Self::promise_value(&child)
+        Ok(child)
     }
 
+    /// `SpeciesConstructor(O, %Promise%)` (ES 7.3.20) for `then`'s child promise.
+    fn promise_species_constructor(
+        &mut self,
+        promise: &Gc<Object>,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let default = self.intrinsic_promise(module)?;
+        let receiver = Self::promise_value(promise);
+        let constructor_key = PropertyKey::intern(&mut self.heap, "constructor");
+        let constructor = self.get_member(&receiver, &constructor_key, module)?;
+        let constructor = match &constructor {
+            Value::Undefined => return Ok(default),
+            Value::Object(_) | Value::Function(_) => constructor.clone(),
+            other => {
+                return Err(RuntimeError::TypeError(format!(
+                    "Promise then: constructor is not an object ({})",
+                    other.type_of()
+                )));
+            }
+        };
+        let species = self.get_member(
+            &constructor,
+            &crate::builtins::species_symbol_key(),
+            module,
+        )?;
+        if matches!(species, Value::Undefined | Value::Null) {
+            return Ok(default);
+        }
+        if self.is_constructor(&species, module) {
+            return Ok(species);
+        }
+        Err(RuntimeError::TypeError(
+            "Promise then: @@species is not a constructor".to_string(),
+        ))
+    }
 
+    /// `%Promise%` itself — the default of `SpeciesConstructor` /
+    /// `NewPromiseCapability` when no subclass is involved.
+    fn intrinsic_promise(&mut self, module: &Module) -> Result<Value, RuntimeError> {
+        let key = PropertyKey::intern(&mut self.heap, "Promise");
+        let global = self.state.global_object.clone();
+        self.get_member(&global, &key, module)
+    }
+
+    /// A capability that settles an **existing** promise (its resolve/reject
+    /// natives are minted from the promise id) — used by `ResolvePromise`'s
+    /// forwarding reaction, which settles `promise` itself.
+    fn capability_for_promise(&mut self, promise: &Gc<Object>) -> PromiseCapability {
+        let id = promise.borrow().as_promise().expect("promise").id;
+        PromiseCapability {
+            promise: Self::promise_value(promise),
+            resolve: Self::native_fn(&mut self.heap, &format!("__promise_resolve__{id}")),
+            reject: Self::native_fn(&mut self.heap, &format!("__promise_reject__{id}")),
+        }
+    }
 
     /// Drain the microtask queue, running each reaction handler.
     fn run_promise_jobs(&mut self, module: &Module) -> Result<(), RuntimeError> {
@@ -3114,34 +3177,41 @@ impl VM {
             } else {
                 reaction.on_rejected.clone()
             };
+            // 结算走 capability 的两个函数（27.2.2.1 第 9/12 步）：内置 promise 下
+            // 它们就是 `__promise_resolve__` / `__promise_reject__`（前者等于
+            // `ResolvePromise`，thenable 会被采纳），子类下则是子类自己的函数。
+            let settle_through = |vm: &mut Self,
+                                   capability: &PromiseCapability,
+                                   fulfilled: bool,
+                                   value: Value|
+             -> Result<(), RuntimeError> {
+                let function = if fulfilled {
+                    capability.resolve.clone()
+                } else {
+                    capability.reject.clone()
+                };
+                match vm.invoke(&function, Value::Undefined, &[value], module) {
+                    Ok(_) => Ok(()),
+                    // 规范里 job 里抛出的异常不可观察（宿主只报告），不往外传播。
+                    Err(_) => Ok(()),
+                }
+            };
             match handler {
                 Some(handler) if handler.is_callable() => {
                     match self.invoke(&handler, Value::Undefined, &[argument], module) {
-                        Ok(value) => {
-                            // ES 27.2.2.1 step 12: the handler's answer goes
-                            // through the resolution procedure, so a thenable it
-                            // returns is adopted rather than fulfilled directly.
-                            self.promise_resolve(&reaction.target, value, module)
-                        }
+                        Ok(value) => settle_through(self, &reaction.capability, true, value)?,
                         Err(RuntimeError::Thrown(reason)) => {
-                            self.promise_settle(&reaction.target, PromiseState::Rejected, reason)
+                            settle_through(self, &reaction.capability, false, reason)?
                         }
                         Err(other) => {
                             let value = self.error_value(other);
-                            self.promise_settle(&reaction.target, PromiseState::Rejected, value)
+                            settle_through(self, &reaction.capability, false, value)?
                         }
                     }
                 }
                 // No handler of the matching kind: the settlement passes
                 // through to the child (ES 27.2.2.1 step 9).
-                _ => {
-                    let state = if fulfilled {
-                        PromiseState::Fulfilled
-                    } else {
-                        PromiseState::Rejected
-                    };
-                    self.promise_settle(&reaction.target, state, argument);
-                }
+                _ => settle_through(self, &reaction.capability, fulfilled, argument)?,
             }
         }
         Ok(())

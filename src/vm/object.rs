@@ -2675,11 +2675,17 @@ pub enum PromiseState {
 
 /// One `then` reaction: the two handlers and the promise they settle when the
 /// handler answers.
+///
+/// The target is a full `PromiseCapability` rather than a bare promise: ES
+/// 27.2.2.1 step 3 creates it with `NewPromiseCapability(SpeciesConstructor(
+/// promise, %Promise%))`, and steps 9-12 settle it through `[[Resolve]]` /
+/// `[[Reject]]` — so a subclass with a custom constructor gets its own promise
+/// back from `then`, and the constructor must be *called* (test262 counts it).
 #[derive(Debug, Clone)]
 pub struct PromiseReaction {
     pub on_fulfilled: Option<Value>,
     pub on_rejected: Option<Value>,
-    pub target: Gc<Object>,
+    pub capability: crate::vm::PromiseCapability,
 }
 
 /// A `Promise` instance: state, settled value, and the reactions waiting on it.

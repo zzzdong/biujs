@@ -38,7 +38,7 @@ impl Trace for PromiseReaction {
     fn trace(&self, out: &mut Worklist) {
         self.on_fulfilled.trace(out);
         self.on_rejected.trace(out);
-        self.target.trace(out);
+        self.capability.trace(out);
     }
 }
 

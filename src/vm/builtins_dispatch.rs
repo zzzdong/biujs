@@ -1169,11 +1169,16 @@ impl VM {
             "then" => {
                 let on_fulfilled = callable(args.first());
                 let on_rejected = callable(args.get(1));
-                Ok(Some(self.promise_then(&promise, on_fulfilled, on_rejected)))
+                Ok(Some(self.promise_then(
+                    &promise,
+                    on_fulfilled,
+                    on_rejected,
+                    module,
+                )?))
             }
             "catch" => {
                 let on_rejected = callable(args.first());
-                Ok(Some(self.promise_then(&promise, None, on_rejected)))
+                Ok(Some(self.promise_then(&promise, None, on_rejected, module)?))
             }
             _ => {
                 // `finally(cb)` (ES 27.2.5.3): returns a *fresh* promise that
@@ -1182,7 +1187,7 @@ impl VM {
                 // callback itself runs when the reaction is drained.
                 let callback = callable(args.first());
                 match callback {
-                    None => Ok(Some(self.promise_then(&promise, None, None))),
+                    None => Ok(Some(self.promise_then(&promise, None, None, module)?)),
                     Some(cb) => {
                         let id = self.state.next_finally_id;
                         self.state.next_finally_id += 1;
@@ -1193,7 +1198,8 @@ impl VM {
                             &promise,
                             Some(fulfilled),
                             Some(rejected),
-                        )))
+                            module,
+                        )?))
                     }
                 }
             }
