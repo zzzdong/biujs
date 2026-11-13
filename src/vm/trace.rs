@@ -12,7 +12,9 @@
 use crate::vm::gc::{Trace, Worklist};
 use crate::vm::object::PromiseReaction;
 
-use super::{BoundFunction, Frame, PromiseAggregation, PromiseJob, SehRecord, State, VM};
+use super::{
+    BoundFunction, Frame, PromiseAggregation, PromiseCapability, PromiseJob, SehRecord, State, VM,
+};
 
 impl Trace for SehRecord {
     fn trace(&self, out: &mut Worklist) {
@@ -61,10 +63,18 @@ impl Trace for PromiseJob {
 
 impl Trace for PromiseAggregation {
     fn trace(&self, out: &mut Worklist) {
-        // `resolve` / `reject` 是宿主函数（对象），`values` 是元素结果 —— 都是根。
+        // capability 里的 `resolve` / `reject` 是宿主函数（对象），`values` 是
+        // 元素结果 —— 都是根。
+        self.capability.trace(out);
+        self.values.trace(out);
+    }
+}
+
+impl Trace for PromiseCapability {
+    fn trace(&self, out: &mut Worklist) {
+        self.promise.trace(out);
         self.resolve.trace(out);
         self.reject.trace(out);
-        self.values.trace(out);
     }
 }
 
@@ -93,6 +103,7 @@ impl Trace for State {
         self.promise_jobs.trace(out);
         self.promises.trace(out);
         self.aggregations.trace(out);
+        self.capabilities.trace(out);
         self.finally_handlers.trace(out);
         self.closure_var_stack.trace(out);
         // `ClosureVar` pushes cells here for the `Make*FuncObj` that follows.

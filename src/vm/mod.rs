@@ -2446,20 +2446,31 @@ impl VM {
     ) -> Result<Option<Value>, RuntimeError> {
         Ok(match name {
             "Promise.resolve" => {
-                let promise = self.new_promise();
-                let value = args.first().cloned().unwrap_or(Value::Undefined);
-                // A promise argument is answered as-is (ES 27.2.4.6 step 2).
-                if let Some(existing) = self.as_promise(&value) {
-                    return Ok(Some(Self::promise_value(&existing)));
+                // `Promise.resolve` (27.2.4.6) 与 `PromiseResolve` (27.2.4.7):
+                // `this` 必须是对象；已经是本构造器的 promise 则原样返回，
+                // 其余情况走 capability 的 `[[Resolve]]`。
+                if !matches!(this, Value::Object(_) | Value::Function(_)) {
+                    return Err(RuntimeError::TypeError(
+                        "Promise.resolve called on a non-object".to_string(),
+                    ));
                 }
-                self.promise_resolve(&promise, value, module);
-                Some(Self::promise_value(&promise))
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                if let Some(existing) = self.as_promise(&value) {
+                    let constructor_key = PropertyKey::intern(&mut self.heap, "constructor");
+                    let constructor = self.get_member(&value, &constructor_key, module)?;
+                    if constructor.strict_eq(this) {
+                        return Ok(Some(Self::promise_value(&existing)));
+                    }
+                }
+                let capability = self.new_promise_capability(this, module)?;
+                self.invoke(&capability.resolve, Value::Undefined, &[value], module)?;
+                Some(capability.promise)
             }
             "Promise.reject" => {
-                let promise = self.new_promise();
+                let capability = self.new_promise_capability(this, module)?;
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
-                self.promise_settle(&promise, PromiseState::Rejected, value);
-                Some(Self::promise_value(&promise))
+                self.invoke(&capability.reject, Value::Undefined, &[value], module)?;
+                Some(capability.promise)
             }
             // 四个组合方法要读 `this.resolve`（ES 27.2.4.x 第 3 步），所以调用的
             // `this` 必须传进来：`Promise.all.call(BadPromise, it)` 用的是
@@ -2586,6 +2597,39 @@ impl VM {
         self.promise_settle(promise, PromiseState::Fulfilled, value);
     }
 
+    /// ES 27.2.1.5 `NewPromiseCapability(C)`.
+    ///
+    /// Constructs `new C(executor)` and answers the `resolve` / `reject` the
+    /// constructor handed to the executor. `C` not being a constructor is a
+    /// **synchronous** TypeError (step 3.b) — that is why this returns `Result`
+    /// rather than rejecting a promise.
+    fn new_promise_capability(
+        &mut self,
+        constructor: &Value,
+        module: &Module,
+    ) -> Result<PromiseCapability, RuntimeError> {
+        let id = self.state.next_capability_id;
+        self.state.next_capability_id += 1;
+        let executor =
+            Self::native_fn(&mut self.heap, &format!("__promise_capability_executor__{id}"));
+        let promise = self.construct(constructor, &[executor], module)?;
+        let capability = self.state.capabilities.remove(&id).ok_or_else(|| {
+            RuntimeError::TypeError(
+                "Promise constructor did not call the capability executor".to_string(),
+            )
+        })?;
+        let callable = |v: &Value| v.is_callable() || matches!(v, Value::Function(_));
+        if !callable(&capability.resolve) || !callable(&capability.reject) {
+            return Err(RuntimeError::TypeError(
+                "Promise capability executor did not provide callable resolve/reject".to_string(),
+            ));
+        }
+        Ok(PromiseCapability {
+            promise,
+            ..capability
+        })
+    }
+
     /// `Promise.all` / `race` / `allSettled` / `any` (ES 27.2.4.1 … .4).
     ///
     /// Elements are consumed **incrementally**: each `next()` is run through
@@ -2605,46 +2649,24 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Value, RuntimeError> {
-        // `NewPromiseCapability(C)` (ES 27.2.1.5): construct `new C(executor)` and
-        // keep the `resolve` / `reject` the executor receives. A non-constructor
-        // `C` is a synchronous TypeError (step 3.b), not a rejection.
+        // `NewPromiseCapability(C)` (ES 27.2.1.5). `C` not being a constructor is a
+        // synchronous TypeError (step 3.b), not a rejection.
+        let capability = self.new_promise_capability(constructor, module)?;
+        let promise = capability.promise.clone();
         let id = self.state.next_aggregation_id;
         self.state.next_aggregation_id += 1;
-        // The aggregation is created *first* so the executor (which runs inside
-        // `construct`) has somewhere to record the two functions.
         self.state.aggregations.insert(
             id,
             PromiseAggregation {
                 kind,
-                resolve: Value::Undefined,
-                reject: Value::Undefined,
+                capability,
                 // 1 = the loop's own share (27.2.4.1.1 step 4: `[[Value]]: 1`).
                 remaining: 1,
                 values: Vec::new(),
                 done: false,
             },
         );
-        // 构造结果 promise，并把它交给构造器的 `resolve` / `reject` 记下来。
-        let executor =
-            Self::native_fn(&mut self.heap, &format!("__promise_capability_executor__{id}"));
-        let promise = match self.construct(constructor, &[executor], module) {
-            Ok(promise) => promise,
-            Err(err) => {
-                self.state.aggregations.remove(&id);
-                return Err(err);
-            }
-        };
-        let capability = match self.state.aggregations.get(&id) {
-            Some(agg) => (agg.resolve.clone(), agg.reject.clone()),
-            None => (Value::Undefined, Value::Undefined),
-        };
         let callable = |v: &Value| v.is_callable() || matches!(v, Value::Function(_));
-        if !callable(&capability.0) || !callable(&capability.1) {
-            self.state.aggregations.remove(&id);
-            return Err(RuntimeError::TypeError(
-                "Promise capability executor did not provide callable resolve/reject".to_string(),
-            ));
-        }
         // `GetPromiseResolve(C)` (27.2.4.1.1 step 3): a fake constructor may
         // override `resolve`, and its abrupt completion rejects the result.
         let resolve_key = PropertyKey::intern(&mut self.heap, "resolve");
@@ -2818,7 +2840,11 @@ impl VM {
         let Some(agg) = self.state.aggregations.remove(&id) else {
             return Ok(());
         };
-        let function = if fulfilled { agg.resolve } else { agg.reject };
+        let function = if fulfilled {
+            agg.capability.resolve
+        } else {
+            agg.capability.reject
+        };
         if function.is_undefined() {
             return Ok(());
         }
@@ -5831,6 +5857,11 @@ struct State {
     /// their aggregation state.
     aggregations: HashMap<u64, PromiseAggregation>,
     next_aggregation_id: u64,
+    /// `NewPromiseCapability` 的临时落点：`new C(executor)` 期间构造器把
+    /// `resolve` / `reject` 交回来，这里按 executor 名字里的 id 暂存，构造返回
+    /// 后立刻取走。和 `promises` / `aggregations` 同一套"名字携带 id"的做法。
+    capabilities: HashMap<u64, PromiseCapability>,
+    next_capability_id: u64,
     /// Pending `finally` callbacks, keyed by the id embedded in the handler
     /// names minted by `try_promise_method`.
     finally_handlers: HashMap<u64, Value>,
@@ -5878,6 +5909,8 @@ impl State {
             next_promise_id: 0,
             aggregations: HashMap::new(),
             next_aggregation_id: 0,
+            capabilities: HashMap::new(),
+            next_capability_id: 0,
             finally_handlers: HashMap::new(),
             next_finally_id: 0,
             closure_var_stack: Vec::new(),
@@ -6486,14 +6519,12 @@ fn set_aggregate_value(values: &mut Vec<Value>, index: usize, value: Value) {
 #[derive(Debug)]
 pub struct PromiseAggregation {
     kind: AggregateKind,
-    /// `NewPromiseCapability(C)`'s `[[Resolve]]` / `[[Reject]]`.
+    /// 结果 promise 及其 `[[Resolve]]` / `[[Reject]]`。
     ///
-    /// 规范里聚合的收尾调的是这两个**函数**，不是内部 settle —— 于是
+    /// 规范里聚合的收尾调的是那两个**函数**，不是内部 settle —— 于是
     /// `Promise.all.call(FakePromise, …)` 用的是 `FakePromise` 自己交给 executor
     /// 的 reject（test262 正是靠这一点数到 `rejectCallCount === 1`）。
-    /// `undefined` 直到 `__promise_capability_executor__{id}` 被构造器调用。
-    resolve: Value,
-    reject: Value,
+    capability: PromiseCapability,
     /// `remainingElementsCount` — **starts at 1** for the loop itself and gains one
     /// per element, exactly like the spec's Record (ES 27.2.4.1.1 steps 4.f/5).
     ///
@@ -6508,6 +6539,20 @@ pub struct PromiseAggregation {
     values: Vec<Value>,
     /// `race` / `any` settle on the first match; once true later ones are noise.
     done: bool,
+}
+
+/// ES 27.2.1.5 `NewPromiseCapability(C)` 的落地形态。
+///
+/// `promise` 就是 `new C(executor)` 的结果；`resolve` / `reject` 是**构造器**
+/// 交给 executor 的那两个函数 —— 规范在后面所有收尾点调的都是它们
+/// （`Promise.all` 的 `[[Resolve]]`、`resolve` / `reject` 静态方法的
+/// `[[Resolve]]` / `[[Reject]]`），而不是引擎内部的 settle。伪造构造器
+/// （test262 的 `BadPromise`）正是靠这一点被观察到的。
+#[derive(Clone, Debug)]
+pub struct PromiseCapability {
+    pub(crate) promise: Value,
+    pub(crate) resolve: Value,
+    pub(crate) reject: Value,
 }
 
 impl Drop for VM {

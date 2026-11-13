@@ -102,10 +102,11 @@ impl VM {
             if let Ok(id) = id.parse::<u64>() {
                 if let Some(promise) = self.state.promises.get(&id).cloned() {
                     let value = args.first().cloned().unwrap_or(Value::Undefined);
-                    // A resolved promise fulfils with the value (thenable
-                    // adoption is not modelled: there is no way to run a
-                    // foreign `then` and observe it synchronously).
-                    self.promise_settle(&promise, PromiseState::Fulfilled, value);
+                    // 这是规范的 **resolve 函数**（ES 27.2.1.3.1）：它走
+                    // `ResolvePromise`，所以 thenable 会被**采纳**（排一个 thenable
+                    // job），而不是直接 fulfil。直接 settle 会让
+                    // `Promise.resolve({then(res){res(7)}})` 兑现成那个对象本身。
+                    self.promise_resolve(&promise, value, module);
                 }
             }
             return Ok(Value::Undefined);
@@ -126,13 +127,18 @@ impl VM {
             }
         }
         // `NewPromiseCapability` 的 executor：构造器把它拿到的 `resolve` / `reject`
-        // 交回来，聚合收尾时调的就是这两个函数（ES 27.2.1.5 第 7 步）。
+        // 交回来，调用方（聚合 / `Promise.resolve` / `Promise.reject`）随后取走
+        // 这两个函数并按规范调用它们（ES 27.2.1.5 第 7 步）。
         if let Some(rest) = name.strip_prefix("__promise_capability_executor__") {
             if let Ok(id) = rest.parse::<u64>() {
-                if let Some(agg) = self.state.aggregations.get_mut(&id) {
-                    agg.resolve = args.first().cloned().unwrap_or(Value::Undefined);
-                    agg.reject = args.get(1).cloned().unwrap_or(Value::Undefined);
-                }
+                self.state.capabilities.insert(
+                    id,
+                    crate::vm::PromiseCapability {
+                        promise: Value::Undefined,
+                        resolve: args.first().cloned().unwrap_or(Value::Undefined),
+                        reject: args.get(1).cloned().unwrap_or(Value::Undefined),
+                    },
+                );
             }
             return Ok(Value::Undefined);
         }
