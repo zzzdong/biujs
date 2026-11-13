@@ -3225,15 +3225,25 @@ impl VM {
                     // 带 `Symbol.toPrimitive` / `toString` 的 key 只有 VM 能转换。
                     // 只影响这次内建分派，用户方法回退仍用原参数。
                     let converted_args;
-                    let dispatch_args: &[Value] =
-                        if method_name == "hasOwnProperty" && !args.is_empty() {
-                            let mut v = args.clone();
-                            v[0] = self.to_property_key_value(&args[0], module)?;
-                            converted_args = v;
-                            &converted_args
-                        } else {
-                            &args
-                        };
+                    // 这些方法的**第一个参数**是属性键，要走 `ToPropertyKey`（可以跑
+                    // 用户 `toString` / `Symbol.toPrimitive`）。
+                    let key_first = matches!(
+                        method_name.as_str(),
+                        "hasOwnProperty"
+                            | "propertyIsEnumerable"
+                            | "__defineGetter__"
+                            | "__defineSetter__"
+                            | "__lookupGetter__"
+                            | "__lookupSetter__"
+                    );
+                    let dispatch_args: &[Value] = if key_first && !args.is_empty() {
+                        let mut v = args.clone();
+                        v[0] = self.to_property_key_value(&args[0], module)?;
+                        converted_args = v;
+                        &converted_args
+                    } else {
+                        &args
+                    };
                     let dispatched = match &native_method {
                         Some(native) => self.call_native_by_name(
                             native,

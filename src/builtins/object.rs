@@ -961,6 +961,53 @@ pub fn object_lookup_accessor(
     }
 }
 
+/// ES B.2.2.2 / B.2.2.3 `Object.prototype.__defineGetter__` /
+/// `__defineSetter__`.
+///
+/// `ToObject(this)` → `IsCallable(fn)`（否则 TypeError）→
+/// `DefinePropertyOrThrow(O, ToPropertyKey(P), {get/set, enumerable: true,
+/// configurable: true})`。以前这两个方法**根本没注册**（`typeof
+/// Object.prototype.__defineGetter__` 是 `undefined`），22 条 Annex B 用例因此
+/// 直接报 "is not a function"。
+pub fn object_define_accessor(
+    heap: &mut super::Heap,
+    obj: &Value,
+    args: &[Value],
+    want_getter: bool,
+) -> Result<Value, RuntimeError> {
+    // `ToObject(this value)`：`__defineGetter__.call(null, …)` 是 TypeError。
+    let target = super::to_object(heap, obj)?;
+    let accessor = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if !(accessor.is_callable() || matches!(accessor, Value::Function(_))) {
+        return Err(RuntimeError::TypeError(
+            "__defineGetter__/__defineSetter__: the second argument is not callable".to_string(),
+        ));
+    }
+    // `ToPropertyKey(P)`：VM 侧已转换（可能跑用户 `toString`），这里只做兜底。
+    let key = match args.first() {
+        Some(Value::String(s)) => PropertyKey::intern(heap, s),
+        Some(Value::Symbol(sym)) => PropertyKey::Symbol(sym.id),
+        Some(other) => PropertyKey::intern(heap, &other.to_js_string()),
+        None => PropertyKey::intern(heap, "undefined"),
+    };
+    let desc = PropertyDescriptor {
+        value: Value::Undefined,
+        writable: false,
+        enumerable: true,
+        configurable: true,
+        getter: want_getter.then(|| accessor.clone()),
+        setter: (!want_getter).then(|| accessor),
+    };
+    let Value::Object(obj_ref) = target else {
+        return Ok(Value::Undefined);
+    };
+    obj_ref
+        .borrow_mut()
+        .define_property(heap, key, desc)
+        .map_err(RuntimeError::from)?;
+    Ok(Value::Undefined)
+}
+
 /// Name of the `Object.prototype.toString` native.
 ///
 /// It needs a dedicated name because `Object.prototype.toString.call(x)` must
@@ -1004,6 +1051,9 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
     // 实现要 heap（原语接收者需装箱），住在 `call_prototype_method` 的分派里。
     super::mark_prototype_method(proto, heap, "__lookupGetter__");
     super::mark_prototype_method(proto, heap, "__lookupSetter__");
+    // ES B.2.2.2 / B.2.2.3：对称的 define 一半（以前**完全没注册**）。
+    super::mark_prototype_method(proto, heap, "__defineGetter__");
+    super::mark_prototype_method(proto, heap, "__defineSetter__");
     set_prototype_method(proto, heap, "toLocaleString", |this, args| {
         object_prototype_to_string(this, args)
     });

@@ -1603,6 +1603,11 @@ fn call_prototype_method_inner(
                 dispatch_value_of(obj)
             }
         }
+        // ES Annex B：`__defineGetter__` / `__defineSetter__`。
+        "__defineGetter__" => object::object_define_accessor(heap, obj, args, true),
+        "__defineSetter__" => object::object_define_accessor(heap, obj, args, false),
+        "__lookupGetter__" => object::object_lookup_accessor(heap, obj, args, true),
+        "__lookupSetter__" => object::object_lookup_accessor(heap, obj, args, false),
         "getTime" => date::date_value_of(obj),
         "toISOString" => date::date_to_iso_string(obj),
         "toJSON" => date::date_to_json(obj),
