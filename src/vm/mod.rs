@@ -2582,14 +2582,26 @@ impl VM {
         // `ResolvePromise` step 8: an object (or function) with a callable
         // `then` is adopted through a job that calls `thenable.then(...)`.
         if matches!(value, Value::Object(_) | Value::Function(_)) {
-            if let Ok(then) = self.get_member(&value, &PropertyKey::well_known("then").expect("well-known name"), module) {
-                if then.is_callable() || matches!(then, Value::Function(_)) {
-                    let then = self.as_object_value(&then);
-                    let _ = then;
-                    self.state.promise_jobs.push_back(PromiseJob::Thenable {
-                        promise: *promise,
-                        thenable: value,
-                    });
+            // `Get(x, "then")` 的 abrupt completion **rejects** the promise
+            // (27.2.1.3.2 第 8 步 → 第 9 步)。以前 `if let Ok(then)` 把它吞掉，
+            // 于是 `resolve({ get then() { throw e } })` 兑现成那个对象。
+            match self.get_member(
+                &value,
+                &PropertyKey::well_known("then").expect("well-known name"),
+                module,
+            ) {
+                Ok(then) => {
+                    if then.is_callable() || matches!(then, Value::Function(_)) {
+                        self.state.promise_jobs.push_back(PromiseJob::Thenable {
+                            promise: *promise,
+                            thenable: value,
+                        });
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let reason = self.error_value(err);
+                    self.promise_settle(promise, PromiseState::Rejected, reason);
                     return;
                 }
             }
@@ -2900,7 +2912,12 @@ impl VM {
         let (id, index) = parse_aggregation_handler(name)?;
         let argument = args.first().cloned().unwrap_or(Value::Undefined);
         let fulfilled = name.starts_with("__promise_agg_ok__");
-        let kind = self.state.aggregations.get(&id)?.kind;
+        let Some(kind) = self.state.aggregations.get(&id).map(|agg| agg.kind) else {
+            // 聚合已经结算（`all` 因某个元素被拒而提前 reject、`race` 已经赢了）：
+            // 迟到的元素处理器必须**无操作**返回，不能掉到"未知内建函数"
+            // （`all/call-resolve-element-after-return` 就是这条）。
+            return Some(Ok(Value::Undefined));
+        };
         // 结算路径统一走这里，省掉四份重复的 "取 result → remove → settle"。
         let settle = |vm: &mut Self, ok: bool, value: Value| -> Option<Result<Value, RuntimeError>> {
             Some(vm.settle_aggregate(id, ok, value, module).map(|()| Value::Undefined))

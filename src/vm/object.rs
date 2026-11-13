@@ -2144,6 +2144,12 @@ impl NativeFunctionObject {
         } else if self.name == crate::builtins::ARRAY_SPECIES_NATIVE {
             // `Array[Symbol.species]`'s getter is named like any other accessor.
             "get [Symbol.species]".to_string()
+        } else if self.name.starts_with("__promise_") {
+            // 引擎内部的 Promise 闭包（resolve/reject、capability executor、
+            // 每元素处理器、finally 包装）。规范里它们都是**匿名**内建函数：
+            // `name` 是空字符串，`length` 见 `builtin_arity`
+            // （`all/resolve-element-function-name.js`、`executor-function-name.js`）。
+            String::new()
         } else {
             self.name
                 .rsplit('.')

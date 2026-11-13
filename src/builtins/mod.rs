@@ -2102,6 +2102,16 @@ pub fn set_set_method(proto: &Gc<Object>, heap: &mut Heap, name: &str) {
 /// `tests/features/builtin_metadata.rs`; a name missing from this table keeps
 /// `length === 0`, which is what most predicates want anyway.
 pub fn builtin_arity(registered_name: &str) -> usize {
+    // 引擎内部的 Promise 闭包：规范把它们定义成一元的匿名内建函数
+    // （`GetCapabilitiesExecutor` 是二元的），
+    // `all/resolve-element-function-length.js` / `executor-function-length.js` /
+    // `exec-args.js` 断言这两个数字。
+    if registered_name.starts_with("__promise_capability_executor__") {
+        return 2;
+    }
+    if registered_name.starts_with("__promise_") {
+        return 1;
+    }
     let name = registered_name
         .strip_prefix(PROTO_METHOD_PREFIX)
         .unwrap_or(registered_name);

@@ -1109,19 +1109,46 @@ impl VM {
     }
 
     /// `then` / `catch` / `finally`, when the receiver is a promise.
+    ///
+    /// `catch` also works on a non-promise receiver (it is defined as
+    /// `Invoke(this, "then", …)`), so `module` is needed even on that path.
     pub(crate) fn try_promise_method(
         &mut self,
         this: &Value,
         method: &str,
         args: &[Value],
-        _module: &Module,
+        module: &Module,
     ) -> Result<Option<Value>, RuntimeError> {
         if !matches!(method, "then" | "catch" | "finally") {
             return Ok(None);
         }
         let Some(promise) = self.as_promise(this) else {
-            // Not a promise: let the ordinary prototype dispatch answer (it is
-            // what reports "not a function" for a missing method).
+            // `Promise.prototype.catch` 不要求接收者是 promise：规范第 2 步直接
+            // `Invoke(this, "then", « undefined, onRejected »)`，所以任何带
+            // `then` 的接收者都能用（`catch/this-value-obj-coercible`），
+            // `then` 的 getter 抛出也照原样传播（`this-value-then-poisoned`）。
+            if method == "catch" {
+                // 接收者自己带 `catch`（`{ catch() { return 42 } }`）时这不是
+                // `Promise.prototype.catch` 的调用 —— 让分派回落到用户方法
+                // （`ident-name-method-def-catch-escaped` 就是这样被误伤的）。
+                let catch_key = PropertyKey::intern(&mut self.heap, "catch");
+                let existing = self.get_member(this, &catch_key, module)?;
+                if !matches!(existing, Value::Undefined)
+                    && crate::builtins::native_function_name(&existing).is_none()
+                {
+                    return Ok(None);
+                }
+                let then_key = PropertyKey::well_known("then").expect("well-known name");
+                let then = self.get_member(this, &then_key, module)?;
+                let on_rejected = args.first().cloned().unwrap_or(Value::Undefined);
+                return Ok(Some(self.invoke(
+                    &then,
+                    this.clone(),
+                    &[Value::Undefined, on_rejected],
+                    module,
+                )?));
+            }
+            // 其余情况让普通原型分派回答（`then` 对非 promise 就是 TypeError）。
             return Ok(None);
         };
         // A bare `Value::Function(id)` is callable but `is_callable()` only
