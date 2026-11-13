@@ -61,7 +61,9 @@ impl Trace for PromiseJob {
 
 impl Trace for PromiseAggregation {
     fn trace(&self, out: &mut Worklist) {
-        self.result.trace(out);
+        // `resolve` / `reject` 是宿主函数（对象），`values` 是元素结果 —— 都是根。
+        self.resolve.trace(out);
+        self.reject.trace(out);
         self.values.trace(out);
     }
 }

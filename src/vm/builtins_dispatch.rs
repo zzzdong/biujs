@@ -121,9 +121,20 @@ impl VM {
         }
         // Per-element handlers of `Promise.all` / `race` / `allSettled` / `any`.
         if name.starts_with("__promise_agg_ok__") || name.starts_with("__promise_agg_err__") {
-            if let Some(result) = self.dispatch_aggregation(name, args) {
+            if let Some(result) = self.dispatch_aggregation(name, args, module) {
                 return result;
             }
+        }
+        // `NewPromiseCapability` 的 executor：构造器把它拿到的 `resolve` / `reject`
+        // 交回来，聚合收尾时调的就是这两个函数（ES 27.2.1.5 第 7 步）。
+        if let Some(rest) = name.strip_prefix("__promise_capability_executor__") {
+            if let Ok(id) = rest.parse::<u64>() {
+                if let Some(agg) = self.state.aggregations.get_mut(&id) {
+                    agg.resolve = args.first().cloned().unwrap_or(Value::Undefined);
+                    agg.reject = args.get(1).cloned().unwrap_or(Value::Undefined);
+                }
+            }
+            return Ok(Value::Undefined);
         }
         // `Promise.prototype.finally` callbacks (name carries a registry id).
         if let Some(rest) = name.strip_prefix("__promise_finally__") {
@@ -634,7 +645,7 @@ impl VM {
             // The descriptor arguments are read through [[Get]] first, which
             // `Promise.resolve` / `Promise.reject` build promises, which only the
             // VM can register.
-            if let Some(result) = self.promise_static(name, args, module) {
+            if let Some(result) = self.promise_static(name, &this, args, module)? {
                 return Ok(result);
             }
             // only the VM can do (their fields may be accessors).

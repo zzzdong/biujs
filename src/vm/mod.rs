@@ -2437,14 +2437,20 @@ impl VM {
     /// `Promise.resolve(value)` / `Promise.reject(reason)` / `Promise.all` /
     /// `race` / `allSettled` / `any` — the statics that need the VM (they either
     /// register a promise or have to call user `then` methods).
-    fn promise_static(&mut self, name: &str, args: &[Value], module: &Module) -> Option<Value> {
-        match name {
+    fn promise_static(
+        &mut self,
+        name: &str,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Value>, RuntimeError> {
+        Ok(match name {
             "Promise.resolve" => {
                 let promise = self.new_promise();
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
                 // A promise argument is answered as-is (ES 27.2.4.6 step 2).
                 if let Some(existing) = self.as_promise(&value) {
-                    return Some(Self::promise_value(&existing));
+                    return Ok(Some(Self::promise_value(&existing)));
                 }
                 self.promise_resolve(&promise, value, module);
                 Some(Self::promise_value(&promise))
@@ -2455,14 +2461,17 @@ impl VM {
                 self.promise_settle(&promise, PromiseState::Rejected, value);
                 Some(Self::promise_value(&promise))
             }
-            "Promise.all" => Some(self.promise_aggregate(AggregateKind::All, args, module)),
-            "Promise.race" => Some(self.promise_aggregate(AggregateKind::Race, args, module)),
+            // 四个组合方法要读 `this.resolve`（ES 27.2.4.x 第 3 步），所以调用的
+            // `this` 必须传进来：`Promise.all.call(BadPromise, it)` 用的是
+            // `BadPromise.resolve`。
+            "Promise.all" => Some(self.promise_aggregate(AggregateKind::All, this, args, module)?),
+            "Promise.race" => Some(self.promise_aggregate(AggregateKind::Race, this, args, module)?),
             "Promise.allSettled" => {
-                Some(self.promise_aggregate(AggregateKind::AllSettled, args, module))
+                Some(self.promise_aggregate(AggregateKind::AllSettled, this, args, module)?)
             }
-            "Promise.any" => Some(self.promise_aggregate(AggregateKind::Any, args, module)),
+            "Promise.any" => Some(self.promise_aggregate(AggregateKind::Any, this, args, module)?),
             _ => None,
-        }
+        })
     }
 
     /// A host function boxed for use as a handler (the reaction runner checks
@@ -2577,107 +2586,244 @@ impl VM {
         self.promise_settle(promise, PromiseState::Fulfilled, value);
     }
 
-    /// `Promise.all` / `race` / `allSettled` / `any`. The iterable's elements are
-    /// each resolved to a promise and get a per-element native handler whose name
-    /// carries `(aggregation id, index)`.
+    /// `Promise.all` / `race` / `allSettled` / `any` (ES 27.2.4.1 … .4).
+    ///
+    /// Elements are consumed **incrementally**: each `next()` is run through
+    /// `C.resolve` and wired with `then` before the following one is pulled, which
+    /// is what `PerformPromiseAll` prescribes.
+    ///
+    /// The old shape materialised the iterable first. That was wrong twice over:
+    /// an iterator that never reports `done` grew the element vector without
+    /// bound (the memory guard caught 14 test262 cases that way), and `C.resolve`
+    /// was never consulted at all, so `Promise.all.call(BadPromise, …)` never
+    /// called `BadPromise.resolve` — whose throwing is exactly what those tests
+    /// assert on.
     fn promise_aggregate(
         &mut self,
         kind: AggregateKind,
+        constructor: &Value,
         args: &[Value],
         module: &Module,
-    ) -> Value {
-        let result = self.new_promise();
-        let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    ) -> Result<Value, RuntimeError> {
+        // `NewPromiseCapability(C)` (ES 27.2.1.5): construct `new C(executor)` and
+        // keep the `resolve` / `reject` the executor receives. A non-constructor
+        // `C` is a synchronous TypeError (step 3.b), not a rejection.
         let id = self.state.next_aggregation_id;
         self.state.next_aggregation_id += 1;
-        // Collect the element promises first: `remaining` is only known once the
-        // iterable is exhausted, and the handlers must not fire before then.
-        let mut elements: Vec<Value> = Vec::new();
-        match self.make_iterator(iterable, module) {
-            Ok(iter) => loop {
-                let (value, done) = match self.iterator_next(iter.clone(), None, module) {
-                    Ok(step) => step,
-                    Err(err) => {
-                        // A throwing iterator rejects the result promise
-                        // (ES 27.2.4.1.1 step 6.f.i).
-                        let reason = self.error_value(err);
-                        self.promise_settle(&result, PromiseState::Rejected, reason);
-                        return Self::promise_value(&result);
-                    }
-                };
-                if done {
-                    break;
-                }
-                elements.push(value);
-            },
-            Err(err) => {
-                let reason = self.error_value(err);
-                self.promise_settle(&result, PromiseState::Rejected, reason);
-                return Self::promise_value(&result);
-            }
-        }
-        let total = elements.len();
+        // The aggregation is created *first* so the executor (which runs inside
+        // `construct`) has somewhere to record the two functions.
         self.state.aggregations.insert(
             id,
             PromiseAggregation {
                 kind,
-                result,
-                remaining: total,
-                values: vec![Value::Undefined; total],
+                resolve: Value::Undefined,
+                reject: Value::Undefined,
+                // 1 = the loop's own share (27.2.4.1.1 step 4: `[[Value]]: 1`).
+                remaining: 1,
+                values: Vec::new(),
                 done: false,
-                rejections: 0,
-                total,
             },
         );
-        // `Promise.all([])` / `race([])` / `allSettled([])` settle right away;
-        // `Promise.any([])` rejects with an (empty) AggregateError.
-        if total == 0 {
-            return self.finish_empty_aggregate(id, kind);
+        // 构造结果 promise，并把它交给构造器的 `resolve` / `reject` 记下来。
+        let executor =
+            Self::native_fn(&mut self.heap, &format!("__promise_capability_executor__{id}"));
+        let promise = match self.construct(constructor, &[executor], module) {
+            Ok(promise) => promise,
+            Err(err) => {
+                self.state.aggregations.remove(&id);
+                return Err(err);
+            }
+        };
+        let capability = match self.state.aggregations.get(&id) {
+            Some(agg) => (agg.resolve.clone(), agg.reject.clone()),
+            None => (Value::Undefined, Value::Undefined),
+        };
+        let callable = |v: &Value| v.is_callable() || matches!(v, Value::Function(_));
+        if !callable(&capability.0) || !callable(&capability.1) {
+            self.state.aggregations.remove(&id);
+            return Err(RuntimeError::TypeError(
+                "Promise capability executor did not provide callable resolve/reject".to_string(),
+            ));
         }
-        for (index, element) in elements.into_iter().enumerate() {
-            let element_promise = match self.as_promise(&element) {
-                Some(p) => p,
-                None => {
-                    let p = self.new_promise();
-                    self.promise_resolve(&p, element, module);
-                    p
+        // `GetPromiseResolve(C)` (27.2.4.1.1 step 3): a fake constructor may
+        // override `resolve`, and its abrupt completion rejects the result.
+        let resolve_key = PropertyKey::intern(&mut self.heap, "resolve");
+        let resolve_fn = match self.get_member(constructor, &resolve_key, module) {
+            Ok(f) if callable(&f) => f,
+            Ok(_) => {
+                let reason = self.error_value(RuntimeError::TypeError(
+                    "Promise resolve is not a function".to_string(),
+                ));
+                self.settle_aggregate(id, false, reason, module)?;
+                return Ok(promise);
+            }
+            Err(err) => {
+                let reason = self.error_value(err);
+                self.settle_aggregate(id, false, reason, module)?;
+                return Ok(promise);
+            }
+        };
+        let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+        let iterator = match self.make_iterator(iterable, module) {
+            Ok(iter) => iter,
+            Err(err) => {
+                let reason = self.error_value(err);
+                self.settle_aggregate(id, false, reason, module)?;
+                return Ok(promise);
+            }
+        };
+        let then_key = PropertyKey::well_known("then").expect("well-known name");
+        let mut index = 0usize;
+        loop {
+            let (value, done) = match self.iterator_next(iterator.clone(), None, module) {
+                Ok(step) => step,
+                Err(err) => {
+                    // The iterator itself threw: `[[Done]]` is already set, so no
+                    // `IteratorClose`; just reject (27.2.4.1.1 step 4.b).
+                    let reason = self.error_value(err);
+                    self.settle_aggregate(id, false, reason, module)?;
+                    return Ok(promise);
                 }
             };
-            // `promise_then` mints the child that the handler's return value
-            // settles; the aggregation itself settles the result promise.
+            if done {
+                break;
+            }
+            // 4.d: reserve the slot *before* resolving, so the handler can index it.
+            // The count is bumped here too (the spec does it after `Invoke(then)`):
+            // a thenable that calls its `ok` **synchronously** would otherwise see
+            // the sentinel-only count and settle the aggregation with a partial
+            // element list. Real promises are always async, so this is invisible
+            // for them and strictly safer for hostile thenables.
+            if let Some(agg) = self.state.aggregations.get_mut(&id) {
+                agg.values.push(Value::Undefined);
+                agg.remaining += 1;
+            }
+            // 4.e: `Call(promiseResolve, C, « next »)`.
+            let next_promise =
+                match self.invoke(&resolve_fn, constructor.clone(), &[value], module) {
+                    Ok(promise) => promise,
+                    Err(err) => {
+                        let _ = self.iterator_close(iterator.clone(), None, true, module);
+                        let reason = self.error_value(err);
+                        self.settle_aggregate(id, false, reason, module)?;
+                        return Ok(promise);
+                    }
+                };
             let ok = Self::native_fn(&mut self.heap, &format!("__promise_agg_ok__{id}_{index}"));
-            let err = Self::native_fn(&mut self.heap, &format!("__promise_agg_err__{id}_{index}"));
-            self.promise_then(&element_promise, Some(ok), Some(err));
+            let err_fn =
+                Self::native_fn(&mut self.heap, &format!("__promise_agg_err__{id}_{index}"));
+            // 4.g: `Invoke(nextPromise, "then", …)` — `C.resolve` may hand back a
+            // thenable, so the method is fetched instead of assuming a promise.
+            let then_fn = match self.get_member(&next_promise, &then_key, module) {
+                Ok(f) if callable(&f) => f,
+                Ok(_) => {
+                    let _ = self.iterator_close(iterator.clone(), None, true, module);
+                    let reason = self.error_value(RuntimeError::TypeError(
+                        "Promise resolve returned a non-thenable".to_string(),
+                    ));
+                    self.settle_aggregate(id, false, reason, module)?;
+                    return Ok(promise);
+                }
+                Err(err) => {
+                    let _ = self.iterator_close(iterator.clone(), None, true, module);
+                    let reason = self.error_value(err);
+                    self.settle_aggregate(id, false, reason, module)?;
+                    return Ok(promise);
+                }
+            };
+            if let Err(err) = self.invoke(&then_fn, next_promise, &[ok, err_fn], module) {
+                let _ = self.iterator_close(iterator.clone(), None, true, module);
+                let reason = self.error_value(err);
+                self.settle_aggregate(id, false, reason, module)?;
+                return Ok(promise);
+            }
+            index += 1;
         }
-        Self::promise_value(&result)
+        // Steps 5-6: drop the loop's own share; zero means every element has
+        // already settled (this is also the empty-iterable path).
+        let finished = match self.state.aggregations.get_mut(&id) {
+            Some(agg) => {
+                agg.remaining = agg.remaining.saturating_sub(1);
+                agg.remaining == 0
+            }
+            None => false,
+        };
+        if finished {
+            self.finish_aggregate(id, module)?;
+        }
+        Ok(promise)
     }
 
-    /// Settle an aggregation whose element list is empty.
-    fn finish_empty_aggregate(&mut self, id: u64, kind: AggregateKind) -> Value {
-        let result = {
-            let Some(agg) = self.state.aggregations.get(&id) else {
-                return Value::Undefined;
-            };
-            agg.result
+    /// `remainingElementsCount` reached zero: settle the aggregation
+    /// (ES 27.2.4.1.1 step 6 / 27.2.4.3 step 5).
+    ///
+    /// An empty iterable takes this path too — `remaining` starts at 1 and the
+    /// end-of-loop decrement brings it to 0, so `all`/`allSettled` fulfil with an
+    /// empty array, `any` rejects with an empty `AggregateError`, and `race`
+    /// stays pending for ever.
+    fn finish_aggregate(&mut self, id: u64, module: &Module) -> Result<(), RuntimeError> {
+        let Some(agg) = self.state.aggregations.get(&id) else {
+            return Ok(());
         };
-        self.state.aggregations.remove(&id);
-        match kind {
+        let kind = agg.kind;
+        let (fulfilled, value) = match kind {
             AggregateKind::All | AggregateKind::AllSettled => {
-                let array = Value::Object(self.heap.alloc(Object::Array(
-                    crate::vm::object::ArrayObject::from_vec(vec![]),
-                )));
-                self.promise_settle(&result, PromiseState::Fulfilled, array);
+                let values = std::mem::take(
+                    &mut self
+                        .state
+                        .aggregations
+                        .get_mut(&id)
+                        .expect("checked above")
+                        .values,
+                );
+                (
+                    true,
+                    Value::Object(self.heap.alloc(Object::Array(
+                        crate::vm::object::ArrayObject::from_vec(values),
+                    ))),
+                )
+            }
+            AggregateKind::Any => {
+                let values = std::mem::take(
+                    &mut self
+                        .state
+                        .aggregations
+                        .get_mut(&id)
+                        .expect("checked above")
+                        .values,
+                );
+                (false, self.aggregate_error(values))
             }
             AggregateKind::Race => {
                 // `race` over an empty iterable stays pending for ever.
-                self.promise_settle(&result, PromiseState::Pending, Value::Undefined);
+                self.state.aggregations.remove(&id);
+                return Ok(());
             }
-            AggregateKind::Any => {
-                let err = self.aggregate_error(vec![]);
-                self.promise_settle(&result, PromiseState::Rejected, err);
-            }
+        };
+        self.settle_aggregate(id, fulfilled, value, module)
+    }
+
+    /// Settle an aggregation through its capability's `resolve` / `reject`.
+    ///
+    /// The two are *functions* (ES 27.2.1.5): calling them is what makes a fake
+    /// constructor's own `reject` observable, and it also keeps the intrinsic
+    /// path honest (`__promise_resolve__<id>` assimilates thenables).
+    fn settle_aggregate(
+        &mut self,
+        id: u64,
+        fulfilled: bool,
+        value: Value,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        let Some(agg) = self.state.aggregations.remove(&id) else {
+            return Ok(());
+        };
+        let function = if fulfilled { agg.resolve } else { agg.reject };
+        if function.is_undefined() {
+            return Ok(());
         }
-        Self::promise_value(&result)
+        self.invoke(&function, Value::Undefined, &[value], module)?;
+        Ok(())
     }
 
     /// `AggregateError` with an `errors` array, as a JS error value.
@@ -2713,76 +2859,50 @@ impl VM {
         value
     }
 
-    /// Run one per-element handler of an aggregation. Returns the value the
-    /// reaction's child should settle with (ignored — the aggregation settles the
-    /// result promise directly).
+    /// Run one per-element handler of an aggregation.
+    ///
+    /// The handler's own return value is irrelevant: what settles the result is
+    /// the aggregation's `resolve` / `reject` (see `settle_aggregate`), so every
+    /// path here answers `undefined`. A handler whose aggregation is already gone
+    /// (settled by an earlier element) is a no-op.
     fn dispatch_aggregation(
         &mut self,
         name: &str,
         args: &[Value],
+        module: &Module,
     ) -> Option<Result<Value, RuntimeError>> {
         let (id, index) = parse_aggregation_handler(name)?;
         let argument = args.first().cloned().unwrap_or(Value::Undefined);
+        let fulfilled = name.starts_with("__promise_agg_ok__");
         let kind = self.state.aggregations.get(&id)?.kind;
+        // 结算路径统一走这里，省掉四份重复的 "取 result → remove → settle"。
+        let settle = |vm: &mut Self, ok: bool, value: Value| -> Option<Result<Value, RuntimeError>> {
+            Some(vm.settle_aggregate(id, ok, value, module).map(|()| Value::Undefined))
+        };
         match kind {
             AggregateKind::All => {
-                if name.starts_with("__promise_agg_err__") {
-                    let result = {
-                        let Some(agg) = self.state.aggregations.get(&id) else {
-                            return Some(Ok(Value::Undefined));
-                        };
-                        if agg.done {
-                            return Some(Ok(Value::Undefined));
-                        }
-                        agg.result
-                    };
-                    self.state.aggregations.remove(&id);
-                    self.promise_settle(&result, PromiseState::Rejected, argument);
-                    return Some(Ok(Value::Undefined));
+                if !fulfilled {
+                    // 任一元素被拒 ⇒ 结果立刻被拒（27.2.4.1.1 第 4.g.iii 步）。
+                    return settle(self, false, argument);
                 }
-                let (complete, result) = {
+                let complete = {
                     let Some(agg) = self.state.aggregations.get_mut(&id) else {
                         return Some(Ok(Value::Undefined));
                     };
-                    agg.values[index] = argument;
-                    agg.remaining -= 1;
-                    (agg.remaining == 0, agg.result)
+                    set_aggregate_value(&mut agg.values, index, argument);
+                    agg.remaining = agg.remaining.saturating_sub(1);
+                    agg.remaining == 0
                 };
                 if complete {
-                    let values = self
-                        .state
-                        .aggregations
-                        .remove(&id)
-                        .map(|a| a.values)
-                        .unwrap_or_default();
-                    let array = Value::Object(self.heap.alloc(Object::Array(
-                        crate::vm::object::ArrayObject::from_vec(values),
-                    )));
-                    self.promise_settle(&result, PromiseState::Fulfilled, array);
+                    // 归零 = 循环已结束且所有元素都落定（见 `finish_aggregate`）。
+                    return Some(self.finish_aggregate(id, module).map(|()| Value::Undefined));
                 }
             }
             AggregateKind::Race => {
-                let fulfilled = name.starts_with("__promise_agg_ok__");
-                let result = {
-                    let Some(agg) = self.state.aggregations.get(&id) else {
-                        return Some(Ok(Value::Undefined));
-                    };
-                    if agg.done {
-                        return Some(Ok(Value::Undefined));
-                    }
-                    agg.result
-                };
-                self.state.aggregations.remove(&id);
-                let state = if fulfilled {
-                    PromiseState::Fulfilled
-                } else {
-                    PromiseState::Rejected
-                };
-                self.promise_settle(&result, state, argument);
+                return settle(self, fulfilled, argument);
             }
             AggregateKind::AllSettled => {
-                let fulfilled = name.starts_with("__promise_agg_ok__");
-                let (complete, result) = {
+                let complete = {
                     let Some(agg) = self.state.aggregations.get_mut(&id) else {
                         return Some(Ok(Value::Undefined));
                     };
@@ -2798,54 +2918,31 @@ impl VM {
                         crate::vm::property::PropertyDescriptor::data_descriptor(argument),
                     )
                     .ok();
-                    agg.values[index] = Value::Object(self.heap.alloc(Object::Ordinary(obj)));
-                    agg.remaining -= 1;
-                    (agg.remaining == 0, agg.result)
+                    let slot = Value::Object(self.heap.alloc(Object::Ordinary(obj)));
+                    set_aggregate_value(&mut agg.values, index, slot);
+                    agg.remaining = agg.remaining.saturating_sub(1);
+                    agg.remaining == 0
                 };
                 if complete {
-                    let values = self
-                        .state
-                        .aggregations
-                        .remove(&id)
-                        .map(|a| a.values)
-                        .unwrap_or_default();
-                    let array = Value::Object(self.heap.alloc(Object::Array(
-                        crate::vm::object::ArrayObject::from_vec(values),
-                    )));
-                    self.promise_settle(&result, PromiseState::Fulfilled, array);
+                    return Some(self.finish_aggregate(id, module).map(|()| Value::Undefined));
                 }
             }
             AggregateKind::Any => {
-                if name.starts_with("__promise_agg_ok__") {
-                    let result = {
-                        let Some(agg) = self.state.aggregations.get(&id) else {
-                            return Some(Ok(Value::Undefined));
-                        };
-                        if agg.done {
-                            return Some(Ok(Value::Undefined));
-                        }
-                        agg.result
-                    };
-                    self.state.aggregations.remove(&id);
-                    self.promise_settle(&result, PromiseState::Fulfilled, argument);
-                    return Some(Ok(Value::Undefined));
+                if fulfilled {
+                    return settle(self, true, argument);
                 }
-                let (exhausted, errors, result) = {
+                // `any` 的结算条件同样是 `remaining == 0`：计数里含"循环自己"那一份，
+                // 所以它只在**迭代结束且所有元素都被拒绝**时归零（27.2.4.4 第 5 步）。
+                let exhausted = {
                     let Some(agg) = self.state.aggregations.get_mut(&id) else {
                         return Some(Ok(Value::Undefined));
                     };
-                    agg.values[index] = argument;
-                    agg.rejections += 1;
-                    (
-                        agg.rejections == agg.total,
-                        agg.values.clone(),
-                        agg.result,
-                    )
+                    set_aggregate_value(&mut agg.values, index, argument);
+                    agg.remaining = agg.remaining.saturating_sub(1);
+                    agg.remaining == 0
                 };
                 if exhausted {
-                    self.state.aggregations.remove(&id);
-                    let err = self.aggregate_error(errors);
-                    self.promise_settle(&result, PromiseState::Rejected, err);
+                    return Some(self.finish_aggregate(id, module).map(|()| Value::Undefined));
                 }
             }
         }
@@ -6366,6 +6463,20 @@ fn parse_aggregation_handler(name: &str) -> Option<(u64, usize)> {
     Some((id.parse().ok()?, index.parse().ok()?))
 }
 
+/// Write an element result into an aggregation's slot list.
+///
+/// `values` grows with the iterator (see `promise_aggregate`), so the slot is
+/// normally already there; the `resize` covers a handler that arrives for a
+/// slot which was reserved *after* the element resolved (`C.resolve` returning
+/// an already-settled promise still goes through a queued job, but the
+/// aggregation may be re-entered from a host callback).
+fn set_aggregate_value(values: &mut Vec<Value>, index: usize, value: Value) {
+    if index >= values.len() {
+        values.resize(index + 1, Value::Undefined);
+    }
+    values[index] = value;
+}
+
 /// State for one in-flight `Promise.all` / `race` / `allSettled` / `any`.
 ///
 /// The per-element handlers are natives whose names carry `id`; when the queue
@@ -6375,17 +6486,28 @@ fn parse_aggregation_handler(name: &str) -> Option<(u64, usize)> {
 #[derive(Debug)]
 pub struct PromiseAggregation {
     kind: AggregateKind,
-    result: Gc<Object>,
-    /// Elements still to settle (for `all` / `allSettled` / `any`).
+    /// `NewPromiseCapability(C)`'s `[[Resolve]]` / `[[Reject]]`.
+    ///
+    /// 规范里聚合的收尾调的是这两个**函数**，不是内部 settle —— 于是
+    /// `Promise.all.call(FakePromise, …)` 用的是 `FakePromise` 自己交给 executor
+    /// 的 reject（test262 正是靠这一点数到 `rejectCallCount === 1`）。
+    /// `undefined` 直到 `__promise_capability_executor__{id}` 被构造器调用。
+    resolve: Value,
+    reject: Value,
+    /// `remainingElementsCount` — **starts at 1** for the loop itself and gains one
+    /// per element, exactly like the spec's Record (ES 27.2.4.1.1 steps 4.f/5).
+    ///
+    /// The sentinel is what makes the loop *incremental*: with the count starting
+    /// at zero, the first element to settle would conclude "everything is done"
+    /// while the iterator is still running. It also makes the empty case fall out
+    /// naturally (1 → 0), so there is no separate `finish_empty_aggregate` path.
     remaining: usize,
     /// Element results, by index (`all` / `allSettled` values, `any` reasons).
+    /// Grows as the iterator produces elements — never pre-sized, because the
+    /// element count is not known until the iterator is exhausted.
     values: Vec<Value>,
     /// `race` / `any` settle on the first match; once true later ones are noise.
     done: bool,
-    /// `any` rejection countdown.
-    rejections: usize,
-    /// `any` total element count (known only after the iterable is exhausted).
-    total: usize,
 }
 
 impl Drop for VM {
