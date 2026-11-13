@@ -76,7 +76,7 @@ language/statements/function	325	121	5
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	53	20	0
-built-ins/Array	2381	453	247
+built-ins/Array	2392	453	236
 built-ins/JSON	123	29	13
 built-ins/WeakSet	77	8	0
 built-ins/Number	252	38	50
@@ -104,6 +104,6 @@ language/literals/boolean	4	0	0
 language/computed-property-names	42	0	6
 built-ins/Boolean	38	3	10
 built-ins/Map	153	51	0
-built-ins/TypedArray	292	772	382
+built-ins/TypedArray	342	772	332
 built-ins/Object	3108	143	160
 built-ins/String	852	168	203

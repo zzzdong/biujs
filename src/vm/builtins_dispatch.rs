@@ -382,6 +382,62 @@ impl VM {
                 args,
             );
         }
+        // `Array.prototype.<name>`：共享名（`slice` / `indexOf` / `includes` /
+        // `concat` / `join` …）按**归属**走数组口径 —— `Array.prototype.slice.
+        // call("abc")` 是 `["a","b","c"]`，即使接收者看起来像字符串。
+        if let Some(method) = name.strip_prefix("Array.prototype.") {
+            // `ToObject(this value)`：原语接收者先装箱 ——
+            // `Array.prototype.indexOf.call('ab', 'b')` 的类数组语义来自字符串
+            // 包装对象的索引属性（规范要求 1，不是"不是数组"）。
+            let receiver = match &this {
+                Value::Object(_) | Value::Function(_) => this.clone(),
+                other => crate::builtins::to_object(&mut self.heap, other)?,
+            };
+            // VM 侧的通用实现优先（回调族要调 JS；读族要逐步 `[[Get]]`），
+            // 内建层那份是密集数组的快速路径 —— 与 `__proto_method__` 入口同序。
+            if let Some(result) =
+                self.try_array_callback_method(&receiver, method, args, module)?
+            {
+                return Ok(result);
+            }
+            if let Some(result) = self.try_array_read_method(&receiver, method, args, module)? {
+                return Ok(result);
+            }
+            return crate::builtins::call_prototype_method_owned(
+                "Array",
+                &mut self.heap,
+                &receiver,
+                method,
+                args,
+            );
+        }
+        // `%TypedArray%.prototype.<name>`：先做 brand check（ES 23.2.3.x 的
+        // `ValidateTypedArray`）。以前按接收者形状分派，于是
+        // `%TypedArray%.prototype.indexOf.call({}, 1)` 悄悄走了数组那条路。
+        if let Some(method) = name.strip_prefix("TypedArray.prototype.") {
+            if !crate::builtins::typedarray::is_typedarray_receiver(&this) {
+                return Err(RuntimeError::TypeError(format!(
+                    "%TypedArray%.prototype.{method} called on a receiver that is not a TypedArray"
+                )));
+            }
+            // 回调族（`map` / `filter` / `sort` …）要开帧，归 VM。
+            if let Some(result) =
+                self.try_typedarray_callback_method(&this, method, args, module)?
+            {
+                return Ok(result);
+            }
+            // `keys` / `values` / `entries` 返回迭代器，只有 VM 能构造。
+            if matches!(method, "keys" | "values" | "entries") {
+                return self.make_typed_array_iterator(&this, method);
+            }
+            return crate::builtins::call_prototype_method_owned(
+                "TypedArray",
+                &mut self.heap,
+                &this,
+                method,
+                args,
+            );
+        }
         if let Some(method) = name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
             // `f.call` / `f.apply` / `f.bind` are the same operations as the
             // `CallMethod` opcode path handles; they must work identically when

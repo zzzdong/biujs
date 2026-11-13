@@ -1063,8 +1063,8 @@ pub fn register_arraybuffer_statics(ctor: &Value) {
 /// 即可。以前是八个 prototype 各注册一份（与基类重复），已去重；与类型有关的
 /// 那一项见 [`register_typedarray_bytes_per_element`]。
 pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method;
-    set_prototype_method(proto, heap, "set", |_this, _args| {
+    use super::set_prototype_method_owned;
+    set_prototype_method_owned("TypedArray", proto, heap, "set", |_this, _args| {
         Err(RuntimeError::NotImplemented(
             "method implemented by the VM".to_string(),
         ))
@@ -1072,19 +1072,19 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // 下面这两个闭包**永不被调用**：`set_prototype_method` 只登记名字，实际分派
     // 在 `call_prototype_method` 里按名字走（`ta_subarray` / `ta_slice`）。留着
     // 只是为了满足签名，别被它误导成"subarray/slice 返回 undefined"。
-    set_prototype_method(proto, heap, "subarray", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "fill", |this, args| ta_fill(this, args));
+    set_prototype_method_owned("TypedArray", proto, heap, "subarray", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("TypedArray", proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("TypedArray", proto, heap, "fill", |this, args| ta_fill(this, args));
     // 只读 / 原地的一族（不需要回调 ⇒ 不需要 VM）：
-    set_prototype_method(proto, heap, "indexOf", |this, args| ta_index_of(this, args));
-    set_prototype_method(proto, heap, "lastIndexOf", |this, args| {
+    set_prototype_method_owned("TypedArray", proto, heap, "indexOf", |this, args| ta_index_of(this, args));
+    set_prototype_method_owned("TypedArray", proto, heap, "lastIndexOf", |this, args| {
         ta_last_index_of(this, args)
     });
-    set_prototype_method(proto, heap, "includes", |this, args| ta_includes(this, args));
-    set_prototype_method(proto, heap, "join", |this, args| ta_join(this, args));
-    set_prototype_method(proto, heap, "reverse", |this, args| ta_reverse(this, args));
-    set_prototype_method(proto, heap, "at", |this, args| ta_at(this, args));
-    set_prototype_method(proto, heap, "copyWithin", |this, args| {
+    set_prototype_method_owned("TypedArray", proto, heap, "includes", |this, args| ta_includes(this, args));
+    set_prototype_method_owned("TypedArray", proto, heap, "join", |this, args| ta_join(this, args));
+    set_prototype_method_owned("TypedArray", proto, heap, "reverse", |this, args| ta_reverse(this, args));
+    set_prototype_method_owned("TypedArray", proto, heap, "at", |this, args| ta_at(this, args));
+    set_prototype_method_owned("TypedArray", proto, heap, "copyWithin", |this, args| {
         ta_copy_within(this, args)
     });
 
@@ -1094,21 +1094,21 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `keys` / `values` / `entries`：返回迭代器，同样由 VM 构造
     // （`make_typed_array_iterator`），闭包永不被调用。
     for m in ["keys", "values", "entries"] {
-        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
     // ES2023 的一族：同样由 VM 分派 —— `findLast*` 要 invoke 谓词，`toSorted` 要
     // invoke 比较器，`with` / `toReversed` / `toSorted` 还要按 species 建新视图。
     for m in ["with", "toReversed", "toSorted", "findLast", "findLastIndex"] {
-        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
     // `sort`：比较器可选，且是**原地**排序（与 Array.prototype.sort 同）。
     for m in ["sort"] {
-        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
     // `toString` / `toLocaleString`（23.2.3.37 / 23.2.3.38）：都是 join(",")，
     // 闭包永不被调用，实际分派在 `call_prototype_method`。
     for m in ["toString", "toLocaleString"] {
-        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
     // `get %TypedArray%.prototype[@@toStringTag]`（23.2.3.32）：返回接收者自己的
     // TypedArray 名，不是常量 —— 故必须是取值器而非数据属性。
@@ -1127,7 +1127,7 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         "reduce",
         "reduceRight",
     ] {
-        set_prototype_method(proto, heap, m, |_this, _args| Ok(Value::Undefined));
+        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
     }
 
     let desc = accessor(heap, TA_LENGTH_NATIVE);

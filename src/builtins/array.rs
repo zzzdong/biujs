@@ -13,36 +13,36 @@ use crate::vm::value::Value;
 // ─────────────────────────────────────────────────────────
 
 pub fn register_array_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::{mark_prototype_method, set_prototype_method};
+    use super::{mark_prototype_method, set_prototype_method_owned};
 
-    set_prototype_method(proto, heap, "push", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "pop", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "shift", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "unshift", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "indexOf", |this, args| array_index_of(this, args));
-    set_prototype_method(proto, heap, "includes", |this, args| array_includes(this, args));
-    set_prototype_method(proto, heap, "join", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "concat", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "splice", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "reverse", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "lastIndexOf", |this, args| array_last_index_of(this, args));
-    set_prototype_method(proto, heap, "fill", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "toString", |this, _args| array_to_string(this));
-    set_prototype_method(proto, heap, "toLocaleString", |this, _args| {
+    set_prototype_method_owned("Array", proto, heap, "push", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "pop", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "shift", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "unshift", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "indexOf", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "includes", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "join", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "concat", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "splice", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "reverse", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "lastIndexOf", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "fill", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "toString", |this, _args| array_to_string(this));
+    set_prototype_method_owned("Array", proto, heap, "toLocaleString", |this, _args| {
         array_to_string(this)
     });
-    set_prototype_method(proto, heap, "at", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "flat", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "at", |_this, _args| Ok(Value::Undefined));
+    set_prototype_method_owned("Array", proto, heap, "flat", |_this, _args| Ok(Value::Undefined));
     // `flatMap` needs to call back into JS, so the VM dispatches it (next to
     // `map` / `filter`); this registration is what makes the name resolvable.
-    set_prototype_method(proto, heap, "flatMap", |_this, _args| {
+    set_prototype_method_owned("Array", proto, heap, "flatMap", |_this, _args| {
         Err(RuntimeError::InternalError(
             "Array.prototype.flatMap is dispatched by the VM".to_string(),
         ))
     });
     // 闭包从不被调用（`set_prototype_method` 只登记名字）；实现住在分派表里。
-    set_prototype_method(proto, heap, "copyWithin", |_, _| {
+    set_prototype_method_owned("Array", proto, heap, "copyWithin", |_, _| {
         Err(RuntimeError::NotImplemented(
             "method implemented by the VM".to_string(),
         ))
@@ -761,80 +761,114 @@ pub fn array_reverse(heap: &mut Heap, obj: &Value) -> Result<Value, RuntimeError
     Ok(obj.clone())
 }
 
-pub fn array_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    match obj {
-        Value::Object(obj_ref) => {
-            let arr = obj_ref.borrow();
-            if let Some(array_obj) = arr.as_array() {
-                if args.is_empty() {
-                    return Ok(Value::Number(-1.0));
-                }
-                let from = if args.len() < 2 {
-                    0
-                } else {
-                    clamped_index(Some(&args[1]), array_obj.len())?
-                };
-                Ok(Value::Number(array_obj.index_of(&args[0], from) as f64))
-            } else {
-                Err(RuntimeError::TypeError("not an array".to_string()))
-            }
-        }
-        _ => Err(RuntimeError::TypeError("not an array".to_string())),
-    }
+/// `LengthOfArrayLike` for the **generic** search paths, capped at the engine's
+/// iteration budget — the same `1 << 24` the VM's `array_like_length` uses.
+///
+/// Without the cap a receiver that merely *claims* `length = 2**32 - 1`
+/// (`Array.prototype.indexOf.call({ length: 2**32 - 1 }, 1)`, which test262
+/// exercises) turns one call into four billion `[[Get]]`s; the suite wall clock
+/// went from ~130s to ~520s before this.
+fn capped_generic_length(heap: &mut Heap, obj: &Value) -> u64 {
+    generic_length(heap, obj).min(1 << 24)
 }
 
-pub fn array_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    match obj {
-        Value::Object(obj_ref) => {
-            let arr = obj_ref.borrow();
-            if let Some(array_obj) = arr.as_array() {
-                if args.is_empty() {
-                    return Ok(Value::Bool(false));
-                }
-                Ok(Value::Bool(array_obj.includes(&args[0])))
+/// `Array.prototype.indexOf(searchElement[, fromIndex])` (ES 23.1.3.11).
+///
+/// Generic over array-likes: `Array.prototype.indexOf.call('ab', 'b')` is `1`
+/// because `ToObject('ab')` is a String wrapper whose index properties are the
+/// elements. The dense-array fast path stays first; anything else goes through
+/// `HasProperty` + `[[Get]]` one index at a time.
+pub fn array_index_of(
+    heap: &mut Heap,
+    obj: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let needle = args.first().cloned().unwrap_or(Value::Undefined);
+    // Dense fast path — **without** copying the elements: `indexOf` on a big
+    // array must not allocate a snapshot per call.
+    if let Value::Object(obj_ref) = obj {
+        let borrowed = obj_ref.borrow();
+        if let Some(dense) = borrowed.as_array().and_then(|array| array.dense_elements()) {
+            let from = if args.len() < 2 {
+                0
             } else {
-                Err(RuntimeError::TypeError("not an array".to_string()))
-            }
+                clamped_index(Some(&args[1]), dense.len())?
+            };
+            return Ok(Value::Number(
+                match dense[from..].iter().position(|v| v.strict_eq(&needle)) {
+                    Some(offset) => (from + offset) as f64,
+                    None => -1.0,
+                },
+            ));
         }
-        _ => Err(RuntimeError::TypeError("not an array".to_string())),
     }
+    let len = capped_generic_length(heap, obj);
+    let mut index = relative_index(args.get(1), len)?;
+    while index < len {
+        // `HasProperty` first: a hole may still be visible through the prototype.
+        if generic_has(heap, obj, index) && generic_get(heap, obj, index).strict_eq(&needle) {
+            return Ok(Value::Number(index as f64));
+        }
+        index += 1;
+    }
+    Ok(Value::Number(-1.0))
+}
+
+/// `Array.prototype.includes(searchElement[, fromIndex])` (ES 23.1.3.13).
+pub fn array_includes(
+    heap: &mut Heap,
+    obj: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let needle = args.first().cloned().unwrap_or(Value::Undefined);
+    let len = capped_generic_length(heap, obj);
+    let mut index = relative_index(args.get(1), len)?;
+    while index < len {
+        // No `HasProperty` step here: holes compare as `undefined`.
+        if crate::vm::object::same_value_zero(&generic_get(heap, obj, index), &needle) {
+            return Ok(Value::Bool(true));
+        }
+        index += 1;
+    }
+    Ok(Value::Bool(false))
 }
 
 /// `Array.prototype.lastIndexOf(searchElement[, fromIndex])`.
-pub fn array_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    if let Value::Object(obj_ref) = obj {
-        let arr = obj_ref.borrow();
-        if let Some(array_obj) = arr.as_array() {
-            let needle = args.first().cloned().unwrap_or(Value::Undefined);
-            let len = array_obj.len();
-            if len == 0 {
+pub fn array_last_index_of(
+    heap: &mut Heap,
+    obj: &Value,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let needle = args.first().cloned().unwrap_or(Value::Undefined);
+    let len = capped_generic_length(heap, obj);
+    if len == 0 {
+        return Ok(Value::Number(-1.0));
+    }
+    // `fromIndex` defaults to +Infinity here (unlike `indexOf`, whose default is 0).
+    let from = if args.len() < 2 {
+        len as i64 - 1
+    } else {
+        let n = super::to_integer_or_infinity_throwing(args.get(1))?;
+        if n >= 0 {
+            n.min(len as i64 - 1)
+        } else {
+            let wrapped = len as i64 + n;
+            if wrapped < 0 {
                 return Ok(Value::Number(-1.0));
             }
-            let from = match args.get(1) {
-                Some(v) => {
-                    let n = super::to_number_throwing(v)?;
-                    if n.is_nan() {
-                        0
-                    } else {
-                        n as i64
-                    }
-                }
-                None => len as i64 - 1,
-            };
-            let from = if from < 0 {
-                (len as i64 + from).max(0)
-            } else {
-                from.min(len as i64 - 1)
-            };
-            for i in (0..=from).rev() {
-                if array_obj.get(i as usize).is_some_and(|v| v.strict_eq(&needle)) {
-                    return Ok(Value::Number(i as f64));
-                }
-            }
-            return Ok(Value::Number(-1.0));
+            wrapped
         }
+    };
+    let mut index = from;
+    while index >= 0 {
+        if generic_has(heap, obj, index as u64)
+            && generic_get(heap, obj, index as u64).strict_eq(&needle)
+        {
+            return Ok(Value::Number(index as f64));
+        }
+        index -= 1;
     }
-    Err(RuntimeError::TypeError("not an array".to_string()))
+    Ok(Value::Number(-1.0))
 }
 
 /// `Array.prototype.fill(value[, start[, end]])` (ES 23.1.3.6).

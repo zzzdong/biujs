@@ -1439,11 +1439,57 @@ pub fn call_prototype_method(
     method_name: &str,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
+    call_prototype_method_inner(heap, None, obj, method_name, args)
+}
+
+/// Same dispatch, but the **owning prototype** is known (`"Array"` /
+/// `"String"` / `"TypedArray"`), so names shared between families
+/// (`slice`, `indexOf`, `includes`, `concat`, `join`, `at`, …) resolve by
+/// identity instead of by the shape of the receiver:
+/// `Array.prototype.slice.call("abc")` is the array one (`["a","b","c"]`), even
+/// though a string receiver would normally pick the String implementation.
+pub fn call_prototype_method_owned(
+    owner: &str,
+    heap: &mut Heap,
+    obj: &Value,
+    method_name: &str,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    call_prototype_method_inner(heap, Some(owner), obj, method_name, args)
+}
+
+fn call_prototype_method_inner(
+    heap: &mut Heap,
+    owner: Option<&str>,
+    obj: &Value,
+    method_name: &str,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    // 共享名的族归属：带归属时听归属的，否则（旧入口 / 属性取值后再调）按形状猜。
+    let string_family = match owner {
+        Some("String") => true,
+        Some(_) => false,
+        None => string_prototype_receiver(obj),
+    };
+    // 归属为 Array 时原语接收者先装箱：`Array.prototype.slice.call("abc")` 要的是
+    // 字符串包装对象上的虚拟索引属性（`["a","b","c"]`），而不是空数组。
+    let boxed_receiver;
+    let obj = match (owner, obj) {
+        (Some("Array"), Value::Object(_) | Value::Function(_)) => obj,
+        (Some("Array"), primitive) => {
+            boxed_receiver = to_object(heap, primitive)?;
+            &boxed_receiver
+        }
+        _ => obj,
+    };
     // A TypedArray view: `set` / `subarray` / `slice` / `fill` collide with
     // `Array.prototype`'s, so the receiver has to decide before the shared
     // names are reached. (Registered on the prototype *and* dispatched here —
     // the closure a prototype method carries is never called, only its name is.)
-    if typedarray::is_typedarray_receiver(obj) {
+    //
+    // 带归属时只有 `%TypedArray%` 才走这条（`Array.prototype.slice.call(ta)` 要的是
+    // 普通数组）。
+    if (owner.is_none() || owner == Some("TypedArray")) && typedarray::is_typedarray_receiver(obj) {
         match method_name {
             "set" => return typedarray::ta_set(heap, obj, args),
             "subarray" => return typedarray::ta_subarray(heap, obj, args),
@@ -1462,10 +1508,10 @@ pub fn call_prototype_method(
             _ => {}
         }
     }
-    if typedarray::is_arraybuffer_receiver(obj) && method_name == "slice" {
+    if owner.is_none() && typedarray::is_arraybuffer_receiver(obj) && method_name == "slice" {
         return typedarray::ab_slice(heap, obj, args);
     }
-    if typedarray::is_dataview_receiver(obj) {
+    if owner.is_none() && typedarray::is_dataview_receiver(obj) {
         use typedarray::DataViewType::*;
         // Only the 8 `get*` / 8 `set*` are DataView-specific; every other method
         // (`hasOwnProperty`, `toString`, `valueOf`, …) is inherited from
@@ -1657,10 +1703,34 @@ pub fn call_prototype_method(
         "repeat" => string::string_repeat(obj, args),
         "lastIndexOf" => string::string_last_index_of(obj, args),
         // Dispatched by type
-        "concat" => dispatch_concat(heap, obj, args),
-        "includes" => dispatch_includes(obj, args),
-        "indexOf" => dispatch_index_of(obj, args),
-        "slice" => dispatch_slice(heap, obj, args),
+        "concat" => {
+            if string_family {
+                string::string_concat(obj, args)
+            } else {
+                array::array_concat(heap, obj, args)
+            }
+        }
+        "includes" => {
+            if string_family {
+                string::string_includes(obj, args)
+            } else {
+                array::array_includes(heap, obj, args)
+            }
+        }
+        "indexOf" => {
+            if string_family {
+                string::string_index_of(obj, args)
+            } else {
+                array::array_index_of(heap, obj, args)
+            }
+        }
+        "slice" => {
+            if string_family {
+                string::string_slice(obj, args)
+            } else {
+                array::array_slice(heap, obj, args)
+            }
+        }
         // Array prototype
         "push" => array::array_push(heap, obj, args),
         "pop" => array::array_pop(heap, obj),
@@ -1669,7 +1739,7 @@ pub fn call_prototype_method(
         "join" => array::array_join(heap, obj, args),
         "splice" => array::array_splice(heap, obj, args),
         "reverse" => array::array_reverse(heap, obj),
-        "lastIndexOf" => array::array_last_index_of(obj, args),
+        "lastIndexOf" => array::array_last_index_of(heap, obj, args),
         "fill" => array::array_fill(heap, obj, args),
         _ => Err(RuntimeError::TypeError(format!(
             "unknown prototype method: {method_name}"
@@ -1686,46 +1756,6 @@ fn string_prototype_receiver(obj: &Value) -> bool {
     matches!(obj, Value::String(_))
         || matches!(obj, Value::Object(o)
             if matches!(o.borrow().kind(), ObjectKind::String | ObjectKind::Number | ObjectKind::Boolean))
-}
-
-fn dispatch_concat(
-    heap: &mut Heap,
-    obj: &Value,
-    args: &[Value],
-) -> Result<Value, RuntimeError> {
-    if string_prototype_receiver(obj) {
-        string::string_concat(obj, args)
-    } else {
-        array::array_concat(heap, obj, args)
-    }
-}
-
-fn dispatch_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    if string_prototype_receiver(obj) {
-        string::string_includes(obj, args)
-    } else {
-        array::array_includes(obj, args)
-    }
-}
-
-fn dispatch_index_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    if string_prototype_receiver(obj) {
-        string::string_index_of(obj, args)
-    } else {
-        array::array_index_of(obj, args)
-    }
-}
-
-fn dispatch_slice(
-    heap: &mut Heap,
-    obj: &Value,
-    args: &[Value],
-) -> Result<Value, RuntimeError> {
-    if string_prototype_receiver(obj) {
-        string::string_slice(obj, args)
-    } else {
-        array::array_slice(heap, obj, args)
-    }
 }
 
 // ─────────────────────────────────────────────────────────
