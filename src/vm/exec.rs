@@ -3161,6 +3161,10 @@ impl VM {
                             | "Object.keys"
                             | "Object.getOwnPropertyNames"
                             | "Object.getOwnPropertySymbols"
+                            // 每个参数都要 `ToNumber`，对对象要跑 `valueOf` / `toString`
+                            // （`String.fromCharCode({valueOf(){return 1}})` 是 U+0001）。
+                            | "String.fromCharCode"
+                            | "String.fromCodePoint"
                     );
                     if !vm_handled_static {
                         // A missing static falls through to the prototype chain,

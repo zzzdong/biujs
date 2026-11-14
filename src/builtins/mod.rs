@@ -472,7 +472,9 @@ pub fn global_parse_float(args: &[Value]) -> Result<Value, RuntimeError> {
     }
     Ok(Value::Number(best))
 }
-pub use string::{split_string, string_constructor};
+pub use string::{
+    split_string, string_constructor, string_from_char_code, string_from_code_point,
+};
 pub use symbol::symbol_constructor;
 pub use symbol::{
     HAS_INSTANCE_SYMBOL_ID, MATCH_SYMBOL_ID, REPLACE_SYMBOL_ID, SEARCH_SYMBOL_ID,

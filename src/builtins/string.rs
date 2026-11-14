@@ -104,7 +104,7 @@ pub fn register_string_prototype(proto: &Gc<Object>, heap: &mut Heap) {
 pub fn string_from_char_code(args: &[Value]) -> Result<Value, RuntimeError> {
     let mut out = String::new();
     for arg in args {
-        let unit = super::to_uint16(arg.to_number());
+        let unit = super::to_uint16(super::to_number_throwing(arg)?);
         // Lone surrogates are valid in JS strings but not in Rust's `String`,
         // so they are encoded as the replacement character.
         out.push(char::from_u32(unit as u32).unwrap_or('\u{FFFD}'));
@@ -117,7 +117,7 @@ pub fn string_from_char_code(args: &[Value]) -> Result<Value, RuntimeError> {
 pub fn string_from_code_point(args: &[Value]) -> Result<Value, RuntimeError> {
     let mut out = String::new();
     for arg in args {
-        let n = arg.to_number();
+        let n = super::to_number_throwing(arg)?;
         // ToIntegerOrInfinity, then the range check.
         let code = if n.is_nan() { 0.0 } else { n.trunc() };
         if !code.is_finite() || code < 0.0 || code > 0x10_FFFF as f64 {

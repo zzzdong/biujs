@@ -610,6 +610,26 @@ impl VM {
             if name == "String.raw" {
                 return self.string_raw(args, module);
             }
+            // `String.fromCharCode` / `fromCodePoint`：每个参数都是 `ToNumber`，
+            // 对对象要跑 `valueOf` / `toString`（`{valueOf(){return 1}}` 得到 U+0001，
+            // `S9.7_A3.1_T4`；Symbol 是 TypeError）。内建层只有 `to_number()`。
+            if matches!(name, "String.fromCharCode" | "String.fromCodePoint") {
+                let mut converted = Vec::with_capacity(args.len());
+                for arg in args {
+                    let primitive = match arg {
+                        Value::Object(_) | Value::Function(_) => {
+                            self.to_primitive(arg, "number", module)?
+                        }
+                        other => other.clone(),
+                    };
+                    converted.push(primitive);
+                }
+                return if name == "String.fromCharCode" {
+                    crate::builtins::string_from_char_code(&converted)
+                } else {
+                    crate::builtins::string_from_code_point(&converted)
+                };
+            }
             // `%TypedArray%.from` / `%TypedArray%.of`：迭代、可选回调、再
             // `new C(len)` —— 三样都只有 VM 能做。
             if name == "TypedArray.from" {
@@ -1409,27 +1429,45 @@ impl VM {
     /// 这正是它存在的意义 —— `` String.raw`\n` `` 得到字面的反斜杠 n。
     fn string_raw(&mut self, args: &[Value], module: &Module) -> Result<Value, RuntimeError> {
         let template = args.first().cloned().unwrap_or(Value::Undefined);
-        // 第一步是 ToObject：非对象（含 undefined / null）是 TypeError。
-        if !matches!(template, Value::Object(_)) {
-            return Err(RuntimeError::TypeError(
-                "String.raw: template must be an object".to_string(),
-            ));
+        // 1. `ToObject(template)`：非对象（含 undefined / null）是 TypeError。
+        let cooked = crate::builtins::to_object(&mut self.heap, &template)?;
+        // 2. `Get(cooked, "raw")` 再 `ToObject` —— raw 常常是**字符串**
+        //    （`String.raw({raw: "abc"})`），它的索引属性就是各段。
+        let raw_key = PropertyKey::well_known("raw").expect("well-known name");
+        let raw = self.get_member(&cooked, &raw_key, module)?;
+        let raw = crate::builtins::to_object(&mut self.heap, &raw)?;
+        // 3. `ToLength(Get(raw, "length"))`：`ToNumber` 会跑用户 `valueOf`，
+        //    Symbol 长度是 TypeError（`template-length-is-symbol-throws`）。
+        let length_key = PropertyKey::well_known("length").expect("well-known name");
+        let length_value = self.get_member(&raw, &length_key, module)?;
+        let length_value = match &length_value {
+            Value::Object(_) | Value::Function(_) => {
+                self.to_primitive(&length_value, "number", module)?
+            }
+            other => other.clone(),
+        };
+        // 上限与 `array_like_length` 一致：只是声称 `length = 2**53-1` 的接收者
+        // 不该把一次调用变成无限循环/无界分配。
+        let segments = crate::builtins::to_length_throwing(&length_value)?.min(1 << 24);
+        if segments == 0 {
+            return Ok(Value::string(""));
         }
-        // `Get(template, "raw")` —— 走真 [[Get]]，getter 可以抛。
-        let raw = self.get_member(&template, &PropertyKey::well_known("raw").expect("well-known name"), module)?;
-        let len = self
-            .array_like_elements(&raw)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let substitutions = args.get(1..).unwrap_or(&[]);
         let mut out = String::new();
-        for i in 0..len {
-            let key = PropertyKey::element(&mut self.heap, i as u64);
-            let chunk = self.get_member(&raw, &key, module)?;
-            // 每个替换值都 ToString（`undefined` / `null` 走 ToString 而非跳过 ——
-            // `String.raw` 不做 `join` 那样的空串替换）。
-            out.push_str(&chunk.to_js_string());
-            if i + 1 < args.len() {
-                out.push_str(&args[i + 1].to_js_string());
+        for index in 0..segments {
+            let key = PropertyKey::element(&mut self.heap, index);
+            let segment = self.get_member(&raw, &key, module)?;
+            // `ToString(Get(raw, nextKey))`：Symbol 段是 TypeError
+            // （`nextkey-is-symbol-throws`）。
+            out.push_str(&crate::builtins::to_string_throwing(&segment)?);
+            // 9.e：**最后一段之后立刻返回** —— 末尾不再插替换值，多余的替换值
+            // 被忽略（`substitutions-are-limited-to-template-raw-length`：三个替换值
+            // 配三段，第三段的 `toString` 根本不该被调用）。
+            if index + 1 == segments {
+                return Ok(Value::string(&out));
+            }
+            if let Some(sub) = substitutions.get(index as usize) {
+                out.push_str(&crate::builtins::to_string_throwing(sub)?);
             }
         }
         Ok(Value::string(&out))
