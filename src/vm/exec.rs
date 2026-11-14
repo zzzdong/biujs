@@ -3217,6 +3217,22 @@ impl VM {
                 //   内建原型方法只有这条路能到。
                 let receiver = self.as_object_value(&obj_val);
                 let method_val = self.lookup_property_on_object(&receiver, &method_name, module)?;
+                // 原语接收者走不到真正的 `[[Get]]`（`lookup_property_on_object`
+                // 只读对象），所以 `String.prototype.split` 这条需要 VM 的路径
+                // 在这里单独接一次 —— `@@split` / `ToUint32(limit)` /
+                // `ToString(separator)` 都可能跑用户代码，按名字分派的兜底拿不到
+                // `module`。只在**这个名字**上补，别处不为每次原语方法调用多付一次
+                // 名字拼接（实测全量墙钟会从 ~90s 涨到 ~800s）。
+                if crate::builtins::native_function_name(&method_val).is_none()
+                    && method_name == "split"
+                {
+                    if matches!(obj_val, Value::String(_)) {
+                        let result = self.string_prototype_split(&obj_val, &args, module)?;
+                        self.state.set_register(Register::Rv, result)?;
+                        self.state.jump_offset(1);
+                        return Ok(true);
+                    }
+                }
                 let native_method = crate::builtins::native_function_name(&method_val);
                 // 用户（或 Proxy/访问器）提供的可调用值：内建分派无权插手。
                 let user_method = !matches!(method_val, Value::Undefined) && native_method.is_none();

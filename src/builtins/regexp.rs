@@ -555,6 +555,20 @@ pub fn regexp_search(
 }
 
 /// `String.prototype.split(separator[, limit])` with a RegExp separator.
+/// `RegExp.prototype[@@split](string, limit)` (ES 22.2.5.11) — the half that
+/// `String.prototype.split` delegates to when the separator is a RegExp.
+///
+/// The loop is the spec's, not the `regex` crate's `split`: three of its
+/// properties are observable and only the explicit walk gets them right
+///
+/// * **capture groups are spliced into the result**
+///   (`"a1b2".split(/(\d)/)` → `["a","1","b","2",""]`),
+/// * a **zero-width match at the previous split point** is skipped instead of
+///   producing a leading empty piece (`"x".split(/^/)` → `["x"]`, not
+///   `["","x"]`; `"hello".split(/(?:)/)` → five letters, matching the
+///   `AdvanceStringIndex` step),
+/// * `limit` counts the spliced pieces too, and is `ToUint32`, so `-1` means
+///   "no limit" rather than "none".
 pub fn regexp_split(
     heap: &mut Heap,
     this: &Value,
@@ -562,17 +576,58 @@ pub fn regexp_split(
 ) -> Result<Value, RuntimeError> {
     let text = super::string_receiver(this)?;
     let (matcher, _) = matcher_for(heap, args.first().unwrap_or(&Value::Undefined))?;
-    let limit = match args.get(1) {
-        Some(v) if !v.is_undefined() => v.to_number() as usize,
-        _ => usize::MAX,
+    let lim = match args.get(1) {
+        None | Some(Value::Undefined) => u32::MAX,
+        Some(v) => super::to_uint32_number(super::to_number_throwing(v)?),
     };
-    let parts: Vec<Value> = matcher
-        .split(text.as_str())
-        .take(limit)
-        .map(Value::string)
-        .collect();
+    let mut out: Vec<Value> = Vec::new();
+    if lim == 0 {
+        return Ok(Value::Object(
+            heap.alloc(Object::Array(ArrayObject::from_vec(out))),
+        ));
+    }
+    let size = text.len();
+    let mut p = 0usize; // 上一段的起点
+    let mut q = 0usize; // 从这里开始找下一个匹配
+    while q < size {
+        // `captures_at` 给的是"不早于 q 的最左匹配"，等价于规范里 q 逐位前进
+        // 找到的那个 —— 但它是 O(1) 次扫描而不是 O(n) 次（按位前进在长串上
+        // 是 O(n²)，实测把全量墙钟拉高一个数量级）。
+        let Some(caps) = matcher.captures_at(&text, q) else {
+            break;
+        };
+        let whole = caps.get(0).expect("a match implies group 0");
+        let start = whole.start();
+        let e = whole.end();
+        if e == p {
+            // 零宽匹配且落在上次切分点：前进一个字符再试（22.2.5.11 第 14.d.iii 步）。
+            q = super::next_char_boundary(&text, q);
+            continue;
+        }
+        out.push(Value::string(&text[p..start]));
+        if out.len() as u32 >= lim {
+            return Ok(Value::Object(
+                heap.alloc(Object::Array(ArrayObject::from_vec(out))),
+            ));
+        }
+        // 捕获组原样插在分隔符的位置上；未参与匹配的组是 `undefined`。
+        for i in 1..caps.len() {
+            out.push(match caps.get(i) {
+                Some(m) => Value::string(m.as_str()),
+                None => Value::Undefined,
+            });
+            if out.len() as u32 >= lim {
+                return Ok(Value::Object(
+                    heap.alloc(Object::Array(ArrayObject::from_vec(out))),
+                ));
+            }
+        }
+        p = e;
+        q = p;
+    }
+    out.push(Value::string(&text[p..]));
     Ok(Value::Object(
-        heap.alloc(Object::Array(ArrayObject::from_vec(parts))),
+        heap.alloc(Object::Array(ArrayObject::from_vec(out))),
     ))
 }
 

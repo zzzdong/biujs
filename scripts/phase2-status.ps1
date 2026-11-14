@@ -175,8 +175,15 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host 'test262_runner 构建失败 —— 拒绝用旧二进制跑全量。'
     exit 3
 }
-$runner = Get-ChildItem -LiteralPath 'target/release/deps' -Filter 'test262_runner-*.exe' -File |
+# 产物位置随工具链/配置而变：正常在 `target/release/deps`，但只要 `deps` 不存在
+# 就不能直接报"找不到" —— 退化为全仓搜索（实测某些环境把它放在
+# `target/release/build/<pkg>/<hash>/out/`）。
+$runner = Get-ChildItem -LiteralPath 'target/release/deps' -Filter 'test262_runner-*.exe' -File -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($null -eq $runner) {
+    $runner = Get-ChildItem -LiteralPath 'target/release' -Filter 'test262_runner-*.exe' -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
 if ($null -eq $runner) {
     Write-Host '找不到 test262_runner 二进制（先 cargo test --release --test test262_runner --no-run）。'
     exit 1

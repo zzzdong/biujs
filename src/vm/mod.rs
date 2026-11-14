@@ -5710,6 +5710,25 @@ impl VM {
         }
         let this_val = Value::Object(self.heap.alloc(Object::Ordinary(this_obj)));
 
+        // `new String(x)` / `new Number(x)`：`[[StringData]]` / `[[NumberData]]` 是
+        // `ToString(x)` / `ToNumber(x)` 的结果，而对象要走用户的 `valueOf` /
+        // `toString` —— 内建层没有 `module`，所以在这里先转。
+        // `new String({valueOf(){}, toString: undefined})` 的数据必须是
+        // `"undefined"`（`separator-override-valueof` 那条用例就靠它）。
+        let converted_args;
+        let args: &[Value] = if matches!(name, "String" | "Number") && !args.is_empty() {
+            let primitive = match &args[0] {
+                Value::Object(_) | Value::Function(_) => {
+                    let hint = if name == "String" { "string" } else { "number" };
+                    self.to_primitive(&args[0], hint, module)?
+                }
+                other => other.clone(),
+            };
+            converted_args = vec![primitive];
+            &converted_args
+        } else {
+            args
+        };
         let result = crate::builtins::call_native(name, args, &mut self.heap)?;
         let result = self.finish_native_construct(result, &proto, this_val);
         if reparent {

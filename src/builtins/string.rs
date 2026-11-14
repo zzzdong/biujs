@@ -544,24 +544,87 @@ pub fn string_locale_compare(obj: &Value, args: &[Value]) -> Result<Value, Runti
     }))
 }
 
+
+
+/// `String.prototype.split`'s core loop (ES 22.1.3.23 steps 10-24) with the
+/// separator **already** converted.
+///
+/// Two shapes:
+/// * an empty separator splits by code unit, so `"😀".split("").length === 2`
+///   (a surrogate pair is two elements) and `limit` truncates it;
+/// * otherwise every non-overlapping occurrence is a split point, and the
+///   pieces between them are kept **including** the empty ones at the edges:
+///   `"a,b".split(",")` → `["a","b"]`, `",a".split(",")` → `["","a"]`,
+///   `"aa".split("a")` → `["","",""]`.
+pub fn split_string(s: &str, separator: &str, lim: u32) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if lim == 0 {
+        return out;
+    }
+    if separator.is_empty() {
+        for unit in s.encode_utf16() {
+            if out.len() as u32 >= lim {
+                return out;
+            }
+            out.push(crate::vm::utf16::from_units(&[unit]));
+        }
+        return out;
+    }
+    let size = s.len();
+    let mut p = 0usize; // 上一段的起点
+    let mut q = 0usize; // 当前扫描位置（总是 char 边界）
+    while q < size {
+        if s[q..].starts_with(separator) {
+            let e = q + separator.len();
+            if e == p {
+                // 与上一段起点重合的匹配不能再切一次（否则死循环）。
+                q = super::next_char_boundary(s, q);
+                continue;
+            }
+            out.push(s[p..q].to_string());
+            if out.len() as u32 >= lim {
+                return out;
+            }
+            p = e;
+            q = p;
+        } else {
+            q = super::next_char_boundary(s, q);
+        }
+    }
+    // 最后一段总是要的（可以为空串）。
+    out.push(s[p..].to_string());
+    out
+}
+
+/// `String.prototype.split(separator, limit)`，**不跑用户代码**的那一半。
+///
+/// 完整的入口在 VM（`builtins_dispatch::string_prototype_split`）：`@@split`
+/// 协议、`ToString(this)`、`ToUint32(limit)`、`ToString(separator)` 都可能执行
+/// 用户函数，这个函数只负责在三个值都已转换好之后走切分循环 —— 它同时也给
+/// `call_prototype_method` 的按名分派当兜底。
 pub fn string_split(
     heap: &mut Heap,
     obj: &Value,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
-    if args.is_empty() {
+    let lim = match args.get(1) {
+        None | Some(Value::Undefined) => u32::MAX,
+        // ToUint32 —— 这条路上 `limit` 只可能是原语（对象由 VM 先转）。
+        Some(v) => super::to_uint32_number(super::to_number_throwing(v)?),
+    };
+    if lim == 0 {
+        return Ok(new_array_object_from_vec(heap, Vec::new()));
+    }
+    let separator = args.first().cloned().unwrap_or(Value::Undefined);
+    if separator.is_undefined() {
         return Ok(new_array_object_from_vec(heap, vec![Value::string(&s)]));
     }
-    let sep = super::to_string_throwing(&args[0])?;
-    let parts: Vec<Value> = if sep.is_empty() {
-        // 空分隔符按**码元**切（`"😀".split("").length` 是 2）。
-        s.encode_utf16()
-            .map(|unit| Value::string(&crate::vm::utf16::from_units(&[unit])))
-            .collect()
-    } else {
-        s.split(&sep).map(|part| Value::string(part)).collect()
-    };
+    let sep = super::to_string_throwing(&separator)?;
+    let parts: Vec<Value> = split_string(&s, &sep, lim)
+        .into_iter()
+        .map(|part| Value::string(&part))
+        .collect();
     Ok(new_array_object_from_vec(heap, parts))
 }
 

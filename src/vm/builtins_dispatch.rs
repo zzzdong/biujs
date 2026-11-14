@@ -376,6 +376,12 @@ impl VM {
         // 可以跑用户代码（`String.prototype.slice.call({toString(){…}}, 1)`），
         // 所以转换在这里做 —— 内建层没有 `module`。
         if let Some(method) = name.strip_prefix("String.prototype.") {
+            // `split` 的步骤顺序和别的方法不一样：`@@split` 协议在
+            // `ToString(this)` **之前**，`ToUint32(limit)` 在 `ToString(separator)`
+            // 之前 —— 三步都可能跑用户代码，只能在这里做。
+            if method == "split" {
+                return self.string_prototype_split(&this, args, module);
+            }
             // `RequireObjectCoercible(this)`：`String.prototype.trim.call(null)`
             // 是 TypeError，不能因为 `ToString(null)` 恰好是 "null" 就放过去。
             crate::builtins::require_object_coercible(&this)?;
@@ -836,6 +842,88 @@ impl VM {
             self.set_member(&target, key, value, module)?;
         }
         Ok(Some(target))
+    }
+
+    /// `String.prototype.split(separator, limit)` (ES 22.1.3.23).
+    ///
+    /// 三个转换的顺序**可观察**，而且每一个都可能跑用户代码，所以整段前导只能在
+    /// 这里做（内建层没有 `module`）：
+    ///
+    /// ```text
+    /// 1. RequireObjectCoercible(this)
+    /// 2. separator 带 @@split  →  Call(splitter, separator, «this, limit»)
+    /// 3. S = ToString(this)          ← 只在没有 @@split 时（`this-value-tostring-error`）
+    /// 4. lim = ToUint32(limit)       ← 在 ToString(separator) **之前**
+    /// 5. R = ToString(separator)     ← 在 lim == 0 检查**之前**
+    /// 6. lim == 0 → []
+    /// 7. separator === undefined → [S]
+    /// ```
+    ///
+    /// 第 4/5 步的先后由 `limit-touint32-error` / `separator-tostring-error`
+    /// 两条用例钉住；第 3 步之前做协议查找由 `this-value-tostring-error` 钉住。
+    pub(crate) fn string_prototype_split(
+        &mut self,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        crate::builtins::require_object_coercible(this)?;
+        let separator = args.first().cloned().unwrap_or(Value::Undefined);
+        // `@@split` 只对**对象**分隔符查找（ES 22.1.3.23 第 2 步 "If separator
+        // is not Object, then …"）：原语分隔符不会走到原型上的 getter，
+        // `cstm-split-on-{string,number,boolean}-primitive` 正是断言这一点 ——
+        // 以前对 `","` 也会做 `GetMethod`，把 `String.prototype[Symbol.split]`
+        // 上的 getter 触发了一次。
+        if matches!(separator, Value::Object(_) | Value::Function(_)) {
+            let splitter =
+                self.get_member(&separator, &crate::builtins::split_symbol_key(), module)?;
+            if splitter.is_callable() || matches!(splitter, Value::Function(_)) {
+                let limit = args.get(1).cloned().unwrap_or(Value::Undefined);
+                return self.invoke(&splitter, separator, &[this.clone(), limit], module);
+            }
+        }
+        let text = match this {
+            Value::Object(_) | Value::Function(_) => {
+                self.to_primitive(this, "string", module)?.to_js_string()
+            }
+            other => other.to_js_string(),
+        };
+        let lim = match args.get(1) {
+            None | Some(Value::Undefined) => u32::MAX,
+            Some(value) => {
+                let primitive = match value {
+                    Value::Object(_) | Value::Function(_) => {
+                        self.to_primitive(value, "number", module)?
+                    }
+                    other => other.clone(),
+                };
+                crate::builtins::to_uint32_number(crate::builtins::to_number_throwing(&primitive)?)
+            }
+        };
+        let separator_text = match &separator {
+            Value::Object(_) | Value::Function(_) => {
+                self.to_primitive(&separator, "string", module)?.to_js_string()
+            }
+            other => other.to_js_string(),
+        };
+        if lim == 0 {
+            return Ok(self.new_array_from_vec(Vec::new()));
+        }
+        if separator.is_undefined() {
+            return Ok(self.new_array_from_vec(vec![Value::string(&text)]));
+        }
+        let parts: Vec<Value> = crate::builtins::split_string(&text, &separator_text, lim)
+            .into_iter()
+            .map(|part| Value::string(&part))
+            .collect();
+        Ok(self.new_array_from_vec(parts))
+    }
+
+    /// 一个普通数组值 —— `map` / `filter` / `split` 这类"造结果数组"的收口点。
+    fn new_array_from_vec(&mut self, values: Vec<Value>) -> Value {
+        Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
+            crate::vm::object::ArrayObject::from_vec(values),
+        )))
     }
 
     /// `String.prototype.replace(searchValue, replacer)` when the replacer is a

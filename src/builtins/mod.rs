@@ -197,6 +197,35 @@ pub fn to_uint16(n: f64) -> u16 {
 /// `undefined` and `null` have no object form, so every built-in that starts
 /// with `Let O be ? ToObject(this)` — or needs the *receiver itself* rather than
 /// a wrapper — reports a TypeError here.
+/// ES `ToUint32` on an **already converted** number: NaN / ±∞ / 0 → 0, then
+/// `trunc(n) modulo 2**32`.
+///
+/// `-1` is `4294967295`, not 0 — that is what makes
+/// `"a,b".split(",", -1)` keep both pieces while `"a,b".split(",", 0)` returns
+/// an empty array.
+pub fn to_uint32_number(n: f64) -> u32 {
+    if n.is_nan() || n.is_infinite() || n == 0.0 {
+        return 0;
+    }
+    (n.trunc().rem_euclid(4_294_967_296.0)) as u32
+}
+
+/// Next byte offset after `at` that sits on a `char` boundary (`at` itself is
+/// always one, and so is `s.len()`).
+///
+/// The split loops advance one *character* at a time. The spec advances one
+/// UTF-16 code unit, but a match on a UTF-8 string can only start on a boundary
+/// anyway, so stepping by character is the same walk for every non-empty
+/// separator (the code-unit behaviour matters only for the empty separator,
+/// which has its own branch in `string::split_string`).
+pub fn next_char_boundary(s: &str, at: usize) -> usize {
+    let mut i = at + 1;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i.min(s.len())
+}
+
 pub fn require_object_coercible(value: &Value) -> Result<&Value, RuntimeError> {
     match value {
         Value::Undefined | Value::Null => Err(RuntimeError::TypeError(
@@ -443,7 +472,7 @@ pub fn global_parse_float(args: &[Value]) -> Result<Value, RuntimeError> {
     }
     Ok(Value::Number(best))
 }
-pub use string::string_constructor;
+pub use string::{split_string, string_constructor};
 pub use symbol::symbol_constructor;
 pub use symbol::{
     HAS_INSTANCE_SYMBOL_ID, MATCH_SYMBOL_ID, REPLACE_SYMBOL_ID, SEARCH_SYMBOL_ID,
