@@ -3218,19 +3218,21 @@ impl VM {
                 let receiver = self.as_object_value(&obj_val);
                 let method_val = self.lookup_property_on_object(&receiver, &method_name, module)?;
                 // 原语接收者走不到真正的 `[[Get]]`（`lookup_property_on_object`
-                // 只读对象），所以 `String.prototype.split` 这条需要 VM 的路径
-                // 在这里单独接一次 —— `@@split` / `ToUint32(limit)` /
-                // `ToString(separator)` 都可能跑用户代码，按名字分派的兜底拿不到
-                // `module`。只在**这个名字**上补，别处不为每次原语方法调用多付一次
-                // 名字拼接（实测全量墙钟会从 ~90s 涨到 ~800s）。
-                if crate::builtins::native_function_name(&method_val).is_none()
-                    && method_name == "split"
-                {
-                    if matches!(obj_val, Value::String(_)) {
-                        let result = self.string_prototype_split(&obj_val, &args, module)?;
-                        self.state.set_register(Register::Rv, result)?;
-                        self.state.jump_offset(1);
-                        return Ok(true);
+                // 只读对象），所以 `String.prototype` 这条需要 VM 的路径在这里
+                // 单独接一次：接收者的 `ToString` 与参数的 `ToPrimitive` 都要
+                // 跑用户代码，按名字分派的兜底拿不到 `module`。
+                if crate::builtins::native_function_name(&method_val).is_none() {
+                    if let Value::String(_) = &obj_val {
+                        match self.string_prototype_method(&obj_val, &method_name, &args, module) {
+                            Ok(result) => {
+                                self.state.set_register(Register::Rv, result)?;
+                                self.state.jump_offset(1);
+                                return Ok(true);
+                            }
+                            // 没有这个方法：照旧回落到用户方法 / TypeError。
+                            Err(err) if crate::builtins::is_unknown_builtin(&err) => {}
+                            Err(err) => return Err(err),
+                        }
                     }
                 }
                 let native_method = crate::builtins::native_function_name(&method_val);

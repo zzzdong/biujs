@@ -683,46 +683,77 @@ fn expand_replacement(
     start: usize,
     end: usize,
 ) -> String {
+    let chars: Vec<char> = template.chars().collect();
     let mut out = String::new();
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
+    // `regex::Captures::len()` 把 group 0 也算进去。
+    let group_count = captures.len().saturating_sub(1);
+    let push_group = |out: &mut String, n: usize| {
+        // 未参与匹配的组贡献空串（ES 21.1.3.14 第 12.c.v 步）—— 不 push 就是空串。
+        if let Some(m) = captures.get(n) {
+            out.push_str(m.as_str());
+        }
+    };
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
         if c != '$' {
             out.push(c);
+            i += 1;
             continue;
         }
-        match chars.peek() {
-            Some('$') => {
-                chars.next();
+        let Some(&next) = chars.get(i + 1) else {
+            out.push('$');
+            i += 1;
+            continue;
+        };
+        match next {
+            '$' => {
                 out.push('$');
+                i += 2;
             }
-            Some('&') => {
-                chars.next();
+            '&' => {
                 out.push_str(&input[start..end]);
+                i += 2;
             }
-            Some('`') => {
-                chars.next();
+            '`' => {
                 out.push_str(&input[..start]);
+                i += 2;
             }
-            Some('\'') => {
-                chars.next();
+            '\'' => {
                 out.push_str(&input[end..]);
+                i += 2;
             }
-            Some(d) if d.is_ascii_digit() => {
-                let mut index = String::new();
-                while let Some(d) = chars.peek() {
-                    if d.is_ascii_digit() {
-                        index.push(*d);
-                        chars.next();
-                    } else {
-                        break;
-                    }
+            d if d.is_ascii_digit() => {
+                // `$nn`：两位优先，但**只有** `1 <= nn <= 组数` 才吃两位 ——
+                // 否则退回一位（`"uid=31".replace(/(uid=)(\d+)/, "$11")` 是
+                // group 1 + 字面 "1"，不是 group 11），再不行就是字面量
+                // （`$0` 从来不是组，`"$0"` 原样保留）。
+                let two = chars
+                    .get(i + 2)
+                    .copied()
+                    .filter(char::is_ascii_digit)
+                    .map(|second| {
+                        (d.to_digit(10).unwrap() * 10 + second.to_digit(10).unwrap()) as usize
+                    })
+                    .filter(|n| (1..=group_count).contains(n));
+                if let Some(n) = two {
+                    push_group(&mut out, n);
+                    i += 3;
+                    continue;
                 }
-                let n: usize = index.parse().unwrap_or(0);
-                if let Some(m) = captures.get(n) {
-                    out.push_str(m.as_str());
+                let one = d.to_digit(10).unwrap() as usize;
+                if (1..=group_count).contains(&one) {
+                    push_group(&mut out, one);
+                    i += 2;
+                } else {
+                    out.push('$');
+                    i += 1;
                 }
             }
-            _ => out.push('$'),
+            _ => {
+                out.push('$');
+                i += 1;
+            }
         }
     }
     out

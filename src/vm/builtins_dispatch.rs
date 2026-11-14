@@ -376,34 +376,7 @@ impl VM {
         // 可以跑用户代码（`String.prototype.slice.call({toString(){…}}, 1)`），
         // 所以转换在这里做 —— 内建层没有 `module`。
         if let Some(method) = name.strip_prefix("String.prototype.") {
-            // `split` 的步骤顺序和别的方法不一样：`@@split` 协议在
-            // `ToString(this)` **之前**，`ToUint32(limit)` 在 `ToString(separator)`
-            // 之前 —— 三步都可能跑用户代码，只能在这里做。
-            if method == "split" {
-                return self.string_prototype_split(&this, args, module);
-            }
-            // `RequireObjectCoercible(this)`：`String.prototype.trim.call(null)`
-            // 是 TypeError，不能因为 `ToString(null)` 恰好是 "null" 就放过去。
-            crate::builtins::require_object_coercible(&this)?;
-            // `toString` / `valueOf` 例外：它们要求接收者**本身**是字符串
-            // （21.1.3.26 / 21.1.3.27），不能把 `123` 悄悄转成 `"123"`。
-            let text = if matches!(method, "toString" | "valueOf") {
-                crate::builtins::require_string(&this)?
-            } else {
-                let primitive = match &this {
-                    Value::Object(_) | Value::Function(_) => {
-                        self.to_primitive(&this, "string", module)?
-                    }
-                    other => other.clone(),
-                };
-                crate::builtins::to_string_throwing(&primitive)?
-            };
-            return crate::builtins::call_prototype_method(
-                &mut self.heap,
-                &Value::string(&text),
-                method,
-                args,
-            );
+            return self.string_prototype_method(&this, method, args, module);
         }
         // `Number.prototype.*` / `Boolean.prototype.*`：归属决定 `toString` /
         // `valueOf` 的接收者口径（`Number.prototype.toString.call({})` 是
@@ -842,6 +815,141 @@ impl VM {
             self.set_member(&target, key, value, module)?;
         }
         Ok(Some(target))
+    }
+
+    /// 一个 `String.prototype` 方法调用：接收者与参数都按规范转换，然后交给
+    /// 内建层的按名分派。
+    ///
+    /// 抽成一个函数是因为**两条**调用路径都要它：
+    ///
+    /// * 具名分派（`__proto_method__` 被 `String.prototype.<name>` 取代之后，
+    ///   仍会从 `Function.prototype.call` 之类进来）；
+    /// * 原语接收者的方法调用（`"a,b".split(obj)`）：`[[Get]]` 在规范里先
+    ///   `ToObject`，但这条路径**不装箱**（热路径），直接在 exec 里调这里。
+    ///
+    /// 未知方法照旧返回 "unknown prototype method: …"，调用方据此回落到用户方法。
+    pub(crate) fn string_prototype_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        // `split` 的步骤顺序和别的方法不一样：`@@split` 协议在
+        // `ToString(this)` **之前**，`ToUint32(limit)` 在 `ToString(separator)`
+        // 之前 —— 三步都可能跑用户代码，只能在这里做。
+        if method == "split" {
+            return self.string_prototype_split(this, args, module);
+        }
+        // `RequireObjectCoercible(this)`：`String.prototype.trim.call(null)`
+        // 是 TypeError，不能因为 `ToString(null)` 恰好是 "null" 就放过去。
+        crate::builtins::require_object_coercible(this)?;
+        // `toString` / `valueOf` 例外：它们要求接收者**本身**是字符串
+        // （21.1.3.26 / 21.1.3.27），不能把 `123` 悄悄转成 `"123"`。
+        let text = if matches!(method, "toString" | "valueOf") {
+            crate::builtins::require_string(this)?
+        } else {
+            let primitive = match this {
+                Value::Object(_) | Value::Function(_) => {
+                    self.to_primitive(this, "string", module)?
+                }
+                other => other.clone(),
+            };
+            crate::builtins::to_string_throwing(&primitive)?
+        };
+        // 参数也要按规范逐个转换：`ToString(searchString)` /
+        // `ToIntegerOrInfinity(position)` 对**对象**参数会跑用户的
+        // `toString` / `valueOf` / `@@toPrimitive`，内建层没有 `module`。
+        let coerced = self.coerce_string_method_args(method, args, module)?;
+        let dispatch_args: &[Value] = match &coerced {
+            Some(values) => values,
+            None => args,
+        };
+        crate::builtins::call_prototype_method(
+            &mut self.heap,
+            &Value::string(&text),
+            method,
+            dispatch_args,
+        )
+    }
+
+    /// `String.prototype` 各方法的参数转换（ES 21.1.3.x）。
+    ///
+    /// 参数是对象时 `ToString` / `ToIntegerOrInfinity` 会跑用户的 `toString` /
+    /// `valueOf` / `@@toPrimitive` —— 内建层没有 `module`，`Value::to_number()`
+    /// 得到 NaN 就算了，所以转换在这里做，内建层只见到原语。
+    ///
+    /// 角色表按规范顺序排列（`indexOf` 是 `searchString` 先于 `position`），
+    /// 这一点是可观察的：`separator-override-tostring-limit-override-valueof`
+    /// 那族用例数的就是调用次序。返回 `None` 表示这个方法没有需要转换的参数
+    /// （不分配）。
+    fn coerce_string_method_args(
+        &mut self,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Vec<Value>>, RuntimeError> {
+        // 's' = ToString, 'n' = ToIntegerOrInfinity / ToNumber.
+        const ROLES: &[(&str, &[char])] = &[
+            ("slice", &['n', 'n']),
+            ("substring", &['n', 'n']),
+            ("substr", &['n', 'n']),
+            ("charAt", &['n']),
+            ("charCodeAt", &['n']),
+            ("codePointAt", &['n']),
+            ("repeat", &['n']),
+            ("indexOf", &['s', 'n']),
+            ("lastIndexOf", &['s', 'n']),
+            ("includes", &['s', 'n']),
+            ("startsWith", &['s', 'n']),
+            ("endsWith", &['s', 'n']),
+            ("localeCompare", &['s']),
+            ("normalize", &['s']),
+            // `replace` 的两个参数都是 `ToString` —— 但那是在 `@@replace` 协议与
+            // "replacer 是函数"两条路都让过之后（见调用点的 `callable` 例外）。
+            ("replace", &['s', 's']),
+        ];
+        let roles: &[char] = match ROLES.iter().find(|(name, _)| *name == method) {
+            Some((_, roles)) => roles,
+            // `concat` 是变参：每一个都是 `ToString`。
+            None if method == "concat" => &[],
+            None => return Ok(None),
+        };
+        let is_concat = method == "concat";
+        // 这三个方法的第 1 步是 `IsRegExp(searchString)`，为真就抛 TypeError ——
+        // 必须**先于** `ToString`，否则参数会被转成 "/a/" 而检查失效。
+        let rejects_regexp = matches!(method, "startsWith" | "endsWith" | "includes");
+        let mut out: Option<Vec<Value>> = None;
+        for (index, value) in args.iter().enumerate() {
+            let role = if is_concat {
+                's'
+            } else {
+                match roles.get(index) {
+                    Some(role) => *role,
+                    None => break,
+                }
+            };
+            if rejects_regexp && index == 0 && crate::builtins::is_regexp_receiver(value) {
+                return Err(RuntimeError::TypeError(
+                    "First argument must not be a regular expression".to_string(),
+                ));
+            }
+            // `replace` 的 replaceValue 可以是函数（回调由 `try_string_callback_method`
+            // 处理，走到这里说明它不是函数），其余情况才是 `ToString`。
+            if method == "replace"
+                && index == 1
+                && (value.is_callable() || matches!(value, Value::Function(_)))
+            {
+                continue;
+            }
+            if !matches!(value, Value::Object(_) | Value::Function(_)) {
+                continue;
+            }
+            let hint = if role == 's' { "string" } else { "number" };
+            let primitive = self.to_primitive(value, hint, module)?;
+            out.get_or_insert_with(|| args.to_vec())[index] = primitive;
+        }
+        Ok(out)
     }
 
     /// `String.prototype.split(separator, limit)` (ES 22.1.3.23).

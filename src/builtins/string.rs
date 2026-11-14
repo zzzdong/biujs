@@ -148,20 +148,59 @@ pub fn register_string_statics(string_fn: &Value, heap: &mut Heap) {
     });
 }
 
-pub fn string_starts_with(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let s = super::string_receiver(obj)?;
-    let search = args.first().map_or(Ok("undefined".to_string()), |v| {
-        super::to_string_throwing(v)
-    })?;
-    Ok(Value::Bool(s.starts_with(&search)))
+/// `IsRegExp` 检查：`{startsWith,endsWith,includes}` 的第一个参数是正则时抛
+/// TypeError（ES 21.1.3.6/18/11 第 2-3 步），而不是把它当字符串用。
+fn reject_regexp_search(value: &Value) -> Result<(), RuntimeError> {
+    if super::regexp::is_regexp_receiver(value) {
+        return Err(RuntimeError::TypeError(
+            "First argument must not be a regular expression".to_string(),
+        ));
+    }
+    Ok(())
 }
 
+/// `String.prototype.startsWith(searchString, position)` (ES 21.1.3.18).
+///
+/// `position` used to be ignored entirely, and the comparison was done on the
+/// Rust string (bytes) rather than code units.
+pub fn string_starts_with(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let s = super::string_receiver(obj)?;
+    let search_value = args.first().cloned().unwrap_or(Value::Undefined);
+    reject_regexp_search(&search_value)?;
+    let search = super::to_string_throwing(&search_value)?;
+    let haystack = crate::vm::utf16::units(&s);
+    let needle = crate::vm::utf16::units(&search);
+    let pos = super::to_integer_or_infinity_throwing(args.get(1))?;
+    let start = pos.clamp(0, haystack.len() as i64) as usize;
+    if start + needle.len() > haystack.len() {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(
+        haystack[start..start + needle.len()] == needle[..],
+    ))
+}
+
+/// `String.prototype.endsWith(searchString, endPosition)` (ES 21.1.3.6).
 pub fn string_ends_with(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
-    let search = args.first().map_or(Ok("undefined".to_string()), |v| {
-        super::to_string_throwing(v)
-    })?;
-    Ok(Value::Bool(s.ends_with(&search)))
+    let search_value = args.first().cloned().unwrap_or(Value::Undefined);
+    reject_regexp_search(&search_value)?;
+    let search = super::to_string_throwing(&search_value)?;
+    let haystack = crate::vm::utf16::units(&s);
+    let needle = crate::vm::utf16::units(&search);
+    let end = match args.get(1) {
+        None | Some(Value::Undefined) => haystack.len(),
+        Some(value) => {
+            let pos = super::to_integer_or_infinity_throwing(Some(value))?;
+            pos.clamp(0, haystack.len() as i64) as usize
+        }
+    };
+    if needle.len() > end {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(
+        haystack[end - needle.len()..end] == needle[..],
+    ))
 }
 
 pub fn string_repeat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -265,11 +304,30 @@ pub fn string_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 // Prototype methods
 // ─────────────────────────────────────────────────────────
 
+/// `ToIntegerOrInfinity` for an index argument, **signed**.
+///
+/// `position_arg` clamps to 0, which is right for `slice` / `substring` (they
+/// clamp again with the length) but wrong here: `charAt(-1)` is `""`, not the
+/// first character (`S15.5.4.4_A2`).
+fn signed_position_arg(arg: Option<&Value>) -> Result<i64, RuntimeError> {
+    let n = arg.map_or(Ok(f64::NAN), super::to_number_throwing)?;
+    Ok(if n.is_nan() {
+        0
+    } else if n.is_infinite() {
+        if n > 0.0 { i64::MAX } else { i64::MIN }
+    } else {
+        n.trunc().clamp(-9.2e18, 9.2e18) as i64
+    })
+}
+
 pub fn string_char_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
-    let idx = position_arg(args.first())?;
+    let idx = signed_position_arg(args.first())?;
+    if idx < 0 {
+        return Ok(Value::string(""));
+    }
     // 按**码元**取：非 BMP 字符的第 0 位是半个代理对（存储模型只能给 U+FFFD）。
-    Ok(match s.encode_utf16().nth(idx) {
+    Ok(match s.encode_utf16().nth(idx as usize) {
         Some(unit) => Value::string(&crate::vm::utf16::from_units(&[unit])),
         None => Value::string(""),
     })
@@ -277,8 +335,11 @@ pub fn string_char_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError
 
 pub fn string_char_code_at(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
-    let idx = position_arg(args.first())?;
-    Ok(match crate::vm::utf16::char_code_at(&s, idx) {
+    let idx = signed_position_arg(args.first())?;
+    if idx < 0 {
+        return Ok(Value::Number(f64::NAN));
+    }
+    Ok(match crate::vm::utf16::char_code_at(&s, idx as usize) {
         Some(unit) => Value::Number(unit as f64),
         None => Value::Number(f64::NAN),
     })
@@ -292,14 +353,26 @@ pub fn string_concat(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError>
     Ok(Value::string(&s))
 }
 
+/// `String.prototype.includes(searchString, position)` (ES 21.1.3.11).
+///
+/// `position` was ignored (the whole string was searched) and a RegExp argument
+/// was stringified instead of throwing.
 pub fn string_includes(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let s = super::string_receiver(obj)?;
-    if args.is_empty() {
+    let search_value = args.first().cloned().unwrap_or(Value::Undefined);
+    reject_regexp_search(&search_value)?;
+    let search = super::to_string_throwing(&search_value)?;
+    let haystack = crate::vm::utf16::units(&s);
+    let needle = crate::vm::utf16::units(&search);
+    let pos = super::to_integer_or_infinity_throwing(args.get(1))?;
+    let start = pos.clamp(0, haystack.len() as i64) as usize;
+    if needle.is_empty() {
+        return Ok(Value::Bool(true));
+    }
+    if start + needle.len() > haystack.len() {
         return Ok(Value::Bool(false));
     }
-    Ok(Value::Bool(
-        s.contains(&super::to_string_throwing(&args[0])?),
-    ))
+    Ok(Value::Bool(haystack[start..].windows(needle.len()).any(|w| w == &needle[..])))
 }
 
 /// `String.prototype.indexOf(searchString, position)`.

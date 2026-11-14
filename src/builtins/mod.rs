@@ -34,8 +34,8 @@ pub use array::{
 pub use date::date_construct_value;
 pub use regexp::match_all_matches;
 pub use regexp::{
-    REGEXP_GETTER_PREFIX, regexp_match, regexp_prototype_getter, regexp_replace, regexp_search,
-    regexp_split,
+    REGEXP_GETTER_PREFIX, is_regexp_receiver, regexp_match, regexp_prototype_getter,
+    regexp_replace, regexp_search, regexp_split,
 };
 pub mod typedarray;
 pub mod reflect;
