@@ -3195,9 +3195,19 @@ impl VM {
                 // `slice` / `splice` / `concat` are pure enough for the builtin
                 // layer, but their result array comes from `ArraySpeciesCreate`,
                 // whose `Get`s and `Construct` can run user code.
-                if let Some(result) =
-                    self.try_array_species_method(&obj_val, &method_name, &args, module)?
-                {
+                //
+                // 参数先按 `ToIntegerOrInfinity` 转换（`slice(start, end)` 的
+                // `{valueOf(){…}}` 要在这里跑），这条路径不经过
+                // `call_native_by_name` 的 Array 分支。
+                if let Some(result) = {
+                    let coerced =
+                        self.coerce_index_method_args("Array", &method_name, &args, module)?;
+                    let dispatch_args: &[Value] = match &coerced {
+                        Some(values) => values,
+                        None => &args,
+                    };
+                    self.try_array_species_method(&obj_val, &method_name, dispatch_args, module)?
+                } {
                     self.state.set_register(Register::Rv, result)?;
                     self.state.jump_offset(1);
                     return Ok(true);

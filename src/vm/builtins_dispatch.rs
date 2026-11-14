@@ -410,11 +410,19 @@ impl VM {
                 Value::Object(_) | Value::Function(_) => this.clone(),
                 other => crate::builtins::to_object(&mut self.heap, other)?,
             };
+            // 索引类参数（`copyWithin` / `fill` / `slice` / `indexOf` / `join` …）是
+            // `ToIntegerOrInfinity` / `ToString`：对象参数要跑 `valueOf` /
+            // `@@toPrimitive`，Symbol 留给内建层的 `to_number_throwing` 抛
+            // TypeError。**必须在下面三条 VM 快速路径之前**做 —— 它们（读族 /
+            // species 族）都在内建层之上，自己的 `to_js_string()` 不会跑用户代码。
+            let coerced = self.coerce_index_method_args("Array", method, args, module)?;
+            let args: &[Value] = match &coerced {
+                Some(values) => values,
+                None => args,
+            };
             // VM 侧的通用实现优先（回调族要调 JS；读族要逐步 `[[Get]]`），
             // 内建层那份是密集数组的快速路径 —— 与 `__proto_method__` 入口同序。
-            if let Some(result) =
-                self.try_array_callback_method(&receiver, method, args, module)?
-            {
+            if let Some(result) = self.try_array_callback_method(&receiver, method, args, module)? {
                 return Ok(result);
             }
             if let Some(result) = self.try_array_read_method(&receiver, method, args, module)? {
@@ -447,12 +455,17 @@ impl VM {
             if matches!(method, "keys" | "values" | "entries") {
                 return self.make_typed_array_iterator(&this, method);
             }
+            let coerced = self.coerce_index_method_args("TypedArray", method, args, module)?;
+            let dispatch_args: &[Value] = match &coerced {
+                Some(values) => values,
+                None => args,
+            };
             return crate::builtins::call_prototype_method_owned(
                 "TypedArray",
                 &mut self.heap,
                 &this,
                 method,
-                args,
+                dispatch_args,
             );
         }
         if let Some(method) = name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
@@ -804,6 +817,12 @@ impl VM {
         if !matches!(method, "slice" | "splice" | "concat") {
             return Ok(None);
         }
+        // `slice(start, end)` / `splice(start, deleteCount, …)` 的索引参数。
+        let coerced = self.coerce_index_method_args("Array", method, args, module)?;
+        let args: &[Value] = match &coerced {
+            Some(values) => values,
+            None => args,
+        };
         // `ArraySpeciesCreate(O, 0)`: all three start from an empty result and
         // grow it index by index.
         let Some(target) = self.array_species_create(receiver, 0, module)? else {
@@ -891,6 +910,72 @@ impl VM {
             method,
             dispatch_args,
         )
+    }
+
+    /// `Array.prototype` / `%TypedArray%.prototype` 的**索引类**参数转换
+    /// （ES 23.1.3.x / 23.2.3.x 的 `ToIntegerOrInfinity` / `ToNumber`）。
+    ///
+    /// 对象参数要跑 `valueOf` / `toString` / `@@toPrimitive` —— 可以抛（
+    /// `copyWithin/return-abrupt-from-start`）也可以给任意值
+    /// （`copyWithin/coerced-values-start`）；内建层只有不跑用户代码的
+    /// `to_number_throwing`。`Symbol` **不转**：留给内建层抛 TypeError
+    /// （`return-abrupt-from-start-is-symbol`）。
+    ///
+    /// 角色：`n` = 数字（`ToIntegerOrInfinity`），`s` = 字符串，`x` = 不转换。
+    pub(crate) fn coerce_index_method_args(
+        &mut self,
+        family: &str,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Option<Vec<Value>>, RuntimeError> {
+        const ARRAY: &[(&str, &str)] = &[
+            ("copyWithin", "nnn"),
+            // `fill(value, start, end)`：`value` 可以为任意值（含对象）。
+            ("fill", "xnn"),
+            ("slice", "nn"),
+            ("at", "n"),
+            ("join", "s"),
+            // `indexOf` / `lastIndexOf` / `includes` **故意不在这里转**：规范要求
+            // `LengthOfArrayLike` 先读长度、再 `ToIntegerOrInfinity(fromIndex)`，
+            // 而长度是内建层读的（`indexOf/15.4.4.14-5-26` 一族按顺序打点，
+            // 提前转就是"Step 5 occurred out of order"）。Symbol 仍由内建层的
+            // `to_number_throwing` 抛。
+        ];
+        const TYPED_ARRAY: &[(&str, &str)] = &[
+            ("copyWithin", "nnn"),
+            ("fill", "xnn"),
+            ("slice", "nn"),
+            ("subarray", "nn"),
+            // `set(array, offset)`：`array` 不转换。
+            ("set", "xn"),
+            ("at", "n"),
+            ("join", "s"),
+        ];
+        let table = if family == "TypedArray" {
+            TYPED_ARRAY
+        } else {
+            ARRAY
+        };
+        let Some((_, roles)) = table.iter().find(|(name, _)| *name == method) else {
+            return Ok(None);
+        };
+        let mut out: Option<Vec<Value>> = None;
+        for (index, role) in roles.chars().enumerate() {
+            if role == 'x' {
+                continue;
+            }
+            let Some(value) = args.get(index) else { break };
+            // `Symbol` 是原语：不做转换，内建层的 `to_number_throwing` /
+            // `to_string_throwing` 会按规范抛。
+            if !matches!(value, Value::Object(_) | Value::Function(_)) {
+                continue;
+            }
+            let hint = if role == 's' { "string" } else { "number" };
+            let primitive = self.to_primitive(value, hint, module)?;
+            out.get_or_insert_with(|| args.to_vec())[index] = primitive;
+        }
+        Ok(out)
     }
 
     /// `String.prototype` 各方法的参数转换（ES 21.1.3.x）。
@@ -2581,6 +2666,13 @@ impl VM {
         if !READ_METHODS.contains(&method) {
             return Ok(None);
         }
+        // `join(separator)` 是 `ToString`、`slice(start, end)` / `at(index)` /
+        // `includes(_, fromIndex)` 是 `ToIntegerOrInfinity`：对象参数要跑用户代码。
+        let coerced = self.coerce_index_method_args("Array", method, args, module)?;
+        let args: &[Value] = match &coerced {
+            Some(values) => values,
+            None => args,
+        };
         if matches!(receiver, Value::Undefined | Value::Null) {
             return Err(RuntimeError::TypeError(format!(
                 "Array.prototype.{method} called on null or undefined"

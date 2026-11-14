@@ -682,7 +682,12 @@ pub fn ta_set(
             other.type_of()
         ))),
     };
-    let offset = args.get(1).map(|v| v.to_number()).unwrap_or(0.0);
+    // `ToIntegerOrInfinity(offset)`：`Symbol` 是 TypeError（用户 `valueOf` 已在
+    // VM 的 `coerce_index_method_args` 里跑过）。
+    let offset = match args.get(1) {
+        Some(v) => super::to_number_throwing(v)?,
+        None => 0.0,
+    };
     let offset = if offset.is_nan() { 0.0 } else { offset };
     if offset < 0.0 || offset.fract() != 0.0 {
         return Err(RuntimeError::RangeError(
@@ -720,8 +725,8 @@ pub fn ta_set(
 pub fn ta_subarray(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let ta = as_typedarray(this, "subarray")?;
     let length = ta.length;
-    let begin = relative_index(args.first(), 0, length);
-    let end = relative_index(args.get(1), length, length);
+    let begin = relative_index(args.first(), 0, length)?;
+    let end = relative_index(args.get(1), length, length)?;
     let new_length = end.saturating_sub(begin);
     let kind = ta.kind;
     let byte_offset = ta.byte_offset + begin * kind.bytes_per_element();
@@ -735,8 +740,8 @@ pub fn ta_subarray(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Valu
 pub fn ta_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let ta = as_typedarray(this, "slice")?;
     let length = ta.length;
-    let begin = relative_index(args.first(), 0, length);
-    let end = relative_index(args.get(1), length, length);
+    let begin = relative_index(args.first(), 0, length)?;
+    let end = relative_index(args.get(1), length, length)?;
     let new_length = end.saturating_sub(begin);
     let numbers: Vec<f64> = (0..new_length)
         .map(|i| match ta.get_element(begin + i) {
@@ -768,11 +773,15 @@ pub fn ta_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, 
 
 /// `fill(value, start, end)`.
 pub fn ta_fill(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let value = args.first().map(|v| v.to_number()).unwrap_or(f64::NAN);
+    // ToNumber(value)：Symbol 抛 TypeError，对象走 VM 侧的 alueOf。
+    let value = match args.first() {
+        Some(v) => super::to_number_throwing(v)?,
+        None => f64::NAN,
+    };
     let ta = as_typedarray(this, "fill")?;
     let length = ta.length;
-    let start = relative_index(args.get(1), 0, length);
-    let end = relative_index(args.get(2), length, length);
+    let start = relative_index(args.get(1), 0, length)?;
+    let end = relative_index(args.get(2), length, length)?;
     let kind = ta.kind;
     let byte_offset = ta.byte_offset;
     let buffer = ta.buffer;
@@ -812,7 +821,7 @@ pub fn ta_index_of(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     };
     let ta = as_typedarray(this, "indexOf")?;
     let len = ta.length;
-    let from = relative_index(args.get(1), 0, len);
+    let from = relative_index(args.get(1), 0, len)?;
     for i in from..len {
         if let Value::Number(n) = ta.get_element(i) {
             if n == needle {
@@ -869,7 +878,7 @@ pub fn ta_includes(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> 
     };
     let ta = as_typedarray(this, "includes")?;
     let len = ta.length;
-    let from = relative_index(args.get(1), 0, len);
+    let from = relative_index(args.get(1), 0, len)?;
     for i in from..len {
         if let Value::Number(n) = ta.get_element(i) {
             if n == needle || (n.is_nan() && needle.is_nan()) {
@@ -933,9 +942,9 @@ pub fn ta_at(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
 pub fn ta_copy_within(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let mut ta = as_typedarray(this, "copyWithin")?;
     let len = ta.length;
-    let target = relative_index(args.first(), 0, len);
-    let start = relative_index(args.get(1), 0, len);
-    let end = relative_index(args.get(2), len, len);
+    let target = relative_index(args.first(), 0, len)?;
+    let start = relative_index(args.get(1), 0, len)?;
+    let end = relative_index(args.get(2), len, len)?;
     let count = end.saturating_sub(start).min(len.saturating_sub(target));
     let src: Vec<Value> = (start..start + count).map(|i| ta.get_element(i)).collect();
     for (k, v) in src.into_iter().enumerate() {
@@ -962,8 +971,8 @@ pub fn ab_slice(heap: &mut Heap, this: &Value, args: &[Value]) -> Result<Value, 
         (buffer.data().to_vec(), borrowed.get_prototype().map(Value::Object))
     };
     let length = data.len();
-    let start = relative_index(args.first(), 0, length);
-    let end = relative_index(args.get(1), length, length);
+    let start = relative_index(args.first(), 0, length)?;
+    let end = relative_index(args.get(1), length, length)?;
     let copy = data[start..end].to_vec();
     let new_buffer = make_buffer(heap, copy.len(), proto);
     if let (Value::Object(new_ref), Value::Object(_)) = (&new_buffer, this) {
@@ -984,8 +993,17 @@ pub fn arraybuffer_is_view(args: &[Value]) -> Result<Value, RuntimeError> {
 
 /// `start` as an index into `[0, length]`, clamping the way `Array.prototype`
 /// does and turning negative values into "from the end".
-fn relative_index(argument: Option<&Value>, default: usize, length: usize) -> usize {
-    let value = argument.map(|v| v.to_number()).unwrap_or(default as f64);
+fn relative_index(
+    argument: Option<&Value>,
+    default: usize,
+    length: usize,
+) -> Result<usize, RuntimeError> {
+    // ToIntegerOrInfinity：Symbol 抛 TypeError（用户 alueOf 已在 VM 侧
+    // 的 coerce_index_method_args 里跑过，见 copyWithin/return-abrupt-from-*）。
+    let value = match argument {
+        None => default as f64,
+        Some(v) => super::to_number_throwing(v)?,
+    };
     let index = if value.is_nan() { default as f64 } else { value };
     let index = index.trunc();
     let index = if index < 0.0 {
@@ -993,7 +1011,7 @@ fn relative_index(argument: Option<&Value>, default: usize, length: usize) -> us
     } else {
         index.min(length as f64)
     };
-    index as usize
+    Ok(index as usize)
 }
 
 // ── prototypes ─────────────────────────────────────────────────────────────
