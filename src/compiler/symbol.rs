@@ -80,6 +80,21 @@ impl<T> SymbolTable<T> {
 }
 
 impl SymbolTable<crate::compiler::lowering::Variable> {
+    /// Mutable lookup, for flags that are decided *after* the binding exists
+    /// (e.g. a `const` destructuring declaration marks its leaves immutable
+    /// once `bind_pattern` has created them).
+    pub fn lookup_mut(
+        &mut self,
+        name: impl AsRef<str>,
+    ) -> Option<&mut crate::compiler::lowering::Variable> {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.variables.contains_key(name.as_ref()) {
+                return scope.variables.get_mut(name.as_ref());
+            }
+        }
+        None
+    }
+
     /// Mark the binding of `name` as initialized (end of its temporal dead zone).
     pub fn mark_initialized(&mut self, name: &str) {
         for scope in self.scopes.iter_mut().rev() {

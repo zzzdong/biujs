@@ -251,14 +251,13 @@ impl SemanticAnalyzer {
     fn visit_expression(&mut self, expr: &Expression<'_>) {
         match expr {
             Expression::AssignmentExpression(assign) => {
-                // Check for const reassignment
-                self.check_assignment_target(&assign.left, assign.span);
+                // 常量赋值**不在编译期**报错：规范的失败是运行期 TypeError
+                // （`assert.throws(TypeError, () => { c = 1 })`），而且 RHS 的副作用
+                // 必须先发生。这里只继续遍历，判定交给 lowering 的
+                // `throw_const_assignment` 与 `StoreEnv` 的运行期检查。
                 self.visit_expression(&assign.right);
             }
-            Expression::UpdateExpression(update) => {
-                // Check for const update
-                self.check_update_target(&update.argument, update.span);
-            }
+            Expression::UpdateExpression(_) => {}
             Expression::BinaryExpression(bin) => {
                 self.visit_expression(&bin.left);
                 self.visit_expression(&bin.right);

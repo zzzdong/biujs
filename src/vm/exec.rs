@@ -2882,6 +2882,15 @@ impl VM {
                 let name = match constant_at(module, name_index, "StoreEnv name")? {
                     Constant::String(s) => s.as_str().to_string(),
                 };
+                // `SetMutableBinding` 落在不可变绑定上（`const` / `class`）是
+                // TypeError。编译期在赋值点就能判的已经抛了；走到环境这条路的
+                // 情形是**嵌套函数**写脚本作用域的 `const`（它的符号表里没有
+                // 这个名字），所以这里还要再判一次。
+                if module.const_names.contains(&name) {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Assignment to constant variable '{name}'"
+                    )));
+                }
                 let value = self.get_value(value)?;
                 // A captured local lives in its **cell**: write through it, or
                 // every closure that captured the binding would keep seeing the

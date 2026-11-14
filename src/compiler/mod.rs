@@ -208,7 +208,7 @@ impl Compiler {
         }
 
         // 6. Build module with all functions
-        Ok(Module::new(
+        let mut module = Module::new(
             Some("main".to_string()),
             unit.constants,
             code_blocks,
@@ -217,7 +217,11 @@ impl Compiler {
             unit.templates,
             strict,
             declared_names,
-        ))
+        );
+        // 脚本顶层不可变绑定的名字：`StoreEnv` 靠它拒绝嵌套函数对 `const` 的写入
+        // （编译期的绑定表在嵌套函数里看不到这些名字）。
+        module.const_names = crate::compiler::lowering::collect_script_const_names(&program.body);
+        Ok(module)
     }
 }
 

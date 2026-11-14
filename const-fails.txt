@@ -1,0 +1,124 @@
+
+running 1 test
+[language/statements/for-of                      ] passed  597  skipped   97  failed   57
+
+--- language/statements/for-of failures ---
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\array-contract.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\array-expand.js: Error: Expected SameValue(«1», «2») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\body-dstr-assign-error.js: Error: Iterator is closed Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\body-put-error.js: Error: Iterator is closed Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-iter-rtrn-close-err.js: TypeError: undefined is not a function
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-iter-rtrn-close-null.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-iter-rtrn-close.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-iter-thrw-close-err.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-iter-thrw-close.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-list-rtrn-close-err.js: Error: Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-list-rtrn-close-null.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-list-rtrn-close.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-list-thrw-close-err.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-list-thrw-close.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-rest-rtrn-close-err.js: Error: Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-rest-rtrn-close-null.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-rest-rtrn-close.js: Error: Expected SameValue(«11», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-rest-thrw-close-err.js: Error: Expected SameValue(«11», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-elem-trlg-iter-rest-thrw-close.js: Error: Expected SameValue(«11», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-empty-iter-close-err.js: Error: Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-empty-iter-close-null.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-empty-iter-close.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-rest-iter-rtrn-close-err.js: TypeError: undefined is not a function
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-rest-iter-rtrn-close-null.js: TypeError: undefined is not a function
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-rest-iter-rtrn-close.js: Error
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-rest-iter-thrw-close-err.js: Error: Expected SameValue(«11», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-rest-iter-thrw-close.js: Error: Expected SameValue(«11», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\dstr\array-rest-lref-err.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\float32array-mutate.js: Error: Expected SameValue(«2», «64») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\float64array-mutate.js: Error: Expected SameValue(«2», «64») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\generator-close-via-break.js: Error: Generator is closed after `break` statement Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\generator-close-via-continue.js: Error: Generator is closed after `continue` statement Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\generator-close-via-return.js: Error: Generator is closed after `return` statement Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\generator-close-via-throw.js: Error: Generator is closed after `throw` statement Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\head-const-bound-names-fordecl-tdz.js: Error: Expected a ReferenceError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\head-let-bound-names-fordecl-tdz.js: Error: Expected a ReferenceError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\head-var-bound-names-in-stmt.js: Error: Expected SameValue(«undefined», «99») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\int16array-mutate.js: Error: Expected SameValue(«2», «64») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\int32array-mutate.js: Error: Expected SameValue(«2», «64») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\int8array-mutate.js: Error: Expected SameValue(«2», «64») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\iterator-close-non-throw-get-method-abrupt.js: Error: Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\iterator-close-non-throw-get-method-is-null.js: TypeError: iterator.return is not a function
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\iterator-close-via-continue.js: Error: Iterator is closed after `continue` statement Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\iterator-close-via-return.js: Error: Iterator is closed after `return` statement Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\iterator-close-via-throw.js: Error: Iterator is closed after `throw` statement Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\iterator-next-reference.js: Error: Should not access the `next` method after the iteration prologue.
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\iterator-next-result-type.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\scope-body-lex-boundary.js: Error: Expected SameValue(«"outside"», «"first"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\scope-body-lex-close.js: Error: reference from ForDeclaration Expected SameValue(«"outside"», «"inside"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\scope-body-lex-open.js: Error: Expected a ReferenceError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\scope-head-lex-close.js: Error: Expected a ReferenceError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\scope-head-lex-open.js: Error: Expected a ReferenceError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\string-astral-truncated.js: Error: Expected SameValue(«"�"», «"�d801"») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\uint16array-mutate.js: Error: Expected SameValue(«2», «64») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\uint32array-mutate.js: Error: Expected SameValue(«2», «64») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\uint8array-mutate.js: Error: Expected SameValue(«2», «64») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/for-of\uint8clampedarray-mutate.js: Error: Expected SameValue(«2», «64») to be true
+[language/expressions/assignment/destructuring   ] passed    3  skipped    1  failed    4
+
+--- language/expressions/assignment/destructuring failures ---
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment/destructuring\default-expr-throws-iterator-return-get-throws.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment/destructuring\iterator-destructuring-property-reference-target-evaluation-order.js: Error: Actual [source, iterator, iterator-step, iterator-done, iterator-value, target, target-key, target-key-tostring, set] and expected [source, iterator, target, target-key, iterator-step, iterator-done, target-key-tostring, set] should have the same contents. 
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment/destructuring\keyed-destructuring-property-reference-target-evaluation-order.js: Error: Actual [source, source-key, source-key-tostring, get, target, target-key, target-key-tostring, set] and expected [source, source-key, source-key-tostring, target, target-key, get, target-key-tostring, set] should have the same contents. 
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment/destructuring\target-assign-throws-iterator-return-get-throws.js: Error: Expected SameValue(«0», «1») to be true
+[language/expressions/assignment                 ] passed  342  skipped  113  failed   30
+
+--- language/expressions/assignment failures ---
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\destructuring\default-expr-throws-iterator-return-get-throws.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\destructuring\iterator-destructuring-property-reference-target-evaluation-order.js: Error: Actual [source, iterator, iterator-step, iterator-done, iterator-value, target, target-key, target-key-tostring, set] and expected [source, iterator, target, target-key, iterator-step, iterator-done, target-key-tostring, set] should have the same contents. 
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\destructuring\keyed-destructuring-property-reference-target-evaluation-order.js: Error: Actual [source, source-key, source-key-tostring, get, target, target-key, target-key-tostring, set] and expected [source, source-key, source-key-tostring, target, target-key, get, target-key-tostring, set] should have the same contents. 
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\destructuring\target-assign-throws-iterator-return-get-throws.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-iter-rtrn-close-err.js: TypeError: undefined is not a function
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-iter-rtrn-close-null.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-iter-rtrn-close.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-iter-thrw-close-err.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-iter-thrw-close.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-list-rtrn-close-err.js: Error: Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-list-rtrn-close-null.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-list-rtrn-close.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-list-thrw-close-err.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-list-thrw-close.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-rest-rtrn-close-err.js: Error: Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-rest-rtrn-close-null.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-rest-rtrn-close.js: Error: Expected SameValue(«11», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-rest-thrw-close-err.js: Error: Expected SameValue(«11», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-elem-trlg-iter-rest-thrw-close.js: Error: Expected SameValue(«11», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-empty-iter-close-err.js: Error: Expected a Test262Error to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-empty-iter-close-null.js: Error: Expected a TypeError to be thrown but no exception was thrown at all
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-empty-iter-close.js: Error: Expected SameValue(«0», «1») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-rest-iter-rtrn-close-err.js: TypeError: undefined is not a function
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-rest-iter-rtrn-close-null.js: TypeError: undefined is not a function
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-rest-iter-rtrn-close.js: Error
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-rest-iter-thrw-close-err.js: Error: Expected SameValue(«11», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-rest-iter-thrw-close.js: Error: Expected SameValue(«11», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\dstr\array-rest-lref-err.js: Error: Expected SameValue(«1», «0») to be true
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\fn-name-lhs-cover.js: Error: name descriptor value should be ; name value should be 
+  FAIL D:\code\rust\biujs\tests/test262/test\language/expressions/assignment\target-super-computed-reference.js: Error: Expected a DummyError but got a RangeError
+[language/statements/const                       ] passed  127  skipped    7  failed    2
+
+--- language/statements/const failures ---
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/const\syntax\with-initializer-case-expression-statement-list.js: TypeError: Assignment to constant variable 'x'
+  FAIL D:\code\rust\biujs\tests/test262/test\language/statements/const\syntax\with-initializer-default-statement-list.js: TypeError: Assignment to constant variable 'x'
+
+================ test262 summary ================
+test262 revision: 7e115f46ac64340827d505fa928ad436cb7ba5a6 (pinned baseline)
+suite                                             passed skipped  failed
+language/statements/for-of                           597      97      57
+language/expressions/assignment/destructuring          3       1       4
+language/expressions/assignment                      342     113      30
+language/statements/const                            127       7       2
+------------------------------------------------
+TOTAL                                               1069     218      93
+pass rate over executed tests: 92.00% (1069 / 1162)
+guards: timeout 0, step-limit 0, memory 0   (TEST262_TIMEOUT_MS / TEST262_STEP_LIMIT / TEST262_MEMORY_MB, 0 = off)
+=================================================
+test test262_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 3.48s
+

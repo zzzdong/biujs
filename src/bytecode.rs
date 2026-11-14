@@ -91,6 +91,14 @@ pub struct Module {
     /// `StoreEnv` 用它区分"写到一个已声明的绑定"与"写到一个不可解析的名字"：
     /// 严格模式下后者要抛 `ReferenceError`，前者即便声明语句还没跑也是普通赋值。
     pub declared_names: HashSet<String>,
+    /// 脚本**顶层**不可变绑定的名字（`const` / `class`）。
+    ///
+    /// `StoreEnv` 用它实现 `SetMutableBinding` 的不可写规则：嵌套函数写脚本作用域的
+    /// `const` 时（编译期的绑定表里没有它，只能走环境），必须在运行期抛
+    /// `TypeError`。只收**脚本顶层**的名字 —— 内层块里的 `const` 与同名的外层
+    /// `let` 在这个按名字扁平的模型里无法区分（见 `docs/…` §3.5），收进来会误伤
+    /// `let x = 1; { const x = 2 } x = 3` 这种合法写法。
+    pub const_names: HashSet<String>,
     /// try 区域的**惰性索引**（按起点与"退出点"两端都能查）：`Module` 编译后不可变，
     /// 所以缓存不会失效。存在的理由：查表要能在热路径上用，不能每次扫一遍表。
     eh_index: OnceCell<EhIndex>,
@@ -171,6 +179,7 @@ impl Module {
             templates,
             strict,
             declared_names,
+            const_names: HashSet::new(),
             eh_index: OnceCell::new(),
         }
     }

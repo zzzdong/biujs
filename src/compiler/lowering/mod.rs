@@ -20,6 +20,15 @@ pub struct Variable {
     /// `ReferenceError`, not `undefined` — the binding is there, it just has no
     /// value yet.
     pub initialized: bool,
+    /// `false` for a `const` (and for a `class` binding, whose
+    /// `MutableBinding` is also false).
+    ///
+    /// `SetMutableBinding` on such a binding is a **TypeError** (ES 9.1.1.1.5):
+    /// `const c = 1; c = 2` must throw rather than store. Every write site
+    /// (`lower_assignment`, `lower_update`, `store_into_identifier`) checks it
+    /// *after* the dead-zone check — an uninitialized `const` is a
+    /// `ReferenceError` first, exactly like a `let`.
+    pub mutable: bool,
 }
 
 impl Variable {
@@ -28,6 +37,7 @@ impl Variable {
         Variable {
             slot: addr,
             initialized: true,
+            mutable: true,
         }
     }
 
@@ -36,7 +46,23 @@ impl Variable {
         Variable {
             slot: addr,
             initialized: false,
+            mutable: true,
         }
+    }
+
+    /// An uninitialized `const` / `class` binding.
+    pub fn uninitialized_const(addr: Value) -> Variable {
+        Variable {
+            slot: addr,
+            initialized: false,
+            mutable: false,
+        }
+    }
+
+    /// Mark an existing binding immutable (`const`, `class`).
+    pub fn immutable(mut self) -> Variable {
+        self.mutable = false;
+        self
     }
 }
 
@@ -122,22 +148,30 @@ enum MemberKey {
 /// Nested blocks are *not* descended into: each block is its own scope and
 /// pre-declares its own bindings (via `lower_block_stmt`). Nested functions are
 /// skipped for the same reason as in `collect_var_names`.
-fn collect_lexical_names(stmts: &[Statement<'_>], out: &mut Vec<String>) {
+fn collect_lexical_names(stmts: &[Statement<'_>], out: &mut Vec<(String, bool)>) {
     for stmt in stmts {
         match stmt {
             Statement::VariableDeclaration(decl) => {
                 if decl.kind == VariableDeclarationKind::Var {
                     continue;
                 }
+                // `const` bindings are immutable: `MutableBinding` is false, so
+                // every write is a TypeError (ES 13.3.1.1 / 9.1.1.1.5).
+                let is_const = decl.kind == VariableDeclarationKind::Const;
                 for declarator in &decl.declarations {
-                    collect_binding_names(&declarator.id, out);
+                    let mut names = Vec::new();
+                    collect_binding_names(&declarator.id, &mut names);
+                    for name in names {
+                        out.push((name, is_const));
+                    }
                 }
             }
             // `class` is lexical too: its name is not a property of the global
             // object either. (`function` declarations *are*, so they stay out.)
+            // A class binding is also **immutable**: `class A {}; A = 1` throws.
             Statement::ClassDeclaration(class) => {
                 if let Some(id) = &class.id {
-                    out.push(id.name.to_string());
+                    out.push((id.name.to_string(), true));
                 }
             }
             _ => {}
@@ -168,6 +202,116 @@ fn collect_var_names(stmts: &[Statement<'_>], out: &mut Vec<String>) {
 /// binding is an ordinary assignment — even before the declaration statement
 /// has run, and even though this engine still keeps block-scoped bindings in
 /// the globals map rather than in a real declarative record (§3.5).
+/// 脚本**顶层**的不可变绑定（`const` / `class`），给 `Module::const_names` 用。
+///
+/// 只取顶层：内层块的同名 `const` 与某个外层 `let` 在这个按名字扁平的模型里
+/// 无法区分，收进来会把 `let x = 1; { const x = 2 } x = 3` 误判成非法。
+/// 内层与函数内的 `const` 由编译期的绑定表在赋值点直接抛（见
+/// `JSASTLower::throw_const_assignment`）。
+pub(crate) fn collect_script_const_names(
+    stmts: &[Statement<'_>],
+) -> std::collections::HashSet<String> {
+    let mut all: Vec<(String, bool)> = Vec::new();
+    collect_binding_kinds(stmts, &mut all);
+    let mut immutable = std::collections::HashSet::new();
+    let mut mutable = std::collections::HashSet::new();
+    for (name, is_const) in all {
+        if is_const {
+            immutable.insert(name);
+        } else {
+            mutable.insert(name);
+        }
+    }
+    // 同名既出现过 `const` 又出现过 `let`/`var`/`function` 时**不放行**：
+    // 环境是按名字扁平的，分不清是哪一个绑定，宁可漏判也不误伤。
+    immutable.retain(|name| !mutable.contains(name));
+    immutable
+}
+
+/// 深递归收集 `(名字, 是否 const)`：块、循环、switch、try 与**函数体**都要进去。
+///
+/// 函数体内的 `const` 也要收：被闭包捕获的常量在环境里（`MakeCell`），嵌套函数
+/// 写它时只走 `StoreEnv`，名字是唯一能认出它的东西。
+fn collect_binding_kinds(stmts: &[Statement<'_>], out: &mut Vec<(String, bool)>) {
+    let mut push_decl = |decl: &VariableDeclaration<'_>, out: &mut Vec<(String, bool)>| {
+        let is_const = decl.kind == VariableDeclarationKind::Const;
+        for declarator in &decl.declarations {
+            let mut names = Vec::new();
+            collect_binding_names(&declarator.id, &mut names);
+            for name in names {
+                out.push((name, is_const));
+            }
+        }
+    };
+    for stmt in stmts {
+        match stmt {
+            Statement::VariableDeclaration(decl) => push_decl(decl, out),
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    out.push((id.name.to_string(), true));
+                }
+            }
+            Statement::FunctionDeclaration(func) => {
+                if let Some(id) = &func.id {
+                    out.push((id.name.to_string(), false));
+                }
+                if let Some(body) = &func.body {
+                    collect_binding_kinds(&body.statements, out);
+                }
+            }
+            Statement::BlockStatement(block) => collect_binding_kinds(&block.body, out),
+            Statement::IfStatement(if_stmt) => {
+                collect_binding_kinds(std::slice::from_ref(&if_stmt.consequent), out);
+                if let Some(alternate) = &if_stmt.alternate {
+                    collect_binding_kinds(std::slice::from_ref(&*alternate), out);
+                }
+            }
+            Statement::WhileStatement(while_stmt) => {
+                collect_binding_kinds(std::slice::from_ref(&while_stmt.body), out)
+            }
+            Statement::DoWhileStatement(do_stmt) => {
+                collect_binding_kinds(std::slice::from_ref(&do_stmt.body), out)
+            }
+            Statement::ForStatement(for_stmt) => {
+                if let Some(ForStatementInit::VariableDeclaration(decl)) = &for_stmt.init {
+                    push_decl(decl, out);
+                }
+                collect_binding_kinds(std::slice::from_ref(&for_stmt.body), out);
+            }
+            Statement::ForInStatement(for_in) => {
+                if let ForStatementLeft::VariableDeclaration(decl) = &for_in.left {
+                    push_decl(decl, out);
+                }
+                collect_binding_kinds(std::slice::from_ref(&for_in.body), out);
+            }
+            Statement::ForOfStatement(for_of) => {
+                if let ForStatementLeft::VariableDeclaration(decl) = &for_of.left {
+                    push_decl(decl, out);
+                }
+                collect_binding_kinds(std::slice::from_ref(&for_of.body), out);
+            }
+            Statement::SwitchStatement(switch) => {
+                for case in &switch.cases {
+                    collect_binding_kinds(&case.consequent, out);
+                }
+            }
+            Statement::TryStatement(try_stmt) => {
+                collect_binding_kinds(&try_stmt.block.body, out);
+                if let Some(handler) = &try_stmt.handler {
+                    collect_binding_kinds(&handler.body.body, out);
+                }
+                if let Some(finalizer) = &try_stmt.finalizer {
+                    collect_binding_kinds(&finalizer.body, out);
+                }
+            }
+            Statement::LabeledStatement(labeled) => {
+                collect_binding_kinds(std::slice::from_ref(&labeled.body), out)
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn collect_declared_names(stmts: &[Statement<'_>]) -> Vec<String> {
     let mut out = Vec::new();
     collect_declared_names_in(stmts, &mut out);
@@ -486,6 +630,10 @@ pub struct JSASTLower<'a> {
     /// record's entry — it is not a property of the global object, so
     /// `globalThis.x` stays `undefined`.
     script_lexical: std::collections::HashSet<String>,
+    /// 本脚本里出现过 const / class 声明的名字（深递归，见
+    /// collect_script_const_names）。define_global 用它决定一次声明写入是
+    /// InitLexical（合法）而不是 StoreEnv（运行期会按常量赋值拒绝）。
+    script_consts: std::collections::HashSet<String>,
     /// This function's own bindings that a **nested** function captures.
     ///
     /// They stop living in registers and start living in shared cells
@@ -532,6 +680,7 @@ impl<'a> JSASTLower<'a> {
             seh_frames: Vec::new(),
             global_names: std::collections::HashSet::new(),
             script_lexical: std::collections::HashSet::new(),
+            script_consts: std::collections::HashSet::new(),
             captured_locals: std::collections::HashSet::new(),
             in_param_default: false,
         }
@@ -587,6 +736,43 @@ impl<'a> JSASTLower<'a> {
         let error = self.builder.new_(ctor, vec![message]);
         self.builder.throw_value(error);
         Value::Primitive(Primitive::Undefined)
+    }
+
+    /// The `TypeError` an assignment to an immutable binding raises
+    /// (`const c = 1; c = 2`, and the same for a `class` name).
+    ///
+    /// Emitted **at the assignment site** rather than deferred to the store:
+    /// `SetMutableBinding` on an immutable binding fails unconditionally, so the
+    /// throw does not depend on control flow. Callers evaluate the right-hand
+    /// side first — the spec evaluates the RHS before `PutValue`, so
+    /// `const c = 1; c = f()` still calls `f`.
+    ///
+    /// The value returned keeps the expression well-formed (an assignment is an
+    /// expression); it is never observed because the block ends in a throw.
+    fn throw_const_assignment(&mut self, name: &str) -> Value {
+        let message = self.builder.load_constant(crate::bytecode::Constant::String(
+            std::sync::Arc::new(format!("Assignment to constant variable '{name}'")),
+        ));
+        let ctor = self
+            .builder
+            .load_external_variable("TypeError".to_string());
+        let error = self.builder.new_(ctor, vec![message]);
+        self.builder.throw_value(error);
+        Value::Primitive(Primitive::Undefined)
+    }
+
+    /// Flip already-created bindings to immutable (`const` / `class`).
+    ///
+    /// A destructuring declaration binds its leaves inside `bind_pattern`, after
+    /// which this runs to apply the declaration's kind. Names that do not
+    /// resolve (an exotic pattern) are ignored — the write paths then fall back
+    /// to the environment, which has its own const set for script scope.
+    fn mark_bindings_immutable(&mut self, names: &[String]) {
+        for name in names {
+            if let Some(variable) = self.symbols.lookup_mut(name) {
+                variable.mutable = false;
+            }
+        }
     }
 
     /// Record a binding, honouring `var`'s function scope.
@@ -663,7 +849,7 @@ impl<'a> JSASTLower<'a> {
         names.extend(vars);
         let mut lexicals = Vec::new();
         collect_lexical_names(&body.statements, &mut lexicals);
-        names.extend(lexicals);
+        names.extend(lexicals.into_iter().map(|(name, _is_const)| name));
         for stmt in &body.statements {
             if let Statement::FunctionDeclaration(func) = stmt
                 && let Some(id) = &func.id
@@ -758,7 +944,11 @@ impl<'a> JSASTLower<'a> {
     /// visible to nested functions and to later reads, but it is deliberately
     /// **not** a property of the global object.
     fn define_global(&mut self, name: &str, value: Value) {
-        if self.script_lexical.contains(name) {
+        // 声明写入：脚本作用域的 let/const/class（在 script_lexical 里），
+        // 以及**没有**被提升进脚本记录、但确实是 const 声明的名字（switch
+        // 分支里的 case 1: const x = 1）。后者如果走 StoreEnv，会被运行期的
+        // 常量赋值检查当成非法写入 —— 而它正是初始化。
+        if self.script_lexical.contains(name) || self.script_consts.contains(name) {
             let name_const = self.make_name_constant(name);
             self.builder.init_lexical(name_const, value);
         } else {
@@ -791,6 +981,10 @@ impl<'a> JSASTLower<'a> {
         let entry = self.create_block("main");
         self.builder.switch_to_block(entry);
         self.builder.set_entry(entry);
+
+        // 脚本里所有 `const` / `class` 名字（深递归）。`define_global` 与运行期的
+        // `StoreEnv` 检查都用它，见 `collect_script_const_names`。
+        self.script_consts = collect_script_const_names(&program.body);
 
         // `var` names exist from the start of the script, even when their
         // declaration sits in a block that has not run yet.
@@ -1440,6 +1634,16 @@ impl<'a> JSASTLower<'a> {
             } else {
                 log::warn!("destructuring declaration without initializer");
             }
+            // `const` (and `class`) bind their leaves just like `let`, but the
+            // binding is immutable: every later write is a TypeError. The flag
+            // is set here because a destructuring declaration creates its
+            // `Variable`s inside `bind_pattern`, which knows nothing about the
+            // declaration kind (`const [a] = [1]; a = 2` → TypeError).
+            if decl.kind == VariableDeclarationKind::Const {
+                let mut names = Vec::new();
+                collect_binding_names(&declarator.id, &mut names);
+                self.mark_bindings_immutable(&names);
+            }
         }
         self.var_binding = previous;
     }
@@ -1454,7 +1658,7 @@ impl<'a> JSASTLower<'a> {
     fn hoist_lexical_bindings(&mut self, stmts: &[Statement<'_>], declare_in_script_record: bool) {
         let mut names = Vec::new();
         collect_lexical_names(stmts, &mut names);
-        for name in names {
+        for (name, is_const) in names {
             // The *current* scope only: a block-level `let` must shadow an outer
             // binding of the same name, so the outer one must not count as "this
             // name is already declared here".
@@ -1467,8 +1671,12 @@ impl<'a> JSASTLower<'a> {
                     self.builder
                         .assign(dst, Value::Primitive(Primitive::Undefined));
                 }
-                self.symbols
-                    .insert(name.clone(), Variable::uninitialized(dst));
+                let binding = if is_const {
+                    Variable::uninitialized_const(dst)
+                } else {
+                    Variable::uninitialized(dst)
+                };
+                self.symbols.insert(name.clone(), binding);
             }
             // The script's own lexical bindings go into the script's declarative
             // record, which is what nested functions read: it is the *only* way
@@ -1805,23 +2013,44 @@ impl<'a> JSASTLower<'a> {
                     // `lower_for_of` opens around the loop), so it goes through
                     // the same `var`-scope path as a `var` declaration.
                     let is_var = decl.kind == VariableDeclarationKind::Var;
+                    let is_const = decl.kind == VariableDeclarationKind::Const;
                     let previous = self.var_binding;
                     self.var_binding = is_var;
                     if let BindingPattern::BindingIdentifier(id) = &declarator.id {
                         let dst = self.builder.alloc();
                         self.builder.assign(dst, item.clone());
-                        self.insert_binding(id.name.as_str(), Variable::new(dst));
+                        // `for (const x of …)`: `x` 在每次迭代开始时初始化，
+                        // 但**不可写** —— 循环体里的 `x = …` 是 TypeError
+                        // （`for-of/dstr/*-put-const`、`head-const-bound-names-*`）。
+                        let binding = if is_const {
+                            Variable::new(dst).immutable()
+                        } else {
+                            Variable::new(dst)
+                        };
+                        self.insert_binding(id.name.as_str(), binding);
                         if is_var && self.publishes_as_global() {
                             self.define_global(id.name.as_str(), item.clone());
                         }
                     } else {
                         self.bind_pattern(&declarator.id, item.clone(), true);
+                        if is_const {
+                            let mut names = Vec::new();
+                            collect_binding_names(&declarator.id, &mut names);
+                            self.mark_bindings_immutable(&names);
+                        }
                     }
                     self.var_binding = previous;
                 }
             }
             ForStatementLeft::AssignmentTargetIdentifier(ident) => {
                 match self.symbols.lookup(ident.name.as_str()) {
+                    // `for (x of …)` 写的是一个**已有绑定**：常量目标照样抛。
+                    Some(var) if !var.initialized => {
+                        self.throw_tdz(ident.name.as_str());
+                    }
+                    Some(var) if !var.mutable => {
+                        self.throw_const_assignment(ident.name.as_str());
+                    }
                     Some(var) => {
                         self.builder.assign(var.slot, item);
                         self.sync_global(ident.name.as_str(), item);
@@ -1985,8 +2214,13 @@ impl<'a> JSASTLower<'a> {
                         let dst = self.builder.alloc();
                         self.builder
                             .assign(dst, Value::Primitive(Primitive::Undefined));
-                        self.symbols
-                            .insert(name.clone(), Variable::uninitialized(dst));
+                        // `for (const x = …; …)` 的绑定同样不可写。
+                        let binding = if decl.kind == VariableDeclarationKind::Const {
+                            Variable::uninitialized_const(dst)
+                        } else {
+                            Variable::uninitialized(dst)
+                        };
+                        self.symbols.insert(name.clone(), binding);
                     }
                 }
             }
@@ -2672,6 +2906,9 @@ impl<'a> JSASTLower<'a> {
                     // `x++` reads *and* writes, so a dead-zone binding fails here
                     // as well.
                     Some(var) if !var.initialized => self.throw_tdz(ident.name.as_str()),
+                    // `c++` / `--c` on a `const`: `SetMutableBinding` throws
+                    // (the read is fine, the write is not).
+                    Some(var) if !var.mutable => self.throw_const_assignment(ident.name.as_str()),
                     Some(_) => {
                         // A captured local: read-modify-write through the cell,
                         // exactly like the global path above.
@@ -2848,6 +3085,14 @@ impl<'a> JSASTLower<'a> {
                     // ReferenceError, not a silent assignment (`store_into_ident
                     // ifier` covers the destructuring target, this the plain one).
                     Some(var) if !var.initialized => self.throw_tdz(ident.name.as_str()),
+                    // 不可变绑定（`const` / `class`）：RHS 先求值，再抛 TypeError。
+                    // 复合赋值 `c += 1` 的读在规范里更早，但读一个已初始化的
+                    // 常量没有副作用，跳过不影响可观察行为。
+                    Some(var) if !var.mutable => {
+                        let hint = self.assignment_name_hint(assign, ident.name.as_str());
+                        let _rhs = self.lower_expression_named(&assign.right, hint);
+                        self.throw_const_assignment(ident.name.as_str())
+                    }
                     Some(_) => {
                         // A captured local: the compound read and the write both
                         // go through the cell, so a closure sees the new value.
@@ -4599,6 +4844,13 @@ impl<'a> JSASTLower<'a> {
                 // `let x;` declared *after* the loop the write happens in) is a
                 // `ReferenceError` as well, not a silent assignment.
                 self.throw_tdz(name);
+            }
+            // Destructuring / `for (const x of …)` assignment into an immutable
+            // binding: the element value is discarded and the write throws
+            // (`for-of/dstr/array-elem-put-const` 一族).
+            Some(var) if !var.mutable => {
+                let _ = value;
+                self.throw_const_assignment(name);
             }
             Some(var) => {
                 let slot = var.slot;
