@@ -2073,6 +2073,22 @@ impl VM {
             return Ok(None);
         }
 
+        // ES 2020 把 `sort` 的比较器检查放在**第一步**（23.1.3.30 第 1 步）：
+        // `[].sort.call({ get length() { throw … } }, null)` 必须是 TypeError，
+        // 而不是长度访问器抛出的那个错误（`comparefn-nonfunction-call-throws`）。
+        // 这一步因此要排在 `LengthOfArrayLike` 之前。
+        if method == "sort" {
+            if let Some(cmp) = args.first() {
+                if !cmp.is_undefined()
+                    && !(cmp.is_callable() || matches!(cmp, Value::Function(_)))
+                {
+                    return Err(RuntimeError::TypeError(
+                        "The comparison function must be either a function or undefined"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         // 只取 length：元素在每一步重新 `HasProperty` + `[[Get]]`
         // （`array_live_at`），物化整张清单会让访问器元素被调用两次。
         let len = match self.array_like_length(receiver, module) {
@@ -2147,47 +2163,76 @@ impl VM {
 
         match method {
             "sort" => {
-                let entries = self.array_like_entries(receiver, module)?;
-                // Holes sort to the end; the dense store has no hole marker, so
-                // they are treated as `undefined` (the previous behaviour).
-                let mut items: Vec<Value> = entries
-                    .iter()
-                    .map(|e| e.clone().unwrap_or(Value::Undefined))
-                    .collect();
-                if callback.is_callable() {
-                    // Insertion sort: stable and lets the comparator be a
-                    // fallible JS call.
-                    for i in 1..items.len() {
-                        let mut j = i;
-                        while j > 0 {
-                            let cmp = self
-                                .invoke(
-                                    &callback,
-                                    Value::Undefined,
-                                    &[items[j - 1].clone(), items[j].clone()],
-                                    module,
-                                )?
-                                .to_number();
-                            if cmp > 0.0 {
-                                items.swap(j - 1, j);
-                                j -= 1;
-                            } else {
-                                break;
-                            }
-                        }
+                // ES 2020 `Array.prototype.sort`（tc39/ecma262#1585）的四步：
+                //
+                // 1. `len` 已在上面取好；
+                // 2. `SortIndexedProperties`：逐个 `HasProperty` + `[[Get]]`，
+                //    **空位跳过**（于是 `Object.prototype[2] = 4` 会让一个空位
+                //    变成有值的元素，`precise-prototype-element`）；
+                // 3. 排序：默认按 `ToString` 序，`undefined` 一律排最后；
+                // 4. 写回 `0..count`，尾部 `count..len` 走 `DeletePropertyOrThrow`。
+                //
+                // 以前的实现把整张清单物化成 `undefined`（空位与 undefined 不分）、
+                // 再用 `replace_elements` 直接改密集存储，于是访问器元素
+                // （`precise-getter-*`）、原型元素、写回失败的 TypeError 全都看不到。
+                let mut items: Vec<Value> = Vec::with_capacity(len);
+                let mut keep = self.roots();
+                for k in 0..len {
+                    if let Some(value) = self.array_live_at(receiver, k, module)? {
+                        keep.push(&value);
+                        items.push(value);
                     }
-                } else if !callback.is_undefined() {
-                    return Err(RuntimeError::TypeError(
-                        "The comparison function must be either a function or undefined"
-                            .to_string(),
-                    ));
-                } else {
-                    items.sort_by(|a, b| a.to_js_string().cmp(&b.to_js_string()));
                 }
-                if let Value::Object(obj_ref) = receiver {
-                    let mut borrowed = obj_ref.borrow_mut();
-                    if let Some(arr) = borrowed.as_array_mut() {
-                        arr.replace_elements(items);
+                let count = items.len();
+                if count > 1 {
+                    // 自底向上归并：合并循环里才能 `invoke` / 跑 `ToString`
+                    // （`sort_by` 的闭包拿不到 `&mut self`），且归并天然稳定。
+                    let mut buf = items.clone();
+                    let mut width = 1usize;
+                    while width < count {
+                        let mut i = 0usize;
+                        while i < count {
+                            let mid = (i + width).min(count);
+                            let end = (i + 2 * width).min(count);
+                            let (mut a, mut b, mut k) = (i, mid, i);
+                            while a < mid && b < end {
+                                // `SortCompare(items[b], items[a]) < 0` ⇒ b 先。
+                                if self.sort_compare(&items[b], &items[a], &callback, module)? {
+                                    buf[k] = items[b].clone();
+                                    b += 1;
+                                } else {
+                                    buf[k] = items[a].clone();
+                                    a += 1;
+                                }
+                                k += 1;
+                            }
+                            while a < mid {
+                                buf[k] = items[a].clone();
+                                a += 1;
+                                k += 1;
+                            }
+                            while b < end {
+                                buf[k] = items[b].clone();
+                                b += 1;
+                                k += 1;
+                            }
+                            i = end;
+                        }
+                        std::mem::swap(&mut items, &mut buf);
+                        width *= 2;
+                    }
+                }
+                // 写回：`Set(..., throw=true)` 与 `DeletePropertyOrThrow`。
+                for (j, value) in items.iter().enumerate() {
+                    let key = PropertyKey::element(&mut self.heap, j as u64);
+                    self.set_member(receiver, key, value.clone(), module)?;
+                }
+                for j in count..len {
+                    let key = PropertyKey::element(&mut self.heap, j as u64);
+                    if !self.delete_member(receiver, &key, module)? {
+                        return Err(RuntimeError::TypeError(format!(
+                            "Cannot delete property '{j}'"
+                        )));
                     }
                 }
                 Ok(Some(receiver.clone()))
@@ -2657,6 +2702,53 @@ impl VM {
             }
         }
         Ok(Value::Number(-1.0))
+    }
+
+    /// `SortCompare(x, y) < 0`（ES 23.1.3.30）：答「y 是否应排在 x 之前」。
+    ///
+    /// 判定顺序按规范：
+    ///
+    /// 1. `undefined` **先判**（两个都是 → 相等；只有 x → x 靠后；只有 y → y
+    ///    靠后）。这一步在比较器之前 —— `new Array(undefined, 1).sort(fn)` 的
+    ///    `undefined` 仍然排最后（`S15.4.4.11_A1.4_T2`）。
+    /// 2. 有比较器 → `ToNumber(comparefn(x, y)) < 0`。
+    /// 3. 否则 `ToString(x)` / `ToString(y)`，字典序 —— `ToString` 会跑用户的
+    ///    `toString`（`S15.4.4.11_A2.*` 的 "Check ToString operator"），所以只能
+    ///    在这里做，不能先用 `to_js_string()` 物化成字符串。
+    fn sort_compare(
+        &mut self,
+        x: &Value,
+        y: &Value,
+        comparefn: &Value,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
+        if x.is_undefined() || y.is_undefined() {
+            // `SortCompare(x, y) < 0` ⇔ y 是 undefined 而 x 不是。
+            return Ok(y.is_undefined() && !x.is_undefined());
+        }
+        if comparefn.is_callable() || matches!(comparefn, Value::Function(_)) {
+            let cmp = self
+                .invoke(
+                    comparefn,
+                    Value::Undefined,
+                    &[x.clone(), y.clone()],
+                    module,
+                )?
+                .to_number();
+            return Ok(cmp < 0.0);
+        }
+        let sx = self.sort_to_string(x, module)?;
+        let sy = self.sort_to_string(y, module)?;
+        Ok(sx < sy)
+    }
+
+    /// `ToString(value)` for the default sort comparator (runs user code).
+    fn sort_to_string(&mut self, value: &Value, module: &Module) -> Result<String, RuntimeError> {
+        let primitive = match value {
+            Value::Object(_) | Value::Function(_) => self.to_primitive(value, "string", module)?,
+            other => other.clone(),
+        };
+        crate::builtins::to_string_throwing(&primitive)
     }
 
     /// `Array.prototype` 的**读族**（`join` / `slice` / `includes` / `at` /
