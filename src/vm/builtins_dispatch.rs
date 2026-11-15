@@ -2036,6 +2036,9 @@ impl VM {
             "toSorted",
             "toSpliced",
             "with",
+            // 没有回调，但要那份"逐元素 `HasProperty` + `[[Get]]`"的实现
+            // （空位是删除、不是写 undefined）。
+            "copyWithin",
         ];
         if !CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -2085,9 +2088,13 @@ impl VM {
         // （`array_live_at`），物化整张清单会让访问器元素被调用两次。
         let len = match self.array_like_length(receiver, module) {
             Ok(len) => len,
-            // Not array-like (e.g. `filter.call(undefined, …)`): let the caller
-            // continue with the ordinary dispatch, which raises a TypeError.
-            Err(RuntimeError::TypeError(_)) => return Ok(None),
+            // 接收者**不是**类数组（`filter.call(undefined, …)`、字符串包装）：
+            // 让调用方继续走普通分派，由那里报 TypeError。
+            Err(RuntimeError::TypeError(_)) if !self.receiver_is_array_like(receiver) => {
+                return Ok(None);
+            }
+            // 是类数组，但 `length` 转换失败 —— `ToLength(Symbol)` 就是 TypeError，
+            // 不能吞掉（`copyWithin/return-abrupt-from-this-length-as-symbol`）。
             Err(err) => return Err(err),
         };
 
@@ -2113,6 +2120,23 @@ impl VM {
             };
             return self
                 .array_index_of_live(&target, len, method, args, module)
+                .map(Some);
+        }
+
+        // `copyWithin(target, start, end)`（ES 23.1.3.3）：逐元素
+        // `HasProperty` → `[[Get]]` → `Set(..., true)`，空位则
+        // `DeletePropertyOrThrow`。四种操作都可观察（Proxy / 访问器 /
+        // 非配置属性），而内建层的 `array_copy_within` 只认密集存储。
+        if method == "copyWithin" {
+            if !self.receiver_is_array_like(receiver) {
+                return Ok(None);
+            }
+            let target = match receiver {
+                Value::Object(_) | Value::Function(_) => receiver.clone(),
+                other => crate::builtins::to_object(&mut self.heap, other)?,
+            };
+            return self
+                .array_copy_within_live(&target, len, args, module)
                 .map(Some);
         }
 
@@ -2605,6 +2629,89 @@ impl VM {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `ToIntegerOrInfinity(arg)` 再按 `copyWithin` 的口径夹到 `[0, len]`
+    /// （负值从末尾算）。
+    fn relative_index_arg(
+        &mut self,
+        arg: Option<&Value>,
+        default: i64,
+        len: i64,
+        module: &Module,
+    ) -> Result<i64, RuntimeError> {
+        let n = match arg {
+            None => default,
+            Some(value) => {
+                let primitive = match value {
+                    Value::Object(_) | Value::Function(_) => {
+                        self.to_primitive(value, "number", module)?
+                    }
+                    other => other.clone(),
+                };
+                crate::builtins::to_integer_or_infinity_throwing(Some(&primitive))?
+            }
+        };
+        let clamped = if n < 0 { n.saturating_add(len) } else { n };
+        Ok(clamped.clamp(0, len))
+    }
+
+    /// `Array.prototype.copyWithin(target, start, end)` (ES 23.1.3.3).
+    ///
+    /// 第 8 步是逐元素的：`HasProperty` 为真才 `[[Get]]` + `Set(..., true)`，
+    /// 为假则 `DeletePropertyOrThrow`。空位复制过去是**删除**而不是写
+    /// `undefined`（`fill-holes`），任何一步抛出都原样传播
+    /// （`return-abrupt-from-has-start` / `-get-start-value` / `-set-target-value`
+    /// / `-delete-target`）。
+    fn array_copy_within_live(
+        &mut self,
+        target: &Value,
+        len: usize,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let len_i = len as i64;
+        // 即便 `len == 0` 也要先转换三个参数：第 3-5 步的 `ToIntegerOrInfinity`
+        // 是无条件的，`[].copyWithin(0, {valueOf(){throw …}})` 仍然要抛
+        // （`return-abrupt-from-start` / `-as-symbol` 一族）。
+        // 参数顺序按规范：target → start → end（每次转换都可能跑用户 `valueOf`）。
+        let to = self.relative_index_arg(args.first(), 0, len_i, module)?;
+        let from = self.relative_index_arg(args.get(1), 0, len_i, module)?;
+        let final_index = match args.get(2) {
+            None | Some(Value::Undefined) => len_i,
+            Some(_) => self.relative_index_arg(args.get(2), len_i, len_i, module)?,
+        };
+        let count = (final_index - from).min(len_i - to).max(0);
+        // 第 8/9 步的 `direction`：区间重叠且 `to > from` 时必须**倒着**拷，
+        // 否则边读边写会把自己覆盖掉 —— `[0,1,2,3].copyWithin(1, 0)` 的前向
+        // 循环会得到 `[0,0,0,0]`，规范要的是 `[0,0,1,2]`（memmove 语义）。
+        let mut from_cursor = from;
+        let mut to_cursor = to;
+        let direction: i64 = if from < to && to < from + count {
+            from_cursor += count - 1;
+            to_cursor += count - 1;
+            -1
+        } else {
+            1
+        };
+        let mut remaining = count;
+        while remaining > 0 {
+            let to_key = PropertyKey::element(&mut self.heap, to_cursor as u64);
+            match self.array_live_at(target, from_cursor as usize, module)? {
+                Some(value) => self.set_member(target, to_key, value, module)?,
+                None => {
+                    if !self.delete_member(target, &to_key, module)? {
+                        return Err(RuntimeError::TypeError(
+                            "copyWithin: cannot delete the target element".to_string(),
+                        ));
+                    }
+                }
+            }
+            from_cursor += direction;
+            to_cursor += direction;
+            remaining -= 1;
+        }
+        Ok(target.clone())
     }
 
     /// `indexOf` / `lastIndexOf` with the **live** element view: `HasProperty`
