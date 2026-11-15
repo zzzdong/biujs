@@ -2232,39 +2232,24 @@ impl VM {
         }
         let ctor_is_constructor = self.is_constructor(this, module);
         // 引擎内部的**原生迭代器**（`arr.values()`、`matchAll` 的结果）自己就是
-        // 迭代器对象，没有可观察的 `@@iterator`（规范里靠
-        // `%IteratorPrototype%[@@iterator]` 返回 `this`）。直接抽干它们 ——
-        // 这条路上没有用户代码，不需要走协议。
-        if let Some(items) = crate::vm::iterator::drain_native_iterator(&mut self.heap, source) {
-            let target = if ctor_is_constructor {
-                self.construct(this, &[], module)?
+        // 迭代器对象（规范里靠 `%IteratorPrototype%[@@iterator]` 返回 `this`），
+        // 直接用它当迭代器 —— **不能**在这里抽干：`ArrayLike` 状态要跑
+        // `[[Get]]`，那只有 `iterator_next` 能做。
+        let is_native_iterator = match source {
+            Value::Object(obj_ref) => obj_ref.borrow().as_native_iterator().is_some(),
+            _ => false,
+        };
+        let iterator = if is_native_iterator {
+            Some(source.clone())
+        } else {
+            let factory = self.get_member(source, &iterator_symbol_key(), module)?;
+            if factory.is_callable() || matches!(factory, Value::Function(_)) {
+                Some(self.make_iterator_with(source.clone(), factory, module)?)
             } else {
-                Value::Object(self.heap.alloc(Object::Array(
-                    crate::vm::object::ArrayObject::from_vec(Vec::new()),
-                )))
-            };
-            let _root_target = self.root(&target);
-            let count = items.len();
-            for (k, value) in items.into_iter().enumerate() {
-                let mapped = if mapping {
-                    self.invoke(
-                        mapfn,
-                        this_arg.clone(),
-                        &[value, Value::Number(k as f64)],
-                        module,
-                    )?
-                } else {
-                    value
-                };
-                self.create_data_property_or_throw(&target, k, mapped, module)?;
+                None
             }
-            let length_key = PropertyKey::well_known("length").expect("well-known name");
-            self.set_member(&target, length_key, Value::Number(count as f64), module)?;
-            return Ok(target);
-        }
-        let factory = self.get_member(source, &iterator_symbol_key(), module)?;
-        if factory.is_callable() || matches!(factory, Value::Function(_)) {
-            let iterator = self.make_iterator_with(source.clone(), factory, module)?;
+        };
+        if let Some(iterator) = iterator {
             let _root_iterator = self.root(&iterator);
             // 5.a：`Construct(C)` —— 规范在这里**不传** length。
             let target = if ctor_is_constructor {
@@ -5360,6 +5345,34 @@ impl VM {
         Ok(iter_val)
     }
 
+    /// `Array.prototype.{keys,values,entries}`（ES 23.1.3.28-30）：惰性迭代器。
+    fn make_array_iterator(
+        &mut self,
+        target: &Value,
+        method: &str,
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::iterator::{ArrayIterKind, NativeIteratorObject, NativeIteratorState};
+        let kind = match method {
+            "keys" => ArrayIterKind::Keys,
+            "entries" => ArrayIterKind::Entries,
+            _ => ArrayIterKind::Values,
+        };
+        let id = self.next_iterator_id;
+        self.next_iterator_id += 1;
+        let iter_obj = NativeIteratorObject::new(
+            &mut self.heap,
+            id,
+            NativeIteratorState::ArrayLike {
+                source: target.clone(),
+                idx: 0,
+                kind,
+            },
+        );
+        let iter_val = Value::Object(self.heap.alloc(Object::NativeIterator(iter_obj)));
+        self.iterator_registry.insert(id, iter_val.clone());
+        Ok(iter_val)
+    }
+
     fn make_iterator(&mut self, src: Value, module: &Module) -> Result<Value, RuntimeError> {
         use crate::vm::iterator::NativeIteratorState;
         if std::env::var("BIUJS_TRACE_ITER").is_ok() {
@@ -5451,8 +5464,10 @@ impl VM {
                         .collect())
                 };
                 match kind {
-                    ObjectKind::Array => Some(NativeIteratorState::Array {
-                        items: read_entries(self)?,
+                    // 数组：**惰性**逐元素 [[Get]]（见 ArrayLike）。
+                    ObjectKind::Array => Some(NativeIteratorState::ArrayLike {
+                        kind: crate::vm::iterator::ArrayIterKind::Values,
+                        source: src.clone(),
                         idx: 0,
                     }),
                     // A String *wrapper* iterates its characters. Its built-in
@@ -5474,8 +5489,9 @@ impl VM {
                     // `make_iterator` for ever (a Rust stack overflow, aborting
                     // the process). An object without a usable `length` iterates
                     // as empty, which is what `ToLength(undefined)` gives.
-                    _ => Some(NativeIteratorState::Array {
-                        items: read_entries(self)?,
+                    _ => Some(NativeIteratorState::ArrayLike {
+                        kind: crate::vm::iterator::ArrayIterKind::Values,
+                        source: src.clone(),
                         idx: 0,
                     }),
                 }
@@ -5521,6 +5537,79 @@ impl VM {
                 ));
             }
         };
+
+        // 惰性数组迭代器：每一步都重读 `length` 与 `A[k]`（ES 23.1.5.2.1）。
+        // 边迭代边 `splice` / `push` 的用例靠这里才正确；`native_next` 只有
+        // `heap`，跑不了 `[[Get]]`（访问器 / Proxy 都需要 VM）。
+        let array_like = {
+            let borrowed = iter_obj.borrow();
+            let Some(it) = borrowed.as_native_iterator() else {
+                return Err(RuntimeError::TypeError(
+                    "IteratorNext on non-iterator".to_string(),
+                ));
+            };
+            match &*it.state().borrow() {
+                NativeIteratorState::ArrayLike { source, idx, kind } => {
+                    Some((source.clone(), *idx, *kind))
+                }
+                _ => None,
+            }
+        };
+        if let Some((source, idx, kind)) = array_like {
+            use crate::vm::iterator::ArrayIterKind;
+            // 快路径：真正的数组，`length` 是**不可重定义**的数据属性（数组的
+            // `length` 不能换成访问器），直接读密集存储即可 —— 省掉每步一次
+            // 原型链查找，`for (x of arr)` 是热路径。
+            let dense = match &source {
+                Value::Object(obj_ref) => obj_ref.borrow().as_array().map(|arr| {
+                    (
+                        arr.len(),
+                        arr.get(idx).cloned(),
+                    )
+                }),
+                _ => None,
+            };
+            let (len, dense_element) = match dense {
+                Some((len, element)) => (len, element),
+                None => (self.array_like_length(&source, module)?, None),
+            };
+            if idx >= len {
+                return Ok((Value::Undefined, true));
+            }
+            let key = PropertyKey::element(&mut self.heap, idx as u64);
+            // 空位（或非数组接收者）仍要走 `[[Get]]`：原型链上的值也算数。
+            let read = |vm: &mut Self| -> Result<Value, RuntimeError> {
+                match dense_element.clone() {
+                    Some(value) => Ok(value),
+                    None => vm.get_member(&source, &key, module),
+                }
+            };
+            let value = match kind {
+                ArrayIterKind::Keys => Value::Number(idx as f64),
+                ArrayIterKind::Values => read(self)?,
+                ArrayIterKind::Entries => {
+                    let element = read(self)?;
+                    Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
+                        crate::vm::object::ArrayObject::from_vec(vec![
+                            Value::Number(idx as f64),
+                            element,
+                        ]),
+                    )))
+                }
+            };
+            {
+                let borrowed = iter_obj.borrow();
+                let it = borrowed
+                    .as_native_iterator()
+                    .expect("checked as a native iterator above");
+                if let NativeIteratorState::ArrayLike { idx: cursor, .. } =
+                    &mut *it.state().borrow_mut()
+                {
+                    *cursor += 1;
+                }
+            }
+            return Ok((value, false));
+        }
 
         let is_js_iterator = {
             let borrowed = iter_obj.borrow();

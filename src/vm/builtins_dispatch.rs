@@ -518,42 +518,19 @@ impl VM {
             if let Some(result) = self.try_match_all_method(&this, method, args, module)? {
                 return Ok(result);
             }
-            // `entries` / `keys` / `values` return a *fresh* iterator over a
-            // snapshot; only the VM can mint iterator objects (they live in the
-            // iterator registry so `next()` can find its state).
+            // `entries` / `keys` / `values`：返回一个**惰性**迭代器（ES 23.1.3.28-30），
+            // 每一步重新 `ToLength(Get(O, "length"))` 再 `Get(O, k)` —— 所以
+            // `var it = a.values(); a.push(3); it.next()` 能看到新元素，
+            // 边迭代边 `splice` 也会提前结束。
             if matches!(method, "entries" | "keys" | "values") {
-                // ES 23.1.3.28-30 start with `Let O be ? ToObject(this value)`:
-                // `values.call(null)` is a TypeError, not an empty iterator.
+                // 第 1 步 `Let O be ? ToObject(this value)`：
+                // `values.call(null)` 是 TypeError，不是空迭代器。
                 crate::builtins::require_object_coercible(&this)?;
-                // *Then* `ToLength(Get(O, "length"))`. A receiver without a
-                // usable `length` iterates as empty (`values.call({})`).
-                {
-                    let items = self.array_like_elements(&this).unwrap_or_default();
-                    let snapshot: Vec<Value> = match method {
-                        "entries" => items
-                            .iter()
-                            .enumerate()
-                            .map(|(i, value)| {
-                                Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
-                                    crate::vm::object::ArrayObject::from_vec(vec![
-                                        Value::Number(i as f64),
-                                        value.clone(),
-                                    ]),
-                                )))
-                            })
-                            .collect(),
-                        "keys" => (0..items.len())
-                            .map(|i| Value::Number(i as f64))
-                            .collect(),
-                        _ => items,
-                    };
-                    let snapshot_val = Value::Object(self.heap.alloc(
-                        crate::vm::gc::Object::Array(
-                            crate::vm::object::ArrayObject::from_vec(snapshot),
-                        ),
-                    ));
-                    return self.make_iterator(snapshot_val, module);
-                }
+                let target = match &this {
+                    Value::Object(_) | Value::Function(_) => this.clone(),
+                    other => crate::builtins::to_object(&mut self.heap, other)?,
+                };
+                return self.make_array_iterator(&target, method);
             }
             return crate::builtins::call_prototype_method(&mut self.heap, &this, method, args);
         }

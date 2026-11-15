@@ -106,11 +106,31 @@ impl SetIterKind {
     }
 }
 
+/// `Array.prototype.{keys,values,entries}` 三种口味（ES 23.1.3.28-30）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayIterKind {
+    Keys,
+    Values,
+    Entries,
+}
+
 /// Internal state of an iterator produced by `MakeIterator`.
 #[derive(Debug)]
 pub enum NativeIteratorState {
     /// Fast path: snapshot of the elements at `MakeIterator` time.
     Array { items: Vec<Value>, idx: usize },
+    /// **惰性**数组迭代器（ES 23.1.5.2.1 `%ArrayIteratorPrototype%.next`）：
+    /// 每次前进都重新 `ToLength(Get(O, "length"))` 再 `Get(O, k)`。
+    ///
+    /// 快照版（`Array`）在"边迭代边改数组"时是错的：
+    /// `Array.from(array, function (v) { array.splice(-1, 1); return 127; })`
+    /// 该只走一半（`from/elements-deleted-after`），而快照会读完整个原始长度。
+    /// 由 VM 的 `iterator_next` 处理（要跑 `[[Get]]`，`native_next` 没有 VM）。
+    ArrayLike {
+        source: Value,
+        idx: usize,
+        kind: ArrayIterKind,
+    },
     /// Fast path: pre-split code units of the string.
     String { chars: Vec<Value>, idx: usize },
     /// Slow path: a JS iterator object from `src[Symbol.iterator]()`.
@@ -326,6 +346,8 @@ pub fn native_next(
                 None
             }
         }
+        // 惰性数组迭代器由 VM 的 `iterator_next` 处理（要跑 `[[Get]]`）。
+        NativeIteratorState::ArrayLike { .. } => None,
         NativeIteratorState::Js { .. } => None,
         NativeIteratorState::Set { set, kind, idx, done } => {
             if *done {
@@ -379,6 +401,8 @@ impl Trace for NativeIteratorState {
     fn trace(&self, out: &mut Worklist) {
         match self {
             NativeIteratorState::Array { items, .. } => items.trace(out),
+            // 惰性迭代器握着被迭代的对象本身。
+            NativeIteratorState::ArrayLike { source, .. } => source.trace(out),
             NativeIteratorState::String { chars, .. } => chars.trace(out),
             NativeIteratorState::Js { iterator } => iterator.trace(out),
             NativeIteratorState::Map { map, .. } => map.trace(out),
