@@ -1981,9 +1981,11 @@ impl VM {
                 vals.to_vec(),
             )),
             Some(target) => {
+                // CreateDataPropertyOrThrow，不是 [[Set]]：species 目标把索引
+                // 定义成不可配置时是一次 TypeError，定义成可配置的只读属性时
+                // 则**重新定义**成功（map/target-array-with-non-writable-property）。
                 for (i, v) in vals.iter().enumerate() {
-                    let key = PropertyKey::element(&mut self.heap, i as u64);
-                    self.set_member(&target, key, v.clone(), module)?;
+                    self.create_data_property_or_throw(&target, i, v.clone(), module)?;
                 }
                 Ok(target)
             }
@@ -2313,9 +2315,11 @@ impl VM {
                         result
                     }
                     Some(target) => {
+                        // 只写**存在**的下标，且用 `CreateDataPropertyOrThrow`：
+                        // species 目标拒绝定义时是一次 TypeError，目标可配置时则是
+                        // 重新定义成功（`map/target-array-with-non-writable-property`）。
                         for (i, v) in values {
-                            let key = PropertyKey::element(&mut self.heap, i as u64);
-                            self.set_member(&target, key, v, module)?;
+                            self.create_data_property_or_throw(&target, i, v, module)?;
                         }
                         target
                     }
@@ -2366,9 +2370,9 @@ impl VM {
                 Ok(Some(match species {
                     None => crate::vm::object::new_array_object_from_vec(&mut self.heap, values),
                     Some(target) => {
+                        // CreateDataPropertyOrThrow（见 map 的同一处）。
                         for (i, v) in values.into_iter().enumerate() {
-                            let key = PropertyKey::element(&mut self.heap, i as u64);
-                            self.set_member(&target, key, v, module)?;
+                            self.create_data_property_or_throw(&target, i, v, module)?;
                         }
                         target
                     }
@@ -2397,9 +2401,9 @@ impl VM {
                 Ok(Some(match species {
                     None => crate::vm::object::new_array_object_from_vec(&mut self.heap, out),
                     Some(target) => {
+                        // CreateDataPropertyOrThrow（见 map 的同一处）。
                         for (i, v) in out.iter().enumerate() {
-                            let key = PropertyKey::element(&mut self.heap, i as u64);
-                            self.set_member(&target, key, v.clone(), module)?;
+                            self.create_data_property_or_throw(&target, i, v.clone(), module)?;
                         }
                         target
                     }
