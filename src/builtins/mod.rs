@@ -2418,4 +2418,4 @@ pub fn native_function_name(val: &Value) -> Option<String> {
     }
 }
 
-pub use object::{object_keys, object_values};
+pub use object::{descriptor_to_value, object_keys, object_values};

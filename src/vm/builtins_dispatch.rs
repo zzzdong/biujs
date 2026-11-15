@@ -643,6 +643,17 @@ impl VM {
                     crate::builtins::string_from_code_point(&converted)
                 };
             }
+            // `Array.from` / `Array.of`：`C = this`、`@@iterator` 协议、`mapfn`、
+            // 逐元素 `CreateDataPropertyOrThrow` —— 全都只有 VM 能做。
+            if name == "Array.from" {
+                let source = args.first().cloned().unwrap_or(Value::Undefined);
+                let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+                return self.array_from(&this, &source, &mapfn, &this_arg, module);
+            }
+            if name == "Array.of" {
+                return self.array_of(&this, args, module);
+            }
             // `%TypedArray%.from` / `%TypedArray%.of`：迭代、可选回调、再
             // `new C(len)` —— 三样都只有 VM 能做。
             if name == "TypedArray.from" {

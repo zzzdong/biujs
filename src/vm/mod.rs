@@ -2122,6 +2122,255 @@ impl VM {
     ///
     /// 三步：迭代出元素 → 可选回调（会跑用户代码）→ `new C(len)` 再写入。
     /// 回调期间 `items` 只活在 Rust 局部，故必须入根（收集器看不见机器栈）。
+    /// `CreateDataPropertyOrThrow(target, k, value)` (ES 7.3.3) —— `Array.from`
+    /// 与 `Array.of` 往结果里放元素用的就是它（不是 `[[Set]]`：子类构造器把
+    /// 索引 0 定义成不可写/不可配置时，这里必须抛 TypeError）。
+    fn create_data_property_or_throw(
+        &mut self,
+        target: &Value,
+        index: usize,
+        value: Value,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        let Value::Object(obj_ref) = target else {
+            return Err(RuntimeError::TypeError(
+                "CreateDataProperty on a non-object".to_string(),
+            ));
+        };
+        let obj_ref = *obj_ref;
+        let key = PropertyKey::element(&mut self.heap, index as u64);
+        // Proxy：`[[DefineOwnProperty]]` 会跑 `defineProperty` trap，trap 抛就抛、
+        // 答 falsish 就是 TypeError（`of/return-abrupt-from-data-property-using-proxy`）。
+        // 这条只有 VM 能走，内置的 `define_property` 看不到 trap。
+        let is_proxy = obj_ref.borrow().is_proxy();
+        if is_proxy {
+            if let Some((proxy_target, _handler, trap)) =
+                self.proxy_trap(target, "defineProperty", module)?
+            {
+                let key_value = Self::key_to_value(&mut self.heap, &key);
+                let desc = crate::builtins::descriptor_to_value(
+                    &mut self.heap,
+                    Some(crate::vm::property::PropertyDescriptor::data_descriptor(
+                        value,
+                    )),
+                );
+                let ok = self.invoke(
+                    &trap,
+                    proxy_target.clone(),
+                    &[proxy_target, key_value, desc],
+                    module,
+                )?;
+                if !ok.to_boolean() {
+                    return Err(RuntimeError::TypeError(format!(
+                        "'defineProperty' on proxy: trap returned falsish for property '{index}'"
+                    )));
+                }
+                return Ok(());
+            }
+        }
+        obj_ref
+            .borrow_mut()
+            .define_property(
+                &mut self.heap,
+                key,
+                crate::vm::property::PropertyDescriptor::data_descriptor(value),
+            )
+            .map_err(|_| {
+                RuntimeError::TypeError(format!("Cannot define property '{index}'"))
+            })?;
+        Ok(())
+    }
+
+    /// `LengthOfArrayLike` for `Array.from`'s array-like branch，封顶到迭代预算
+    /// （与 `array_like_length` 同一个数）：只声称 `length = 2**32-1` 的接收者
+    /// 不该把一次调用变成四十亿次 `[[Get]]`。
+    fn array_from_length(&mut self, source: &Value, module: &Module) -> Result<usize, RuntimeError> {
+        let key = PropertyKey::well_known("length").expect("well-known name");
+        let value = self.get_member(source, &key, module)?;
+        let primitive = match &value {
+            Value::Object(_) | Value::Function(_) => self.to_primitive(&value, "number", module)?,
+            other => other.clone(),
+        };
+        let len = crate::builtins::to_length_throwing(&primitive)?;
+        Ok(len.min(1 << 24) as usize)
+    }
+
+    /// `Array.from(items, mapfn, thisArg)` (ES 23.1.2.1).
+    ///
+    /// 两条分支，选择靠 `GetMethod(items, @@iterator)`：
+    ///
+    /// * **可迭代**：`Construct(C)`（**不带参数**）造结果，逐个
+    ///   `CreateDataPropertyOrThrow(A, k, value)`，结束时 `Set(A, "length", k)`；
+    ///   任一步抛出要先 `IteratorClose`。
+    /// * **类数组**：`ToObject` → `ToLength(Get(…, "length"))` →
+    ///   `Construct(C, «len»)` → 逐索引 `[[Get]]` + `CreateDataPropertyOrThrow`。
+    ///
+    /// `C = this`：`Array.from.call(Object, [])` 得到的是 `Object` 实例
+    /// （`source-object-constructor`），非构造器则退回 `ArrayCreate`。
+    fn array_from(
+        &mut self,
+        this: &Value,
+        source: &Value,
+        mapfn: &Value,
+        this_arg: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        // 第 2 步：`mapfn` 不是 undefined 时必须可调用（Symbol / null 都是
+        // TypeError，不是"忽略"）。
+        let mapping = !mapfn.is_undefined();
+        if mapping && !(mapfn.is_callable() || matches!(mapfn, Value::Function(_))) {
+            return Err(RuntimeError::TypeError(
+                "Array.from: the map function is not callable".to_string(),
+            ));
+        }
+        // 第 3/4 步：`GetMethod(items, @@iterator)`；`null`/`undefined` 在这里
+        // 就按 `RequireObjectCoercible` 抛 TypeError。
+        if matches!(source, Value::Undefined | Value::Null) {
+            return Err(RuntimeError::TypeError(
+                "Array.from: items is null or undefined".to_string(),
+            ));
+        }
+        let ctor_is_constructor = self.is_constructor(this, module);
+        // 引擎内部的**原生迭代器**（`arr.values()`、`matchAll` 的结果）自己就是
+        // 迭代器对象，没有可观察的 `@@iterator`（规范里靠
+        // `%IteratorPrototype%[@@iterator]` 返回 `this`）。直接抽干它们 ——
+        // 这条路上没有用户代码，不需要走协议。
+        if let Some(items) = crate::vm::iterator::drain_native_iterator(&mut self.heap, source) {
+            let target = if ctor_is_constructor {
+                self.construct(this, &[], module)?
+            } else {
+                Value::Object(self.heap.alloc(Object::Array(
+                    crate::vm::object::ArrayObject::from_vec(Vec::new()),
+                )))
+            };
+            let _root_target = self.root(&target);
+            let count = items.len();
+            for (k, value) in items.into_iter().enumerate() {
+                let mapped = if mapping {
+                    self.invoke(
+                        mapfn,
+                        this_arg.clone(),
+                        &[value, Value::Number(k as f64)],
+                        module,
+                    )?
+                } else {
+                    value
+                };
+                self.create_data_property_or_throw(&target, k, mapped, module)?;
+            }
+            let length_key = PropertyKey::well_known("length").expect("well-known name");
+            self.set_member(&target, length_key, Value::Number(count as f64), module)?;
+            return Ok(target);
+        }
+        let factory = self.get_member(source, &iterator_symbol_key(), module)?;
+        if factory.is_callable() || matches!(factory, Value::Function(_)) {
+            let iterator = self.make_iterator_with(source.clone(), factory, module)?;
+            let _root_iterator = self.root(&iterator);
+            // 5.a：`Construct(C)` —— 规范在这里**不传** length。
+            let target = if ctor_is_constructor {
+                self.construct(this, &[], module)?
+            } else {
+                Value::Object(self.heap.alloc(Object::Array(
+                    crate::vm::object::ArrayObject::from_vec(Vec::new()),
+                )))
+            };
+            let _root_target = self.root(&target);
+            let mut k = 0usize;
+            loop {
+                let (value, done) = match self.iterator_next(iterator.clone(), None, module) {
+                    Ok(step) => step,
+                    Err(err) => {
+                        let _ = self.iterator_close(iterator.clone(), None, true, module);
+                        return Err(err);
+                    }
+                };
+                if done {
+                    break;
+                }
+                let _root_value = self.root(&value);
+                let mapped = if mapping {
+                    match self.invoke(
+                        mapfn,
+                        this_arg.clone(),
+                        &[value, Value::Number(k as f64)],
+                        module,
+                    ) {
+                        Ok(mapped) => mapped,
+                        Err(err) => {
+                            let _ = self.iterator_close(iterator.clone(), None, true, module);
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    value
+                };
+                if let Err(err) = self.create_data_property_or_throw(&target, k, mapped, module) {
+                    let _ = self.iterator_close(iterator.clone(), None, true, module);
+                    return Err(err);
+                }
+                k += 1;
+            }
+            let length_key = PropertyKey::well_known("length").expect("well-known name");
+            self.set_member(&target, length_key, Value::Number(k as f64), module)?;
+            return Ok(target);
+        }
+        // 6. 类数组分支。
+        let array_like = crate::builtins::to_object(&mut self.heap, source)?;
+        let len = self.array_from_length(&array_like, module)?;
+        let target = if ctor_is_constructor {
+            self.construct(this, &[Value::Number(len as f64)], module)?
+        } else {
+            Value::Object(self.heap.alloc(Object::Array(
+                crate::vm::object::ArrayObject::from_vec(Vec::new()),
+            )))
+        };
+        let _root_target = self.root(&target);
+        for k in 0..len {
+            let key = PropertyKey::element(&mut self.heap, k as u64);
+            let value = self.get_member(&array_like, &key, module)?;
+            let mapped = if mapping {
+                self.invoke(
+                    mapfn,
+                    this_arg.clone(),
+                    &[value, Value::Number(k as f64)],
+                    module,
+                )?
+            } else {
+                value
+            };
+            self.create_data_property_or_throw(&target, k, mapped, module)?;
+        }
+        let length_key = PropertyKey::well_known("length").expect("well-known name");
+        self.set_member(&target, length_key, Value::Number(len as f64), module)?;
+        Ok(target)
+    }
+
+    /// `Array.of(...items)` (ES 23.1.2.3)：`Construct(C, «len»)`（非构造器则
+    /// `ArrayCreate`），逐索引 `CreateDataPropertyOrThrow`，最后定 `length`
+    /// （构造器可能给出一个长度不对的结果对象）。
+    fn array_of(
+        &mut self,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let len = args.len();
+        let target = if self.is_constructor(this, module) {
+            self.construct(this, &[Value::Number(len as f64)], module)?
+        } else {
+            Value::Object(self.heap.alloc(Object::Array(
+                crate::vm::object::ArrayObject::from_vec(Vec::new()),
+            )))
+        };
+        let _root_target = self.root(&target);
+        for (k, value) in args.iter().enumerate() {
+            self.create_data_property_or_throw(&target, k, value.clone(), module)?;
+        }
+        let length_key = PropertyKey::well_known("length").expect("well-known name");
+        self.set_member(&target, length_key, Value::Number(len as f64), module)?;
+        Ok(target)
+    }
+
     fn typed_array_from(
         &mut self,
         ctor: &Value,
@@ -5148,6 +5397,20 @@ impl VM {
         // invisible. The fast path is still taken when the method resolves to
         // the built-in factory, so an ordinary `for (x of arr)` is unchanged.
         let factory = self.get_member(&src, &iterator_symbol_key(), module)?;
+        self.make_iterator_with(src, factory, module)
+    }
+
+    /// 从**已经取出的** `@@iterator` 方法建迭代器。
+    ///
+    /// `Array.from` 已经做过一次 `GetMethod(items, @@iterator)`（规范里只查一次，
+    /// 再查一次会让 getter 跑两遍），所以把 `make_iterator` 的前缀和其余部分拆开。
+    fn make_iterator_with(
+        &mut self,
+        src: Value,
+        factory: Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::iterator::NativeIteratorState;
         if !factory.is_callable() {
             return Err(RuntimeError::TypeError(format!(
                 "{} is not iterable",

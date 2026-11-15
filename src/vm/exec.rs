@@ -3198,6 +3198,10 @@ impl VM {
                             // （`String.fromCharCode({valueOf(){return 1}})` 是 U+0001）。
                             | "String.fromCharCode"
                             | "String.fromCodePoint"
+                            // `Array.from` / `Array.of` 要用 `this` 当 `C`、跑
+                            // `@@iterator` / `mapfn`、逐元素 `CreateDataProperty`。
+                            | "Array.from"
+                            | "Array.of"
                     );
                     if !vm_handled_static {
                         // A missing static falls through to the prototype chain,
