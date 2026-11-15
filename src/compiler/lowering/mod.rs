@@ -5330,6 +5330,189 @@ impl<'a> JSASTLower<'a> {
         }
     }
 
+    /// 写目标里的**子表达式**：`arr[i] = v` 读的是 `arr` 与 `i`，`o.x = v`
+    /// 读的是 `o`。
+    ///
+    /// 以前只认「目标本身就是标识符」（`x = v`），于是
+    ///
+    /// ```js
+    /// var arr = [0, 1];
+    /// function f(v) { arr[0] = v; }   // 自由变量集合里没有 arr
+    /// ```
+    ///
+    /// 外层因此不认为 `arr` 被捕获（不建 cell），内层函数继承了外层的**寄存器**
+    /// 槽位 —— 写到的是自己的参数/`arguments` 槽：静默不生效，或者
+    /// `TypeError: Cannot create property '0' on number`（两个以上参数时）。
+    fn collect_free_idents_from_assignment_target<'b>(
+        &self,
+        target: &'b AssignmentTarget<'b>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+        declared: &mut std::collections::HashSet<String>,
+        nested_only: bool,
+    ) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                if !nested_only {
+                    referenced.insert(ident.name.as_str());
+                }
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &member.expression, referenced, declared, nested_only,
+                );
+            }
+            AssignmentTarget::PrivateFieldExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+            }
+            // `[a, b] = value` / `({ x } = value)`：递归到每个元素与默认值。
+            _ => self.collect_free_idents_from_destructuring_target(
+                target, referenced, declared, nested_only,
+            ),
+        }
+    }
+
+    /// 解构目标的元素（`AssignmentTarget` 的变体里只可能是这几个）。
+    fn collect_free_idents_from_destructuring_target<'b>(
+        &self,
+        target: &'b AssignmentTarget<'b>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+        declared: &mut std::collections::HashSet<String>,
+        nested_only: bool,
+    ) {
+        match target {
+            AssignmentTarget::ArrayAssignmentTarget(array) => {
+                for element in array.elements.iter().flatten() {
+                    self.collect_free_idents_from_maybe_default(
+                        element, referenced, declared, nested_only,
+                    );
+                }
+                if let Some(rest) = &array.rest {
+                    self.collect_free_idents_from_assignment_target(
+                        &rest.target, referenced, declared, nested_only,
+                    );
+                }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    match property {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                            if !nested_only {
+                                referenced.insert(p.binding.name.as_str());
+                            }
+                            if let Some(init) = &p.init {
+                                self.collect_free_idents_from_expression(
+                                    init, referenced, declared, nested_only,
+                                );
+                            }
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                            self.collect_free_idents_from_maybe_default(
+                                &p.binding, referenced, declared, nested_only,
+                            );
+                        }
+                    }
+                }
+                if let Some(rest) = &object.rest {
+                    self.collect_free_idents_from_assignment_target(
+                        &rest.target, referenced, declared, nested_only,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `AssignmentTargetMaybeDefault`：带默认值的元素要把 `init` 也算进去。
+    fn collect_free_idents_from_maybe_default<'b>(
+        &self,
+        target: &'b AssignmentTargetMaybeDefault<'b>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+        declared: &mut std::collections::HashSet<String>,
+        nested_only: bool,
+    ) {
+        match target {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                self.collect_free_idents_from_assignment_target(
+                    &d.binding, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &d.init, referenced, declared, nested_only,
+                );
+            }
+            AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(ident) => {
+                if !nested_only {
+                    referenced.insert(ident.name.as_str());
+                }
+            }
+            AssignmentTargetMaybeDefault::StaticMemberExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+            }
+            AssignmentTargetMaybeDefault::ComputedMemberExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &member.expression, referenced, declared, nested_only,
+                );
+            }
+            AssignmentTargetMaybeDefault::PrivateFieldExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// `SimpleAssignmentTarget`（`++` / `--` 的操作数）：成员表达式的对象与键
+    /// 同样是被读的标识符（`arr[i]++`）。
+    fn collect_free_idents_from_simple_target<'b>(
+        &self,
+        target: &'b SimpleAssignmentTarget<'b>,
+        referenced: &mut std::collections::HashSet<&'b str>,
+        declared: &mut std::collections::HashSet<String>,
+        nested_only: bool,
+    ) {
+        match target {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                if !nested_only {
+                    referenced.insert(ident.name.as_str());
+                }
+            }
+            SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+                self.collect_free_idents_from_expression(
+                    &member.expression, referenced, declared, nested_only,
+                );
+            }
+            SimpleAssignmentTarget::PrivateFieldExpression(member) => {
+                self.collect_free_idents_from_expression(
+                    &member.object, referenced, declared, nested_only,
+                );
+            }
+            _ => {}
+        }
+    }
+
     fn collect_free_idents_from_expression<'b>(
         &self,
         expr: &'b Expression<'b>,
@@ -5368,14 +5551,9 @@ impl<'a> JSASTLower<'a> {
                 );
             }
             Expression::AssignmentExpression(assign) => {
-                match &assign.left {
-                    AssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                        if !nested_only {
-                            referenced.insert(ident.name.as_str());
-                        }
-                    }
-                    _ => {}
-                }
+                self.collect_free_idents_from_assignment_target(
+                    &assign.left, referenced, declared, nested_only,
+                );
                 self.collect_free_idents_from_expression(
                     &assign.right, referenced, declared, nested_only,
                 );
@@ -5434,14 +5612,11 @@ impl<'a> JSASTLower<'a> {
                     self.collect_free_idents_from_expression(exp, referenced, declared, nested_only);
                 }
             }
-            Expression::UpdateExpression(update) => match &update.argument {
-                SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
-                    if !nested_only {
-                        referenced.insert(ident.name.as_str());
-                    }
-                }
-                _ => {}
-            },
+            Expression::UpdateExpression(update) => {
+                self.collect_free_idents_from_simple_target(
+                    &update.argument, referenced, declared, nested_only,
+                );
+            }
             Expression::ArrayExpression(arr) => {
                 for elem in &arr.elements {
                     if let Some(expr) = elem.as_expression() {

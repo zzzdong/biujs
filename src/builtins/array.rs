@@ -1098,23 +1098,29 @@ pub fn array_splice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Valu
         if let Some(array_obj) = arr.as_array_mut() {
             let len = array_obj.len();
             let start = clamped_index(args.first(), len)?;
-            // Step 5 of ES 23.1.3.28: with no arguments at all `start` is not
-            // present, so nothing is deleted (only `splice(start)` deletes the
-            // range `len - start`).
-            let delete_count = if args.is_empty() {
-                0
-            } else if args.len() < 2 || args[1].is_undefined() {
-                len - start
-            } else {
-                let n = super::to_number_throwing(&args[1])?;
-                let n = if n.is_nan() || n < 0.0 {
-                    0usize
-                } else if n.is_infinite() {
-                    len - start
-                } else {
-                    n.trunc() as usize
-                };
-                n.min(len - start)
+            // ES 23.1.3.28 第 7 步按**实参个数**分支，不是按值：
+            //   0 个 → 不删；1 个（只有 start）→ 删到结尾；
+            //   ≥2 个 → `ToIntegerOrInfinity(deleteCount)`，于是**显式**的
+            //   `undefined` 是 0 (`x.splice(1, undefined)` 一条都不删，
+            //   `S15.4.4.12_A1.5_T1/T2`)，而对象会跑它的 `valueOf`。
+            let delete_count = match args.len() {
+                0 => 0,
+                1 => len - start,
+                _ => {
+                    if args[1].is_undefined() {
+                        0
+                    } else {
+                        let n = super::to_number_throwing(&args[1])?;
+                        let n = if n.is_nan() || n < 0.0 {
+                            0usize
+                        } else if n.is_infinite() {
+                            len - start
+                        } else {
+                            n.trunc() as usize
+                        };
+                        n.min(len - start)
+                    }
+                }
             };
             let insert_items: Vec<Value> = if args.len() > 2 {
                 args[2..].to_vec()
@@ -1129,18 +1135,18 @@ pub fn array_splice(heap: &mut Heap, obj: &Value, args: &[Value]) -> Result<Valu
     to_object(heap, obj)?;
     let len = generic_length(heap, obj);
     let start = relative_index(args.first(), len)?;
-    let delete_count = if args.is_empty() {
-        // `splice()` with no arguments: `start` is not present, so nothing is
-        // removed (ES 23.1.3.28 step 5).
-        0
-    } else {
-        match args.get(1) {
-            None | Some(Value::Undefined) => len - start,
+    // 与密集路径同一口径（第 7 步按实参个数分支）。
+    let delete_count = match args.len() {
+        0 => 0,
+        1 => len - start,
+        _ => match args.get(1) {
+            Some(Value::Undefined) => 0,
             Some(v) => {
                 let n = super::to_integer_or_infinity_throwing(Some(v))?;
                 n.max(0).min((len - start) as i64) as u64
             }
-        }
+            None => len - start,
+        },
     };
     let items: &[Value] = if args.len() > 2 { &args[2..] } else { &[] };
     let item_count = items.len() as u64;

@@ -922,6 +922,8 @@ impl VM {
             // `fill(value, start, end)`：`value` 可以为任意值（含对象）。
             ("fill", "xnn"),
             ("slice", "nn"),
+            // `splice(start, deleteCount, ...items)`：items 不转换。
+            ("splice", "nn"),
             ("at", "n"),
             ("join", "s"),
             // `indexOf` / `lastIndexOf` / `includes` **故意不在这里转**：规范要求
