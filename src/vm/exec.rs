@@ -1776,7 +1776,7 @@ impl VM {
             Instr::MakeArray { .. } | Instr::ArrayPushSpread { .. } | Instr::MarkHole { .. } |
               Instr::ArrayPush { .. } | Instr::MakeTemplate { .. } => self.run_array(inst, module)?,
             Instr::MakeObject { .. } | Instr::IndexGet { .. } | Instr::PropGet { .. } |
-              Instr::IndexSet { .. } | Instr::PropSet { .. } | Instr::IndexDelete { .. } |
+              Instr::IndexSet { .. } | Instr::DefineOwn { .. } | Instr::PropSet { .. } | Instr::IndexDelete { .. } |
               Instr::PropDelete { .. } | Instr::Arguments { .. } | Instr::StoreEnv { .. } |
               Instr::CallMethod { .. } => self.run_object(inst, module)?,
             Instr::Try { .. } | Instr::EndTry { .. } | Instr::ThrowExc { .. } | Instr::LoadException { .. } => self.run_exception(inst, module)?,
@@ -2822,6 +2822,30 @@ impl VM {
                 }
                 let value = self.get_member(&obj, &key, module)?;
                 self.set_value(a0, value)?;
+            }
+            // `CreateDataPropertyOrThrow(object, key, value)` —— 对象字面量的
+            // 属性（ES 12.2.6.8）。与 `[[Set]]` 的关键差别：它**总是**建自己的
+            // 数据属性，所以原型链上同名的只读/访问器属性不会让 `{ x: 1 }` 失败。
+            // 这条指令存在的理由是可观察语义 + 成本：走 `Object.defineProperty`
+            // 要建描述符对象再调原生函数，全量墙钟会从 ~85s 涨到 ~500s。
+            Instr::DefineOwn { object: a0, key: a1, value: a2 } => {
+                let obj = self.get_value(a0)?;
+                let key = self.resolve_property_key(a1, module)?;
+                let val = self.get_value(a2)?;
+                let obj = self.as_object_value(&obj);
+                if let Value::Object(obj_ref) = &obj {
+                    obj_ref
+                        .borrow_mut()
+                        .define_property(
+                            &mut self.heap,
+                            key,
+                            crate::vm::property::PropertyDescriptor::data_descriptor(val),
+                        )
+                        .map_err(RuntimeError::from)?;
+                }
+                if is_addressable(a0) {
+                    self.set_value(a0, obj)?;
+                }
             }
             Instr::IndexSet { object: a0, index: a1, value: a2 }
               | Instr::PropSet { object: a0, property: a1, value: a2 } => {

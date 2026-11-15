@@ -996,6 +996,7 @@ define_instrs! {
         IterNext { dst: w, has_next: w, src: r },
         IndexGet { dst: w, object: r, index: r },
         IndexSet { object: r, index: r, value: r },
+        DefineOwn { object: r, key: r, value: r },
         PropGet { dst: w, object: r, property: r },
         PropSet { object: r, property: r, value: r },
         PropDelete { dst: w, object: r, property: r },
@@ -1149,6 +1150,9 @@ pub enum Opcode {
     IndexGet,
     /// index_set obj, idx, value
     IndexSet,
+    /// define_own obj, key, value — CreateDataPropertyOrThrow (object literal
+    /// properties, { x: 1 }): always an own data property, never [[Set]].
+    DefineOwn,
     /// prop_get dst, obj, prop
     PropGet,
     /// prop_set obj, prop, value
@@ -1301,6 +1305,7 @@ impl fmt::Display for Opcode {
             Opcode::MakeTemplate => write!(f, "make_template"),
             Opcode::IndexGet => write!(f, "index_get"),
             Opcode::IndexSet => write!(f, "index_set"),
+            Opcode::DefineOwn => write!(f, "define_own"),
             Opcode::PropGet => write!(f, "prop_get"),
             Opcode::PropSet => write!(f, "prop_set"),
             Opcode::PropDelete => write!(f, "prop_delete"),
@@ -1959,8 +1964,9 @@ mod tests {
     #[test]
     fn kind_markers_cover_the_table() {
         // `MakeCell` 入表（闭包共享单元，见 `vm::EnvCell`）后是 91；
-        // `MakeTemplate`（带标签模板的站点缓存）再 +1。
-        assert_eq!(Instr::ALL.len(), 92, "表里的指令条数");
+        // `MakeTemplate`（带标签模板的站点缓存）再 +1；
+        // `DefineOwn`（对象字面量的 `CreateDataPropertyOrThrow`）再 +1。
+        assert_eq!(Instr::ALL.len(), 93, "表里的指令条数");
         assert_eq!(count_of(Kind::Call), 8, "Call* / New*");
         assert_eq!(count_of(Kind::Jump), 4, "Jump / BrIf / DelayedJump / ResumeExc");
         assert_eq!(count_of(Kind::Return), 2, "Ret / Halt");

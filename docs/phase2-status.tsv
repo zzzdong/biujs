@@ -65,7 +65,7 @@ language/expressions/greater-than	38	10	1
 language/expressions/instanceof	27	12	4
 language/expressions/logical-and	15	3	0
 language/expressions/modulus	32	8	0
-language/expressions/object	679	456	35
+language/expressions/object	684	456	30
 language/expressions/prefix-increment	22	8	3
 language/expressions/strict-equals	19	11	0
 language/expressions/this	2	4	0
@@ -76,7 +76,7 @@ language/statements/function	325	121	5
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	53	20	0
-built-ins/Array	2399	453	229
+built-ins/Array	2420	453	208
 built-ins/JSON	123	29	13
 built-ins/WeakSet	77	8	0
 built-ins/Number	264	38	38

@@ -214,6 +214,17 @@ impl Codegen {
                         self.codes
                             .push(Instr::IndexSet { object: object, index: idx, value: value });
                     }
+                    Instruction::DefineOwn {
+                        object,
+                        key,
+                        value,
+                    } => {
+                        let object = self.gen_operand(object);
+                        let key = self.gen_operand(key);
+                        let value = self.gen_operand(value);
+                        self.codes
+                            .push(Instr::DefineOwn { object: object, key: key, value: value });
+                    }
                     Instruction::IndexGet {
                         dst,
                         object,

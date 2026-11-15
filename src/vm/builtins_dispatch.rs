@@ -2580,22 +2580,26 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Value, RuntimeError> {
-        fn same_value_zero(a: &Value, b: &Value) -> bool {
-            if let (Value::Number(x), Value::Number(y)) = (a, b)
-                && x.is_nan()
-                && y.is_nan()
-            {
-                return true;
-            }
+        // `indexOf` / `lastIndexOf` 用的是 **严格相等**（`NaN` 谁也不等于，
+        // `+0 === -0`）：`[NaN].indexOf(NaN)` 是 `-1` 而不是 `0`。
+        // `includes` 才用 SameValueZero，它在读族里，不走这个函数。
+        fn same_value_strict(a: &Value, b: &Value) -> bool {
             a.strict_eq(b)
         }
 
         let search = args.first().cloned().unwrap_or(Value::Undefined);
         let len_i = len as i64;
-        // `? ToIntegerOrInfinity(fromIndex)`: ToNumber(Symbol) is abrupt, while
-        // an absent argument reads as ToIntegerOf(undefined) = 0.
+        // 13/14 步：`len = 0` → -1，**先于** `ToIntegerOrInfinity(fromIndex)`
+        // （`indexOf/length-zero-returns-minus-one`：`fromIndex` 的 `valueOf`
+        // 根本不该被调用）。
+        if len_i == 0 {
+            return Ok(Value::Number(-1.0));
+        }
+        // `? ToIntegerOrInfinity(fromIndex)`：只有**缺省**参数才用默认值，
+        // 显式的 `undefined` 走 `ToIntegerOrInfinity(undefined) = 0`
+        // （`lastIndexOf/15.4.4.15-5-4`：`a.lastIndexOf(2, undefined)` 从 0 往前找）。
         let from = match args.get(1) {
-            Some(v) if !v.is_undefined() => {
+            Some(v) => {
                 // `ToNumber` runs `ToPrimitive`, i.e. a user `valueOf` /
                 // `toString` on an object argument (`fromIndex` of `{toString() {
                 // toStringAccessed = true; return 1 }}` must be observed).
@@ -2607,7 +2611,7 @@ impl VM {
                 };
                 crate::builtins::to_integer_or_infinity_throwing(Some(&primitive))?
             }
-            _ => {
+            None => {
                 if method == "indexOf" {
                     0
                 } else {
@@ -2617,22 +2621,35 @@ impl VM {
         };
 
         if method == "indexOf" {
-            let start = from.max(0);
+            // 第 5 步：`n >= len` → -1；`n < 0` → `max(len + n, 0)`。
+            // （`from.max(0)` 会把 `-1` 当成 0，`[0,'x',2].indexOf('x', -1)`
+            // 于是从 0 开始找。）
+            let start = if from < 0 {
+                len_i.saturating_add(from).max(0)
+            } else {
+                from.min(len_i)
+            };
             if start >= len_i {
                 return Ok(Value::Number(-1.0));
             }
             for i in start..len_i {
                 if let Some(element) = self.array_live_at(target, i as usize, module)?
-                    && same_value_zero(&element, &search)
+                    && same_value_strict(&element, &search)
                 {
                     return Ok(Value::Number(i as f64));
                 }
             }
         } else {
-            let mut i = if from < 0 { -1 } else { from.min(len_i - 1) };
+            // 第 5 步：`n >= 0` → `min(n, len-1)`；否则 `len + n`，仍为负则 -1。
+            let mut i = if from >= 0 {
+                from.min(len_i - 1)
+            } else {
+                let n = len_i.saturating_add(from);
+                if n < 0 { -1 } else { n.min(len_i - 1) }
+            };
             while i >= 0 {
                 if let Some(element) = self.array_live_at(target, i as usize, module)?
-                    && same_value_zero(&element, &search)
+                    && same_value_strict(&element, &search)
                 {
                     return Ok(Value::Number(i as f64));
                 }

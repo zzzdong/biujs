@@ -418,6 +418,15 @@ pub trait InstBuilder {
         });
     }
 
+    /// CreateDataPropertyOrThrow(object, key, value).
+    fn define_own(&mut self, object: Value, key: Value, value: Value) {
+        self.emit(Instruction::DefineOwn {
+            object,
+            key,
+            value,
+        });
+    }
+
     fn delete_property(&mut self, object: Value, property: &str) -> Value {
         let dst = self.alloc();
         let property = self.make_constant(property.into());

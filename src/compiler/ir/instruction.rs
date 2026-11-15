@@ -301,6 +301,14 @@ pub enum Instruction {
         index: Value,
         value: Value,
     },
+    /// CreateDataPropertyOrThrow(object, key, value) — 对象字面量的属性
+    /// （ES 12.2.6.8）：永远建**自己的数据属性**，不走 [[Set]]，所以原型链上
+    /// 同名的只读/访问器属性不会让 { x: 1 } 失败。
+    DefineOwn {
+        object: Value,
+        key: Value,
+        value: Value,
+    },
     PropertyDelete {
         dst: Value,
         object: Value,
@@ -728,6 +736,11 @@ impl Instruction {
                 index,
                 value,
             } => (vec![], vec![*object, *index, *value]),
+            Instruction::DefineOwn {
+                object,
+                key,
+                value,
+            } => (vec![], vec![*object, *key, *value]),
             Instruction::PropertyDelete {
                 dst,
                 object,
@@ -1013,6 +1026,13 @@ impl std::fmt::Display for Instruction {
                 value,
             } => {
                 write!(f, "{object}[{index}] = index_set {value}")
+            }
+            Instruction::DefineOwn {
+                object,
+                key,
+                value,
+            } => {
+                write!(f, "{object}[{key}] = define_own {value}")
             }
             Instruction::PropertyDelete {
                 dst,

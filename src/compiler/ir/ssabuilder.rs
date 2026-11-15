@@ -898,6 +898,15 @@ impl<'a> SSABuilder<'a> {
                 SSABuilder::rename_use(index, stacks);
                 SSABuilder::rename_use(value, stacks);
             }
+            Instruction::DefineOwn {
+                object,
+                key,
+                value,
+            } => {
+                SSABuilder::rename_use(object, stacks);
+                SSABuilder::rename_use(key, stacks);
+                SSABuilder::rename_use(value, stacks);
+            }
             Instruction::Halt { value } => {
                 if let Some(v) = value {
                     SSABuilder::rename_use(v, stacks);

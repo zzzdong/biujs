@@ -3468,6 +3468,23 @@ impl<'a> JSASTLower<'a> {
         }
     }
 
+    /// `CreateDataPropertyOrThrow(target, key, value)` (ES 7.3.3).
+    ///
+    /// Object literals use this instead of `[[Set]]`: `{ x: 1 }` always creates
+    /// an own data property, even when the prototype chain has a read-only
+    /// accessor called `x`. It is a dedicated instruction rather than
+    /// `Object.defineProperty` because the latter builds a descriptor object and
+    /// calls a native per property — measurably slower on literal-heavy code.
+    fn create_data_member(&mut self, target: Value, key: &MemberKey, value: Value) {
+        let key_value = match key {
+            MemberKey::Static(name) => self.builder.load_constant(
+                crate::bytecode::Constant::String(std::sync::Arc::new(name.clone().into())),
+            ),
+            MemberKey::Dynamic(value) => value.clone(),
+        };
+        self.builder.define_own(target, key_value, value);
+    }
+
     /// `Object.defineProperty(target, key, descriptor)` with a key that may only
     /// be known at run time.
     fn define_member(&mut self, target: Value, key: &MemberKey, desc: Value) {
@@ -3611,7 +3628,23 @@ impl<'a> JSASTLower<'a> {
                                 }
                                 None => value,
                             };
-                            self.set_member(object, &key, value);
+                            // ES 12.2.6.8 的 `PropertyDefinitionEvaluation` 用
+                            // `CreateDataPropertyOrThrow`：字面量的键**总是**建自己的
+                            // 数据属性，即使原型链上有同名的只读/访问器属性 ——
+                            // `Object.prototype` 上的 getter-only `x` 不该让
+                            // `{ x: 2 }` 抛 TypeError（`15.4.4.15-8-b-i-6` 一族正是
+                            // 靠这一点把所有数组方法的 `Object.prototype[0]` 访问器
+                            // 打上标记）。
+                            //
+                            // 唯一的例外是 `__proto__`：它是 `Object.prototype` 上的
+                            // 访问器，字面量里的 `__proto__: p` 必须走 `[[Set]]` 才能
+                            // 改原型。
+                            let is_proto_key = matches!(&key, MemberKey::Static(name) if name == "__proto__");
+                            if is_proto_key {
+                                self.set_member(object, &key, value);
+                            } else {
+                                self.create_data_member(object, &key, value);
+                            }
                         }
                     }
                 }

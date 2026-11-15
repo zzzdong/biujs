@@ -14,8 +14,8 @@ constants 13:
   c11 = "includes"
   c12 = "length"
 functions 1:
-  fn 0: start=0 end=95 exit=none name="main" arity=0 flags=-
-    0: addc rsp, rsp, 55
+  fn 0: start=0 end=99 exit=none name="main" arity=0 flags=-
+    0: addc rsp, rsp, 59
     1: mov [rbp+0], undefined
     2: store_env 0, undefined
     3: mov [rbp+1], undefined
@@ -30,83 +30,87 @@ functions 1:
     12: store_env 5, undefined
     13: make_object [rbp+6]
     14: load_const [rbp+7], 0
-    15: prop_set [rbp+6], 0, 1
-    16: load_const [rbp+8], 6
-    17: prop_set [rbp+6], 6, 2
-    18: load_const [rbp+9], 7
-    19: prop_set [rbp+6], 7, 3
-    20: load_const [rbp+10], 8
-    21: prop_set [rbp+6], 8, 4
-    22: require_object_coercible [rbp+6]
-    23: load_const [rbp+11], 0
-    24: prop_get [rbp+12], [rbp+6], 0
-    25: store_env 0, [rbp+12]
-    26: load_const [rbp+13], 6
-    27: prop_get [rbp+14], [rbp+6], 6
-    28: store_env 1, [rbp+14]
-    29: make_object [rbp+15]
-    30: make_array [rbp+16]
-    31: array_push [rbp+16], [rbp+11]
-    32: array_push [rbp+16], [rbp+13]
-    33: load_env [rbp+17], 9
-    34: push [rbp+6]
-    35: call_method [rbp+17], 10, 1
-    36: subc rsp, rsp, 1
-    37: mov [rbp+18], rv
-    38: make_iter [rbp+19], [rbp+18]
-    39: br 1
-    40: iter_next [rbp+20], [rbp+21], [rbp+19]
-    41: br_if [rbp+21], 46, 1
-    42: store_env 2, [rbp+15]
-    43: make_array [rbp+22]
-    44: array_push [rbp+22], 1
-    45: array_push [rbp+22], 2
-    46: array_push [rbp+22], 3
-    47: array_push [rbp+22], 4
-    48: array_push [rbp+22], 5
-    49: make_iter [rbp+23], [rbp+22]
-    50: iter_next [rbp+24], [rbp+25], [rbp+23]
-    51: store_env 3, [rbp+24]
-    52: iter_next [rbp+26], [rbp+27], [rbp+23]
-    53: iter_next [rbp+28], [rbp+29], [rbp+23]
-    54: mov [rbp+30], [rbp+28]
-    55: seq [rbp+31], [rbp+30], undefined
-    56: not [rbp+32], [rbp+29]
-    57: bitor [rbp+33], [rbp+32], [rbp+31]
-    58: load_const [rbp+34], 4
-    59: mov [rbp+35], [rbp+30]
-    60: br_if [rbp+33], 24, 1
-    61: store_env 4, [rbp+35]
-    62: make_array [rbp+36]
-    63: br 1
-    64: iter_next [rbp+37], [rbp+38], [rbp+23]
-    65: br_if [rbp+38], 17, 1
-    66: store_env 5, [rbp+36]
-    67: load_env [rbp+39], 0
-    68: load_env [rbp+40], 1
-    69: addx [rbp+41], [rbp+39], [rbp+40]
-    70: load_env [rbp+42], 2
-    71: prop_get [rbp+43], [rbp+42], 7
-    72: addx [rbp+44], [rbp+41], [rbp+43]
-    73: load_env [rbp+45], 3
-    74: addx [rbp+46], [rbp+44], [rbp+45]
-    75: load_env [rbp+47], 4
-    76: addx [rbp+48], [rbp+46], [rbp+47]
-    77: load_env [rbp+49], 5
-    78: prop_get [rbp+50], [rbp+49], 12
-    79: addx [rbp+51], [rbp+48], [rbp+50]
-    80: mov rv, [rbp+51]
-    81: halt
-    82: array_push [rbp+36], [rbp+37]
-    83: br -19
-    84: mov [rbp+52], 9
-    85: mov [rbp+35], [rbp+52]
-    86: br -25
-    87: push [rbp+20]
-    88: call_method [rbp+16], 11, 1
-    89: subc rsp, rsp, 1
-    90: mov [rbp+53], rv
-    91: br_if [rbp+53], -51, 1
-    92: index_get [rbp+54], [rbp+6], [rbp+20]
-    93: index_set [rbp+15], [rbp+20], [rbp+54]
-    94: br -54
+    15: load_const [rbp+8], 0
+    16: define_own [rbp+6], [rbp+8], 1
+    17: load_const [rbp+9], 6
+    18: load_const [rbp+10], 6
+    19: define_own [rbp+6], [rbp+10], 2
+    20: load_const [rbp+11], 7
+    21: load_const [rbp+12], 7
+    22: define_own [rbp+6], [rbp+12], 3
+    23: load_const [rbp+13], 8
+    24: load_const [rbp+14], 8
+    25: define_own [rbp+6], [rbp+14], 4
+    26: require_object_coercible [rbp+6]
+    27: load_const [rbp+15], 0
+    28: prop_get [rbp+16], [rbp+6], 0
+    29: store_env 0, [rbp+16]
+    30: load_const [rbp+17], 6
+    31: prop_get [rbp+18], [rbp+6], 6
+    32: store_env 1, [rbp+18]
+    33: make_object [rbp+19]
+    34: make_array [rbp+20]
+    35: array_push [rbp+20], [rbp+15]
+    36: array_push [rbp+20], [rbp+17]
+    37: load_env [rbp+21], 9
+    38: push [rbp+6]
+    39: call_method [rbp+21], 10, 1
+    40: subc rsp, rsp, 1
+    41: mov [rbp+22], rv
+    42: make_iter [rbp+23], [rbp+22]
+    43: br 1
+    44: iter_next [rbp+24], [rbp+25], [rbp+23]
+    45: br_if [rbp+25], 46, 1
+    46: store_env 2, [rbp+19]
+    47: make_array [rbp+26]
+    48: array_push [rbp+26], 1
+    49: array_push [rbp+26], 2
+    50: array_push [rbp+26], 3
+    51: array_push [rbp+26], 4
+    52: array_push [rbp+26], 5
+    53: make_iter [rbp+27], [rbp+26]
+    54: iter_next [rbp+28], [rbp+29], [rbp+27]
+    55: store_env 3, [rbp+28]
+    56: iter_next [rbp+30], [rbp+31], [rbp+27]
+    57: iter_next [rbp+32], [rbp+33], [rbp+27]
+    58: mov [rbp+34], [rbp+32]
+    59: seq [rbp+35], [rbp+34], undefined
+    60: not [rbp+36], [rbp+33]
+    61: bitor [rbp+37], [rbp+36], [rbp+35]
+    62: load_const [rbp+38], 4
+    63: mov [rbp+39], [rbp+34]
+    64: br_if [rbp+37], 24, 1
+    65: store_env 4, [rbp+39]
+    66: make_array [rbp+40]
+    67: br 1
+    68: iter_next [rbp+41], [rbp+42], [rbp+27]
+    69: br_if [rbp+42], 17, 1
+    70: store_env 5, [rbp+40]
+    71: load_env [rbp+43], 0
+    72: load_env [rbp+44], 1
+    73: addx [rbp+45], [rbp+43], [rbp+44]
+    74: load_env [rbp+46], 2
+    75: prop_get [rbp+47], [rbp+46], 7
+    76: addx [rbp+48], [rbp+45], [rbp+47]
+    77: load_env [rbp+49], 3
+    78: addx [rbp+50], [rbp+48], [rbp+49]
+    79: load_env [rbp+51], 4
+    80: addx [rbp+52], [rbp+50], [rbp+51]
+    81: load_env [rbp+53], 5
+    82: prop_get [rbp+54], [rbp+53], 12
+    83: addx [rbp+55], [rbp+52], [rbp+54]
+    84: mov rv, [rbp+55]
+    85: halt
+    86: array_push [rbp+40], [rbp+41]
+    87: br -19
+    88: mov [rbp+56], 9
+    89: mov [rbp+39], [rbp+56]
+    90: br -25
+    91: push [rbp+24]
+    92: call_method [rbp+20], 11, 1
+    93: subc rsp, rsp, 1
+    94: mov [rbp+57], rv
+    95: br_if [rbp+57], -51, 1
+    96: index_get [rbp+58], [rbp+6], [rbp+24]
+    97: index_set [rbp+19], [rbp+24], [rbp+58]
+    98: br -54
