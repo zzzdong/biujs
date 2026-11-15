@@ -957,8 +957,11 @@ impl VM {
             }
         }
         let key = PropertyKey::element(&mut self.heap, index as u64);
-        let present = crate::vm::prototype::internal_has_property(*obj_ref, &key)
-            .map_err(RuntimeError::TypeError)?;
+        // `HasProperty` 必须走 VM 的链式实现：链上任意一环是 Proxy 时，
+        // 它的 `has` trap 要接管（ES 10.5.7），而
+        // `prototype::internal_has_property` 只是纯描述符 walk —— trap 看不到，
+        // 于是 `new Proxy(arr, { has() {…} })` 上 map/flat 一族的 trap 从不触发。
+        let present = self.object_has_property(*obj_ref, &key, module)?;
         if !present {
             return Ok(None);
         }

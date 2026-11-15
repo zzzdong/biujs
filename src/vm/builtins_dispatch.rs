@@ -837,9 +837,12 @@ impl VM {
             }
             _ => Vec::new(),
         };
+        // `CreateDataPropertyOrThrow`（slice 22.1.3.22 第 12.a 步 /
+        // splice 22.1.3.28 第 11.b.iii 步）：species 目标拒绝定义时是 TypeError，
+        // 目标上是**可配置的**只读属性时则重新定义成功
+        // （`splice/target-array-with-non-{writable,configurable}-property`）。
         for (i, value) in elements {
-            let key = PropertyKey::element(&mut self.heap, i as u64);
-            self.set_member(&target, key, value, module)?;
+            self.create_data_property_or_throw(&target, i, value, module)?;
         }
         Ok(Some(target))
     }
