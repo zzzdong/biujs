@@ -76,7 +76,7 @@ language/statements/function	325	121	5
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	53	20	0
-built-ins/Array	2503	453	125
+built-ins/Array	2505	453	123
 built-ins/JSON	123	29	13
 built-ins/WeakSet	77	8	0
 built-ins/Number	264	38	38

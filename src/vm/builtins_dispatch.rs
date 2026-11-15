@@ -2039,6 +2039,9 @@ impl VM {
             // 没有回调，但要那份"逐元素 `HasProperty` + `[[Get]]`"的实现
             // （空位是删除、不是写 undefined）。
             "copyWithin",
+            // `flat` 要走 `ArraySpeciesCreate` 与逐元素 `CreateDataProperty`，
+            // 内建层两样都做不到。
+            "flat",
         ];
         if !CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -2349,6 +2352,26 @@ impl VM {
                     }
                 }))
             }
+            "flat" => {
+                // 第 3 步：`depthNum`（缺省 **1**；显式 `undefined` 也是 1，
+                // 其余走 `ToIntegerOrInfinity`，对象参数会跑用户 `valueOf`）。
+                let depth = match args.first() {
+                    None | Some(Value::Undefined) => 1,
+                    Some(_) => self.to_integer_or_infinity_arg(args.first(), 1, module)?,
+                };
+                // 第 4 步：`ArraySpeciesCreate(O, 0)` —— 结果由子类的 species 决定，
+                // 以前内建层直接造普通数组，于是 `class My extends Array {}` 的
+                // `m.flat()` 返回的不是 `My`。
+                let target = match self.array_species_create(receiver, 0, module)? {
+                    Some(target) => target,
+                    None => {
+                        crate::vm::object::new_array_object_from_vec(&mut self.heap, Vec::new())
+                    }
+                };
+                let _root_target = self.root(&target);
+                self.flatten_into_array(&target, receiver, len, 0, depth, 0, module)?;
+                Ok(Some(target))
+            }
             "flatMap" => {
                 // Map, then flatten one level (ES 23.1.3.?): a mapped value that
                 // is an array contributes its elements, anything else is
@@ -2631,6 +2654,24 @@ impl VM {
         }
     }
 
+    /// `ToIntegerOrInfinity(arg)`，对象参数先 `ToPrimitive(number)`
+    /// （会跑用户的 `valueOf` / `@@toPrimitive`）。
+    fn to_integer_or_infinity_arg(
+        &mut self,
+        arg: Option<&Value>,
+        default: i64,
+        module: &Module,
+    ) -> Result<i64, RuntimeError> {
+        let Some(value) = arg else {
+            return Ok(default);
+        };
+        let primitive = match value {
+            Value::Object(_) | Value::Function(_) => self.to_primitive(value, "number", module)?,
+            other => other.clone(),
+        };
+        crate::builtins::to_integer_or_infinity_throwing(Some(&primitive))
+    }
+
     /// `ToIntegerOrInfinity(arg)` 再按 `copyWithin` 的口径夹到 `[0, len]`
     /// （负值从末尾算）。
     fn relative_index_arg(
@@ -2640,20 +2681,65 @@ impl VM {
         len: i64,
         module: &Module,
     ) -> Result<i64, RuntimeError> {
-        let n = match arg {
-            None => default,
-            Some(value) => {
-                let primitive = match value {
-                    Value::Object(_) | Value::Function(_) => {
-                        self.to_primitive(value, "number", module)?
-                    }
-                    other => other.clone(),
-                };
-                crate::builtins::to_integer_or_infinity_throwing(Some(&primitive))?
-            }
-        };
+        let n = self.to_integer_or_infinity_arg(arg, default, module)?;
         let clamped = if n < 0 { n.saturating_add(len) } else { n };
         Ok(clamped.clamp(0, len))
+    }
+
+    /// `FlattenIntoArray(target, source, sourceLen, start, depth)`（ES 23.1.3.12.1）。
+    ///
+    /// 逐元素 `HasProperty` → `[[Get]]` → （可选映射）→ 深度够且是数组就递归，
+    /// 否则 `CreateDataPropertyOrThrow(target, ToString(index), element)`。
+    /// 返回新的 `targetIndex`。
+    ///
+    /// `level` 只是递归深度守卫：`flat(Infinity)` 遇到自引用数组（`a.push(a)`）
+    /// 会无限深入，JS 引擎靠调用栈上限报 RangeError，这里给同一个结论。
+    fn flatten_into_array(
+        &mut self,
+        target: &Value,
+        source: &Value,
+        source_len: usize,
+        start: usize,
+        depth: i64,
+        level: usize,
+        module: &Module,
+    ) -> Result<usize, RuntimeError> {
+        if level > 1000 {
+            return Err(RuntimeError::RangeError(
+                "Maximum call stack size exceeded".to_string(),
+            ));
+        }
+        let mut target_index = start;
+        for source_index in 0..source_len {
+            // `HasProperty` 为假（空洞）就跳过：`flat` 连空位都不保留。
+            let Some(element) = self.array_live_at(source, source_index, module)? else {
+                continue;
+            };
+            let should_flatten = depth > 0
+                && matches!(&element, Value::Object(o) if o.borrow().kind() == ObjectKind::Array);
+            if should_flatten {
+                let element_len = self.array_like_length(&element, module)?;
+                let inner_depth = if depth == i64::MAX { i64::MAX } else { depth - 1 };
+                target_index = self.flatten_into_array(
+                    target,
+                    &element,
+                    element_len,
+                    target_index,
+                    inner_depth,
+                    level + 1,
+                    module,
+                )?;
+            } else {
+                if target_index as u64 >= (1u64 << 53) - 1 {
+                    return Err(RuntimeError::TypeError(
+                        "flat: target index exceeds 2**53 - 1".to_string(),
+                    ));
+                }
+                self.create_data_property_or_throw(target, target_index, element, module)?;
+                target_index += 1;
+            }
+        }
+        Ok(target_index)
     }
 
     /// `Array.prototype.copyWithin(target, start, end)` (ES 23.1.3.3).
