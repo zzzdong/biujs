@@ -926,6 +926,95 @@ impl VM {
         Ok((len.trunc() as u64).min(1u64 << 24) as usize)
     }
 
+    /// `LengthOfArrayLike`，但**不**把长度截到 `1<<24`。
+    ///
+    /// `concat` 需要用真实长度判断 `n + len > 2**53-1` 的 TypeError；截断会让
+    /// 这个检查永远不触发（`arg-length-exceeding-integer-limit` 得到 RangeError
+    /// 而不是 TypeError）。真正的迭代另有上限，见调用点。
+    fn array_like_length_raw(
+        &mut self,
+        receiver: &Value,
+        module: &Module,
+    ) -> Result<u64, RuntimeError> {
+        let boxed = match receiver {
+            Value::Object(_) | Value::Function(_) => None,
+            _ => Some(crate::builtins::to_object(&mut self.heap, receiver)?),
+        };
+        let target = boxed.as_ref().unwrap_or(receiver);
+        let key = PropertyKey::well_known("length").expect("well-known name");
+        let len_value = self.get_member(target, &key, module)?;
+        let len_value = match &len_value {
+            Value::Object(_) | Value::Function(_) => {
+                self.to_primitive(&len_value, "number", module)?
+            }
+            _ => len_value,
+        };
+        let len = crate::builtins::to_number_throwing(&len_value)?;
+        if !len.is_finite() || len <= 0.0 {
+            return Ok(0);
+        }
+        Ok(len.min(9_007_199_254_740_991.0) as u64)
+    }
+
+    /// ES 7.2.2 `IsArray`：**Proxy 递归看 target**（revoked 是 TypeError）。
+    ///
+    /// `obj.borrow().kind() == Array` 只能看穿一层，`new Proxy([], {})` 因此被
+    /// 当成"不是数组"（`concat/is-concat-spreadable-proxy` 期望它是）。
+    fn is_array_including_proxies(&mut self, value: &Value, module: &Module) -> Result<bool, RuntimeError> {
+        match value {
+            Value::Object(obj_ref) => {
+                let is_proxy = obj_ref.borrow().is_proxy();
+                if is_proxy {
+                    let (target, _handler) = self.proxy_parts(value, "IsArray")?;
+                    return self.is_array_including_proxies(&target, module);
+                }
+                Ok(obj_ref.borrow().kind() == ObjectKind::Array)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// ES 23.1.3.1.1 `IsConcatSpreadable(O)`.
+    fn is_concat_spreadable_value(
+        &mut self,
+        value: &Value,
+        module: &Module,
+    ) -> Result<bool, RuntimeError> {
+        let Value::Object(obj_ref) = value else {
+            return Ok(false);
+        };
+        // 快路径：普通对象（非 Proxy）用**结构**查找 `@@isConcatSpreadable`。
+        // 常见情形（数组，没人覆盖过这个符号）连符号键都不用建、也不用走一次
+        // `[[Get]]` —— 每次 `concat` 的每个元素都省一笔，实测是墙钟的大头。
+        if !obj_ref.borrow().is_proxy() {
+            match crate::vm::prototype::find_descriptor(
+                *obj_ref,
+                &crate::builtins::is_concat_spreadable_symbol_key(),
+            ) {
+                Ok(None) => return self.is_array_including_proxies(value, module),
+                Ok(Some((_, desc))) if !desc.is_accessor_descriptor() => {
+                    // 数据属性：`undefined` 仍然回落到 `IsArray`。
+                    return if desc.value.is_undefined() {
+                        self.is_array_including_proxies(value, module)
+                    } else {
+                        Ok(desc.value.to_boolean())
+                    };
+                }
+                // 访问器 / 出错：交给 `[[Get]]`（getter 可能抛）。
+                _ => {}
+            }
+        }
+        let flag = self.get_member(
+            value,
+            &crate::builtins::is_concat_spreadable_symbol_key(),
+            module,
+        )?;
+        if !flag.is_undefined() {
+            return Ok(flag.to_boolean());
+        }
+        self.is_array_including_proxies(value, module)
+    }
+
     /// One step of the array iteration protocol: `HasProperty(O, index)`
     /// **re-checked every time**, then `[[Get]]`.
     ///
@@ -957,11 +1046,20 @@ impl VM {
             }
         }
         let key = PropertyKey::element(&mut self.heap, index as u64);
-        // `HasProperty` 必须走 VM 的链式实现：链上任意一环是 Proxy 时，
-        // 它的 `has` trap 要接管（ES 10.5.7），而
-        // `prototype::internal_has_property` 只是纯描述符 walk —— trap 看不到，
-        // 于是 `new Proxy(arr, { has() {…} })` 上 map/flat 一族的 trap 从不触发。
-        let present = self.object_has_property(*obj_ref, &key, module)?;
+        // `HasProperty`：**自身**是 Proxy 时走 VM 的链式实现，让 `has` trap 接管
+        // （ES 10.5.7）；普通对象走纯描述符 walk。
+        //
+        // 这条路上每个元素都要判一次，而回调族是测试里最热的路径。全走
+        // `object_has_property`（逐跳 `is_proxy()` + 借出）实测全量墙钟涨了
+        // 约 15%。已知边角：**原型链上游**的 Proxy 的 `has` trap 仍然看不到
+        // （自身是 Proxy 的情形是 `map`/`flat` 那一族用例真正覆盖的）。
+        let is_proxy_self = obj_ref.borrow().is_proxy();
+        let present = if is_proxy_self {
+            self.object_has_property(*obj_ref, &key, module)?
+        } else {
+            crate::vm::prototype::internal_has_property(*obj_ref, &key)
+                .map_err(RuntimeError::TypeError)?
+        };
         if !present {
             return Ok(None);
         }

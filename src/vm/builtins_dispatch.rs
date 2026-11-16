@@ -410,6 +410,15 @@ impl VM {
                 Value::Object(_) | Value::Function(_) => this.clone(),
                 other => crate::builtins::to_object(&mut self.heap, other)?,
             };
+            // `concat` 需要 `ArraySpeciesCreate` + `IsConcatSpreadable`
+            // （Proxy 的 `IsArray`、用户 `valueOf`、`2**53-1` 的 TypeError），
+            // 内建层那份做不到 —— `Array.prototype.concat.call(obj, …)` 走这里。
+            if method == "concat"
+                && !crate::vm::receiver_is_string(&receiver)
+                && self.receiver_concat_like(&receiver)
+            {
+                return self.array_concat_vm(&receiver, args, module);
+            }
             // 索引类参数（`copyWithin` / `fill` / `slice` / `indexOf` / `join` …）是
             // `ToIntegerOrInfinity` / `ToString`：对象参数要跑 `valueOf` /
             // `@@toPrimitive`，Symbol 留给内建层的 `to_number_throwing` 抛
@@ -804,6 +813,23 @@ impl VM {
     ) -> Result<Option<Value>, RuntimeError> {
         if !matches!(method, "slice" | "splice" | "concat") {
             return Ok(None);
+        }
+        // `concat` 的参数不是索引：`ArraySpeciesCreate` 要在循环之前做，
+        // 每个元素还要 `IsConcatSpreadable` / `LengthOfArrayLike`
+        // （Proxy 的 `IsArray`、用户 `valueOf`、`2**53-1` 的 TypeError）。
+        //
+        // 字符串接收者除外：`"a".concat("b")` 是 `String.prototype.concat`
+        // （拼接），不是数组的展开 —— 让出，由字符串那条路接手。
+        if method == "concat" {
+            // 字符串接收者（`"a".concat("b")`）走 `String.prototype.concat`；
+            // 没有 `length` 的接收者（`Object(42).concat(false, true)` 走的是
+            // 引擎的同名回落）也原样让出 —— 否则会得到数组的 `"42,false,true"`。
+            if crate::vm::receiver_is_string(receiver)
+                || !self.receiver_concat_like(receiver)
+            {
+                return Ok(None);
+            }
+            return self.array_concat_vm(receiver, args, module).map(Some);
         }
         // `slice(start, end)` / `splice(start, deleteCount, …)` 的索引参数。
         let coerced = self.coerce_index_method_args("Array", method, args, module)?;
@@ -2689,6 +2715,131 @@ impl VM {
         Ok(clamped.clamp(0, len))
     }
 
+    /// 往 `concat` / `flat` 的结果数组追加一个元素。
+    ///
+    /// 结果是**密集普通数组**（species 取默认值时的常见情形）就直接写密集存储：
+    /// 逐个 `define_property` 会把数组推进属性表那条慢路径，实测全量墙钟
+    /// 从 ~85s 涨到 ~93–106s。其余情况（子类实例、Proxy、非数组 target）仍走
+    /// `CreateDataPropertyOrThrow` —— 那里必须能抛。
+    fn append_result_element(
+        &mut self,
+        target: &Value,
+        index: usize,
+        value: Value,
+        module: &Module,
+    ) -> Result<(), RuntimeError> {
+        if let Value::Object(obj_ref) = target {
+            let mut borrowed = obj_ref.borrow_mut();
+            if let Some(arr) = borrowed.as_array_mut()
+                && arr.dense_elements().is_some()
+            {
+                // `index` 之前没写过的位置是空洞（`concat` 的空位、`flat` 的跳过）。
+                while arr.len() < index {
+                    arr.push(Value::Undefined);
+                    let hole = arr.len() - 1;
+                    arr.mark_hole(hole);
+                }
+                arr.push(value);
+                return Ok(());
+            }
+        }
+        self.create_data_property_or_throw(target, index, value, module)
+    }
+
+    /// 这个接收者该不该走数组口径的 `concat`。
+    ///
+    /// 规范里 `concat` 是通用的，但引擎有一条历史回落：`Object(42).concat(…)`
+    /// 落到 `String.prototype.concat`（`"42falsetrue"`，见 feature 测试
+    /// `string_methods_win_for_string_receivers`）。所以只有**像数组**的接收者
+    /// （有 `length`，或带 `@@isConcatSpreadable`）才走 VM 实现 —— 后者是必须的，
+    /// 因为 getter 可能抛（`spreadable-getter-throws` 的接收者没有 `length`）。
+    fn receiver_concat_like(&mut self, receiver: &Value) -> bool {
+        if self.receiver_is_array_like(receiver) {
+            return true;
+        }
+        match receiver {
+            Value::Object(obj_ref) => crate::vm::prototype::find_descriptor(
+                *obj_ref,
+                &crate::builtins::is_concat_spreadable_symbol_key(),
+            )
+            .ok()
+            .flatten()
+            .is_some(),
+            _ => false,
+        }
+    }
+
+    /// `Array.prototype.concat(...items)`（ES 23.1.3.1）。
+    ///
+    /// 内建层那份做不到三件事，全都可观察：
+    ///
+    /// * 第 2 步 `ArraySpeciesCreate(O, 0)` 在循环**之前** —— 于是 `constructor`
+    ///   的读取先于每个元素的 `@@isConcatSpreadable`
+    ///   （`is-concat-spreadable-get-order` 数的是 `["constructor",
+    ///   "isConcatSpreadable"]`）；species 结果也不再是普通数组。
+    /// * `IsConcatSpreadable` 里的 `IsArray` 要**看穿 Proxy**
+    ///   （`new Proxy([], {})` 是数组，revoked 是 TypeError）。
+    /// * `LengthOfArrayLike` 要跑用户的 `valueOf` / `toString`，`Symbol` 是
+    ///   TypeError；`n + len > 2**53-1` 是 TypeError 而不是 RangeError。
+    fn array_concat_vm(
+        &mut self,
+        receiver: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
+        let target = match self.array_species_create(receiver, 0, module)? {
+            Some(target) => target,
+            None => crate::vm::object::new_array_object_from_vec(&mut self.heap, Vec::new()),
+        };
+        let _root_target = self.root(&target);
+        // `O` 自己是第一个 item（第 4 步的 `items`）。
+        let mut items: Vec<Value> = Vec::with_capacity(args.len() + 1);
+        items.push(receiver.clone());
+        items.extend(args.iter().cloned());
+        let _roots = self.root_all(&items);
+        let mut n: u64 = 0;
+        for item in &items {
+            if self.is_concat_spreadable_value(item, module)? {
+                let len = self.array_like_length_raw(item, module)?;
+                if n as f64 + len as f64 > MAX_SAFE {
+                    return Err(RuntimeError::TypeError(
+                        "concat: the resulting array would be too long".to_string(),
+                    ));
+                }
+                // 迭代另有上限：声称 `length = 2**32` 的元素列表不该真跑四十亿次
+                // 属性查找（超过 2**53 的情形上面已经按规范抛了）。
+                let len = len.min(1 << 24);
+                for k in 0..len {
+                    if let Some(value) = self.array_live_at(item, k as usize, module)? {
+                        if n as f64 + 1.0 > MAX_SAFE {
+                            return Err(RuntimeError::TypeError(
+                                "concat: the resulting array would be too long".to_string(),
+                            ));
+                        }
+                        self.append_result_element(&target, n as usize, value, module)?;
+                    }
+                    // `n` 无条件前进（第 5.b.iv.4 步）：空位在结果里也留一个**空洞**，
+                    // 而不是把后面的元素挤上来（`[1,,3].concat([4])` 长度是 4）。
+                    n += 1;
+                }
+            } else {
+                if n as f64 + 1.0 > MAX_SAFE {
+                    return Err(RuntimeError::TypeError(
+                        "concat: the resulting array would be too long".to_string(),
+                    ));
+                }
+                self.append_result_element(&target, n as usize, item.clone(), module)?;
+                n += 1;
+            }
+        }
+        // 第 6 步：`Set(A, "length", n, true)` —— 结果数组的 length 由写入维护，
+        // 但 species 目标可能不是数组（`Symbol.species = Object`），要显式定长。
+        let length_key = PropertyKey::well_known("length").expect("well-known name");
+        self.set_member(&target, length_key, Value::Number(n as f64), module)?;
+        Ok(target)
+    }
+
     /// `FlattenIntoArray(target, source, sourceLen, start, depth)`（ES 23.1.3.12.1）。
     ///
     /// 逐元素 `HasProperty` → `[[Get]]` → （可选映射）→ 深度够且是数组就递归，
@@ -2738,7 +2889,7 @@ impl VM {
                         "flat: target index exceeds 2**53 - 1".to_string(),
                     ));
                 }
-                self.create_data_property_or_throw(target, target_index, element, module)?;
+                self.append_result_element(target, target_index, element, module)?;
                 target_index += 1;
             }
         }
@@ -2961,7 +3112,9 @@ impl VM {
         args: &[Value],
         module: &Module,
     ) -> Result<Option<Value>, RuntimeError> {
-        const READ_METHODS: &[&str] = &["join", "slice", "includes", "at", "concat", "reverse"];
+        // `concat` 不在这里：它要走 `ArraySpeciesCreate` + `IsConcatSpreadable`
+        // （见 `array_concat_vm`），而这条读族路径比 species 那条更早。
+        const READ_METHODS: &[&str] = &["join", "slice", "includes", "at", "reverse"];
         if !READ_METHODS.contains(&method) {
             return Ok(None);
         }
