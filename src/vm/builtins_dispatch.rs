@@ -2071,6 +2071,16 @@ impl VM {
             // `flat` 要走 `ArraySpeciesCreate` 与逐元素 `CreateDataProperty`，
             // 内建层两样都做不到。
             "flat",
+            // 栈族四个方法每一步都是对**接收者**的 `Set(..., true)` / `Get` /
+            // `DeletePropertyOrThrow`：原型链上的 setter、冻结的数组、
+            // 不可写的 `length` 全都要能看到，内建层直接改密集存储。
+            "push",
+            "pop",
+            "shift",
+            "unshift",
+            // `toLocaleString` 要**调用每个元素自己的** `toLocaleString`
+            // （用户代码），内建层只能 `to_js_string()`。
+            "toLocaleString",
         ];
         if !CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -2169,6 +2179,57 @@ impl VM {
             };
             return self
                 .array_copy_within_live(&target, len, args, module)
+                .map(Some);
+        }
+
+        // `toLocaleString`（ES 23.1.3.32）：逐个元素 `Invoke(element,
+        // "toLocaleString")`，`undefined` / `null` 贡献空串，其余用 `,` 连起来。
+        // 元素自己的方法可能抛、也可能返回任意值，内建层做不到。
+        // `toLocaleString` 是**共享名**：`Boolean.prototype.toLocaleString` /
+        // `Number.prototype.toLocaleString` 也走这条分派。只有类数组接收者
+        // 才归数组口径（`[true].toLocaleString()` 里的 `true` 必须落到
+        // `Boolean.prototype` 上，否则得到空串）。
+        if method == "toLocaleString" {
+            if !self.receiver_is_array_like(receiver) {
+                return Ok(None);
+            }
+            if len == 0 {
+                return Ok(Some(Value::string("")));
+            }
+            let separator = ",";
+            let locale_key = PropertyKey::intern(&mut self.heap, "toLocaleString");
+            let mut out = String::new();
+            for k in 0..len {
+                if k > 0 {
+                    out.push_str(separator);
+                }
+                let key = PropertyKey::element(&mut self.heap, k as u64);
+                let element = self.get_member(receiver, &key, module)?;
+                if element.is_undefined() || matches!(element, Value::Null) {
+                    continue;
+                }
+                let method_value = self.get_member(&element, &locale_key, module)?;
+                let piece = self.invoke(&method_value, element, &[], module)?;
+                out.push_str(&crate::builtins::to_string_throwing(&piece)?);
+            }
+            return Ok(Some(Value::string(&out)));
+        }
+
+        // 栈族：`push` / `pop` / `shift` / `unshift`（ES 23.1.3.20 / .17 / .22 / .29）。
+        if matches!(method, "push" | "pop" | "shift" | "unshift") {
+            if !self.receiver_is_array_like(receiver) {
+                return Ok(None);
+            }
+            let target = match receiver {
+                Value::Object(_) | Value::Function(_) => receiver.clone(),
+                other => crate::builtins::to_object(&mut self.heap, other)?,
+            };
+            // 真实长度，**不截到 1<<24**：`obj.length = 4294967296; obj.push(…)`
+            // 必须返回 4294967299（`S15.4.4.7_A4_T1`）。搬运循环另有上限，
+            // 见 `array_stack_method` 里的 `iter_len`。
+            let raw_len = self.array_like_length_raw(&target, module)?;
+            return self
+                .array_stack_method(&target, method, raw_len, args, module)
                 .map(Some);
         }
 
@@ -2894,6 +2955,125 @@ impl VM {
             }
         }
         Ok(target_index)
+    }
+
+    /// `push` / `pop` / `shift` / `unshift`（ES 23.1.3.20 / .17 / .22 / .29）。
+    ///
+    /// 四个方法都不是"改密集存储"，而是对**接收者**做一串可观察操作：
+    ///
+    /// * 写元素是 `Set(O, key, value, true)` —— 接收者自己没有这个下标时会走到
+    ///   原型链上的 setter（`set-length-array-is-frozen` 正是让
+    ///   `Array.prototype[0]` 的 setter 去冻结数组）；
+    /// * 读元素是 `Get`，空位会读到原型链上的值（`S15.4.4.6_A4_T1`）；
+    /// * 移除位置是 `DeletePropertyOrThrow`（不可配置 → TypeError）；
+    /// * 收尾的 `Set(O, "length", …)` 在冻结数组或不可写 `length` 上必须抛
+    ///   （`set-length-array-length-is-non-writable`）。
+    fn array_stack_method(
+        &mut self,
+        target: &Value,
+        method: &str,
+        len: u64,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        const MAX_SAFE: u64 = 9_007_199_254_740_991;
+        let length_key = PropertyKey::well_known("length").expect("well-known name");
+        let argc = args.len() as u64;
+        // `shift` / `unshift` 要真正搬 `len` 个元素：声称 `length = 2**32` 的
+        // 接收者不能把一次调用变成四十亿次属性操作（超长的那几条用例数的是
+        // `push` 的返回值与 `length` 写入失败，不数搬运）。
+        let iter_len = len.min(1 << 24);
+        match method {
+            "push" => {
+                // ES 23.1.3.20 第 7 步：`len + argCount > 2**53-1` 是 TypeError。
+                if len as f64 + argc as f64 > MAX_SAFE as f64 {
+                    return Err(RuntimeError::TypeError(
+                        "push: the resulting length would be too large".to_string(),
+                    ));
+                }
+                let mut n = len;
+                for value in args {
+                    let key = PropertyKey::element(&mut self.heap, n);
+                    self.set_member(target, key, value.clone(), module)?;
+                    n += 1;
+                }
+                self.set_member(target, length_key, Value::Number(n as f64), module)?;
+                Ok(Value::Number(n as f64))
+            }
+            "pop" => {
+                if len == 0 {
+                    self.set_member(target, length_key, Value::Number(0.0), module)?;
+                    return Ok(Value::Undefined);
+                }
+                let new_len = len - 1;
+                let key = PropertyKey::element(&mut self.heap, new_len);
+                let element = self.get_member(target, &key, module)?;
+                if !self.delete_member(target, &key, module)? {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Cannot delete property '{new_len}'"
+                    )));
+                }
+                self.set_member(target, length_key, Value::Number(new_len as f64), module)?;
+                Ok(element)
+            }
+            "shift" => {
+                if len == 0 {
+                    self.set_member(target, length_key, Value::Number(0.0), module)?;
+                    return Ok(Value::Undefined);
+                }
+                let first_key = PropertyKey::element(&mut self.heap, 0);
+                let first = self.get_member(target, &first_key, module)?;
+                for k in 1..iter_len {
+                    let to_key = PropertyKey::element(&mut self.heap, k - 1);
+                    if let Some(value) = self.array_live_at(target, k as usize, module)? {
+                        self.set_member(target, to_key, value, module)?;
+                    } else if !self.delete_member(target, &to_key, module)? {
+                        return Err(RuntimeError::TypeError(format!(
+                            "Cannot delete property '{}'",
+                            k - 1
+                        )));
+                    }
+                }
+                let last_key = PropertyKey::element(&mut self.heap, iter_len - 1);
+                if !self.delete_member(target, &last_key, module)? {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Cannot delete property '{}'",
+                        iter_len - 1
+                    )));
+                }
+                self.set_member(target, length_key, Value::Number((len - 1) as f64), module)?;
+                Ok(first)
+            }
+            // `unshift`：从末尾往前搬，再在头部写入参数。
+            _ => {
+                if len as f64 + argc as f64 > MAX_SAFE as f64 {
+                    return Err(RuntimeError::TypeError(
+                        "unshift: the resulting length would be too large".to_string(),
+                    ));
+                }
+                let mut k = iter_len;
+                while k > 0 {
+                    let from_index = k - 1;
+                    let to_index = from_index + argc;
+                    let to_key = PropertyKey::element(&mut self.heap, to_index);
+                    if let Some(value) = self.array_live_at(target, from_index as usize, module)? {
+                        self.set_member(target, to_key, value, module)?;
+                    } else if !self.delete_member(target, &to_key, module)? {
+                        return Err(RuntimeError::TypeError(format!(
+                            "Cannot delete property '{to_index}'"
+                        )));
+                    }
+                    k -= 1;
+                }
+                for (j, value) in args.iter().enumerate() {
+                    let key = PropertyKey::element(&mut self.heap, j as u64);
+                    self.set_member(target, key, value.clone(), module)?;
+                }
+                let new_len = len + argc;
+                self.set_member(target, length_key, Value::Number(new_len as f64), module)?;
+                Ok(Value::Number(new_len as f64))
+            }
+        }
     }
 
     /// `Array.prototype.copyWithin(target, start, end)` (ES 23.1.3.3).
