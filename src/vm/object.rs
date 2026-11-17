@@ -1532,11 +1532,21 @@ impl JSObject for ArrayObject {
         }
 
         // 普通（非索引）属性
-        if let Some(existing) = self.properties.get(&key) {
+        if let Some(existing) = self.properties.get_mut(&key) {
+            if existing.is_accessor_descriptor() {
+                return Err(PropertyError::type_error("Cannot assign to accessor property"));
+            }
             if !existing.writable {
                 return Err(PropertyError::type_error("Cannot assign to read-only property"));
             }
-        } else if !self.header.is_extensible() {
+            // `[[Set]]` 只改**值**，保留原描述符的属性 —— 以前这里插入一份
+            // `data_descriptor`（三项都 true），于是
+            // `Array.prototype.reduce = f` 之后 `reduce` 变成可枚举，
+            // `8.12.5-3-b_1` 因此失败。
+            existing.value = value;
+            return Ok(true);
+        }
+        if !self.header.is_extensible() {
             return Err(PropertyError::type_error("Cannot add property to non-extensible array"));
         }
         self.properties

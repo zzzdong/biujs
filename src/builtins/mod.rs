@@ -552,7 +552,16 @@ impl crate::vm::gc::Trace for Builtins {
 impl Builtins {
     pub fn new(heap: &mut Heap) -> Self {
         let object_proto = new_proto(heap, None, "Object");
-        let array_proto = new_proto(heap, Some(object_proto), "Array");
+        // ES 23.1.3：`Array.prototype` **本身就是一个 Array exotic 对象**
+        // （`length` 为 0、没有索引）。以前用普通对象，于是
+        // `Array.isArray(Array.prototype)` 是 false、`Array.prototype.length`
+        // 是 `undefined`。与 `Boolean.prototype` / `Number.prototype` 是包装
+        // 对象同一类做法。
+        let array_proto = {
+            let mut proto = crate::vm::object::ArrayObject::new();
+            proto.set_prototype(Some(object_proto));
+            heap.alloc(Object::Array(proto))
+        };
         let error_proto = new_proto(heap, Some(object_proto), "Error");
         let type_error_proto = new_proto(heap, Some(error_proto), "TypeError");
         let reference_error_proto = new_proto(heap, Some(error_proto), "ReferenceError");
