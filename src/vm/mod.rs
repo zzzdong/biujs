@@ -1290,13 +1290,11 @@ impl VM {
         len: usize,
         module: &Module,
     ) -> Result<Option<Value>, RuntimeError> {
-        // Step 2-3: a receiver that is not an Array never consults species.
-        let is_array = match receiver {
-            Value::Object(obj_ref) => {
-                obj_ref.borrow().kind() == crate::vm::ObjectKind::Array
-            }
-            _ => false,
-        };
+        // Step 2-3: `IsArray(originalArray)` —— **看穿 Proxy**（ES 7.2.2 明确
+        // 递归到 target，revoked 抛 TypeError）。以前用 `kind() == Array`，
+        // 于是 `Array.prototype.concat.call(new Proxy([], {}))` 不走 species
+        // （`concat/create-proxy`），revoked 也不抛（`create-revoked-proxy`）。
+        let is_array = self.is_array_including_proxies(receiver, module)?;
         if !is_array {
             return self.array_species_ordinary(len);
         }
