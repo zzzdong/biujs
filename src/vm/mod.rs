@@ -6116,7 +6116,62 @@ impl VM {
         }
         if let Some(kind) = crate::builtins::typedarray::kind_from_name(name) {
             let proto = self.prototype_from_constructor(constructor_val, new_target);
-            return crate::builtins::typedarray::typedarray_construct(&mut self.heap, kind, args, proto);
+            // `new TA(items)`（ES 23.2.5.1）：`items` 是**可迭代**对象时走
+            // `GetIterator` + 逐次 `next()`，不是只读 `length`/下标 —— 内建层
+            // 的 `source_numbers` 只认后者，于是 `new Uint8Array(new Set([…]))`
+            // 与 `new Uint8Array(generator)` 一律得到长度 0（一整族 TypedArray
+            // 回调用例因此根本没跑回调）。
+            //
+            // 先把可迭代对象展开成一份临时的密集数组，再交给内建层统一做
+            // `ToNumber` + 分配缓冲区（数值转换与类型化写入已经有实现）。
+            let mut dispatch_args = args.to_vec();
+            if let Some(items) = args.first() {
+                let is_view_or_buffer = match items {
+                    Value::Object(obj_ref) => matches!(
+                        obj_ref.borrow().kind(),
+                        ObjectKind::TypedArray | ObjectKind::ArrayBuffer
+                    ),
+                    _ => false,
+                };
+                if !is_view_or_buffer && matches!(items, Value::Object(_) | Value::Function(_)) {
+                    let factory = self.get_member(items, &iterator_symbol_key(), module)?;
+                    if factory.is_callable() || matches!(factory, Value::Function(_)) {
+                        let iterator = self.make_iterator_with(items.clone(), factory, module)?;
+                        let _root_iterator = self.root(&iterator);
+                        let mut values = Vec::new();
+                        // 迭代步会调用用户 `next()`（可能分配 / GC），已收集的值
+                        // 必须全程是根。
+                        let mut keep = self.roots();
+                        loop {
+                            let step = match self.iterator_next(iterator.clone(), None, module) {
+                                Ok(step) => step,
+                                Err(err) => {
+                                    let _ = self.iterator_close(
+                                        iterator.clone(), None, true, module,
+                                    );
+                                    return Err(err);
+                                }
+                            };
+                            if step.1 {
+                                break;
+                            }
+                            keep.push(&step.0);
+                            values.push(step.0);
+                            if values.len() >= (1 << 24) {
+                                self.iterator_close(iterator.clone(), None, false, module)?;
+                                break;
+                            }
+                        }
+                        let source = Value::Object(self.heap.alloc(Object::Array(
+                            crate::vm::object::ArrayObject::from_vec(values),
+                        )));
+                        dispatch_args[0] = source;
+                    }
+                }
+            }
+            return crate::builtins::typedarray::typedarray_construct(
+                &mut self.heap, kind, &dispatch_args, proto,
+            );
         }
         // `new Date(...)` builds the object itself: `Date()` without `new`
         // answers a *string*, so `call_native` cannot serve both
