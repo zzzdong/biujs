@@ -37,9 +37,9 @@ functions 2:
     28: halt
   fn 1: start=29 end=36 exit=35 name="count" arity=0 flags=-
     29: addc rsp, rsp, 4
-    30: make_rest [rbp+0], 0
-    31: arguments [rbp+1]
+    30: arguments [rbp+0]
+    31: make_rest [rbp+1], 0
     32: mov [rbp+2], sym_1
-    33: prop_get [rbp+3], [rbp+0], 0
+    33: prop_get [rbp+3], [rbp+1], 0
     34: mov rv, [rbp+3]
     35: ret

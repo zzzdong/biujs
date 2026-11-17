@@ -18,18 +18,18 @@ functions 2:
     9: halt
   fn 1: start=10 end=33 exit=32 name="classify" arity=1 flags=-
     10: addc rsp, rsp, 9
-    11: mov [rbp+0], [rbp-1]
-    12: arguments [rbp+1]
+    11: arguments [rbp+0]
+    12: mov [rbp+1], [rbp-1]
     13: mov [rbp+2], sym_1
     14: br 1
-    15: seq [rbp+3], [rbp+0], 0
+    15: seq [rbp+3], [rbp+1], 0
     16: br_if [rbp+3], 12, 1
-    17: seq [rbp+4], [rbp+0], 1
+    17: seq [rbp+4], [rbp+1], 1
     18: br_if [rbp+4], 9, 4
     19: load_const [rbp+5], 1
     20: mov rv, [rbp+5]
     21: ret
-    22: seq [rbp+6], [rbp+0], 2
+    22: seq [rbp+6], [rbp+1], 2
     23: br_if [rbp+6], -4, 1
     24: load_const [rbp+7], 2
     25: mov rv, [rbp+7]

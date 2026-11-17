@@ -252,11 +252,11 @@ functions 5:
     229: halt
   fn 1: start=230 end=238 exit=237 name="Base" arity=1 flags=-
     230: addc rsp, rsp, 4
-    231: mov [rbp+0], [rbp-1]
-    232: arguments [rbp+1]
+    231: arguments [rbp+0]
+    232: mov [rbp+1], [rbp-1]
     233: mov [rbp+2], sym_1
     234: load_this [rbp+3]
-    235: prop_set [rbp+3], 2, [rbp+0]
+    235: prop_set [rbp+3], 2, [rbp+1]
     236: mov rv, undefined
     237: ret
   fn 2: start=238 end=245 exit=244 name="value" arity=0 flags=-
@@ -269,13 +269,13 @@ functions 5:
     244: ret
   fn 3: start=245 end=257 exit=256 name="Derived" arity=1 flags=derived-ctor
     245: addc rsp, rsp, 7
-    246: mov [rbp+0], [rbp-1]
-    247: arguments [rbp+1]
+    246: arguments [rbp+0]
+    247: mov [rbp+1], [rbp-1]
     248: mov [rbp+2], sym_3
     249: load_current_function [rbp+3]
     250: prop_get [rbp+4], [rbp+3], 15
     251: make_array [rbp+5]
-    252: array_push [rbp+5], [rbp+0]
+    252: array_push [rbp+5], [rbp+1]
     253: call_super_spread [rbp+4], undefined, [rbp+5]
     254: mov [rbp+6], rv
     255: mov rv, undefined

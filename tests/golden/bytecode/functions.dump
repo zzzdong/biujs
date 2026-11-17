@@ -30,19 +30,19 @@ functions 4:
     22: halt
   fn 1: start=23 end=31 exit=30 name="add" arity=2 flags=-
     23: addc rsp, rsp, 5
-    24: mov [rbp+0], [rbp-1]
-    25: mov [rbp+1], [rbp-2]
-    26: arguments [rbp+2]
+    24: arguments [rbp+0]
+    25: mov [rbp+1], [rbp-1]
+    26: mov [rbp+2], [rbp-2]
     27: mov [rbp+3], sym_1
-    28: addx [rbp+4], [rbp+0], [rbp+1]
+    28: addx [rbp+4], [rbp+1], [rbp+2]
     29: mov rv, [rbp+4]
     30: ret
   fn 2: start=31 end=41 exit=40 name="outer" arity=1 flags=-
     31: addc rsp, rsp, 5
     32: make_cell 0
-    33: mov [rbp+0], [rbp-1]
-    34: init_lexical 0, [rbp+0]
-    35: arguments [rbp+1]
+    33: arguments [rbp+0]
+    34: mov [rbp+1], [rbp-1]
+    35: init_lexical 0, [rbp+1]
     36: mov [rbp+2], sym_2
     37: closure_var 0, [rbp+3], 0
     38: make_func_obj [rbp+4], sym_3
@@ -50,10 +50,10 @@ functions 4:
     40: ret
   fn 3: start=41 end=49 exit=48 name="inner" arity=1 flags=-
     41: addc rsp, rsp, 5
-    42: mov [rbp+0], [rbp-1]
-    43: arguments [rbp+1]
+    42: arguments [rbp+0]
+    43: mov [rbp+1], [rbp-1]
     44: mov [rbp+2], sym_3
     45: load_env [rbp+3], 0
-    46: addx [rbp+4], [rbp+3], [rbp+0]
+    46: addx [rbp+4], [rbp+3], [rbp+1]
     47: mov rv, [rbp+4]
     48: ret

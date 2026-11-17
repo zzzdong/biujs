@@ -4122,6 +4122,32 @@ impl<'a> JSASTLower<'a> {
         func_lower.prepare_captured_locals(formal_params, body);
         func_lower.emit_captured_cells();
 
+        // `arguments` 必须在**参数默认值之前**建好：ES 10.2.11 的
+        // `FunctionDeclarationInstantiation` 先 `CreateUnmappedArgumentsObject`
+        // 并 `CreateMutableBinding("arguments")`，之后才
+        // `IteratorBindingInitialization` 求值默认值。所以
+        // `function f(a = arguments[0]) {}` 里 `arguments` 是可用的
+        // （`params-dflt-ref-arguments` 一族，14 条）。
+        //
+        // 它同样要**急切**绑定（不是首次使用时）：嵌套箭头函数克隆这份符号表，
+        // 靠它词法解析 `arguments`。
+        if !is_arrow {
+            let args_val = func_lower.builder.arguments_object();
+            if func_lower.is_captured_local("arguments") {
+                // A nested function reads `arguments` through the cell, so the
+                // object is stored there; the register is a placeholder.
+                func_lower.builder.init_lexical_name("arguments", args_val);
+                let dst = func_lower.builder.alloc();
+                func_lower
+                    .symbols
+                    .insert("arguments".to_string(), Variable::new(dst));
+            } else {
+                func_lower
+                    .symbols
+                    .insert("arguments".to_string(), Variable::new(args_val));
+            }
+        }
+
         // Load arguments and bind parameters. A parameter with an initializer
         // (default value) gets an `undefined` check: the initializer runs only
         // when the argument was not passed (or was passed as `undefined`).
@@ -4190,26 +4216,6 @@ impl<'a> JSASTLower<'a> {
         if let Some(rest) = formal_params.rest.as_deref() {
             let rest_args = func_lower.builder.make_rest(params.len());
             func_lower.bind_pattern(&rest.rest.argument, rest_args, false);
-        }
-
-        // Every ordinary function (`...args`): binds a fresh array of every argument `arguments` binding. It has to be
-        // installed eagerly (not on first use) so that nested arrow functions,
-        // which clone this symbol table, resolve `arguments` lexically.
-        if !is_arrow {
-            let args_val = func_lower.builder.arguments_object();
-            if func_lower.is_captured_local("arguments") {
-                // A nested function reads `arguments` through the cell, so the
-                // object is stored there; the register is a placeholder.
-                func_lower.builder.init_lexical_name("arguments", args_val);
-                let dst = func_lower.builder.alloc();
-                func_lower
-                    .symbols
-                    .insert("arguments".to_string(), Variable::new(dst));
-            } else {
-                func_lower
-                    .symbols
-                    .insert("arguments".to_string(), Variable::new(args_val));
-            }
         }
 
         // A generator binds its parameters — and builds `arguments` — when it is

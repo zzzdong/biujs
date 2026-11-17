@@ -1429,6 +1429,9 @@ pub fn call_static_method(
         "Object.setPrototypeOf" => object::object_set_prototype_of(args),
         "Object.getOwnPropertyNames" => object::object_get_own_property_names(heap, args),
         "Object.getOwnPropertySymbols" => object::object_get_own_property_symbols(heap, args),
+        "Object.getOwnPropertyDescriptors" => {
+            object::object_get_own_property_descriptors(heap, args)
+        }
         "Object.getOwnPropertyDescriptor" => {
             object::object_get_own_property_descriptor(heap, args)
         }

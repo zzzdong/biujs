@@ -248,6 +248,38 @@ pub fn object_get_own_property_descriptor(
     Ok(descriptor_to_value(heap, borrowed.property_get(&key)))
 }
 
+/// `Object.getOwnPropertyDescriptors(O)` (ES 20.1.2.9)。
+///
+/// `OwnPropertyKeys(O)` 逐个取自有描述符，`FromPropertyDescriptor` 之后
+/// `CreateDataProperty` 到结果对象上 —— 于是结果里没有 `undefined` 的项
+/// （不可见的键直接跳过）。
+pub fn object_get_own_property_descriptors(
+    heap: &mut super::Heap,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let obj_val = super::to_object(heap, args.first().unwrap_or(&Value::Undefined))?;
+    let Value::Object(obj) = &obj_val else {
+        return Err(RuntimeError::TypeError(
+            "Object.getOwnPropertyDescriptors: first argument must be an object".to_string(),
+        ));
+    };
+    let keys = obj.borrow().own_keys();
+    let mut out = crate::vm::object::OrdinaryObject::with_optional_prototype(
+        crate::builtins::wrapper_prototype("Object"),
+    );
+    for key in keys {
+        let desc = obj.borrow().property_get(&key);
+        let Some(desc) = desc else { continue };
+        let value = descriptor_to_value(heap, Some(desc));
+        let _ = out.define_property(
+            heap,
+            key,
+            PropertyDescriptor::data_descriptor(value),
+        );
+    }
+    Ok(Value::Object(heap.alloc(super::Object::Ordinary(out))))
+}
+
 /// A `PropertyDescriptor` as the object `Object.getOwnPropertyDescriptor` (and
 /// `Reflect.getOwnPropertyDescriptor`) answers. `None` becomes `undefined`.
 pub fn descriptor_to_value(

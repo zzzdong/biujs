@@ -28,13 +28,13 @@ functions 2:
     18: halt
   fn 1: start=19 end=30 exit=29 name="tag" arity=2 flags=-
     19: addc rsp, rsp, 8
-    20: mov [rbp+0], [rbp-1]
-    21: mov [rbp+1], [rbp-2]
-    22: arguments [rbp+2]
+    20: arguments [rbp+0]
+    21: mov [rbp+1], [rbp-1]
+    22: mov [rbp+2], [rbp-2]
     23: mov [rbp+3], sym_1
-    24: index_get [rbp+4], [rbp+0], 0
-    25: addx [rbp+5], [rbp+4], [rbp+1]
-    26: index_get [rbp+6], [rbp+0], 1
+    24: index_get [rbp+4], [rbp+1], 0
+    25: addx [rbp+5], [rbp+4], [rbp+2]
+    26: index_get [rbp+6], [rbp+1], 1
     27: addx [rbp+7], [rbp+5], [rbp+6]
     28: mov rv, [rbp+7]
     29: ret
