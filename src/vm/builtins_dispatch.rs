@@ -410,6 +410,19 @@ impl VM {
                 Value::Object(_) | Value::Function(_) => this.clone(),
                 other => crate::builtins::to_object(&mut self.heap, other)?,
             };
+            // `Array.prototype.toString()`（ES 23.1.3.37）：`Get(O, "join")`，
+            // 可调用就 `Call(join, O)`，否则回落到 `Object.prototype.toString`
+            // —— 于是 `Array.prototype.toString.call(true)` 是 `[object Boolean]`
+            // 而不是 `"true"`，自定义 `join` 的抛出也照样传播
+            // （`S15.4.4.2_A1_T4`）。
+            if method == "toString" {
+                let join_key = PropertyKey::intern(&mut self.heap, "join");
+                let join = self.get_member(&receiver, &join_key, module)?;
+                if join.is_callable() || matches!(join, Value::Function(_)) {
+                    return self.invoke(&join, receiver.clone(), &[], module);
+                }
+                return crate::builtins::object_prototype_to_string(&receiver, &[]);
+            }
             // `concat` 需要 `ArraySpeciesCreate` + `IsConcatSpreadable`
             // （Proxy 的 `IsArray`、用户 `valueOf`、`2**53-1` 的 TypeError），
             // 内建层那份做不到 —— `Array.prototype.concat.call(obj, …)` 走这里。
@@ -2181,8 +2194,11 @@ impl VM {
                 other => crate::builtins::to_object(&mut self.heap, other)
                     .unwrap_or_else(|_| other.clone()),
             };
+            // 真实长度（不截到 1<<24）：`a[4294967294] = 2; a.lastIndexOf(2)`
+            // 要答 4294967294。这两个方法的扫描从 `fromIndex` 开始而不是从 0，
+            // 所以大长度本身不贵（`15.4.4.15-8-9` 一族把匹配放在末尾）。
             return self
-                .array_index_of_live(&target, len, method, args, module)
+                .array_index_of_live(&target, len_raw.min(usize::MAX as u64) as usize, method, args, module)
                 .map(Some);
         }
 
