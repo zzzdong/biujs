@@ -974,7 +974,9 @@ impl VM {
                     let (target, _handler) = self.proxy_parts(value, "IsArray")?;
                     return self.is_array_including_proxies(&target, module);
                 }
-                Ok(obj_ref.borrow().kind() == ObjectKind::Array)
+                let borrowed = obj_ref.borrow();
+                // rguments 在本引擎里是 ArrayObject，但 IsArray 必须是 false。
+                Ok(matches!(borrowed.as_array(), Some(arr) if !arr.is_arguments()))
             }
             _ => Ok(false),
         }

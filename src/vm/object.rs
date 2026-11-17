@@ -1013,9 +1013,23 @@ pub struct ArrayObject {
     /// Array `length` starts writable; `Object.defineProperty(arr, "length",
     /// {writable: false})` can freeze it.
     length_writable: bool,
+    /// 这是 `arguments` 对象（引擎用 `ArrayObject` 承载它的 `length` + 索引）。
+    ///
+    /// 两个可观察差别：`Object.prototype.toString` 答 `[object Arguments]`，
+    /// 而 **`Array.isArray(arguments)` 是 false**（`IsArray` 只认 Array exotic）。
+    is_arguments: bool,
 }
 
 impl ArrayObject {
+    /// 标成 arguments 对象：见 `is_arguments` 字段的文档。
+    pub fn mark_arguments(&mut self) {
+        self.is_arguments = true;
+    }
+
+    pub fn is_arguments(&self) -> bool {
+        self.is_arguments
+    }
+
     pub fn new() -> Self {
         Self::with_length(0)
     }
@@ -1029,6 +1043,7 @@ impl ArrayObject {
             properties: PropertyTable::new(),
             holes: std::collections::BTreeSet::new(),
             length_writable: true,
+            is_arguments: false,
             // Arrays created by the engine (literals, `Array(...)`, `map`,
             // `slice`, …) inherit from `Array.prototype` unconditionally.
             header: ObjectHeader::with_optional_prototype(crate::builtins::wrapper_prototype("Array")),
@@ -1797,7 +1812,8 @@ impl JSObject for ArrayObject {
     }
 
     fn class_name(&self) -> &'static str {
-        "Array"
+        // `arguments` 借 `ArrayObject` 承载，但它的类名不是 Array。
+        if self.is_arguments { "Arguments" } else { "Array" }
     }
 
     fn to_primitive(&self, _hint: &str) -> Result<Value, String> {

@@ -2555,6 +2555,8 @@ impl VM {
                 let from = immd(&from, "MakeRest from")?.max(0) as usize;
                 let argc = self.current_argc();
                 let rbp = self.state.rbp as isize;
+                // rest 参数是**真数组**（`Array.isArray(rest)` 必须 true），
+                // 不要标成 arguments。
                 let mut arr = ArrayObject::new();
                 if argc > from {
                     for i in from..argc {
@@ -2883,6 +2885,9 @@ impl VM {
                 let argc = self.current_argc();
                 let rbp = self.state.rbp;
                 let mut arr = ArrayObject::new();
+                // arguments 不是数组：Object.prototype.toString 答 [object Arguments]，
+                // Array.isArray(arguments) 是 false。
+                arr.mark_arguments();
                 for i in 0..argc {
                     // `load_arg(i)` reads `[rbp - (i + 1)]`, so `arguments[i]`
                     // must use exactly the same slot.
@@ -2898,25 +2903,9 @@ impl VM {
                     };
                     arr.push(val);
                 }
+                // 类名由 `ArrayObject::is_arguments` 决定（`[object Arguments]`，
+                // 且 `Array.isArray(arguments)` 是 false），不需要额外的属性。
                 let obj = Value::Object(self.heap.alloc(Object::Array(arr)));
-                // `Object.prototype.toString.call(arguments)` 必须是
-                // `[object Arguments]`（ES 20.1.3.6 走内部的 `[[Class]]` 槽）。
-                // 本引擎没有那个槽，挂一个**非枚举**的 `@@toStringTag` 等效 ——
-                // `Object.keys` / `for-in` / `getOwnPropertyNames` 都看不到它。
-                if let Value::Object(obj_ref) = &obj {
-                    let _ = obj_ref.borrow_mut().define_property(
-                        &mut self.heap,
-                        crate::builtins::to_string_tag_symbol_key(),
-                        crate::vm::property::PropertyDescriptor {
-                            value: Value::string("Arguments"),
-                            writable: false,
-                            enumerable: false,
-                            configurable: true,
-                            getter: None,
-                            setter: None,
-                        },
-                    );
-                }
                 self.set_value(dst, obj)?;
             }
             Instr::StoreEnv { name, value } => {
