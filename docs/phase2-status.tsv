@@ -1,6 +1,6 @@
 # 阶段二基线快照 —— 由 scripts/phase2-status.sh --update 生成
 # 格式：suite<TAB>passed<TAB>skipped<TAB>failed
-# 最近更新：2026-11-16
+# 最近更新：2026-11-17
 # guards: timeout 0 step-limit 0 memory 0 (TEST262_TIMEOUT_MS=15000 TEST262_STEP_LIMIT=0 TEST262_MEMORY_MB=384)
 language/statements/for-of	608	97	46
 language/statements/for-in	71	30	14
@@ -76,7 +76,7 @@ language/statements/function	325	121	5
 language/statements/switch	51	54	6
 language/statements/while	25	13	0
 language/literals/string	53	20	0
-built-ins/Array	2535	453	93
+built-ins/Array	2559	453	69
 built-ins/JSON	123	29	13
 built-ins/WeakSet	77	8	0
 built-ins/Number	264	38	38
@@ -105,5 +105,5 @@ language/computed-property-names	42	0	6
 built-ins/Boolean	48	3	0
 built-ins/Map	153	51	0
 built-ins/TypedArray	368	772	306
-built-ins/Object	3127	143	141
+built-ins/Object	3129	143	139
 built-ins/String	985	168	70

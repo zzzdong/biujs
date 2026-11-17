@@ -2899,6 +2899,24 @@ impl VM {
                     arr.push(val);
                 }
                 let obj = Value::Object(self.heap.alloc(Object::Array(arr)));
+                // `Object.prototype.toString.call(arguments)` 必须是
+                // `[object Arguments]`（ES 20.1.3.6 走内部的 `[[Class]]` 槽）。
+                // 本引擎没有那个槽，挂一个**非枚举**的 `@@toStringTag` 等效 ——
+                // `Object.keys` / `for-in` / `getOwnPropertyNames` 都看不到它。
+                if let Value::Object(obj_ref) = &obj {
+                    let _ = obj_ref.borrow_mut().define_property(
+                        &mut self.heap,
+                        crate::builtins::to_string_tag_symbol_key(),
+                        crate::vm::property::PropertyDescriptor {
+                            value: Value::string("Arguments"),
+                            writable: false,
+                            enumerable: false,
+                            configurable: true,
+                            getter: None,
+                            setter: None,
+                        },
+                    );
+                }
                 self.set_value(dst, obj)?;
             }
             Instr::StoreEnv { name, value } => {
@@ -3202,6 +3220,8 @@ impl VM {
                             // `@@iterator` / `mapfn`、逐元素 `CreateDataProperty`。
                             | "Array.from"
                             | "Array.of"
+                            // `IsArray` 要看穿 Proxy（revoked 是 TypeError）。
+                            | "Array.isArray"
                     );
                     if !vm_handled_static {
                         // A missing static falls through to the prototype chain,

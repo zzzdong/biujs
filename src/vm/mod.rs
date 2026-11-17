@@ -950,8 +950,14 @@ impl VM {
             _ => len_value,
         };
         let len = crate::builtins::to_number_throwing(&len_value)?;
-        if !len.is_finite() || len <= 0.0 {
+        // `ToLength`：NaN / 负数 → 0，`+∞` → **2**53-1**（不是 0）——
+        // `map.call({length: Infinity}, …)` 要拿 2^53-1 去 `ArraySpeciesCreate`，
+        // 于是抛 RangeError（`map/15.4.4.19-3-8`）。
+        if len.is_nan() || len <= 0.0 {
             return Ok(0);
+        }
+        if len.is_infinite() {
+            return Ok(9_007_199_254_740_991);
         }
         Ok(len.min(9_007_199_254_740_991.0) as u64)
     }

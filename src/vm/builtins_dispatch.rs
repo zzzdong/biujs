@@ -629,6 +629,13 @@ impl VM {
                     crate::builtins::string_from_code_point(&converted)
                 };
             }
+            // `Array.isArray(value)`（ES 23.1.2.2）：`IsArray` 要**看穿 Proxy**
+            // （`Array.isArray(new Proxy([], {}))` 是 true，revoked 是 TypeError），
+            // 内建层只看 `kind()`。
+            if name == "Array.isArray" {
+                let target = args.first().cloned().unwrap_or(Value::Undefined);
+                return Ok(Value::Bool(self.is_array_including_proxies(&target, module)?));
+            }
             // `Array.from` / `Array.of`：`C = this`、`@@iterator` 协议、`mapfn`、
             // 逐元素 `CreateDataPropertyOrThrow` —— 全都只有 VM 能做。
             if name == "Array.from" {
@@ -2078,6 +2085,9 @@ impl VM {
             "pop",
             "shift",
             "unshift",
+            // `fill(value, start, end)` 是逐下标 `Set(O, k, value, true)`
+            // （空位也写），且长度 / 索引的转换都要能抛。
+            "fill",
             // `toLocaleString` 要**调用每个元素自己的** `toLocaleString`
             // （用户代码），内建层只能 `to_js_string()`。
             "toLocaleString",
@@ -2128,7 +2138,9 @@ impl VM {
         }
         // 只取 length：元素在每一步重新 `HasProperty` + `[[Get]]`
         // （`array_live_at`），物化整张清单会让访问器元素被调用两次。
-        let len = match self.array_like_length(receiver, module) {
+        // 一次读**真实长度**（u64），再派生出截断后的迭代预算 —— 读两次会让
+        // 计数的 `length` getter 多看到一次。
+        let len_raw = match self.array_like_length_raw(receiver, module) {
             Ok(len) => len,
             // 接收者**不是**类数组（`filter.call(undefined, …)`、字符串包装）：
             // 让调用方继续走普通分派，由那里报 TypeError。
@@ -2139,6 +2151,15 @@ impl VM {
             // 不能吞掉（`copyWithin/return-abrupt-from-this-length-as-symbol`）。
             Err(err) => return Err(err),
         };
+        // 会 `ArraySpeciesCreate(O, len)` 的方法：`len > 2**32-1` 是 RangeError
+        // （`map/15.4.4.19-3-8`：`{0: 9, length: Infinity}`）。
+        const SPECIES_METHODS: &[&str] = &[
+            "map", "filter", "flatMap", "flat", "toReversed", "toSorted", "toSpliced", "with",
+        ];
+        if SPECIES_METHODS.contains(&method) && len_raw > 0xFFFF_FFFF {
+            return Err(RuntimeError::RangeError("Invalid array length".to_string()));
+        }
+        let len = len_raw.min(1 << 24) as usize;
 
         // `indexOf` / `lastIndexOf` take a search element, not a callback, and
         // must not hit the callable check below. Strings keep their own
@@ -2213,6 +2234,34 @@ impl VM {
                 out.push_str(&crate::builtins::to_string_throwing(&piece)?);
             }
             return Ok(Some(Value::string(&out)));
+        }
+
+        // `fill(value, start, end)`（ES 23.1.3.7）：逐下标 `Set(O, k, value, true)`。
+        if method == "fill" {
+            if !self.receiver_is_array_like(receiver) {
+                return Ok(None);
+            }
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            // 真实长度：`fill` 的**跨度**可能很小但下标很大
+            // （`fill.call({length: 2**53-1}, v, 2**53-4, 2**53-1)` 只写三个）。
+            let len_i = len_raw as i64;
+            let start = self.relative_index_arg(args.get(1), 0, len_i, module)?;
+            let end = match args.get(2) {
+                None | Some(Value::Undefined) => len_i,
+                Some(_) => self.relative_index_arg(args.get(2), len_i, len_i, module)?,
+            };
+            // 跨度过大就拒绝，而不是静默截断或真写几十亿个下标
+            // （`absurd_lengths_do_not_allocate` 要求 RangeError）。
+            if end.saturating_sub(start) > (1 << 24) {
+                return Err(RuntimeError::RangeError(
+                    "fill: the range is too large".to_string(),
+                ));
+            }
+            for k in start..end {
+                let key = PropertyKey::element(&mut self.heap, k as u64);
+                self.set_member(receiver, key, value.clone(), module)?;
+            }
+            return Ok(Some(receiver.clone()));
         }
 
         // 栈族：`push` / `pop` / `shift` / `unshift`（ES 23.1.3.20 / .17 / .22 / .29）。
@@ -3102,6 +3151,13 @@ impl VM {
             Some(_) => self.relative_index_arg(args.get(2), len_i, len_i, module)?,
         };
         let count = (final_index - from).min(len_i - to).max(0);
+        // 跨度过大同样拒绝：`copyWithin.call({length: 2**53-1}, 0)` 的 count
+        // 是 2**53-1，真跑就是几十亿次属性操作（与 `fill` 同一个理由）。
+        if count > (1 << 24) {
+            return Err(RuntimeError::RangeError(
+                "copyWithin: the range is too large".to_string(),
+            ));
+        }
         // 第 8/9 步的 `direction`：区间重叠且 `to > from` 时必须**倒着**拷，
         // 否则边读边写会把自己覆盖掉 —— `[0,1,2,3].copyWithin(1, 0)` 的前向
         // 循环会得到 `[0,0,0,0]`，规范要的是 `[0,0,1,2]`（memmove 语义）。
