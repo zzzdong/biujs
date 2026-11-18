@@ -1683,6 +1683,8 @@ impl VM {
             "toSorted",
             // `sort` 原地排序（比较器可选），行为上更接近这一族
             "sort",
+            // `%TypedArray%.prototype.toLocaleString` 要逐个 Invoke 元素的同名方法
+            "toLocaleString",
         ];
         if !TA_CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -1738,6 +1740,29 @@ impl VM {
 
         let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
         match method {
+            // ES 23.2.3.28（同 Array.prototype.toLocaleString）：逐元素
+            // `Invoke(element, "toLocaleString")` 再 `ToString`。内建层那份
+            // 只做 `to_js_string()`，用户的 Number.prototype.toLocaleString
+            // 抛错看不到（6 条 return-abrupt-from-* 用例）。
+            "toLocaleString" => {
+                if elements.is_empty() {
+                    return Ok(Some(Value::string("")));
+                }
+                let locale_key = PropertyKey::intern(&mut self.heap, "toLocaleString");
+                let mut out = String::new();
+                for (i, e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    if e.is_undefined() || matches!(e, Value::Null) {
+                        continue;
+                    }
+                    let method_value = self.get_member(e, &locale_key, module)?;
+                    let piece = self.invoke(&method_value, e.clone(), &[], module)?;
+                    out.push_str(&crate::builtins::to_string_throwing(&piece)?);
+                }
+                return Ok(Some(Value::string(&out)));
+            }
             "forEach" => {
                 for (i, e) in elements.iter().enumerate() {
                     self.invoke(
