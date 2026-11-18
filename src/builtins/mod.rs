@@ -2406,6 +2406,16 @@ pub fn mark_prototype_method(proto: &Gc<Object>, heap: &mut Heap, name: &str) {
     });
 }
 
+/// 同上，但带上规范的 `length`（Annex B 的 `__defineGetter__` / `__lookupGetter__`
+/// 一族分别是 2 / 1；默认 0 会让 `*.length` 用例失败）。
+pub fn mark_prototype_method_arity(proto: &Gc<Object>, heap: &mut Heap, name: &str, arity: usize) {
+    set_prototype_method_arity(proto, heap, name, arity, |_, _| {
+        Err(RuntimeError::NotImplemented(
+            "method implemented by the VM".to_string(),
+        ))
+    });
+}
+
 pub fn is_native_function(val: &Value) -> bool {
     match val {
         Value::Object(obj_ref) => obj_ref.borrow().kind() == ObjectKind::NativeFunction,

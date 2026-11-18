@@ -1024,7 +1024,7 @@ pub fn object_define_accessor(
         Some(other) => PropertyKey::intern(heap, &other.to_js_string()),
         None => PropertyKey::intern(heap, "undefined"),
     };
-    let desc = PropertyDescriptor {
+    let mut desc = PropertyDescriptor {
         value: Value::Undefined,
         writable: false,
         enumerable: true,
@@ -1035,6 +1035,18 @@ pub fn object_define_accessor(
     let Value::Object(obj_ref) = target else {
         return Ok(Value::Undefined);
     };
+    // `DefinePropertyOrThrow` 的 ValidateAndApply：描述符里**没写**的那一半
+    // 要从当前自有描述符继承。先有 get+set 的 accessor 再
+    // `__defineGetter__` 时，原来的 setter 必须还在（`define-existing`）。
+    if let Some(existing) = obj_ref.borrow().property_get(&key)
+        && existing.is_accessor_descriptor()
+    {
+        if want_getter {
+            desc.setter = existing.setter;
+        } else {
+            desc.getter = existing.getter;
+        }
+    }
     obj_ref
         .borrow_mut()
         .define_property(heap, key, desc)
@@ -1083,11 +1095,11 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
     // "方法不存在时静默返回 undefined" 的 bug 顺带跑过的（测试因此假绿），
     // `obj.missing()` 修正为抛 TypeError 之后必须真正实现它们。
     // 实现要 heap（原语接收者需装箱），住在 `call_prototype_method` 的分派里。
-    super::mark_prototype_method(proto, heap, "__lookupGetter__");
-    super::mark_prototype_method(proto, heap, "__lookupSetter__");
+    super::mark_prototype_method_arity(proto, heap, "__lookupGetter__", 1);
+    super::mark_prototype_method_arity(proto, heap, "__lookupSetter__", 1);
     // ES B.2.2.2 / B.2.2.3：对称的 define 一半（以前**完全没注册**）。
-    super::mark_prototype_method(proto, heap, "__defineGetter__");
-    super::mark_prototype_method(proto, heap, "__defineSetter__");
+    super::mark_prototype_method_arity(proto, heap, "__defineGetter__", 2);
+    super::mark_prototype_method_arity(proto, heap, "__defineSetter__", 2);
     set_prototype_method(proto, heap, "toLocaleString", |this, args| {
         object_prototype_to_string(this, args)
     });
