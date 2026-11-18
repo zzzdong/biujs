@@ -1685,6 +1685,9 @@ impl VM {
             "sort",
             // `%TypedArray%.prototype.toLocaleString` 要逐个 Invoke 元素的同名方法
             "toLocaleString",
+            // `set(source, offset)` 的 source 是类数组时，`length` / 每个下标 /
+            // 元素 ToNumber 都是可观察操作（getter 与 valueOf 要跑、Symbol 要抛）。
+            "set",
         ];
         if !TA_CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -1740,6 +1743,72 @@ impl VM {
 
         let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
         match method {
+            // ES 23.2.3.24 `%TypedArray%.prototype.set(source, offset)` 的
+            // 类数组分支：`Get(source, "length")` → `ToInteger(offset)` →
+            // 逐下标 `Get` + `ToNumber` → `Set(O, …, true)`。内建层用
+            // `source_numbers()` 只查自有描述符，getter / valueOf 全看不到。
+            "set" => {
+                let source = args.first().cloned().unwrap_or(Value::Undefined);
+                if !matches!(source, Value::Object(_) | Value::Function(_)) {
+                    return Err(RuntimeError::TypeError(
+                        "TypedArray.prototype.set: source is not array-like".to_string(),
+                    ));
+                }
+                // 先读 source 的 length（`array_like_length_raw` 走 `[[Get]]`，
+                // Symbol 长度是 TypeError），再转 offset —— 每次转换都跑用户代码。
+                let src_len = self.array_like_length_raw(&source, module)?.min(1 << 24);
+                let offset = self.to_integer_or_infinity_arg(args.get(1), 0, module)?;
+                if offset < 0 {
+                    return Err(RuntimeError::RangeError("Invalid offset".to_string()));
+                }
+                // ES 第 4/7 步：offset 的转换跑完用户代码后要复查 detachment。
+                let detached = |vm: &Self, value: &Value| -> bool {
+                    match value {
+                        Value::Object(o) => o
+                            .borrow()
+                            .as_typed_array()
+                            .is_some_and(|ta| ta.is_detached()),
+                        _ => false,
+                    }
+                };
+                if detached(self, &source) || detached(self, receiver) {
+                    return Err(RuntimeError::TypeError(
+                        "set: a viewed ArrayBuffer was detached".to_string(),
+                    ));
+                }
+                let mut values = Vec::with_capacity(src_len as usize);
+                let mut keep = self.roots();
+                for k in 0..src_len {
+                    let key = PropertyKey::element(&mut self.heap, k);
+                    let value = self.get_member(&source, &key, module)?;
+                    keep.push(&value);
+                    let primitive = match &value {
+                        Value::Object(_) | Value::Function(_) => {
+                            self.to_primitive(&value, "number", module)?
+                        }
+                        other => other.clone(),
+                    };
+                    values.push(crate::builtins::to_number_throwing(&primitive)?);
+                }
+                let Value::Object(target_ref) = receiver else {
+                    return Ok(None);
+                };
+                {
+                    let ta = target_ref.borrow();
+                    let ta = ta.as_typed_array().expect("checked by caller");
+                    if (offset as u64).saturating_add(src_len) > ta.length as u64 {
+                        return Err(RuntimeError::RangeError(
+                            "Source is too large".to_string(),
+                        ));
+                    }
+                }
+                let mut ta = target_ref.borrow_mut();
+                let ta = ta.as_typed_array_mut().expect("checked by caller");
+                for (k, value) in values.into_iter().enumerate() {
+                    ta.set_element(offset as usize + k, Value::Number(value));
+                }
+                return Ok(Some(Value::Undefined));
+            }
             // ES 23.2.3.28（同 Array.prototype.toLocaleString）：逐元素
             // `Invoke(element, "toLocaleString")` 再 `ToString`。内建层那份
             // 只做 `to_js_string()`，用户的 Number.prototype.toLocaleString
