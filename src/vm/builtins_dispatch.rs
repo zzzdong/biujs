@@ -507,6 +507,15 @@ impl VM {
             );
         }
         if let Some(method) = name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
+            // Annex B 的四个访问器方法必须走 VM：`ToPropertyKey` 会跑用户的
+            // `toString`，而 `defineProperty` / `getOwnPropertyDescriptor` /
+            // `getPrototypeOf` 三只 Proxy trap 都要能被观察到并原样传播。
+            if matches!(
+                method,
+                "__defineGetter__" | "__defineSetter__" | "__lookupGetter__" | "__lookupSetter__"
+            ) {
+                return self.object_accessor_method(&this, method, args, module);
+            }
             // `f.call` / `f.apply` / `f.bind` are the same operations as the
             // `CallMethod` opcode path handles; they must work identically when
             // the method value is fetched first (`Function.prototype.call.bind(…)`).
@@ -2936,6 +2945,143 @@ impl VM {
             .flatten()
             .is_some(),
             _ => false,
+        }
+    }
+
+    /// Annex B.2.2 `Object.prototype.__{define,lookup}{Getter,Setter}__`。
+    ///
+    /// 四件事只有 VM 能做：`ToPropertyKey(key)` 跑用户 `toString`；define
+    /// 走 Proxy 的 `defineProperty` trap；lookup 的每一跳都要走 Proxy 的
+    /// `getOwnPropertyDescriptor` / `getPrototypeOf` trap（trap 抛原样传播）。
+    fn object_accessor_method(
+        &mut self,
+        this: &Value,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::property::PropertyDescriptor;
+        // 名字形如 __defineGetter__（尾部也有下划线），不能直接 ends_with。
+        let want_getter = method.trim_end_matches('_').ends_with("Getter");
+        let defining = method.starts_with("__define");
+        crate::builtins::require_object_coercible(this)?;
+        let get_key = PropertyKey::intern(&mut self.heap, "get");
+        let set_key = PropertyKey::intern(&mut self.heap, "set");
+        let obj = match this {
+            Value::Object(_) | Value::Function(_) => this.clone(),
+            other => crate::builtins::to_object(&mut self.heap, other)?,
+        };
+
+        if defining {
+            // ES B.2.2.2 第 2 步：accessor 的 callable 检查**在** ToPropertyKey
+            // 之前 —— 不可调用时连 `key.toString` 都不该跑
+            // （`getter-non-callable` 断言 `toStringCount === 0`）。
+            let accessor = args.get(1).cloned().unwrap_or(Value::Undefined);
+            if !accessor.is_callable() && !matches!(accessor, Value::Function(_)) {
+                return Err(RuntimeError::TypeError(format!(
+                    "{method}: accessor must be callable"
+                )));
+            }
+        }
+
+        let key_arg = args.first().cloned().unwrap_or(Value::Undefined);
+        let key_value = self.to_property_key_value(&key_arg, module)?;
+        let key = crate::builtins::reflect::to_key(&mut self.heap, &key_value);
+
+        if defining {
+            let accessor = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let mut desc = PropertyDescriptor {
+                value: Value::Undefined,
+                writable: false,
+                enumerable: true,
+                configurable: true,
+                getter: want_getter.then(|| accessor.clone()),
+                setter: (!want_getter).then(|| accessor),
+            };
+            // ValidateAndApply：没写的那一半从当前自有描述符继承。
+            if let Value::Object(obj_ref) = &obj {
+                if let Some(old) = obj_ref.borrow().property_get(&key)
+                    && old.is_accessor_descriptor()
+                {
+                    if want_getter {
+                        desc.setter = old.setter;
+                    } else {
+                        desc.getter = old.getter;
+                    }
+                }
+            }
+            if let Value::Object(obj_ref) = &obj {
+                if obj_ref.borrow().is_proxy() {
+                    let desc_value =
+                        crate::builtins::descriptor_to_value(&mut self.heap, Some(desc));
+                    self.proxy_static_trap(
+                        "Object.defineProperty",
+                        &[obj.clone(), key_value, desc_value],
+                        module,
+                    )?;
+                } else {
+                    obj_ref
+                        .borrow_mut()
+                        .define_property(&mut self.heap, key, desc)
+                        .map_err(|_| {
+                            RuntimeError::TypeError(format!("{method}: cannot define property"))
+                        })?;
+                }
+            }
+            return Ok(Value::Undefined);
+        }
+
+        let mut current = obj;
+        loop {
+            let mut desc_value: Option<Value> = None;
+            if let Value::Object(obj_ref) = &current {
+                let is_proxy = obj_ref.borrow().is_proxy();
+                if is_proxy {
+                    if let Some((target, handler, trap)) =
+                        self.proxy_trap(&current, "getOwnPropertyDescriptor", module)?
+                    {
+                        let answered =
+                            self.invoke(&trap, handler, &[target, key_value.clone()], module)?;
+                        if !answered.is_undefined() {
+                            desc_value = Some(answered);
+                        }
+                    } else if let Some(desc) = obj_ref.borrow().property_get(&key) {
+                        desc_value =
+                            Some(crate::builtins::descriptor_to_value(&mut self.heap, Some(desc)));
+                    }
+                } else if let Some(desc) = obj_ref.borrow().property_get(&key) {
+                    desc_value = Some(crate::builtins::descriptor_to_value(&mut self.heap, Some(desc)));
+                }
+            }
+            if let Some(desc_value) = desc_value {
+                let getter = self.get_member(&desc_value, &get_key, module)?;
+                let setter = self.get_member(&desc_value, &set_key, module)?;
+                if !getter.is_undefined() || !setter.is_undefined() {
+                    return Ok(if want_getter { getter } else { setter });
+                }
+                // 数据描述符让查找**停下**并返回 undefined，不会继续上原型链。
+                return Ok(Value::Undefined);
+            }
+            let next = match &current {
+                Value::Object(obj_ref) => {
+                    let is_proxy = obj_ref.borrow().is_proxy();
+                    if is_proxy {
+                        match self.proxy_trap(&current, "getPrototypeOf", module)? {
+                            Some((target, handler, trap)) => {
+                                Some(self.invoke(&trap, handler, &[target], module)?)
+                            }
+                            None => obj_ref.borrow().get_prototype().map(Value::Object),
+                        }
+                    } else {
+                        obj_ref.borrow().get_prototype().map(Value::Object)
+                    }
+                }
+                _ => None,
+            };
+            match next {
+                None | Some(Value::Null) => return Ok(Value::Undefined),
+                Some(next) => current = next,
+            }
         }
     }
 

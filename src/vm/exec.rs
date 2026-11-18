@@ -3312,12 +3312,11 @@ impl VM {
                     // 用户 `toString` / `Symbol.toPrimitive`）。
                     let key_first = matches!(
                         method_name.as_str(),
-                        "hasOwnProperty"
-                            | "propertyIsEnumerable"
-                            | "__defineGetter__"
-                            | "__defineSetter__"
-                            | "__lookupGetter__"
-                            | "__lookupSetter__"
+                        "hasOwnProperty" | "propertyIsEnumerable"
+                        // Annex B 四个方法不再在这里预转换：它们的
+                        // `ToPropertyKey` 由 `object_accessor_method` 自己做，
+                        // 且 `__define*` 的 callable 检查**先于** key 转换
+                        // （`getter-non-callable` 要求 toStringCount === 0）。
                     );
                     let dispatch_args: &[Value] = if key_first && !args.is_empty() {
                         let mut v = args.clone();
