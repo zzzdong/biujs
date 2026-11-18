@@ -642,6 +642,23 @@ impl VM {
                     crate::builtins::string_from_code_point(&converted)
                 };
             }
+            // `Object.prototype.toLocaleString`（ES 20.1.3.4）：`Get(O,
+            // "toString")` 后**用原始 this 值**调用它 —— 严格模式下
+            // `true.toLocaleString()` 的 `this` 必须是布尔原语
+            // （`primitive_this_value` 把 `Boolean.prototype.toString`
+            // 换成 `() => typeof this`）。内建层只会自己拆包装。
+            if name == "Object.prototype.toLocaleString" {
+                crate::builtins::require_object_coercible(&this)?;
+                let key = PropertyKey::intern(&mut self.heap, "toString");
+                let boxed = crate::builtins::to_object(&mut self.heap, &this)?;
+                let to_string = self.get_member(&boxed, &key, module)?;
+                if !to_string.is_callable() && !matches!(to_string, Value::Function(_)) {
+                    return Err(RuntimeError::TypeError(
+                        "Object.prototype.toLocaleString: toString is not callable".to_string(),
+                    ));
+                }
+                return self.invoke(&to_string, this, &[], module);
+            }
             // test262 宿主 hook：`$262.detachArrayBuffer(buf)`（ES 25.1.2.1
             // 的内部 DetachArrayBuffer）。只有 runner 调用
             // `install_test_hosts()` 之后才会装上 `$262`，默认引擎不可见。

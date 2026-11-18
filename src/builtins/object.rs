@@ -903,15 +903,17 @@ pub fn object_has_own_property(
 /// `Object.prototype.isPrototypeOf(V)` — is `this` anywhere on `V`'s
 /// prototype chain?
 pub fn object_is_prototype_of(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    // ES 20.1.3.5: `ToObject(this)`, then walk V's chain — `null`/`undefined`
-    // receivers raise a TypeError instead of answering `false`.
+    // ES 20.1.3.3 第 1 步：V 不是对象就直接 false —— **先于** `ToObject(this)`。
+    // 所以 `Object.prototype.isPrototypeOf.call(null, 1)` 是 false 而不是
+    // TypeError（`null-this-and-primitive-arg-returns-false`）。
+    let Some(Value::Object(candidate)) = args.first() else {
+        return Ok(Value::Bool(false));
+    };
+    // 参数确实是对象时才要求 this 可强制转换。
     super::require_object_coercible(obj)?;
     let Value::Object(target) = obj else {
         // A primitive receiver has no object identity, so no object can have it
         // on its prototype chain.
-        return Ok(Value::Bool(false));
-    };
-    let Some(Value::Object(candidate)) = args.first() else {
         return Ok(Value::Bool(false));
     };
     let mut current = candidate.borrow().get_prototype();

@@ -352,15 +352,17 @@ impl VM {
             hint
         };
 
-        // ES 7.1.1 ToPrimitive step 2: an object with `Symbol.toPrimitive`
-        // converts through that method instead of OrdinaryToPrimitive, and a
-        // non-primitive result is a TypeError (no fallback to valueOf/toString).
+        // ES 7.1.1 ToPrimitive step 2 uses **GetMethod(input, @@toPrimitive)**,
+        // not a raw `[[Get]]`: `null` / `undefined` mean "absent" and fall
+        // through to OrdinaryToPrimitive, while any *other* non-callable value
+        // is a TypeError. Treating only `undefined` as absent broke
+        // `{ [Symbol.toPrimitive]: null, valueOf() { return 1 } }`.
         let exotic = self.get_member(
             val,
             &crate::builtins::to_primitive_symbol_key(),
             module,
         )?;
-        if !exotic.is_undefined() {
+        if !exotic.is_undefined() && !exotic.is_null() {
             if !exotic.is_callable() {
                 return Err(RuntimeError::TypeError(
                     "Symbol.toPrimitive is not a function".to_string(),
