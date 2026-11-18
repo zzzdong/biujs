@@ -239,6 +239,10 @@ pub struct VM {
     /// Iterators opened by `yield*` in the frames currently running, innermost
     /// last. An abrupt completion of a generator closes everything it opened.
     delegate_stack: Vec<Value>,
+    /// 是否安装 test262 宿主对象 `$262`（默认关；只有 runner 打开）。
+    /// 存在 VM 上而不是直接写进 `state.globals`，是因为 `run()` 每次都换
+    /// realm（`State::new`），装早了会被整个丢掉。
+    test_hosts: bool,
     /// 本次运行所用模块的**每函数描述**（`CodeBlock` 的副本）。
     ///
     /// 存在的理由：`materialize_function` / `make_capturing_function_object` 需要
@@ -512,6 +516,7 @@ impl VM {
             generator_yielded: None,
             generator_yield_pc: 0,
             delegate_stack: Vec::new(),
+            test_hosts: false,
             current_code: None,
             func_objs: HashMap::new(),
             step_limit: Some(DEFAULT_STEP_LIMIT),
@@ -529,6 +534,12 @@ impl VM {
             scope: std::rc::Rc::new(crate::vm::gc::Scope::new()),
             heap,
         }
+    }
+
+    /// test262 runner 专用：每次 `run()` 换新 realm 后重装 `$262`。
+    pub fn with_test_hosts(mut self) -> Self {
+        self.test_hosts = true;
+        self
     }
 
     /// Builder-style override of the instruction budget.
@@ -605,6 +616,9 @@ impl VM {
                 crate::builtins::method_descriptor(self.state.global_object.clone()),
             );
         self.state.set_global_prototype(self.builtins.object_prototype);
+        if self.test_hosts {
+            self.install_test_hosts();
+        }
 
         // **顶层脚本也是一个帧**（`architecture-redesign.md` §4.3 陷阱 5）。
         // 这条不是锦上添花：`pc` 现在住在 `Frame` 里，如果脚本没有帧，`pc` 就没有
@@ -649,6 +663,32 @@ impl VM {
             .borrow()
             .get(&PropertyKey::Str(atom))
             .map(|descriptor| descriptor.value.clone())
+    }
+
+    /// 安装 test262 的宿主对象 `$262`（仅供 runner 使用）。
+    ///
+    /// `$262` 不是语言的一部分，所以默认引擎里**没有**它；`test262_runner`
+    /// 显式调用这个方法。宿主能力按名字走 `call_native_by_name`，与普通
+    /// 内建函数同一条分派路径，不需要在 VM 里存 Rust 闭包。
+    pub fn install_test_hosts(&mut self) {
+        use crate::vm::object::NativeFunctionObject;
+        let detach = Value::Object(self.heap.alloc(Object::NativeFunction(
+            NativeFunctionObject::new("$262.detachArrayBuffer"),
+        )));
+        let mut host = crate::vm::object::OrdinaryObject::with_optional_prototype(Some(
+            self.builtins.object_prototype,
+        ));
+        let key = PropertyKey::intern(&mut self.heap, "detachArrayBuffer");
+        let _ = host.define_property(
+            &mut self.heap,
+            key,
+            crate::vm::property::PropertyDescriptor::data_descriptor(detach),
+        );
+        let host_val = Value::Object(self.heap.alloc(Object::Ordinary(host)));
+        self.state.globals.borrow_mut().insert(
+            PropertyKey::intern(&mut self.heap, "$262"),
+            crate::builtins::method_descriptor(host_val),
+        );
     }
 
     /// Box a bare `Value::Function(id)` into a stable `FunctionObject`.
@@ -6136,6 +6176,27 @@ impl VM {
                 if !is_view_or_buffer && matches!(items, Value::Object(_) | Value::Function(_)) {
                     let factory = self.get_member(items, &iterator_symbol_key(), module)?;
                     if factory.is_callable() || matches!(factory, Value::Function(_)) {
+                        // 普通数组 + 默认 @@iterator：内建层的 array-like 分支
+                        // 语义等价（空位 → NaN），省掉一份 10000 元素的临时
+                        // Value 清单 —— `copyWithin/coerced-values-*-detached`
+                        // 在 8 个构造器上各做一次后会顶到内存护栏。
+                        let plain_array = match items {
+                            Value::Object(obj_ref) => {
+                                let borrowed = obj_ref.borrow();
+                                borrowed.kind() == ObjectKind::Array && !borrowed.is_proxy()
+                            }
+                            _ => false,
+                        };
+                        let default_factory = self.get_member(
+                            &Value::Object(self.builtins.array_prototype),
+                            &iterator_symbol_key(),
+                            module,
+                        )?;
+                        if plain_array && factory.strict_eq(&default_factory) {
+                            return crate::builtins::typedarray::typedarray_construct(
+                                &mut self.heap, kind, args, proto,
+                            );
+                        }
                         let iterator = self.make_iterator_with(items.clone(), factory, module)?;
                         let _root_iterator = self.root(&iterator);
                         let mut values = Vec::new();

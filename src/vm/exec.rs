@@ -3211,6 +3211,9 @@ impl VM {
                             | "Array.of"
                             // `IsArray` 要看穿 Proxy（revoked 是 TypeError）。
                             | "Array.isArray"
+                            // test262 宿主对象由 runner 显式安装（默认引擎里
+                            // 没有 `$262`）。
+                            | "$262.detachArrayBuffer"
                     );
                     if !vm_handled_static {
                         // A missing static falls through to the prototype chain,

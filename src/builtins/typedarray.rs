@@ -615,22 +615,42 @@ fn make_view(
 // ── getters ────────────────────────────────────────────────────────────────
 
 pub fn ta_length(this: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::Number(as_typedarray(this, "length")?.length as f64))
+    let ta = as_typedarray(this, "length")?;
+    // ES 23.2.4.8 / 9 / 10：detach 之后 length / byteLength / byteOffset
+    // 三个取值器都答 0，不做越界检查。
+    Ok(Value::Number(if ta.is_detached() {
+        0.0
+    } else {
+        ta.length as f64
+    }))
 }
 
 pub fn ta_byte_length(this: &Value) -> Result<Value, RuntimeError> {
     let ta = as_typedarray(this, "byteLength")?;
-    Ok(Value::Number((ta.length * ta.kind.bytes_per_element()) as f64))
+    Ok(Value::Number(if ta.is_detached() {
+        0.0
+    } else {
+        (ta.length * ta.kind.bytes_per_element()) as f64
+    }))
 }
 
 pub fn ta_byte_offset(this: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::Number(
-        as_typedarray(this, "byteOffset")?.byte_offset as f64,
-    ))
+    let ta = as_typedarray(this, "byteOffset")?;
+    Ok(Value::Number(if ta.is_detached() {
+        0.0
+    } else {
+        ta.byte_offset as f64
+    }))
 }
 
 pub fn ta_buffer(this: &Value) -> Result<Value, RuntimeError> {
     let ta = as_typedarray(this, "buffer")?;
+    // ES 23.2.4.1：`buffer` 在 detach 之后是 TypeError。
+    if ta.is_detached() {
+        return Err(RuntimeError::TypeError(
+            "buffer getter called on a detached TypedArray".to_string(),
+        ));
+    }
     Ok(Value::Object(ta.buffer))
 }
 
@@ -944,6 +964,15 @@ pub fn ta_copy_within(this: &Value, args: &[Value]) -> Result<Value, RuntimeErro
     let len = ta.length;
     let target = relative_index(args.first(), 0, len)?;
     let start = relative_index(args.get(1), 0, len)?;
+    // ES 23.2.3.3 第 9 步：detach 检查在 target/start 的 `ToIntegerOrInfinity`
+    // **之后**（`coerced-values-*-detached`：valueOf 里 detach，然后期望
+    // TypeError），在 end 与逐元素读写之前 —— 漏掉它会把 detached 视图
+    // 交给 set_element，触发无界分配撞上内存护栏。
+    if ta.is_detached() {
+        return Err(RuntimeError::TypeError(
+            "copyWithin called on a detached TypedArray".to_string(),
+        ));
+    }
     let end = relative_index(args.get(2), len, len)?;
     let count = end.saturating_sub(start).min(len.saturating_sub(target));
     let src: Vec<Value> = (start..start + count).map(|i| ta.get_element(i)).collect();

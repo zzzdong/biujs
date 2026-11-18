@@ -2929,11 +2929,23 @@ impl ArrayBufferObject {
     }
 
     pub fn byte_length(&self) -> usize {
-        self.data.len()
+        // ES 25.1.4.3：detach 之后 `[[ArrayBufferByteLength]]` 是 0。
+        if self.detached {
+            0
+        } else {
+            self.data.len()
+        }
     }
 
     pub fn is_detached(&self) -> bool {
         self.detached
+    }
+
+    /// test262 宿主 hook `$262.detachArrayBuffer(buf)`（ES 25.1.2.1 的内部
+    /// `DetachArrayBuffer`）。字节本身不清空 —— 视图侧一律先查 `is_detached()`
+    /// 再访问 `data_mut()`，清掉反而会让漏检的路径 panic 而不是抛 TypeError。
+    pub fn detach(&mut self) {
+        self.detached = true;
     }
 }
 
@@ -3096,6 +3108,10 @@ impl TypedArrayObject {
 
     /// `true` when the buffer is gone: every element read then answers
     /// `undefined` and every write is dropped.
+    pub fn is_detached(&self) -> bool {
+        self.detached()
+    }
+
     fn detached(&self) -> bool {
         match self.buffer.borrow().as_array_buffer() {
             Some(buf) => buf.is_detached(),

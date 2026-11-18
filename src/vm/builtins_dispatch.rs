@@ -642,6 +642,17 @@ impl VM {
                     crate::builtins::string_from_code_point(&converted)
                 };
             }
+            // test262 宿主 hook：`$262.detachArrayBuffer(buf)`（ES 25.1.2.1
+            // 的内部 DetachArrayBuffer）。只有 runner 调用
+            // `install_test_hosts()` 之后才会装上 `$262`，默认引擎不可见。
+            if name == "$262.detachArrayBuffer" {
+                if let Some(Value::Object(obj_ref)) = args.first() {
+                    if let Some(buffer) = obj_ref.borrow_mut().as_array_buffer_mut() {
+                        buffer.detach();
+                    }
+                }
+                return Ok(Value::Undefined);
+            }
             // `Array.isArray(value)`（ES 23.1.2.2）：`IsArray` 要**看穿 Proxy**
             // （`Array.isArray(new Proxy([], {}))` 是 true，revoked 是 TypeError），
             // 内建层只看 `kind()`。

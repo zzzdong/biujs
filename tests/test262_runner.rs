@@ -178,7 +178,12 @@ fn guarded_vm() -> VM {
         Ordering::Relaxed,
     );
 
-    VM::new().with_step_limit(limit).with_timeout(timeout)
+    // test262 的 `$262` 是宿主对象，不是语言内建：只有 runner 打开它，
+    // 默认引擎保持干净。`detachArrayBuffer` 让 detach 一族用例能真正运行。
+    VM::new()
+        .with_test_hosts()
+        .with_step_limit(limit)
+        .with_timeout(timeout)
 }
 
 // ─────────────────────────────────────────────────────────
