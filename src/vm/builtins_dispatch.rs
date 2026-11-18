@@ -2031,11 +2031,32 @@ impl VM {
         len: usize,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
-        let ctor = self.get_member(receiver, &PropertyKey::well_known("constructor").expect("well-known name"), module)?;
-        let species = if ctor.is_object() {
+        // ES 9.4.2.3 `SpeciesConstructor(O, defaultConstructor)`：
+        // `constructor` 缺失（包括被 getter 改成 undefined）时**落到默认构造器**
+        // —— 不是 `Construct(undefined)`（`callbackfn-called-before-ctor`、
+        // `speciesctor-get-ctor-inherited`）。默认构造器按视图种类的内建名取。
+        let default_ctor = match receiver {
+            Value::Object(obj_ref) => obj_ref
+                .borrow()
+                .as_typed_array()
+                .and_then(|ta| self.global(ta.kind.name()))
+                .unwrap_or(Value::Undefined),
+            _ => Value::Undefined,
+        };
+        let ctor = self.get_member(
+            receiver,
+            &PropertyKey::well_known("constructor").expect("well-known name"),
+            module,
+        )?;
+        // 构造器在本引擎里是 `Value::Function`，不是 `Value::Object` —— 以前的
+        // `ctor.is_object()` 把所有真构造器都当"没有 @@species"，于是
+        // `map` / `filter` / `slice` 的 species 一整族用例全失败。
+        let species = if ctor.is_undefined() || matches!(ctor, Value::Null) {
+            default_ctor
+        } else if matches!(ctor, Value::Object(_) | Value::Function(_)) {
             let s = self.get_member(&ctor, &crate::builtins::species_symbol_key(), module)?;
             if matches!(s, Value::Undefined | Value::Null) {
-                ctor.clone()
+                default_ctor
             } else {
                 s
             }
