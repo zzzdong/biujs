@@ -467,6 +467,22 @@ impl VM {
                     "%TypedArray%.prototype.{method} called on a receiver that is not a TypedArray"
                 )));
             }
+            // ES 23.2.3.x 的 `ValidateTypedArray`：view 的 buffer 已 detach 时
+            // **所有**原型方法都抛 TypeError（`detached-buffer` 一族跨
+            // indexOf / fill / reduce / keys / map / …）。集中放在分派口，
+            // 不逐个方法补检查 —— 这是这一族唯一的共同入口。
+            let detached = match &this {
+                Value::Object(obj_ref) => obj_ref
+                    .borrow()
+                    .as_typed_array()
+                    .is_some_and(|ta| ta.is_detached()),
+                _ => false,
+            };
+            if detached {
+                return Err(RuntimeError::TypeError(format!(
+                    "%TypedArray%.prototype.{method} called on a detached buffer"
+                )));
+            }
             // 回调族（`map` / `filter` / `sort` …）要开帧，归 VM。
             if let Some(result) =
                 self.try_typedarray_callback_method(&this, method, args, module)?

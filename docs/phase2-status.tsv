@@ -104,6 +104,6 @@ language/literals/boolean	4	0	0
 language/computed-property-names	42	0	6
 built-ins/Boolean	48	3	0
 built-ins/Map	153	51	0
-built-ins/TypedArray	531	772	143
+built-ins/TypedArray	552	772	122
 built-ins/Object	3146	143	122
 built-ins/String	987	168	68
