@@ -2112,8 +2112,18 @@ impl VM {
             Instr::SetFunctionName { func, name } => {
                 let func = self.get_value(func)?;
                 let name = self.get_value(name)?;
-                if let Value::String(text) = &name {
-                    self.set_function_name(&func, text);
+                // ES SetFunctionName: 字符串键直接用，Symbol 键用 `[description]`
+                //（`Symbol()` 得到 `[]`），这正是计算属性名推导函数 name 的形状。
+                let inferred = match &name {
+                    Value::String(text) => Some(text.to_string()),
+                    Value::Symbol(sym) => sym
+                        .description
+                        .as_ref()
+                        .map(|desc| format!("[{desc}]")),
+                    _ => None,
+                };
+                if let Some(text) = inferred {
+                    self.set_function_name(&func, &text);
                 }
             }
             Instr::LoadEnv { dst, name } => {

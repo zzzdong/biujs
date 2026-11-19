@@ -257,7 +257,12 @@ pub fn setup_error_prototype(
     // Error.prototype.toString
     // 闭包从不被调用（`set_prototype_method` 忽略它）；实现需要 heap，住在
     // `call_prototype_method` 的按名分派里。
-    super::set_prototype_method_impl(proto, heap, "toString", crate::vm::native::VmSlot::LegacyProto("toString").entry());
+    super::set_prototype_method_impl(
+        proto,
+        heap,
+        "toString",
+        crate::vm::native::VmSlot::ErrorToString.entry(),
+    );
 }
 
 /// Install the own `name` / `message` properties of a native error prototype.

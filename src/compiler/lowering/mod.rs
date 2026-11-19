@@ -1961,7 +1961,7 @@ impl<'a> JSASTLower<'a> {
         let object_fn = self.builder.load_external_variable("Object".to_string());
         let keys = self
             .builder
-            .call_property(object_fn, "keys", vec![obj]);
+            .call_property(object_fn, "__forInKeys__", vec![obj]);
 
         // Reuse the for-of CFG with the key array as the source.
         let it = self.builder.make_iterator(keys);

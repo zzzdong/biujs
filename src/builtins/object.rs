@@ -1079,6 +1079,24 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
             crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::ObjectProtoSet),
         ),
     )));
+    // ES 规定 accessor 函数的 `name` 是 "get __proto__" / "set __proto__"，
+    // 合成内建名不能拿来做 JS-visible 的 name。
+    for (function, name) in [(&getter, "get __proto__"), (&setter, "set __proto__")] {
+        if let Value::Object(obj_ref) = function {
+            let _ = obj_ref.borrow_mut().define_property(
+                heap,
+                PropertyKey::well_known("name").expect("well-known name"),
+                PropertyDescriptor {
+                    value: Value::string(name),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: None,
+                    setter: None,
+                },
+            );
+        }
+    }
     let key = PropertyKey::intern(heap, "__proto__");
     let _ = proto.borrow_mut().define_property(
         heap,
@@ -1123,6 +1141,13 @@ pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins, h
     // 下面几个要先在 VM 里做 ToPropertyKey / Proxy trap / 描述符 [[Get]]，
     // 再落到纯 builtin 表 —— 统一由 `VM::object_static_vm` 串起来。
     use crate::vm::native::VmSlot;
+    // `for-in` 的内部键枚举器（不是规范暴露的属性名，仅供编译器 lowering 使用）。
+    set_static_method_impl(
+        object_fn,
+        "__forInKeys__",
+        heap,
+        VmSlot::ForInKeys.entry(),
+    );
     for (name, slot) in [
         ("defineProperty", VmSlot::ObjectDefineProperty),
         ("defineProperties", VmSlot::ObjectDefineProperties),

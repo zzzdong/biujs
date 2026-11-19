@@ -88,6 +88,88 @@ impl VM {
         crate::builtins::call_native(name, &boxed_args, &mut self.heap)
     }
 
+    /// `for (x in obj)` 的键枚举：OwnPropertyKeys 沿原型链逐层取，跳过重复，
+    /// 只保留 enumerable。`null` / `undefined` 不抛、直接得到空列表。
+    pub(crate) fn for_in_keys(&mut self, args: &[Value]) -> Result<Value, RuntimeError> {
+        let mut keys: Vec<Value> = Vec::new();
+        let mut seen: Vec<PropertyKey> = Vec::new();
+        let Some(source) = args.first() else {
+            return Ok(Value::Object(
+                self.heap.alloc(crate::vm::gc::Object::Array(crate::vm::object::ArrayObject::from_vec(keys))),
+            ));
+        };
+        if matches!(source, Value::Undefined | Value::Null) {
+            return Ok(Value::Object(
+                self.heap.alloc(crate::vm::gc::Object::Array(crate::vm::object::ArrayObject::from_vec(keys))),
+            ));
+        }
+        let mut current = Some(self.as_object_value(source));
+        while let Some(Value::Object(obj_ref)) = current {
+            let (own, next) = {
+                let borrowed = obj_ref.borrow();
+                let own: Vec<(PropertyKey, bool)> = borrowed
+                    .own_keys()
+                    .into_iter()
+                    .filter_map(|key| {
+                        borrowed
+                            .property_get(&key)
+                            .filter(|desc| desc.enumerable)
+                            .map(|_| (key, false))
+                    })
+                    .collect();
+                (own, borrowed.get_prototype().map(Value::Object))
+            };
+            for (key, _) in own {
+                if seen.iter().any(|k| *k == key) {
+                    continue;
+                }
+                seen.push(key.clone());
+                keys.push(match key {
+                    PropertyKey::Str(atom) => {
+                        let text = self.heap.resolve(atom).to_string();
+                        Value::string(&text)
+                    }
+                    PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(id),
+                    PropertyKey::Index(i) => Value::string(&i.to_string()),
+                });
+            }
+            current = next;
+        }
+        Ok(Value::Object(
+            self.heap.alloc(crate::vm::gc::Object::Array(crate::vm::object::ArrayObject::from_vec(keys))),
+        ))
+    }
+
+    /// `Error.prototype.toString`（ES 20.5.3.4）：`name` / `message` 都通过
+    /// 真 `[[Get]]` 读取（getter 可抛），`ToString` 对 Symbol 要抛。
+    pub(crate) fn error_to_string_host(
+        &mut self,
+        this: &Value,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        crate::builtins::require_object_coercible(this)?;
+        let boxed = crate::builtins::to_object(&mut self.heap, this)?;
+        let name_key = PropertyKey::intern(&mut self.heap, "name");
+        let msg_key = PropertyKey::intern(&mut self.heap, "message");
+        let name_val = self.get_member(&boxed, &name_key, module)?;
+        let msg_val = self.get_member(&boxed, &msg_key, module)?;
+        let name = if name_val.is_undefined() {
+            "Error".to_string()
+        } else {
+            crate::builtins::to_string_throwing(&self.as_object_value(&name_val))?
+        };
+        let msg = if msg_val.is_undefined() {
+            String::new()
+        } else {
+            crate::builtins::to_string_throwing(&self.as_object_value(&msg_val))?
+        };
+        Ok(Value::string(&match (name.is_empty(), msg.is_empty()) {
+            (true, _) => msg,
+            (_, true) => name,
+            _ => format!("{name}: {msg}"),
+        }))
+    }
+
     /// `String.prototype.matchAll(re)` / `RegExp.prototype[Symbol.matchAll](s)`.
     ///
     /// Both answer an iterator of match arrays, and only the VM can mint

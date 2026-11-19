@@ -179,6 +179,8 @@ pub(crate) enum VmSlot {
     TypedArrayProto(&'static str),
     LegacyProto(&'static str),
     MatchAll,
+    ErrorToString,
+    ForInKeys,
 }
 
 /// Map/Set/WeakMap/WeakSet 原型方法。方法归属由枚举变体固定，调用期不再从
@@ -566,6 +568,14 @@ impl VmSlot {
                     .map(|v| v.unwrap_or(Value::Undefined))
             });
         }
+        if matches!(self, VmSlot::ErrorToString) {
+            return NativeEntry::Vm(|vm, this, _args, module| {
+                vm.error_to_string_host(this, module)
+            });
+        }
+        if matches!(self, VmSlot::ForInKeys) {
+            return NativeEntry::Vm(|vm, _this, args, _module| vm.for_in_keys(args));
+        }
         let f: VmImpl = match self {
             VmSlot::PromiseResolve => |vm, this, args, module| {
                 crate::vm::VM::promise_static_resolve(vm, this, args, module)
@@ -840,7 +850,9 @@ impl VmSlot {
             | VmSlot::Collection(_)
             | VmSlot::TypedArrayProto(_)
             | VmSlot::LegacyProto(_)
-            | VmSlot::MatchAll => unreachable!(),
+            | VmSlot::MatchAll
+            | VmSlot::ErrorToString
+            | VmSlot::ForInKeys => unreachable!(),
         };
         NativeEntry::Vm(f)
     }
