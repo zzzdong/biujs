@@ -1,5 +1,5 @@
 pub mod iterator;
-pub(crate) mod builtins_dispatch;
+pub(crate) mod native_hosts;
 pub(crate) mod exec;
 pub(crate) mod gc;
 pub(crate) mod native;
@@ -2974,15 +2974,23 @@ pub(crate) fn promise_static_any(
         let id = self.state.next_finally_id;
         self.state.next_finally_id += 1;
         self.state.finally_handlers.insert(id, callback);
-        let fulfilled = Self::native_fn(&mut self.heap, &format!("__promise_finally__{id}_f"));
-        let rejected = Self::native_fn(&mut self.heap, &format!("__promise_finally__{id}_r"));
+        let fulfilled = Self::native_state_fn(
+            &mut self.heap,
+            &format!("__promise_finally__{id}_f"),
+            crate::vm::native::NativeState::PromiseFinally { id, on_rejected: false },
+        );
+        let rejected = Self::native_state_fn(
+            &mut self.heap,
+            &format!("__promise_finally__{id}_r"),
+            crate::vm::native::NativeState::PromiseFinally { id, on_rejected: true },
+        );
         self.promise_then(&promise, Some(fulfilled), Some(rejected), module)
     }
 
-    /// A host function boxed for use as a handler (the reaction runner checks
-    /// `is_callable`, which is only answered by the boxed form).
-    fn native_fn(heap: &mut Heap, name: &str) -> Value {
-        let obj = NativeFunctionObject::new(name);
+    /// 同上，但把状态装进函数对象（id 不再藏在名字里）。
+    fn native_state_fn(heap: &mut Heap, name: &str, state: crate::vm::native::NativeState) -> Value {
+        let obj = NativeFunctionObject::new(name)
+            .with_entry(crate::vm::native::NativeEntry::State(state));
         Value::Object(heap.alloc(Object::NativeFunction(obj)))
     }
 
@@ -3127,7 +3135,11 @@ pub(crate) fn promise_static_any(
         let id = self.state.next_capability_id;
         self.state.next_capability_id += 1;
         let executor =
-            Self::native_fn(&mut self.heap, &format!("__promise_capability_executor__{id}"));
+            Self::native_state_fn(
+                &mut self.heap,
+                &format!("__promise_capability_executor__{id}"),
+                crate::vm::native::NativeState::PromiseCapability(id),
+            );
         let promise = self.construct(constructor, &[executor], module)?;
         let capability = self.state.capabilities.remove(&id).ok_or_else(|| {
             RuntimeError::TypeError(
@@ -3247,9 +3259,16 @@ pub(crate) fn promise_static_any(
                         return Ok(promise);
                     }
                 };
-            let ok = Self::native_fn(&mut self.heap, &format!("__promise_agg_ok__{id}_{index}"));
-            let err_fn =
-                Self::native_fn(&mut self.heap, &format!("__promise_agg_err__{id}_{index}"));
+            let ok = Self::native_state_fn(
+                &mut self.heap,
+                &format!("__promise_agg_ok__{id}_{index}"),
+                crate::vm::native::NativeState::PromiseAggregate { id, index, fulfilled: true },
+            );
+            let err_fn = Self::native_state_fn(
+                &mut self.heap,
+                &format!("__promise_agg_err__{id}_{index}"),
+                crate::vm::native::NativeState::PromiseAggregate { id, index, fulfilled: false },
+            );
             // 4.g: `Invoke(nextPromise, "then", …)` — `C.resolve` may hand back a
             // thenable, so the method is fetched instead of assuming a promise.
             let then_fn = match self.get_member(&next_promise, &then_key, module) {
@@ -3409,13 +3428,13 @@ pub(crate) fn promise_static_any(
     /// (settled by an earlier element) is a no-op.
     fn dispatch_aggregation(
         &mut self,
-        name: &str,
+        id: u64,
+        index: usize,
+        fulfilled: bool,
         args: &[Value],
         module: &Module,
     ) -> Option<Result<Value, RuntimeError>> {
-        let (id, index) = parse_aggregation_handler(name)?;
         let argument = args.first().cloned().unwrap_or(Value::Undefined);
-        let fulfilled = name.starts_with("__promise_agg_ok__");
         let Some(kind) = self.state.aggregations.get(&id).map(|agg| agg.kind) else {
             // 聚合已经结算（`all` 因某个元素被拒而提前 reject、`race` 已经赢了）：
             // 迟到的元素处理器必须**无操作**返回，不能掉到"未知内建函数"
@@ -3632,8 +3651,16 @@ pub(crate) fn promise_static_any(
         let id = promise.borrow().as_promise().expect("promise").id;
         PromiseCapability {
             promise: Self::promise_value(promise),
-            resolve: Self::native_fn(&mut self.heap, &format!("__promise_resolve__{id}")),
-            reject: Self::native_fn(&mut self.heap, &format!("__promise_reject__{id}")),
+            resolve: Self::native_state_fn(
+                &mut self.heap,
+                &format!("__promise_resolve__{id}"),
+                crate::vm::native::NativeState::PromiseResolve(id),
+            ),
+            reject: Self::native_state_fn(
+                &mut self.heap,
+                &format!("__promise_reject__{id}"),
+                crate::vm::native::NativeState::PromiseReject(id),
+            ),
         }
     }
 
@@ -3651,9 +3678,17 @@ pub(crate) fn promise_static_any(
                     // functions that resolve/reject the adopting promise.
                     let id = promise.borrow().as_promise().expect("promise").id;
                     let resolve =
-                        Self::native_fn(&mut self.heap, &format!("__promise_resolve__{id}"));
+                        Self::native_state_fn(
+                            &mut self.heap,
+                            &format!("__promise_resolve__{id}"),
+                            crate::vm::native::NativeState::PromiseResolve(id),
+                        );
                     let reject =
-                        Self::native_fn(&mut self.heap, &format!("__promise_reject__{id}"));
+                        Self::native_state_fn(
+                            &mut self.heap,
+                            &format!("__promise_reject__{id}"),
+                            crate::vm::native::NativeState::PromiseReject(id),
+                        );
                     let then = match self.get_member(
                         &thenable,
                         &PropertyKey::well_known("then").expect("well-known name"),
@@ -3753,8 +3788,16 @@ pub(crate) fn promise_static_any(
             _ => self.new_promise(),
         };
         let id = promise.borrow().as_promise().expect("promise").id;
-        let resolve = Self::native_fn(&mut self.heap, &format!("__promise_resolve__{id}"));
-        let reject = Self::native_fn(&mut self.heap, &format!("__promise_reject__{id}"));
+        let resolve = Self::native_state_fn(
+            &mut self.heap,
+            &format!("__promise_resolve__{id}"),
+            crate::vm::native::NativeState::PromiseResolve(id),
+        );
+        let reject = Self::native_state_fn(
+            &mut self.heap,
+            &format!("__promise_reject__{id}"),
+            crate::vm::native::NativeState::PromiseReject(id),
+        );
         match self.invoke(executor, Value::Undefined, &[resolve, reject], module) {
             Ok(_) => {}
             Err(err) => {
@@ -7255,16 +7298,6 @@ pub enum AggregateKind {
     Race,
     AllSettled,
     Any,
-}
-
-/// Recognise the two per-element handler names minted by `promise_aggregate`,
-/// answering `(aggregation id, element index)`.
-fn parse_aggregation_handler(name: &str) -> Option<(u64, usize)> {
-    let rest = name
-        .strip_prefix("__promise_agg_ok__")
-        .or_else(|| name.strip_prefix("__promise_agg_err__"))?;
-    let (id, index) = rest.split_once('_')?;
-    Some((id.parse().ok()?, index.parse().ok()?))
 }
 
 /// Write an element result into an aggregation's slot list.

@@ -3945,24 +3945,31 @@ pub struct GeneratorObject {
 
 impl GeneratorObject {
     pub fn new(heap: &mut Heap, id: u64, func_id: u32, args: Vec<Value>, this: Value) -> Self {
-        let mk = |heap: &mut Heap, name: String| {
-            Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(&name))))
+        let mk = |heap: &mut Heap, name: String, state: crate::vm::native::NativeState| {
+            Value::Object(heap.alloc(Object::NativeFunction(
+                NativeFunctionObject::new(&name)
+                    .with_entry(crate::vm::native::NativeEntry::State(state)),
+            )))
         };
         let iterator_fn = mk(
             heap,
             format!("{}{}", crate::vm::iterator::GENERATOR_ITERATOR_PREFIX, id),
+            crate::vm::native::NativeState::GeneratorIterator(id),
         );
         let next_fn = mk(
             heap,
             format!("{}{}", crate::vm::iterator::GENERATOR_NEXT_PREFIX, id),
+            crate::vm::native::NativeState::GeneratorNext(id),
         );
         let return_fn = mk(
             heap,
             format!("{}{}", crate::vm::iterator::GENERATOR_RETURN_PREFIX, id),
+            crate::vm::native::NativeState::GeneratorReturn(id),
         );
         let throw_fn = mk(
             heap,
             format!("{}{}", crate::vm::iterator::GENERATOR_THROW_PREFIX, id),
+            crate::vm::native::NativeState::GeneratorThrow(id),
         );
         Self {
             id,

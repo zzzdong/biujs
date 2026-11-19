@@ -582,7 +582,10 @@ impl Builtins {
         ));
         // ES 19.2.3：`Function.prototype` 本身是一个**函数**，不是普通对象。
         let function_proto = heap.alloc(Object::NativeFunction(
-            crate::vm::object::NativeFunctionObject::new(FUNCTION_PROTO_NATIVE),
+            crate::vm::object::NativeFunctionObject::new(FUNCTION_PROTO_NATIVE)
+                .with_entry(crate::vm::native::NativeEntry::VmSpecial(
+                    crate::vm::native::SpecialOp::FunctionProto,
+                )),
         ));
         let _ = function_proto.borrow_mut().set_prototype(Some(object_proto));
         let string_proto = new_proto(heap, Some(object_proto), "String");
@@ -762,7 +765,11 @@ impl Builtins {
             );
         }
         let string_iterator_fn = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME),
+            NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME).with_entry(
+                crate::vm::native::NativeEntry::VmSpecial(
+                    crate::vm::native::SpecialOp::ArrayIteratorFactory,
+                ),
+            ),
         )));
         let _ = self.string_prototype.borrow_mut().define_property(heap, crate::vm::iterator::iterator_symbol_key(),
             method_descriptor(string_iterator_fn),
@@ -784,7 +791,11 @@ impl Builtins {
         globals.insert(PropertyKey::intern(heap, "Number"), method_descriptor(number_fn_val));
 
         let string_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new("String"),
+            NativeFunctionObject::new("String").with_entry(
+                crate::vm::native::NativeEntry::VmSpecial(
+                    crate::vm::native::SpecialOp::StringCtor,
+                ),
+            ),
         )));
         string::register_string_prototype(&self.string_prototype, heap);
         string::register_string_statics(&string_fn_val, heap);
@@ -876,7 +887,9 @@ impl Builtins {
             // `%TypedArray%[Symbol.species]`（22.2.2.4）：返回接收者的取值器，
             // `length` 0、`configurable` true、`set` 为 undefined。
             let species_getter = Value::Object(heap.alloc(Object::NativeFunction(
-                NativeFunctionObject::new(typedarray::TA_SPECIES_NATIVE),
+                NativeFunctionObject::new(typedarray::TA_SPECIES_NATIVE).with_entry(
+                    crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::Species),
+                ),
             )));
             let _ = ta_obj.borrow_mut().define_property(heap, species_symbol_key(),
                 PropertyDescriptor {
@@ -923,7 +936,11 @@ impl Builtins {
                 // （实测 TypedArray 套件的 Symbol.species/* 全败，报
                 // "Cannot read properties of undefined (reading 'get')"）。
                 let species_getter = Value::Object(heap.alloc(Object::NativeFunction(
-                    NativeFunctionObject::new(typedarray::TA_SPECIES_NATIVE),
+                    NativeFunctionObject::new(typedarray::TA_SPECIES_NATIVE).with_entry(
+                        crate::vm::native::NativeEntry::VmSpecial(
+                            crate::vm::native::SpecialOp::Species,
+                        ),
+                    ),
                 )));
                 let _ = ctor_obj.borrow_mut().define_property(heap, species_symbol_key(),
                     PropertyDescriptor {
@@ -971,7 +988,9 @@ impl Builtins {
         // `Map[Symbol.species]` is an accessor returning its receiver
         // (ES 23.1.2.2); like `Array`'s, the getter is dispatched by the VM.
         let species_getter = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(map::MAP_SPECIES_NATIVE),
+            NativeFunctionObject::new(map::MAP_SPECIES_NATIVE).with_entry(
+                crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::Species),
+            ),
         )));
         if let Value::Object(map_obj) = &map_fn_val {
             let _ = map_obj.borrow_mut().define_property(heap, species_symbol_key(),
@@ -1016,7 +1035,9 @@ impl Builtins {
         register_wrapper_prototype("Set", self.set_prototype);
         // `Set[Symbol.species]` (ES 23.2.2.2), mirroring `Map`'s accessor.
         let set_species_getter = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(set::SET_SPECIES_NATIVE),
+            NativeFunctionObject::new(set::SET_SPECIES_NATIVE).with_entry(
+                crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::Species),
+            ),
         )));
         if let Value::Object(set_obj) = &set_fn_val {
             let _ = set_obj.borrow_mut().define_property(heap, species_symbol_key(),
@@ -1150,7 +1171,9 @@ impl Builtins {
         // `Promise[Symbol.species]` (ES 27.2.2.3) is an accessor returning its
         // receiver, mirroring `Map`/`Set`/`Array`; the VM answers the getter.
         let promise_species_getter = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(promise::PROMISE_SPECIES_NATIVE),
+            NativeFunctionObject::new(promise::PROMISE_SPECIES_NATIVE).with_entry(
+                crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::Species),
+            ),
         )));
         if let Value::Object(promise_obj) = &promise_fn_val {
             let _ = promise_obj.borrow_mut().define_property(heap, species_symbol_key(),

@@ -19,7 +19,7 @@
 
 use crate::bytecode::Module;
 use crate::vm::gc::Heap;
-use crate::vm::{RuntimeError, VM, Value};
+use crate::vm::{PromiseState, RuntimeError, VM, Value};
 
 /// 只碰堆的实现：不跑用户代码，也就不需要 `VM` / `Module`。
 ///
@@ -46,6 +46,42 @@ pub(crate) enum NativeEntry {
     VmArray(ArrayOp),
     /// `String.prototype` 方法：算法由 `StringOp` 选中。
     VmString(StringOp),
+    /// 无状态的特殊内建（getter / species / Function.prototype 工具等）。
+    VmSpecial(SpecialOp),
+    /// Map/Set/WeakMap/WeakSet 原型方法：归属由 op 决定。
+    VmCollection(CollectionOp),
+    /// TypedArray 原型方法：方法名在注册期钉在函数对象上。
+    VmTypedArray(&'static str),
+    /// 尚未迁移的原型方法：名字在注册期固定，调用期直接查纯内建表。
+    LegacyProto(&'static str),
+    /// 捕获状态的内建（`__bound__<id>` / `__revoke__<id>` 等的替代）。
+    State(NativeState),
+}
+
+/// 函数对象携带的状态：id 不再是名字的一部分，调用时无需解析字符串。
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativeState {
+    Bound(u32),
+    Revoke(u32),
+    GeneratorNext(u64),
+    GeneratorReturn(u64),
+    GeneratorThrow(u64),
+    GeneratorIterator(u64),
+    IteratorNext(u64),
+    IteratorReturn(u64),
+    PromiseResolve(u64),
+    PromiseReject(u64),
+    PromiseAggregate {
+        id: u64,
+        index: usize,
+        fulfilled: bool,
+    },
+    PromiseCapability(u64),
+    PromiseFinally {
+        id: u64,
+        on_rejected: bool,
+    },
+    RegExpGetter(&'static str),
 }
 
 impl NativeEntry {
@@ -62,6 +98,13 @@ impl NativeEntry {
             NativeEntry::Vm(f) => f(vm, this, args, module),
             NativeEntry::VmArray(op) => vm.array_proto_host(op, this, args, module),
             NativeEntry::VmString(op) => vm.string_proto_host(op, this, args, module),
+            NativeEntry::VmSpecial(op) => vm.special_host(op, this, args, module),
+            NativeEntry::VmCollection(op) => vm.collection_host(op, this, args, module),
+            NativeEntry::VmTypedArray(name) => vm.typed_array_proto_host(name, this, args, module),
+            NativeEntry::LegacyProto(name) => {
+                crate::builtins::call_prototype_method(&mut vm.heap, this, name, args)
+            }
+            NativeEntry::State(state) => vm.call_state(state, this, args, module),
         }
     }
 }
@@ -131,6 +174,83 @@ pub(crate) enum VmSlot {
     SetValues,
     ArrayProto(ArrayOp),
     StringProto(StringOp),
+    Special(SpecialOp),
+    Collection(CollectionOp),
+    TypedArrayProto(&'static str),
+    LegacyProto(&'static str),
+    MatchAll,
+}
+
+/// Map/Set/WeakMap/WeakSet 原型方法。方法归属由枚举变体固定，调用期不再从
+/// `__map_method__<name>` 这类前缀里还原。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionOp {
+    MapGet,
+    MapHas,
+    MapSet,
+    MapDelete,
+    MapClear,
+    MapForEach,
+    MapGetOrInsert,
+    MapGetOrInsertComputed,
+    SetAdd,
+    SetHas,
+    SetDelete,
+    SetClear,
+    SetForEach,
+    SetUnion,
+    SetIntersection,
+    SetDifference,
+    SetSymmetricDifference,
+    SetIsSubsetOf,
+    SetIsSupersetOf,
+    SetIsDisjointFrom,
+    WeakMapSet,
+    WeakMapGet,
+    WeakMapHas,
+    WeakMapDelete,
+    WeakMapGetOrInsert,
+    WeakMapGetOrInsertComputed,
+    WeakSetAdd,
+    WeakSetHas,
+    WeakSetDelete,
+}
+
+impl CollectionOp {
+    pub(crate) fn as_str(self) -> &'static str {
+        use CollectionOp as C;
+        match self {
+            C::MapGet => "get",
+            C::MapHas => "has",
+            C::MapSet => "set",
+            C::MapDelete => "delete",
+            C::MapClear => "clear",
+            C::MapForEach => "forEach",
+            C::MapGetOrInsert => "getOrInsert",
+            C::MapGetOrInsertComputed => "getOrInsertComputed",
+            C::SetAdd => "add",
+            C::SetHas => "has",
+            C::SetDelete => "delete",
+            C::SetClear => "clear",
+            C::SetForEach => "forEach",
+            C::SetUnion => "union",
+            C::SetIntersection => "intersection",
+            C::SetDifference => "difference",
+            C::SetSymmetricDifference => "symmetricDifference",
+            C::SetIsSubsetOf => "isSubsetOf",
+            C::SetIsSupersetOf => "isSupersetOf",
+            C::SetIsDisjointFrom => "isDisjointFrom",
+            C::WeakMapSet => "set",
+            C::WeakMapGet => "get",
+            C::WeakMapHas => "has",
+            C::WeakMapDelete => "delete",
+            C::WeakMapGetOrInsert => "getOrInsert",
+            C::WeakMapGetOrInsertComputed => "getOrInsertComputed",
+            C::WeakSetAdd => "add",
+            C::WeakSetHas => "has",
+            C::WeakSetDelete => "delete",
+        }
+    }
 }
 
 /// `Array.prototype` 上需要 VM 实现的算法选择器。
@@ -266,6 +386,45 @@ impl ArrayOp {
     }
 }
 
+/// 不带捕获状态的特殊内建：getter、species、`Function.prototype` 工具等。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpecialOp {
+    FunctionProto,
+    FunctionHasInstance,
+    ObjectToString,
+    FunctionToString,
+    ObjectProtoGet,
+    ObjectProtoSet,
+    ThrowTypeError,
+    SymbolDescription,
+    MapSize,
+    SetSize,
+    TaLength,
+    TaByteLength,
+    TaByteOffset,
+    TaBuffer,
+    AbByteLength,
+    DvBuffer,
+    DvByteLength,
+    DvByteOffset,
+    ArrayIteratorFactory,
+    TaToStringTag,
+    StringCtor,
+    ProxyCtor,
+    Species,
+    RegExpMatch,
+    RegExpReplace,
+    RegExpSearch,
+    RegExpSplit,
+    FunctionCall,
+    FunctionApply,
+    FunctionBind,
+    ObjectDefineGetter,
+    ObjectDefineSetter,
+    ObjectLookupGetter,
+    ObjectLookupSetter,
+}
+
 /// `String.prototype` 上需要 VM 参与的方法（ToString(this) 与参数 ToPrimitive
 /// 都可能跑用户代码，协议方法还要调用 `@@match` / `@@replace` 等）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,6 +547,24 @@ impl VmSlot {
         }
         if let VmSlot::StringProto(op) = self {
             return NativeEntry::VmString(op);
+        }
+        if let VmSlot::Special(op) = self {
+            return NativeEntry::VmSpecial(op);
+        }
+        if let VmSlot::Collection(op) = self {
+            return NativeEntry::VmCollection(op);
+        }
+        if let VmSlot::TypedArrayProto(name) = self {
+            return NativeEntry::VmTypedArray(name);
+        }
+        if let VmSlot::LegacyProto(name) = self {
+            return NativeEntry::LegacyProto(name);
+        }
+        if matches!(self, VmSlot::MatchAll) {
+            return NativeEntry::Vm(|vm, this, args, module| {
+                vm.try_match_all_method(this, "matchAll", args, module)
+                    .map(|v| v.unwrap_or(Value::Undefined))
+            });
         }
         let f: VmImpl = match self {
             VmSlot::PromiseResolve => |vm, this, args, module| {
@@ -657,13 +834,129 @@ impl VmSlot {
             VmSlot::SetEntries => |vm, this, args, module| vm.set_method(this, "entries", args, module),
             VmSlot::SetKeys => |vm, this, args, module| vm.set_method(this, "keys", args, module),
             VmSlot::SetValues => |vm, this, args, module| vm.set_method(this, "values", args, module),
-            VmSlot::ArrayProto(_) | VmSlot::StringProto(_) => unreachable!(),
+            VmSlot::ArrayProto(_)
+            | VmSlot::StringProto(_)
+            | VmSlot::Special(_)
+            | VmSlot::Collection(_)
+            | VmSlot::TypedArrayProto(_)
+            | VmSlot::LegacyProto(_)
+            | VmSlot::MatchAll => unreachable!(),
         };
         NativeEntry::Vm(f)
     }
 }
 
 impl VM {
+    /// 带状态内建的调用：`NativeState` 里已经装着 id，调用期不再 `strip_prefix`
+    /// 加 `parse`（原来的 `__bound__<id>` / `__revoke__<id>` 全靠名字传状态）。
+    pub(crate) fn call_state(
+        &mut self,
+        state: NativeState,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        match state {
+            NativeState::Bound(id) => {
+                let Some((target, this_arg, mut all)) = self
+                    .bound_functions
+                    .get(&id)
+                    .map(|b| (b.target.clone(), b.this_arg.clone(), b.bound_args.clone()))
+                else {
+                    return Err(RuntimeError::InternalError(
+                        "bound function is no longer available".to_string(),
+                    ));
+                };
+                all.extend(args.iter().cloned());
+                self.invoke(&target, this_arg, &all, module)
+            }
+            NativeState::Revoke(id) => {
+                if let Some(Value::Object(obj_ref)) = self.revocable_proxies.get(&id) {
+                    if let Some(proxy) = obj_ref.borrow_mut().as_proxy_mut() {
+                        proxy.revoked = true;
+                    }
+                }
+                Ok(Value::Undefined)
+            }
+            NativeState::GeneratorNext(id) => {
+                let send = args.first().cloned().unwrap_or(Value::Undefined);
+                self.generator_next(id, send, module)
+            }
+            NativeState::GeneratorReturn(id) => {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                self.generator_abrupt(id, Ok(value), module)
+            }
+            NativeState::GeneratorThrow(id) => {
+                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                self.generator_abrupt(id, Err(RuntimeError::Thrown(reason)), module)
+            }
+            NativeState::GeneratorIterator(_) => Ok(this.clone()),
+            NativeState::IteratorNext(id) => {
+                let iter_val = self
+                    .iterator_registry
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::TypeError("iterator is no longer alive".to_string()))?;
+                let send = args.first().cloned();
+                let (item, done) = self.iterator_next(iter_val, send, module)?;
+                Ok(Self::iterator_result(&mut self.heap, item, done))
+            }
+            NativeState::IteratorReturn(id) => {
+                if let Some(iter_val) = self.iterator_registry.get(&id).cloned() {
+                    self.iterator_close(iter_val, args.first(), false, module)?;
+                }
+                Ok(Self::iterator_result(&mut self.heap, Value::Undefined, true))
+            }
+            NativeState::PromiseResolve(id) => {
+                if let Some(promise) = self.state.promises.get(&id).cloned() {
+                    let value = args.first().cloned().unwrap_or(Value::Undefined);
+                    self.promise_resolve(&promise, value, module);
+                }
+                Ok(Value::Undefined)
+            }
+            NativeState::PromiseReject(id) => {
+                if let Some(promise) = self.state.promises.get(&id).cloned() {
+                    let value = args.first().cloned().unwrap_or(Value::Undefined);
+                    self.promise_settle(&promise, PromiseState::Rejected, value);
+                }
+                Ok(Value::Undefined)
+            }
+            NativeState::PromiseAggregate {
+                id,
+                index,
+                fulfilled,
+            } => Ok(self
+                .dispatch_aggregation(id, index, fulfilled, args, module)
+                .unwrap_or(Ok(Value::Undefined))?),
+            NativeState::PromiseCapability(id) => {
+                self.state.capabilities.insert(
+                    id,
+                    crate::vm::PromiseCapability {
+                        promise: Value::Undefined,
+                        resolve: args.first().cloned().unwrap_or(Value::Undefined),
+                        reject: args.get(1).cloned().unwrap_or(Value::Undefined),
+                    },
+                );
+                Ok(Value::Undefined)
+            }
+            NativeState::RegExpGetter(prop) => {
+                crate::builtins::regexp_prototype_getter(this, prop)
+            }
+            NativeState::PromiseFinally { id, on_rejected } => {
+                let callback = self.state.finally_handlers.get(&id).cloned();
+                let argument = args.first().cloned().unwrap_or(Value::Undefined);
+                if let Some(cb) = callback {
+                    self.invoke(&cb, Value::Undefined, &[], module)?;
+                    if on_rejected {
+                        return Err(RuntimeError::Thrown(argument));
+                    }
+                    return Ok(argument);
+                }
+                Ok(Value::Undefined)
+            }
+        }
+    }
+
     /// 原生内建的**唯一**调用入口（`[[Call]]` 与 `CallMethod` 都走这里）。
     ///
     /// 已迁移的内建直接调它自带的实现；`entry` 为 `None` 的那批仍交给

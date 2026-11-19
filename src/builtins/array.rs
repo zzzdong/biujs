@@ -97,7 +97,11 @@ fn register_species_accessor(array_fn: &Value, heap: &mut Heap) {
     let Value::Object(obj) = array_fn else {
         return;
     };
-    let getter = Value::Object(heap.alloc(Object::NativeFunction(crate::vm::object::NativeFunctionObject::new(ARRAY_SPECIES_NATIVE))));
+    let getter = Value::Object(heap.alloc(Object::NativeFunction(
+        crate::vm::object::NativeFunctionObject::new(ARRAY_SPECIES_NATIVE).with_entry(
+            crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::Species),
+        ),
+    )));
     let desc = crate::vm::property::PropertyDescriptor {
         value: Value::Undefined,
         writable: false,

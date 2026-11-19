@@ -146,23 +146,29 @@ pub fn weakset_delete(this: &Value, args: &[Value]) -> Result<Value, RuntimeErro
 /// (ES2026 `upsert`, already in the pinned test262). `getOrInsert` is pure; the
 /// computed form needs the VM for the callback, so both are dispatched there.
 pub fn register_weakmap_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    for name in [
-        "set",
-        "get",
-        "has",
-        "delete",
-        "getOrInsert",
-        "getOrInsertComputed",
+    use crate::vm::native::{CollectionOp, VmSlot};
+    for (name, op) in [
+        ("set", CollectionOp::WeakMapSet),
+        ("get", CollectionOp::WeakMapGet),
+        ("has", CollectionOp::WeakMapHas),
+        ("delete", CollectionOp::WeakMapDelete),
+        ("getOrInsert", CollectionOp::WeakMapGetOrInsert),
+        ("getOrInsertComputed", CollectionOp::WeakMapGetOrInsertComputed),
     ] {
-        super::set_vm_method(proto, heap, super::WEAKMAP_METHOD_PREFIX, name);
+        super::set_prototype_method_impl(proto, heap, name, VmSlot::Collection(op).entry());
     }
     super::define_string_tag(heap, proto, "WeakMap");
 }
 
 /// Populate `WeakSet.prototype` (ES 23.4.3): `add` / `has` / `delete`.
 pub fn register_weakset_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    for name in ["add", "has", "delete"] {
-        super::set_vm_method(proto, heap, super::WEAKSET_METHOD_PREFIX, name);
+    use crate::vm::native::{CollectionOp, VmSlot};
+    for (name, op) in [
+        ("add", CollectionOp::WeakSetAdd),
+        ("has", CollectionOp::WeakSetHas),
+        ("delete", CollectionOp::WeakSetDelete),
+    ] {
+        super::set_prototype_method_impl(proto, heap, name, VmSlot::Collection(op).entry());
     }
     super::define_string_tag(heap, proto, "WeakSet");
 }

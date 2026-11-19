@@ -471,7 +471,10 @@ impl VM {
             },
         );
         let bound = Value::Object(self.heap.alloc(Object::NativeFunction(
-            crate::vm::object::NativeFunctionObject::new(&format!("{BOUND_PREFIX}{id}")),
+            crate::vm::object::NativeFunctionObject::new(&format!("{BOUND_PREFIX}{id}"))
+                .with_entry(crate::vm::native::NativeEntry::State(
+                    crate::vm::native::NativeState::Bound(id),
+                )),
         )));
         // 重定义 `length` / `name`（`NativeFunctionObject::new` 已按合成名装过一份，
         // 两者都是 `configurable: true`，重定义不改属性顺序）。

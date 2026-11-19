@@ -121,21 +121,20 @@ pub fn register_map_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `values`) or their *name* is also an ordinary property name elsewhere
     // (`get`, `has`, `set`, `delete`, `clear` — and `has`/`delete`/`clear` also
     // exist on `Set.prototype`). The VM validates the receiver kind.
-    for name in [
-        "get",
-        "has",
-        "set",
-        "delete",
-        "clear",
-        "forEach",
-        // `upsert` (ES2026, already in the pinned test262).
-        "getOrInsert",
-        "getOrInsertComputed",
+    use crate::vm::native::{CollectionOp, VmSlot};
+    for (name, op) in [
+        ("get", CollectionOp::MapGet),
+        ("has", CollectionOp::MapHas),
+        ("set", CollectionOp::MapSet),
+        ("delete", CollectionOp::MapDelete),
+        ("clear", CollectionOp::MapClear),
+        ("forEach", CollectionOp::MapForEach),
+        ("getOrInsert", CollectionOp::MapGetOrInsert),
+        ("getOrInsertComputed", CollectionOp::MapGetOrInsertComputed),
     ] {
-        super::set_map_method(proto, heap, name);
+        super::set_prototype_method_impl(proto, heap, name, VmSlot::Collection(op).entry());
     }
     // 迭代器工厂各带 slot：与 Array/Set 的同名方法靠函数身份区分。
-    use crate::vm::native::VmSlot;
     for (name, slot) in [
         ("entries", VmSlot::MapEntries),
         ("keys", VmSlot::MapKeys),
@@ -147,7 +146,9 @@ pub fn register_map_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `size` is an accessor (ES 23.1.3.9): a getter with no setter.
     let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
         MAP_SIZE_NATIVE,
-    ))));
+    ).with_entry(crate::vm::native::NativeEntry::VmSpecial(
+        crate::vm::native::SpecialOp::MapSize,
+    )))));
     let desc = PropertyDescriptor {
         value: Value::Undefined,
         writable: false,

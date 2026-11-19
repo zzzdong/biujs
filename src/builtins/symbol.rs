@@ -243,16 +243,17 @@ pub const SYMBOL_DESCRIPTION_NATIVE: &str = "__symbol_description__";
 /// descriptive strings) so that `Symbol.prototype.toString.call(sym)` works;
 /// the VM's `call_prototype_method` performs the actual conversion.
 pub fn register_symbol_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use crate::builtins::mark_prototype_method;
 
-    mark_prototype_method(proto, heap, "toString");
-    mark_prototype_method(proto, heap, "valueOf");
+    super::set_prototype_method_impl(proto, heap, "toString", crate::vm::native::VmSlot::LegacyProto("toString").entry());
+    super::set_prototype_method_impl(proto, heap, "valueOf", crate::vm::native::VmSlot::LegacyProto("valueOf").entry());
 
     // `Symbol.prototype.description` is an accessor: the getter unwraps the
     // symbol and returns its description (or undefined).
     let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
         SYMBOL_DESCRIPTION_NATIVE,
-    ))));
+    ).with_entry(crate::vm::native::NativeEntry::VmSpecial(
+        crate::vm::native::SpecialOp::SymbolDescription,
+    )))));
     let description_desc = PropertyDescriptor {
         value: Value::Undefined,
         writable: false,

@@ -722,8 +722,10 @@ impl VM {
         let id = self.next_revoke_id;
         self.next_revoke_id += 1;
         self.revocable_proxies.insert(id, proxy);
-        let mut revoke =
-            crate::vm::object::NativeFunctionObject::new(&format!("{REVOKE_PREFIX}{id}"));
+        let mut revoke = crate::vm::object::NativeFunctionObject::new(&format!("{REVOKE_PREFIX}{id}"))
+            .with_entry(crate::vm::native::NativeEntry::State(
+                crate::vm::native::NativeState::Revoke(id),
+            ));
         // A revocation function is *anonymous* (ES 28.2.2.1.1): its `name` is
         // the empty string, not the synthetic name the VM dispatches on.
         let _ = revoke.define_property(

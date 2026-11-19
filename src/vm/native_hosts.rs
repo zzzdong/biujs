@@ -1,4 +1,5 @@
-//! 内建的**按名字**分派：`call_native_by_name` 与各个 `try_<x>_method` 快速路径。
+//! 各 `NativeEntry::Vm*` 的宿主实现。原形如名字分派文件 `builtins_dispatch.rs`
+//! 已删除：这里的 `call_native_by_name` 只是少数全局函数/构造器的兜底。
 //!
 //! 它们住在 VM 里而不是 `builtins/` 里，是因为这些路径要么要回调 JS
 //! （`Array.prototype.map` 的回调、`String.prototype.replace` 的函数替换器），
@@ -29,12 +30,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bytecode::Module;
-use crate::vm::native::{ArrayOp, StringOp};
-use crate::vm::object::{JSObject, PromiseState};
-use crate::vm::{
-    BOUND_PREFIX, ObjectKind, PropertyDescriptor, PropertyKey, REVOKE_PREFIX,
-    RuntimeError, Value, VM,
-};
+use crate::vm::native::{ArrayOp, CollectionOp, SpecialOp, StringOp};
+use crate::vm::object::JSObject;
+use crate::vm::{ObjectKind, PropertyDescriptor, PropertyKey, RuntimeError, Value, VM};
 
 impl VM {
     /// Array `length` 的 [[Value]] 必须先走 ES `ToNumber`：描述符里可以是一个带
@@ -75,451 +73,19 @@ impl VM {
         Ok(())
     }
 
-    /// Dispatch a built-in by name, honouring prototype methods.
+    /// 仍未挂 `NativeEntry` 的全局函数/构造器的兜底分派。
     ///
-    /// `set_prototype_method` registers prototype methods under the synthetic
-    /// name `__proto_method__<name>`; those need the receiver as their first
-    /// argument, whereas real natives (`Object.keys`, `isNaN`, …) do not.
+    /// 原型方法与静态方法都已迁到函数对象自带的 entry；这里只剩少数按名字
+    /// 注册的全局入口需要映射到纯内建实现表。
     pub(crate) fn call_native_by_name(
         &mut self,
         name: &str,
-        this: Value,
+        _this: Value,
         args: &[Value],
-        module: &Module,
+        _module: &Module,
     ) -> Result<Value, RuntimeError> {
-        // ES 19.2.3：`Function.prototype` 是可以调用的，调用它返回 undefined
-        //（它没有函数体）。
-        if name == crate::builtins::FUNCTION_PROTO_NATIVE {
-            return Ok(Value::Undefined);
-        }
-        if name == crate::builtins::FUNCTION_HAS_INSTANCE_NATIVE {
-            // ES 20.2.3.6：`this` 不可调用 ⇒ false（不抛）；否则
-            // `OrdinaryHasInstance(this, V)` —— 注意参数顺序是 (V, this)。
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
-            if !this.is_callable() {
-                return Ok(Value::Bool(false));
-            }
-            let result = self.ordinary_has_instance(&value, &this, module)?;
-            return Ok(Value::Bool(result));
-        }
-        // Box bare `Value::Function(id)` arguments (and the receiver) into their
-        // memoized function objects before handing them to the builtin layer.
-        // The builtin layer matches on `Value::Object` — `Object.keys(fn)`,
-        // `Object.getOwnPropertyDescriptor(fn, "length")` and friends all used
-        // to report "first argument must be an object" for a plain function
-        // reference, and `ToObject` passes the bare form through unchanged.
         let boxed_args: Vec<Value> = args.iter().map(|a| self.as_object_value(a)).collect();
-        let args: &[Value] = &boxed_args;
-        let this: Value = self.as_object_value(&this);
-
-        // The `resolve` / `reject` handed to a `Promise` executor. They carry
-        // their target's id in the name (see `promise_construct`), because a
-        // native function here is identified by name alone.
-        if let Some(id) = name.strip_prefix("__promise_resolve__") {
-            if let Ok(id) = id.parse::<u64>() {
-                if let Some(promise) = self.state.promises.get(&id).cloned() {
-                    let value = args.first().cloned().unwrap_or(Value::Undefined);
-                    // 这是规范的 **resolve 函数**（ES 27.2.1.3.1）：它走
-                    // `ResolvePromise`，所以 thenable 会被**采纳**（排一个 thenable
-                    // job），而不是直接 fulfil。直接 settle 会让
-                    // `Promise.resolve({then(res){res(7)}})` 兑现成那个对象本身。
-                    self.promise_resolve(&promise, value, module);
-                }
-            }
-            return Ok(Value::Undefined);
-        }
-        if let Some(id) = name.strip_prefix("__promise_reject__") {
-            if let Ok(id) = id.parse::<u64>() {
-                if let Some(promise) = self.state.promises.get(&id).cloned() {
-                    let value = args.first().cloned().unwrap_or(Value::Undefined);
-                    self.promise_settle(&promise, PromiseState::Rejected, value);
-                }
-            }
-            return Ok(Value::Undefined);
-        }
-        // Per-element handlers of `Promise.all` / `race` / `allSettled` / `any`.
-        if name.starts_with("__promise_agg_ok__") || name.starts_with("__promise_agg_err__") {
-            if let Some(result) = self.dispatch_aggregation(name, args, module) {
-                return result;
-            }
-        }
-        // `NewPromiseCapability` 的 executor：构造器把它拿到的 `resolve` / `reject`
-        // 交回来，调用方（聚合 / `Promise.resolve` / `Promise.reject`）随后取走
-        // 这两个函数并按规范调用它们（ES 27.2.1.5 第 7 步）。
-        if let Some(rest) = name.strip_prefix("__promise_capability_executor__") {
-            if let Ok(id) = rest.parse::<u64>() {
-                self.state.capabilities.insert(
-                    id,
-                    crate::vm::PromiseCapability {
-                        promise: Value::Undefined,
-                        resolve: args.first().cloned().unwrap_or(Value::Undefined),
-                        reject: args.get(1).cloned().unwrap_or(Value::Undefined),
-                    },
-                );
-            }
-            return Ok(Value::Undefined);
-        }
-        // `Promise.prototype.finally` callbacks (name carries a registry id).
-        if let Some(rest) = name.strip_prefix("__promise_finally__") {
-            // `"<id>_f"` / `"<id>_r"`: which reaction (fulfilled or rejected)
-            // decides what "pass through unchanged" means.
-            if let Some((id, tag)) = rest.split_once('_') {
-                if let Ok(id) = id.parse::<u64>() {
-                    let callback = self.state.finally_handlers.get(&id).cloned();
-                    let argument = args.first().cloned().unwrap_or(Value::Undefined);
-                    if let Some(cb) = callback {
-                        // A throwing callback rejects the derived promise.
-                        self.invoke(&cb, Value::Undefined, &[], module)?;
-                        if tag == "r" {
-                            return Err(RuntimeError::Thrown(argument));
-                        }
-                        return Ok(argument);
-                    }
-                }
-            }
-            return Ok(Value::Undefined);
-        }
-        if name == crate::builtins::OBJECT_TO_STRING_NATIVE {
-            return self.object_prototype_to_string(&this, args, module);
-        }
-        // `Function.prototype.toString`：与 `Object.prototype.toString` 同名但
-        // 语义完全不同（前者要函数源码形式，后者是 `"[object X]"`），所以它
-        // 在 `Function.prototype` 上挂的是独立内建名。
-        if name == crate::builtins::FUNCTION_PROTO_TO_STRING_NATIVE {
-            return crate::builtins::function_prototype_to_string(&this);
-        }
-        // `RegExp.prototype` 的只读 accessor：名字后缀带属性名。
-        if let Some(prop) = name.strip_prefix(crate::builtins::REGEXP_GETTER_PREFIX) {
-            return crate::builtins::regexp_prototype_getter(&this, prop);
-        }
-        // `RegExp.prototype[@@match/@@replace/@@search/@@split]`：四个
-        // `String.prototype` 方法的协议入口。住在 VM，因为函数式 replacer
-        // 要回调 JS（内建层做不到）。
-        if let Some(symbol) = name.strip_prefix("Symbol.") {
-            if matches!(symbol, "match" | "replace" | "search" | "split") {
-                return self.regexp_symbol_method(symbol, &this, args, module);
-            }
-        }
-        // `Object.prototype.__proto__` 的 Annex B accessor：getter 要用堆做
-        // ToObject，setter 复用 `Object.setPrototypeOf` 的循环检测。
-        if name == crate::builtins::OBJECT_PROTO_GET_NATIVE {
-            return crate::builtins::object_proto_getter(&mut self.heap, &this);
-        }
-        if name == crate::builtins::OBJECT_PROTO_SET_NATIVE {
-            return crate::builtins::object_proto_setter(&this, args);
-        }
-        // %ThrowTypeError%：`Function.prototype.caller` / `arguments` 的
-        // getter 与 setter（ES 9.2.7）。严格模式函数读这两个属性必须抛。
-        if name == crate::builtins::FUNCTION_THROW_TYPE_ERROR_NATIVE {
-            return Err(RuntimeError::TypeError(
-                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions"
-                    .to_string(),
-            ));
-        }
-        // `Symbol.prototype.description` getter: unwrap the receiver.
-        if name == crate::builtins::SYMBOL_DESCRIPTION_NATIVE {
-            return crate::builtins::symbol_description(&this);
-        }
-        // `Map.prototype.size` getter (ES 23.1.3.9).
-        if name == crate::builtins::MAP_SIZE_NATIVE {
-            return crate::builtins::map_size(&this);
-        }
-        // `Set.prototype.size` getter (ES 23.2.3.9).
-        if name == crate::builtins::SET_SIZE_NATIVE {
-            return crate::builtins::set_size(&this);
-        }
-        // TypedArray / ArrayBuffer getters (ES 23.2.3.1-4, 25.1.5.1). They are
-        // accessors on the prototype, so the receiver arrives as `this`.
-        if name == crate::builtins::typedarray::TA_LENGTH_NATIVE {
-            return crate::builtins::typedarray::ta_length(&this);
-        }
-        if name == crate::builtins::typedarray::TA_BYTE_LENGTH_NATIVE {
-            return crate::builtins::typedarray::ta_byte_length(&this);
-        }
-        if name == crate::builtins::typedarray::TA_BYTE_OFFSET_NATIVE {
-            return crate::builtins::typedarray::ta_byte_offset(&this);
-        }
-        if name == crate::builtins::typedarray::TA_BUFFER_NATIVE {
-            return crate::builtins::typedarray::ta_buffer(&this);
-        }
-        if name == crate::builtins::typedarray::AB_BYTE_LENGTH_NATIVE {
-            return crate::builtins::typedarray::ab_byte_length(&this);
-        }
-        if name == crate::builtins::typedarray::DV_BUFFER_NATIVE {
-            return crate::builtins::typedarray::dv_buffer(&this);
-        }
-        if name == crate::builtins::typedarray::DV_BYTE_LENGTH_NATIVE {
-            return crate::builtins::typedarray::dv_byte_length(&this);
-        }
-        if name == crate::builtins::typedarray::DV_BYTE_OFFSET_NATIVE {
-            return crate::builtins::typedarray::dv_byte_offset(&this);
-        }
-        // `get Map[Symbol.species]` / `get Set[Symbol.species]` (23.1.2.2,
-        // 23.2.2.2) and `get Promise[Symbol.species]` (27.2.2.3) all answer
-        // their receiver.
-        if name == crate::builtins::MAP_SPECIES_NATIVE
-            || name == crate::builtins::SET_SPECIES_NATIVE
-            || name == crate::builtins::PROMISE_SPECIES_NATIVE
-            // `%TypedArray%[Symbol.species]` (23.2.2.2) 同样是"返回接收者"。
-            || name == crate::builtins::typedarray::TA_SPECIES_NATIVE
-        {
-            return Ok(this);
-        }
-        // `Map`/`Set` prototype methods are dispatched here, not in the builtin
-        // layer: they either call a user callback or mint an iterator object,
-        // and their dispatch name carries which prototype they came from.
-        if let Some(method) = name.strip_prefix(crate::builtins::MAP_METHOD_PREFIX) {
-            return self.map_method(&this, method, args, module);
-        }
-        if let Some(method) = name.strip_prefix(crate::builtins::SET_METHOD_PREFIX) {
-            return self.set_method(&this, method, args, module);
-        }
-        if let Some(method) = name.strip_prefix(crate::builtins::WEAKMAP_METHOD_PREFIX) {
-            return self.weakmap_method(&this, method, args, module);
-        }
-        if let Some(method) = name.strip_prefix(crate::builtins::WEAKSET_METHOD_PREFIX) {
-            return self.weakset_method(&this, method, args);
-        }
-        // Generator methods: `gen.next(v)` resumes the body, `gen.return(v)` /
-        // `gen.throw(e)` complete it, and `gen[Symbol.iterator]()` hands the
-        // generator itself back.
-        if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_NEXT_PREFIX) {
-            let id: u64 = id.parse().map_err(|_| {
-                RuntimeError::InternalError("malformed generator id".to_string())
-            })?;
-            let send = args.first().cloned().unwrap_or(Value::Undefined);
-            return self.generator_next(id, send, module);
-        }
-        if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_RETURN_PREFIX) {
-            let id: u64 = id.parse().map_err(|_| {
-                RuntimeError::InternalError("malformed generator id".to_string())
-            })?;
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
-            return self.generator_abrupt(id, Ok(value), module);
-        }
-        if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_THROW_PREFIX) {
-            let id: u64 = id.parse().map_err(|_| {
-                RuntimeError::InternalError("malformed generator id".to_string())
-            })?;
-            let reason = args.first().cloned().unwrap_or(Value::Undefined);
-            return self.generator_abrupt(id, Err(RuntimeError::Thrown(reason)), module);
-        }
-        if let Some(id) = name.strip_prefix(crate::vm::iterator::GENERATOR_ITERATOR_PREFIX) {
-            let _id: u64 = id.parse().map_err(|_| {
-                RuntimeError::InternalError("malformed generator id".to_string())
-            })?;
-            return Ok(this);
-        }
-        // `get Array[Symbol.species]` returns its receiver (ES 22.1.2.5).
-        if name == crate::builtins::ARRAY_SPECIES_NATIVE {
-            return Ok(this);
-        }
-        // `Symbol.iterator` factory: returns an internal iterator over `this`.
-        if name == crate::vm::iterator::ITERATOR_NATIVE_NAME {
-            return self.make_iterator(this, module);
-        }
-        // `get %TypedArray%.prototype[@@toStringTag]`：返回接收者自己的
-        // TypedArray 名（23.2.3.32）。
-        if name == crate::builtins::typedarray::TA_TO_STRING_TAG_NATIVE {
-            return crate::builtins::typedarray::ta_to_string_tag(&this);
-        }
-        // `String(value)` is ToString(value): an object converts through
-        // ToPrimitive (hint "string"), which can run user code, so it has to
-        // happen here rather than in the builtin layer.
-        if name == "String" && args.len() == 1 {
-            let primitive = self.to_primitive(&args[0], "string", module)?;
-            return Ok(Value::string(&primitive.to_js_string()));
-        }
-        // Per-iterator `next()` / `return()` methods.
-        if let Some(id) = name.strip_prefix(crate::vm::iterator::ITERATOR_NEXT_PREFIX) {
-            let id: u64 = id
-                .parse()
-                .map_err(|_| RuntimeError::InternalError("malformed iterator id".to_string()))?;
-            let iter_val = self
-                .iterator_registry
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| RuntimeError::TypeError("iterator is no longer alive".to_string()))?;
-            // `next(v)` forwards `v` to a JS iterator: that is how `yield*` gets
-            // the value the outer `next(v)` supplied into the delegate.
-            let send = args.first().cloned();
-            let (item, done) = self.iterator_next(iter_val, send, module)?;
-            return Ok(Self::iterator_result(&mut self.heap, item, done));
-        }
-        if let Some(id) = name.strip_prefix(crate::vm::iterator::ITERATOR_RETURN_PREFIX) {
-            let id: u64 = id
-                .parse()
-                .map_err(|_| RuntimeError::InternalError("malformed iterator id".to_string()))?;
-            if let Some(iter_val) = self.iterator_registry.get(&id).cloned() {
-                self.iterator_close(iter_val, args.first(), false, module)?;
-            }
-            // `return()` is an iterator method, so it answers with an iterator
-            // result — `yield*` checks that the value is an object
-            // (ES 14.4.14 step 5.c.vi).
-            return Ok(Self::iterator_result(&mut self.heap, Value::Undefined, true));
-        }
-        // `Function.prototype` registers `call` / `apply` / `bind` under their
-        // plain names, so handle them before the static-method lookup.
-        if matches!(name, "call" | "apply") && this.is_callable() {
-            self.check_class_ctor(&this)?;
-            let call_args = self.call_or_apply_args(name, args, module)?;
-            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-            return self.invoke(&this, this_arg, &call_args, module);
-        }
-        if name == "bind" && this.is_callable() {
-            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-            let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
-            return self.make_bound(this, this_arg, bound_args, module);
-        }
-        if let Some(id) = name.strip_prefix(BOUND_PREFIX) {
-            let id: u32 = id
-                .parse()
-                .map_err(|_| RuntimeError::InternalError("malformed bound function".to_string()))?;
-            let Some((target, this_arg, mut all)) = self
-                .bound_functions
-                .get(&id)
-                .map(|b| (b.target.clone(), b.this_arg.clone(), b.bound_args.clone()))
-            else {
-                return Err(RuntimeError::InternalError(
-                    "bound function is no longer available".to_string(),
-                ));
-            };
-            all.extend(args.iter().cloned());
-            return self.invoke(&target, this_arg, &all, module);
-        }
-        // `String.prototype.*` 已全部迁到 `NativeEntry::VmString`（`string_proto_host`），
-        // 不再从分派名 strip 归属；同名方法与 Array 的由函数对象身份区分。
-        // Number / Boolean 一族已迁到函数对象自带的 `NativeEntry`；归属由
-        // 函数身份决定（`require_number` / `require_boolean` 做 brand check），
-        // 不再需要从分派名里 strip 出 `Owner.prototype.`。
-        // `Array.prototype.*` 已全部迁到 `NativeEntry::VmArray`（`VM::array_proto_host`），
-        // 不再从分派名里 strip 出归属；`Array.prototype.slice.call("abc")` 的
-        // 数组口径由函数对象身份保证。
-        // `%TypedArray%.prototype.<name>`：先做 brand check（ES 23.2.3.x 的
-        // `ValidateTypedArray`）。以前按接收者形状分派，于是
-        // `%TypedArray%.prototype.indexOf.call({}, 1)` 悄悄走了数组那条路。
-        if let Some(method) = name.strip_prefix("TypedArray.prototype.") {
-            if !crate::builtins::typedarray::is_typedarray_receiver(&this) {
-                return Err(RuntimeError::TypeError(format!(
-                    "%TypedArray%.prototype.{method} called on a receiver that is not a TypedArray"
-                )));
-            }
-            // ES 23.2.3.x 的 `ValidateTypedArray`：view 的 buffer 已 detach 时
-            // **所有**原型方法都抛 TypeError（`detached-buffer` 一族跨
-            // indexOf / fill / reduce / keys / map / …）。集中放在分派口，
-            // 不逐个方法补检查 —— 这是这一族唯一的共同入口。
-            let detached = match &this {
-                Value::Object(obj_ref) => obj_ref
-                    .borrow()
-                    .as_typed_array()
-                    .is_some_and(|ta| ta.is_detached()),
-                _ => false,
-            };
-            if detached {
-                return Err(RuntimeError::TypeError(format!(
-                    "%TypedArray%.prototype.{method} called on a detached buffer"
-                )));
-            }
-            // 回调族（`map` / `filter` / `sort` …）要开帧，归 VM。
-            if let Some(result) =
-                self.try_typedarray_callback_method(&this, method, args, module)?
-            {
-                return Ok(result);
-            }
-            // `keys` / `values` / `entries` 已迁到各自 slot，不再按名字构造。
-            let coerced = self.coerce_index_method_args("TypedArray", method, args, module)?;
-            let dispatch_args: &[Value] = match &coerced {
-                Some(values) => values,
-                None => args,
-            };
-            return crate::builtins::call_prototype_method_owned(
-                "TypedArray",
-                &mut self.heap,
-                &this,
-                method,
-                dispatch_args,
-            );
-        }
-        if let Some(method) = name.strip_prefix(crate::builtins::PROTO_METHOD_PREFIX) {
-            // Annex B 的四个访问器方法必须走 VM：`ToPropertyKey` 会跑用户的
-            // `toString`，而 `defineProperty` / `getOwnPropertyDescriptor` /
-            // `getPrototypeOf` 三只 Proxy trap 都要能被观察到并原样传播。
-            if matches!(
-                method,
-                "__defineGetter__" | "__defineSetter__" | "__lookupGetter__" | "__lookupSetter__"
-            ) {
-                return self.object_accessor_method(&this, method, args, module);
-            }
-            // `f.call` / `f.apply` / `f.bind` are the same operations as the
-            // `CallMethod` opcode path handles; they must work identically when
-            // the method value is fetched first (`Function.prototype.call.bind(…)`).
-            if method == "bind" && this.is_callable() {
-                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-                let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
-                return self.make_bound(this, this_arg, bound_args, module);
-            }
-            if (method == "call" || method == "apply") && this.is_callable() {
-                // `C.call(...)` must fail for a class constructor, same as `C()`.
-                self.check_class_ctor(&this)?;
-                let call_args = self.call_or_apply_args(method, args, module)?;
-                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-                return self.invoke(&this, this_arg, &call_args, module);
-            }
-            if let Some(op) = ArrayOp::from_name(method) {
-                if let Some(result) = self.try_array_callback_method(&this, op, args, module)? {
-                    return Ok(result);
-                }
-            }
-            // 读族（`join` / `slice` / `includes` / `at` / `concat` / `reverse`）：
-            // 同样要在内建层之前截住，否则访问器元素读成空位、类数组接收者走不通。
-            if let Some(result) = self.try_array_read_method(&this, method, args, module)? {
-                return Ok(result);
-            }
-            // TypedArray 的回调一族：上面那条对 TypedArray 接收者直接让出（那里
-            // 产出的是 Array），由这里接手 —— `map` / `filter` 的结果必须是
-            // **同类视图**，不是普通数组。
-            if let Some(result) = self.try_typedarray_callback_method(&this, method, args, module)? {
-                return Ok(result);
-            }
-            // TypedArray 的迭代器三件套已迁到独立 slot；上面按接收者形状猜
-            // 归属的分支整段删除。
-            // `Promise.prototype.then/catch/finally` 已迁到 `NativeEntry::Vm`，
-            // 归属由函数身份决定，不再在这里按方法名截住。
-            // `String.prototype.replace(re, fn)` — the replacer is user code.
-            if let Some(result) = self.try_string_callback_method(&this, method, args, module)? {
-                return Ok(result);
-            }
-            if let Some(result) = self.try_match_all_method(&this, method, args, module)? {
-                return Ok(result);
-            }
-            // Array / Map / Set 的 `entries`/`keys`/`values` 已各自带 slot。
-            return crate::builtins::call_prototype_method(&mut self.heap, &this, method, args);
-        }
-        // 静态方法已全部迁到函数对象自带的 `NativeEntry`，这里不再有按名
-        // 的静态分支；`new Object.keys()` 之类现在正确落到 unknown built-in。
-        // The `revoke` function of `Proxy.revocable`: its work is one flag on
-        // the proxy it names. Everything after revocation throws.
-        if let Some(id) = name.strip_prefix(REVOKE_PREFIX) {
-            let id: u32 = id.parse().map_err(|_| {
-                RuntimeError::InternalError("malformed revoke function".to_string())
-            })?;
-            if let Some(Value::Object(obj_ref)) = self.revocable_proxies.get(&id) {
-                if let Some(proxy) = obj_ref
-                    .borrow_mut().as_proxy_mut()
-                {
-                    proxy.revoked = true;
-                }
-            }
-            return Ok(Value::Undefined);
-        }
-        // `Proxy` has no `[[Call]]` at all (ES 28.2.2): it can only be
-        // constructed.
-        if name == "Proxy" {
-            return Err(RuntimeError::TypeError(
-                "Constructor Proxy requires 'new'".to_string(),
-            ));
-        }
-        crate::builtins::call_native(name, args, &mut self.heap)
+        crate::builtins::call_native(name, &boxed_args, &mut self.heap)
     }
 
     /// `String.prototype.matchAll(re)` / `RegExp.prototype[Symbol.matchAll](s)`.
@@ -638,6 +204,188 @@ impl VM {
     ///   `ToObject`，但这条路径**不装箱**（热路径），直接在 exec 里调这里。
     ///
     /// 未知方法照旧返回 "unknown prototype method: …"，调用方据此回落到用户方法。
+    /// `%TypedArray%.prototype` 方法的唯一入口：brand/detached 检查都在实现里。
+    pub(crate) fn typed_array_proto_host(
+        &mut self,
+        method: &'static str,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        if !crate::builtins::typedarray::is_typedarray_receiver(this) {
+            return Err(RuntimeError::TypeError(format!(
+                "%TypedArray%.prototype.{method} called on a receiver that is not a TypedArray"
+            )));
+        }
+        let detached = match this {
+            Value::Object(obj_ref) => obj_ref
+                .borrow()
+                .as_typed_array()
+                .is_some_and(|ta| ta.is_detached()),
+            _ => false,
+        };
+        if detached {
+            return Err(RuntimeError::TypeError(format!(
+                "%TypedArray%.prototype.{method} called on a detached buffer"
+            )));
+        }
+        if let Some(result) = self.try_typedarray_callback_method(this, method, args, module)? {
+            return Ok(result);
+        }
+        let coerced = self.coerce_index_method_args("TypedArray", method, args, module)?;
+        let dispatch_args: &[Value] = match &coerced {
+            Some(values) => values,
+            None => args,
+        };
+        crate::builtins::call_prototype_method_owned(
+            "TypedArray",
+            &mut self.heap,
+            this,
+            method,
+            dispatch_args,
+        )
+    }
+
+    /// Map/Set/WeakMap/WeakSet 原型方法的唯一入口：归属由 `CollectionOp` 决定。
+    pub(crate) fn collection_host(
+        &mut self,
+        op: CollectionOp,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        use CollectionOp as C;
+        let method = op.as_str();
+        match op {
+            C::MapGet
+            | C::MapHas
+            | C::MapSet
+            | C::MapDelete
+            | C::MapClear
+            | C::MapForEach
+            | C::MapGetOrInsert
+            | C::MapGetOrInsertComputed => self.map_method(this, method, args, module),
+            C::SetAdd
+            | C::SetHas
+            | C::SetDelete
+            | C::SetClear
+            | C::SetForEach
+            | C::SetUnion
+            | C::SetIntersection
+            | C::SetDifference
+            | C::SetSymmetricDifference
+            | C::SetIsSubsetOf
+            | C::SetIsSupersetOf
+            | C::SetIsDisjointFrom => self.set_method(this, method, args, module),
+            C::WeakMapSet
+            | C::WeakMapGet
+            | C::WeakMapHas
+            | C::WeakMapDelete
+            | C::WeakMapGetOrInsert
+            | C::WeakMapGetOrInsertComputed => self.weakmap_method(this, method, args, module),
+            C::WeakSetAdd | C::WeakSetHas | C::WeakSetDelete => {
+                self.weakset_method(this, method, args)
+            }
+        }
+    }
+
+    /// 无状态特殊内建的唯一入口：getter、species、`Function.prototype` 工具等。
+    pub(crate) fn special_host(
+        &mut self,
+        op: SpecialOp,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::native::SpecialOp as Op;
+        match op {
+            Op::FunctionProto => Ok(Value::Undefined),
+            Op::FunctionHasInstance => {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                if !this.is_callable() {
+                    return Ok(Value::Bool(false));
+                }
+                Ok(Value::Bool(self.ordinary_has_instance(&value, this, module)?))
+            }
+            Op::ObjectToString => self.object_prototype_to_string(this, args, module),
+            Op::FunctionToString => crate::builtins::function_prototype_to_string(this),
+            Op::ObjectProtoGet => crate::builtins::object_proto_getter(&mut self.heap, this),
+            Op::ObjectProtoSet => crate::builtins::object_proto_setter(this, args),
+            Op::ThrowTypeError => Err(RuntimeError::TypeError(
+                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions".to_string(),
+            )),
+            Op::SymbolDescription => crate::builtins::symbol_description(this),
+            Op::MapSize => crate::builtins::map_size(this),
+            Op::SetSize => crate::builtins::set_size(this),
+            Op::TaLength => crate::builtins::typedarray::ta_length(this),
+            Op::TaByteLength => crate::builtins::typedarray::ta_byte_length(this),
+            Op::TaByteOffset => crate::builtins::typedarray::ta_byte_offset(this),
+            Op::TaBuffer => crate::builtins::typedarray::ta_buffer(this),
+            Op::AbByteLength => crate::builtins::typedarray::ab_byte_length(this),
+            Op::DvBuffer => crate::builtins::typedarray::dv_buffer(this),
+            Op::DvByteLength => crate::builtins::typedarray::dv_byte_length(this),
+            Op::DvByteOffset => crate::builtins::typedarray::dv_byte_offset(this),
+            Op::Species => Ok(this.clone()),
+            Op::ArrayIteratorFactory => self.make_iterator(this.clone(), module),
+            Op::TaToStringTag => crate::builtins::typedarray::ta_to_string_tag(this),
+            Op::StringCtor => {
+                let primitive = self.to_primitive(&args[0], "string", module)?;
+                Ok(Value::string(&primitive.to_js_string()))
+            }
+            Op::ProxyCtor => Err(RuntimeError::TypeError(
+                "Constructor Proxy requires 'new'".to_string(),
+            )),
+            Op::RegExpMatch | Op::RegExpReplace | Op::RegExpSearch | Op::RegExpSplit => {
+                let symbol = match op {
+                    Op::RegExpMatch => "match",
+                    Op::RegExpReplace => "replace",
+                    Op::RegExpSearch => "search",
+                    _ => "split",
+                };
+                self.regexp_symbol_method(symbol, this, args, module)
+            }
+            Op::FunctionCall | Op::FunctionApply => {
+                if !this.is_callable() {
+                    return Err(RuntimeError::TypeError(format!(
+                        "Function.prototype.{} called on non-callable",
+                        if op == Op::FunctionCall { "call" } else { "apply" }
+                    )));
+                }
+                self.check_class_ctor(this)?;
+                let method = if op == Op::FunctionCall { "call" } else { "apply" };
+                let call_args = self.call_or_apply_args(method, args, module)?;
+                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                self.invoke(this, this_arg, &call_args, module)
+            }
+            Op::FunctionBind => {
+                if !this.is_callable() {
+                    return Err(RuntimeError::TypeError(
+                        "Function.prototype.bind called on non-callable".to_string(),
+                    ));
+                }
+                let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                let bound_args: Vec<Value> = args.iter().skip(1).cloned().collect();
+                self.make_bound(this.clone(), this_arg, bound_args, module)
+            }
+            Op::ObjectDefineGetter | Op::ObjectDefineSetter => {
+                self.object_accessor_method(
+                    this,
+                    if op == Op::ObjectDefineGetter { "__defineGetter__" } else { "__defineSetter__" },
+                    args,
+                    module,
+                )
+            }
+            Op::ObjectLookupGetter | Op::ObjectLookupSetter => {
+                self.object_accessor_method(
+                    this,
+                    if op == Op::ObjectLookupGetter { "__lookupGetter__" } else { "__lookupSetter__" },
+                    args,
+                    module,
+                )
+            }
+        }
+    }
+
     /// `String.prototype` 方法的唯一 VM 入口：协议方法先走 `@@match` / `@@replace`
     /// 等；其余方法在这里做 `ToString(this)` 与参数 `ToPrimitive`（都会跑用户
     /// 代码），再把字符串交给纯内建层。
@@ -1597,6 +1345,10 @@ impl VM {
             // `join(separator)` 的 `ToString` 对 Symbol 要抛，内建层用
             // `to_js_string()` 静默产生 "Symbol(s)"。
             "join",
+            // `slice` / `subarray` 的结果要走 `TypedArraySpeciesCreate`，
+            // 而且 begin/end 的 ToInteger 是可观察操作，内建层做不到。
+            "slice",
+            "subarray",
         ];
         if !TA_CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -1620,6 +1372,43 @@ impl VM {
             }
             (len, els)
         };
+        if method == "slice" || method == "subarray" {
+            let relative = |v: i64| -> usize {
+                if v < 0 {
+                    (len as i64 + v).max(0) as usize
+                } else {
+                    (v as usize).min(len)
+                }
+            };
+            let begin = self.to_integer_or_infinity_arg(args.first(), 0, module)?;
+            let end = self.to_integer_or_infinity_arg(args.get(1), len as i64, module)?;
+            let begin = relative(begin);
+            let end = relative(end);
+            let count = end.saturating_sub(begin);
+            if method == "slice" {
+                let result = self.typed_array_species_create(receiver, count, module)?;
+                self.write_typed_array_elements(&result, &elements[begin..end]);
+                return Ok(Some(result));
+            }
+            // `subarray` 用同一个 buffer 建一个视图：`SpeciesCreate(O, 0)` 后
+            // 以 (buffer, byteOffset, length) 构造（ES 23.2.3.26）。
+            let (buffer, byte_offset, kind_size) = {
+                let Value::Object(o) = receiver else { unreachable!() };
+                let borrowed = o.borrow();
+                let ta = borrowed.as_typed_array().expect("checked above");
+                (ta.buffer, ta.byte_offset, ta.kind.bytes_per_element())
+            };
+            let result = self.typed_array_species_create_with(
+                receiver,
+                &[
+                    Value::Object(buffer),
+                    Value::Number((byte_offset + begin * kind_size) as f64),
+                    Value::Number(count as f64),
+                ],
+                module,
+            )?;
+            return Ok(Some(result));
+        }
         // 只有这一族的首参是**回调**。`with` 的首参是下标、`toReversed` 没有参数、
         // `toSorted` 的比较器是可选的 —— 它们不能被这条检查拦住。
         let needs_callback = matches!(
@@ -2054,6 +1843,16 @@ impl VM {
         len: usize,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        self.typed_array_species_create_with(receiver, &[Value::Number(len as f64)], module)
+    }
+
+    /// 与上面同源，但构造参数由调用方给定（`subarray` 要传 buffer/byteOffset/length）。
+    fn typed_array_species_create_with(
+        &mut self,
+        receiver: &Value,
+        ctor_args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
         // ES 9.4.2.3 `SpeciesConstructor(O, defaultConstructor)`：
         // `constructor` 缺失（包括被 getter 改成 undefined）时**落到默认构造器**
         // —— 不是 `Construct(undefined)`（`callbackfn-called-before-ctor`、
@@ -2086,7 +1885,7 @@ impl VM {
         } else {
             ctor.clone()
         };
-        self.construct(&species, &[Value::Number(len as f64)], module)
+        self.construct(&species, ctor_args, module)
     }
 
     /// 把一批值写进已按 `len` 建好的视图（元素会按视图类型做数值转换）。

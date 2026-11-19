@@ -7,7 +7,7 @@ use crate::vm::value::Value;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{set_static_method, set_static_method_impl};
+use super::set_static_method_impl;
 
 pub fn object_constructor(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     match args.first() {
@@ -1020,46 +1020,45 @@ pub const OBJECT_TO_STRING_NATIVE: &str = "Object.prototype.toString";
 
 /// Populate `Object.prototype` with the methods every object inherits.
 pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &mut Heap) {
-    use super::set_prototype_method;
 
     // Dedicated native so that `.call(receiver)` keeps Array/Number semantics.
     let desc = super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-        crate::vm::object::NativeFunctionObject::new(OBJECT_TO_STRING_NATIVE),
+        crate::vm::object::NativeFunctionObject::new(OBJECT_TO_STRING_NATIVE).with_entry(
+            crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::ObjectToString),
+        ),
     ))));
     let _ = proto.borrow_mut().define_property(
         heap,
         PropertyKey::well_known("toString").expect("well-known name"),
         desc,
     );
-    set_prototype_method(proto, heap, "valueOf", |this, _args| Ok(this.clone()));
+    super::set_prototype_method_impl(proto, heap, "valueOf", crate::vm::native::VmSlot::LegacyProto("valueOf").entry());
     // 闭包从不被调用（`set_prototype_method` 忽略它，真正走
     // `call_prototype_method` 的按名分派）；实现需要 heap，住在分派里。
-    set_prototype_method(proto, heap, "hasOwnProperty", |_, _| {
-        Err(RuntimeError::NotImplemented(
-            "method implemented by the VM".to_string(),
-        ))
-    });
-    set_prototype_method(proto, heap, "isPrototypeOf", |this, args| {
-        object_is_prototype_of(this, args)
-    });
-    set_prototype_method(proto, heap, "propertyIsEnumerable", |_, _| {
-        Err(RuntimeError::NotImplemented(
-            "method implemented by the VM".to_string(),
-        ))
-    });
+    super::set_prototype_method_impl(proto, heap, "hasOwnProperty", crate::vm::native::VmSlot::LegacyProto("hasOwnProperty").entry());
+    super::set_prototype_method_impl(proto, heap, "isPrototypeOf", crate::vm::native::VmSlot::LegacyProto("isPrototypeOf").entry());
+    super::set_prototype_method_impl(proto, heap, "propertyIsEnumerable", crate::vm::native::VmSlot::LegacyProto("propertyIsEnumerable").entry());
     // ES B.2.2.1 / B.2.2.2（web 兼容遗留）：沿原型链找 accessor 的一半。
     // 找不到 ⇒ `undefined`；数据属性 ⇒ `undefined`。实现之前这两条路是靠
     // "方法不存在时静默返回 undefined" 的 bug 顺带跑过的（测试因此假绿），
     // `obj.missing()` 修正为抛 TypeError 之后必须真正实现它们。
     // 实现要 heap（原语接收者需装箱），住在 `call_prototype_method` 的分派里。
-    super::mark_prototype_method_arity(proto, heap, "__lookupGetter__", 1);
-    super::mark_prototype_method_arity(proto, heap, "__lookupSetter__", 1);
-    // ES B.2.2.2 / B.2.2.3：对称的 define 一半（以前**完全没注册**）。
-    super::mark_prototype_method_arity(proto, heap, "__defineGetter__", 2);
-    super::mark_prototype_method_arity(proto, heap, "__defineSetter__", 2);
-    set_prototype_method(proto, heap, "toLocaleString", |this, args| {
-        object_prototype_to_string(this, args)
-    });
+    use crate::vm::native::SpecialOp;
+    for (name, arity, op) in [
+        ("__lookupGetter__", 1, SpecialOp::ObjectLookupGetter),
+        ("__lookupSetter__", 1, SpecialOp::ObjectLookupSetter),
+        ("__defineGetter__", 2, SpecialOp::ObjectDefineGetter),
+        ("__defineSetter__", 2, SpecialOp::ObjectDefineSetter),
+    ] {
+        super::set_prototype_method_arity_impl(
+            proto,
+            heap,
+            name,
+            arity,
+            crate::vm::native::NativeEntry::VmSpecial(op),
+        );
+    }
+    super::set_prototype_method_impl(proto, heap, "toLocaleString", crate::vm::native::VmSlot::LegacyProto("toLocaleString").entry());
     let _ = proto.borrow_mut().define_property(
         heap,
         PropertyKey::well_known("constructor").expect("well-known name"),
@@ -1071,10 +1070,14 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
     // `Object.getOwnPropertyDescriptor(Object.prototype, '__proto__')` 返回
     // undefined（test262 `Object/prototype/__proto__/prop-desc.js`）。
     let getter = Value::Object(heap.alloc(Object::NativeFunction(
-        crate::vm::object::NativeFunctionObject::new(OBJECT_PROTO_GET_NATIVE),
+        crate::vm::object::NativeFunctionObject::new(OBJECT_PROTO_GET_NATIVE).with_entry(
+            crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::ObjectProtoGet),
+        ),
     )));
     let setter = Value::Object(heap.alloc(Object::NativeFunction(
-        crate::vm::object::NativeFunctionObject::new(OBJECT_PROTO_SET_NATIVE),
+        crate::vm::object::NativeFunctionObject::new(OBJECT_PROTO_SET_NATIVE).with_entry(
+            crate::vm::native::NativeEntry::VmSpecial(crate::vm::native::SpecialOp::ObjectProtoSet),
+        ),
     )));
     let key = PropertyKey::intern(heap, "__proto__");
     let _ = proto.borrow_mut().define_property(

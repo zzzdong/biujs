@@ -88,27 +88,24 @@ pub fn register_set_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `MAP_METHOD_PREFIX`): `has`/`delete`/`clear` also exist on
     // `Map.prototype` and are ordinary property names elsewhere, while
     // `forEach`/`entries`/`values` need the receiver-kind check.
-    for name in [
-        "add",
-        "has",
-        "delete",
-        "clear",
-        "forEach",
-        // `set-methods` (ES2024): the seven operators take a *set-like*
-        // argument and drive its `has`/`keys` through user code, so they are
-        // VM dispatching as well.
-        "union",
-        "intersection",
-        "difference",
-        "symmetricDifference",
-        "isSubsetOf",
-        "isSupersetOf",
-        "isDisjointFrom",
+    use crate::vm::native::{CollectionOp, VmSlot};
+    for (name, op) in [
+        ("add", CollectionOp::SetAdd),
+        ("has", CollectionOp::SetHas),
+        ("delete", CollectionOp::SetDelete),
+        ("clear", CollectionOp::SetClear),
+        ("forEach", CollectionOp::SetForEach),
+        ("union", CollectionOp::SetUnion),
+        ("intersection", CollectionOp::SetIntersection),
+        ("difference", CollectionOp::SetDifference),
+        ("symmetricDifference", CollectionOp::SetSymmetricDifference),
+        ("isSubsetOf", CollectionOp::SetIsSubsetOf),
+        ("isSupersetOf", CollectionOp::SetIsSupersetOf),
+        ("isDisjointFrom", CollectionOp::SetIsDisjointFrom),
     ] {
-        super::set_set_method(proto, heap, name);
+        super::set_prototype_method_impl(proto, heap, name, VmSlot::Collection(op).entry());
     }
     // 迭代器工厂各带 slot：与 Array/Map 的同名方法靠函数身份区分。
-    use crate::vm::native::VmSlot;
     for (name, slot) in [
         ("entries", VmSlot::SetEntries),
         ("keys", VmSlot::SetKeys),
@@ -120,7 +117,9 @@ pub fn register_set_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `Set.prototype.size` is an accessor (ES 23.2.3.9).
     let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
         SET_SIZE_NATIVE,
-    ))));
+    ).with_entry(crate::vm::native::NativeEntry::VmSpecial(
+        crate::vm::native::SpecialOp::SetSize,
+    )))));
     let desc = PropertyDescriptor {
         value: Value::Undefined,
         writable: false,

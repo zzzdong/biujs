@@ -182,12 +182,26 @@ impl NativeIteratorObject {
         id: u64,
         state: NativeIteratorState,
     ) -> Self {
-        let mk = |heap: &mut crate::vm::gc::Heap, name: String| {
-            Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(&name))))
+        let mk = |heap: &mut crate::vm::gc::Heap,
+                  name: String,
+                  state: Option<crate::vm::native::NativeState>| {
+            let mut nf = NativeFunctionObject::new(&name);
+            if let Some(state) = state {
+                nf = nf.with_entry(crate::vm::native::NativeEntry::State(state));
+            }
+            Value::Object(heap.alloc(Object::NativeFunction(nf)))
         };
-        let iterator_fn = mk(heap, ITERATOR_NATIVE_NAME.to_string());
-        let next_fn = mk(heap, format!("{ITERATOR_NEXT_PREFIX}{id}"));
-        let return_fn = mk(heap, format!("{ITERATOR_RETURN_PREFIX}{id}"));
+        let iterator_fn = mk(heap, ITERATOR_NATIVE_NAME.to_string(), None);
+        let next_fn = mk(
+            heap,
+            format!("{ITERATOR_NEXT_PREFIX}{id}"),
+            Some(crate::vm::native::NativeState::IteratorNext(id)),
+        );
+        let return_fn = mk(
+            heap,
+            format!("{ITERATOR_RETURN_PREFIX}{id}"),
+            Some(crate::vm::native::NativeState::IteratorReturn(id)),
+        );
         Self {
             id,
             state: RefCell::new(state),

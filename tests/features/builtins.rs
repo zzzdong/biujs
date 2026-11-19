@@ -234,16 +234,17 @@ fn number_to_fixed() {
 
 #[test]
 fn number_to_exponential() {
-    assert_eq!(eval_string("(12345).toExponential()"), "1.2345e4");
-    assert_eq!(eval_string("(12345).toExponential(2)"), "1.23e4");
+    assert_eq!(eval_string("(12345).toExponential()"), "1.2345e+4");
+    assert_eq!(eval_string("(12345).toExponential(2)"), "1.23e+4");
     assert_eq!(eval_string("NaN.toExponential()"), "NaN");
 }
 
 #[test]
 fn number_to_precision() {
-    // Uses decimal places (not significant digits) in current implementation
-    assert_eq!(eval_string("(123.456).toPrecision(4)"), "123.4560");
-    assert_eq!(eval_string("(123.456).toPrecision(2)"), "123.46");
+    // ES 20.1.3.4：参数表示**有效数字**；指数超出范围时用指数形式。
+    assert_eq!(eval_string("(123.456).toPrecision(4)"), "123.5");
+    assert_eq!(eval_string("(123.456).toPrecision(2)"), "1.2e+2");
+    assert_eq!(eval_string("(0).toPrecision(3)"), "0.00");
     assert_eq!(eval_string("NaN.toPrecision(1)"), "NaN");
 }
 

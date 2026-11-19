@@ -34,7 +34,7 @@ IR（SSA 形态 + CFG）──────────────────�
 - `src/vm/exec.rs`（**3404 行**）：`step`（`Halt` / `Ret` 之外全部指令用它分派）、`to_primitive`、`enter_call` / `invoke*` / `open_frame` / `drive_bytecode_frame`、`json_*`、`run_instruction` 与 17 个 `run_<group>`。
 - `src/vm/proxy.rs`（748 行）：`Proxy` 对象与 `proxy_static_trap` 等 9 个静态 trap 钩子。
 - `src/vm/native.rs`（82 行）：**内建实现载体** `NativeEntry`（函数对象自带实现）与唯一调用入口 `VM::invoke_native`。
-- `src/vm/builtins_dispatch.rs`（3963 行）：仍在按名字字符串分派的那部分内建（arity 表 / 前缀约定 / 旁路名单），**正在被 `native.rs` 逐族取代**。
+- `src/vm/native_hosts.rs`：各 `NativeEntry::Vm*` 的宿主实现（Array/String/TypedArray/特殊内建等）。原来的 `builtins_dispatch.rs` 已删除：静态分支、原型前缀分支、集合方法前缀、promise/generator/iterator/bound/revoke 状态分支都已迁到 `NativeEntry` / `NativeState`；文件里只剩极少数全局函数/构造器的按名兜底。
 
 > 拆分现状（2026-10-11）：P0-4 已拆完三步 —— `run_instruction` 的 1740 行巨型 match 先按语义切成 17 个 `run_<group>`，再把 Proxy（`proxy_static_trap` 等）与内建分派搬出，最后把整个执行循环（`step` + `run_*`）搬进 `exec.rs` 子模块。mod.rs 由 11269 行降到 6288 行。逻辑未改，全量零回退（16567 / 7843 / 3141，护栏 7/0/22）。
 
@@ -220,6 +220,20 @@ host 在回调/读族之前先做了参数强转，导致 `copyWithin` 的 `valu
 分支和 `CallMethod` 的 `try_string_callback_method` / `try_match_all_method`
 早段拦截已删除，原语字符串接收者改走同一个 host。String 套件 991/64（基线
 987/68，+4/-4）；全量仍是 17710/833，逐套件相对基线**全部为改善、无回退**。
+
+无状态特殊内建也已迁入 `NativeEntry::VmSpecial(SpecialOp)` 并从
+`call_native_by_name` 删除对应分支：`Function.prototype`（含 call/apply/bind、
+@@hasInstance、toString、%ThrowTypeError%）、`Object.prototype.toString`、
+`__proto__` accessor、Annex B 四个 accessor、RegExp 四个 `@@` 方法、
+`Symbol.description`、`Map/Set.size`、TypedArray/ArrayBuffer/DataView 全部 getter、
+四个 species getter、iterator factory、TA `@@toStringTag`、`String()` 与 `Proxy()`。
+过程中因 `bind` 缺少 callable 检查和 `__defineGetter__` 的 arity 造成两条
+test262 回退，已修复（Function 201/66、Object 3166/102 均回到改善后的基线）。
+带状态内建开始迁入 `NativeEntry::State(NativeState)`：bound、revoke、generator
+的 next/return/throw/iterator、原生迭代器的 next/return 已完成，函数对象直接
+携带 id，调用期不再 `strip_prefix` + `parse::<u64>`。promise 系列（resolve/reject、聚合处理器、capability executor、finally）也已迁入，
+`dispatch_aggregation` 改为直接收 id/index；剩余 Map/Set/WeakMap/WeakSet 前缀、
+TypedArray 回调族与 RegExp getter 后缀。
 迁移中的状态是
 `NativeFunctionObject.entry == None`：
 这类内建仍走 `call_native_by_name` / `call_native` / `call_static_method` /

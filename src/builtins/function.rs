@@ -107,12 +107,19 @@ pub fn register_function_statics(
 pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     let mut p = proto.borrow_mut();
 
-    // `call` / `apply` / `bind` 的实现住 VM（要拿 frame 与 `this`），这里只放
-    // 名字与描述符。
-    for name in ["call", "apply", "bind"] {
+    // `call` / `apply` / `bind` 的实现带在函数对象上（SpecialOp）。
+    use crate::vm::native::SpecialOp;
+    for (name, op) in [
+        ("call", SpecialOp::FunctionCall),
+        ("apply", SpecialOp::FunctionApply),
+        ("bind", SpecialOp::FunctionBind),
+    ] {
         let key = PropertyKey::intern(heap, name);
         let value = super::method_descriptor(Value::Object(heap.alloc(
-            Object::NativeFunction(NativeFunctionObject::new(name)),
+            Object::NativeFunction(
+                NativeFunctionObject::new(name)
+                    .with_entry(crate::vm::native::NativeEntry::VmSpecial(op)),
+            ),
         )));
         p.define_property(heap, key, value).ok();
     }
@@ -121,7 +128,11 @@ pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     {
         let key = PropertyKey::intern(heap, "toString");
         let value = super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(FUNCTION_PROTO_TO_STRING_NATIVE),
+            NativeFunctionObject::new(FUNCTION_PROTO_TO_STRING_NATIVE).with_entry(
+                crate::vm::native::NativeEntry::VmSpecial(
+                    crate::vm::native::SpecialOp::FunctionToString,
+                ),
+            ),
         ))));
         p.define_property(heap, key, value).ok();
     }
@@ -130,7 +141,11 @@ pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `caller` / `arguments` 访问器，其 [[Get]] / [[Set]] 都是 %ThrowTypeError%。
     // 没有它时 `fn.caller` 只是 undefined，一整族 strict-mode 用例不抛错。
     let thrower = Value::Object(heap.alloc(Object::NativeFunction(
-        NativeFunctionObject::new(FUNCTION_THROW_TYPE_ERROR_NATIVE),
+        NativeFunctionObject::new(FUNCTION_THROW_TYPE_ERROR_NATIVE).with_entry(
+            crate::vm::native::NativeEntry::VmSpecial(
+                crate::vm::native::SpecialOp::ThrowTypeError,
+            ),
+        ),
     )));
     for name in ["caller", "arguments"] {
         let key = PropertyKey::intern(heap, name);
@@ -151,7 +166,11 @@ pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // `OrdinaryHasInstance(this, V)` —— 它不走 `@@hasInstance` 再分派
     // （那样会自递归），`this` 不可调用时返回 false。
     let has_instance = Value::Object(heap.alloc(Object::NativeFunction(
-        NativeFunctionObject::new(super::FUNCTION_HAS_INSTANCE_NATIVE),
+        NativeFunctionObject::new(super::FUNCTION_HAS_INSTANCE_NATIVE).with_entry(
+            crate::vm::native::NativeEntry::VmSpecial(
+                crate::vm::native::SpecialOp::FunctionHasInstance,
+            ),
+        ),
     )));
     if let Value::Object(fn_ref) = &has_instance {
         if let Object::NativeFunction(nf) = &mut *fn_ref.borrow_mut() {

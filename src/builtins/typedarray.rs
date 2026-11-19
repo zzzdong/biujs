@@ -7,6 +7,7 @@
 
 use crate::RuntimeError;
 use crate::vm::gc::{Gc, Heap, Object};
+use crate::vm::native::SpecialOp;
 use crate::vm::object::{
     ArrayBufferObject, DataViewObject, JSObject, NativeFunctionObject, TypedArrayKind,
     TypedArrayObject,
@@ -1046,12 +1047,11 @@ fn relative_index(
 // ── prototypes ─────────────────────────────────────────────────────────────
 
 pub fn register_arraybuffer_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method;
     // 同 TypedArray 的 `subarray` / `slice`：这个闭包**永不被调用**，
     // `ArrayBuffer.prototype.slice` 实际由 `call_prototype_method` 按名字分派到
     // `ab_slice`（它需要 `heap`，而闭包签名拿不到）。
-    set_prototype_method(proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
-    let desc = accessor(heap, AB_BYTE_LENGTH_NATIVE);
+    super::set_prototype_method_impl(proto, heap, "slice", crate::vm::native::VmSlot::LegacyProto("slice").entry());
+    let desc = accessor(heap, AB_BYTE_LENGTH_NATIVE, SpecialOp::AbByteLength);
     let _ = proto.borrow_mut().define_property(
         heap,
         PropertyKey::well_known("byteLength").expect("well-known name"),
@@ -1062,7 +1062,6 @@ pub fn register_arraybuffer_prototype(proto: &Gc<Object>, heap: &mut Heap) {
 /// `DataView.prototype`: the 8 `get*` / 8 `set*` methods and the three accessors
 /// (`buffer` / `byteLength` / `byteOffset`).
 pub fn register_dataview_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method;
     let get_types: [(DataViewType, &str); 8] = [
         (DataViewType::Int8, "getInt8"),
         (DataViewType::Uint8, "getUint8"),
@@ -1073,9 +1072,13 @@ pub fn register_dataview_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         (DataViewType::Float32, "getFloat32"),
         (DataViewType::Float64, "getFloat64"),
     ];
-    for (ty, name) in get_types {
-        let ty = ty;
-        set_prototype_method(proto, heap, name, move |this, args| dv_get(this, args, ty));
+    for (_ty, name) in get_types {
+        super::set_prototype_method_impl(
+            proto,
+            heap,
+            name,
+            crate::vm::native::VmSlot::LegacyProto(name).entry(),
+        );
     }
     let set_types: [(DataViewType, &str); 8] = [
         (DataViewType::Int8, "setInt8"),
@@ -1087,15 +1090,19 @@ pub fn register_dataview_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         (DataViewType::Float32, "setFloat32"),
         (DataViewType::Float64, "setFloat64"),
     ];
-    for (ty, name) in set_types {
-        let ty = ty;
-        set_prototype_method(proto, heap, name, move |this, args| dv_set(this, args, ty));
+    for (_ty, name) in set_types {
+        super::set_prototype_method_impl(
+            proto,
+            heap,
+            name,
+            crate::vm::native::VmSlot::LegacyProto(name).entry(),
+        );
     }
-    let desc = accessor(heap, DV_BUFFER_NATIVE);
+    let desc = accessor(heap, DV_BUFFER_NATIVE, SpecialOp::DvBuffer);
     let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("buffer").expect("well-known name"), desc);
-    let desc = accessor(heap, DV_BYTE_LENGTH_NATIVE);
+    let desc = accessor(heap, DV_BYTE_LENGTH_NATIVE, SpecialOp::DvByteLength);
     let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("byteLength").expect("well-known name"), desc);
-    let desc = accessor(heap, DV_BYTE_OFFSET_NATIVE);
+    let desc = accessor(heap, DV_BYTE_OFFSET_NATIVE, SpecialOp::DvByteOffset);
     let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("byteOffset").expect("well-known name"), desc);
 }
 
@@ -1110,37 +1117,28 @@ pub fn register_arraybuffer_statics(ctor: &Value) {
 /// 即可。以前是八个 prototype 各注册一份（与基类重复），已去重；与类型有关的
 /// 那一项见 [`register_typedarray_bytes_per_element`]。
 pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method_owned;
-    set_prototype_method_owned("TypedArray", proto, heap, "set", |_this, _args| {
-        Err(RuntimeError::NotImplemented(
-            "method implemented by the VM".to_string(),
-        ))
-    });
+    use crate::vm::native::VmSlot;
+    super::set_prototype_method_impl(proto, heap, "set", VmSlot::TypedArrayProto("set").entry());
     // 下面这两个闭包**永不被调用**：`set_prototype_method` 只登记名字，实际分派
     // 在 `call_prototype_method` 里按名字走（`ta_subarray` / `ta_slice`）。留着
     // 只是为了满足签名，别被它误导成"subarray/slice 返回 undefined"。
-    set_prototype_method_owned("TypedArray", proto, heap, "subarray", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("TypedArray", proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("TypedArray", proto, heap, "fill", |this, args| ta_fill(this, args));
+    super::set_prototype_method_impl(proto, heap, "subarray", VmSlot::TypedArrayProto("subarray").entry());
+    super::set_prototype_method_impl(proto, heap, "slice", VmSlot::TypedArrayProto("slice").entry());
+    super::set_prototype_method_impl(proto, heap, "fill", VmSlot::TypedArrayProto("fill").entry());
     // 只读 / 原地的一族（不需要回调 ⇒ 不需要 VM）：
-    set_prototype_method_owned("TypedArray", proto, heap, "indexOf", |this, args| ta_index_of(this, args));
-    set_prototype_method_owned("TypedArray", proto, heap, "lastIndexOf", |this, args| {
-        ta_last_index_of(this, args)
-    });
-    set_prototype_method_owned("TypedArray", proto, heap, "includes", |this, args| ta_includes(this, args));
-    set_prototype_method_owned("TypedArray", proto, heap, "join", |this, args| ta_join(this, args));
-    set_prototype_method_owned("TypedArray", proto, heap, "reverse", |this, args| ta_reverse(this, args));
-    set_prototype_method_owned("TypedArray", proto, heap, "at", |this, args| ta_at(this, args));
-    set_prototype_method_owned("TypedArray", proto, heap, "copyWithin", |this, args| {
-        ta_copy_within(this, args)
-    });
+    super::set_prototype_method_impl(proto, heap, "indexOf", VmSlot::TypedArrayProto("indexOf").entry());
+    super::set_prototype_method_impl(proto, heap, "lastIndexOf", VmSlot::TypedArrayProto("lastIndexOf").entry());
+    super::set_prototype_method_impl(proto, heap, "includes", VmSlot::TypedArrayProto("includes").entry());
+    super::set_prototype_method_impl(proto, heap, "join", VmSlot::TypedArrayProto("join").entry());
+    super::set_prototype_method_impl(proto, heap, "reverse", VmSlot::TypedArrayProto("reverse").entry());
+    super::set_prototype_method_impl(proto, heap, "at", VmSlot::TypedArrayProto("at").entry());
+    super::set_prototype_method_impl(proto, heap, "copyWithin", VmSlot::TypedArrayProto("copyWithin").entry());
 
     // 回调一族（`map` / `filter` / …）：闭包**永不被调用**，实际由 VM 的
     // `try_typedarray_callback_method` 接手（它们要 invoke 回调，还得按 species
     // 建出同类视图，builtins 层拿不到 VM）。
     // `keys` / `values` / `entries`：各带一个 slot，brand/detached check 在
     // `VM::typed_array_iterator_host` 里，不再由按名分派口猜接收者。
-    use crate::vm::native::VmSlot;
     for (name, slot) in [
         ("keys", VmSlot::TypedArrayKeys),
         ("values", VmSlot::TypedArrayValues),
@@ -1150,21 +1148,12 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     }
     // ES2023 的一族：同样由 VM 分派 —— `findLast*` 要 invoke 谓词，`toSorted` 要
     // invoke 比较器，`with` / `toReversed` / `toSorted` 还要按 species 建新视图。
-    for m in ["with", "toReversed", "toSorted", "findLast", "findLastIndex"] {
-        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
-    }
-    // `sort`：比较器可选，且是**原地**排序（与 Array.prototype.sort 同）。
-    for m in ["sort"] {
-        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
-    }
-    // `toString` / `toLocaleString`（23.2.3.37 / 23.2.3.38）：都是 join(",")，
-    // 闭包永不被调用，实际分派在 `call_prototype_method`。
-    for m in ["toString", "toLocaleString"] {
-        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
+    for m in ["with", "toReversed", "toSorted", "findLast", "findLastIndex", "sort", "toString", "toLocaleString"] {
+        super::set_prototype_method_impl(proto, heap, m, VmSlot::TypedArrayProto(m).entry());
     }
     // `get %TypedArray%.prototype[@@toStringTag]`（23.2.3.32）：返回接收者自己的
     // TypedArray 名，不是常量 —— 故必须是取值器而非数据属性。
-    let desc = accessor(heap, TA_TO_STRING_TAG_NATIVE);
+    let desc = accessor(heap, TA_TO_STRING_TAG_NATIVE, SpecialOp::TaToStringTag);
     let _ = proto
         .borrow_mut()
         .define_property(heap, crate::builtins::to_string_tag_symbol_key(), desc);
@@ -1179,21 +1168,25 @@ pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         "reduce",
         "reduceRight",
     ] {
-        set_prototype_method_owned("TypedArray", proto, heap, m, |_this, _args| Ok(Value::Undefined));
+        super::set_prototype_method_impl(proto, heap, m, VmSlot::TypedArrayProto(m).entry());
     }
 
-    let desc = accessor(heap, TA_LENGTH_NATIVE);
+    let desc = accessor(heap, TA_LENGTH_NATIVE, SpecialOp::TaLength);
     let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("length").expect("well-known name"), desc);
-    let desc = accessor(heap, TA_BYTE_LENGTH_NATIVE);
+    let desc = accessor(heap, TA_BYTE_LENGTH_NATIVE, SpecialOp::TaByteLength);
     let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("byteLength").expect("well-known name"), desc);
-    let desc = accessor(heap, TA_BYTE_OFFSET_NATIVE);
+    let desc = accessor(heap, TA_BYTE_OFFSET_NATIVE, SpecialOp::TaByteOffset);
     let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("byteOffset").expect("well-known name"), desc);
-    let desc = accessor(heap, TA_BUFFER_NATIVE);
+    let desc = accessor(heap, TA_BUFFER_NATIVE, SpecialOp::TaBuffer);
     let _ = proto.borrow_mut().define_property(heap, PropertyKey::well_known("buffer").expect("well-known name"), desc);
     // Iterating a view yields its elements: the factory reads `length` (a getter
     // here, which the VM dispatches) and then the indices.
     let desc = super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-        NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME),
+        NativeFunctionObject::new(crate::vm::iterator::ITERATOR_NATIVE_NAME).with_entry(
+            crate::vm::native::NativeEntry::VmSpecial(
+                crate::vm::native::SpecialOp::ArrayIteratorFactory,
+            ),
+        ),
     ))));
     let _ = proto
         .borrow_mut()
@@ -1230,14 +1223,20 @@ fn data(value: Value) -> PropertyDescriptor {
 }
 
 /// An accessor with only a getter, as every `length`-style property is.
-fn accessor(heap: &mut Heap, getter_name: &str) -> PropertyDescriptor {
+fn accessor(
+    heap: &mut Heap,
+    getter_name: &str,
+    op: crate::vm::native::SpecialOp,
+) -> PropertyDescriptor {
     PropertyDescriptor {
         value: Value::Undefined,
         writable: true,
         enumerable: false,
         configurable: true,
         getter: Some(Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(getter_name),
+            NativeFunctionObject::new(getter_name).with_entry(
+                crate::vm::native::NativeEntry::VmSpecial(op),
+            ),
         )))),
         setter: None,
     }

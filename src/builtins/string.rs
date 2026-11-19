@@ -639,7 +639,7 @@ pub fn split_string(s: &str, separator: &str, lim: u32) -> Vec<String> {
 
 /// `String.prototype.split(separator, limit)`，**不跑用户代码**的那一半。
 ///
-/// 完整的入口在 VM（`builtins_dispatch::string_prototype_split`）：`@@split`
+/// 完整的入口在 VM（`native_hosts::string_prototype_split`）：`@@split`
 /// 协议、`ToString(this)`、`ToUint32(limit)`、`ToString(separator)` 都可能执行
 /// 用户函数，这个函数只负责在三个值都已转换好之后走切分循环 —— 它同时也给
 /// `call_prototype_method` 的按名分派当兜底。

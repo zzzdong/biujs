@@ -72,7 +72,12 @@ pub fn proxy_construct(
 /// `revocable` 的实现带在函数对象上：revoke 要记住撤销的是哪个 proxy，
 /// 由 VM 铸造（与 `Function.prototype.bind` 的包装函数同理）。
 pub fn create_proxy_constructor(heap: &mut Heap) -> Value {
-    let ctor = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new("Proxy"))));
+    let ctor = Value::Object(heap.alloc(Object::NativeFunction(
+        NativeFunctionObject::new("Proxy")
+            .with_entry(crate::vm::native::NativeEntry::VmSpecial(
+                crate::vm::native::SpecialOp::ProxyCtor,
+            )),
+    )));
     // `Proxy` 没有 `prototype` 属性（实例继承自 target），所以不走
     // `link_constructor_prototype` —— 但它是构造器（`new Proxy(t, h)`）。
     if let Value::Object(obj_ref) = &ctor {

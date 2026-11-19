@@ -377,10 +377,9 @@ pub fn regexp_to_string(this: &Value) -> Result<Value, RuntimeError> {
 }
 
 pub fn register_regexp_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method;
-    set_prototype_method(proto, heap, "test", |this, args| regexp_test(this, args));
-    set_prototype_method(proto, heap, "exec", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method(proto, heap, "toString", |this, _| regexp_to_string(this));
+    super::set_prototype_method_impl(proto, heap, "test", crate::vm::native::VmSlot::LegacyProto("test").entry());
+    super::set_prototype_method_impl(proto, heap, "exec", crate::vm::native::VmSlot::LegacyProto("exec").entry());
+    super::set_prototype_method_impl(proto, heap, "toString", crate::vm::native::VmSlot::LegacyProto("toString").entry());
     // `RegExp.prototype[Symbol.matchAll]` is the other entry point of the same
     // algorithm (`String.prototype.matchAll` delegates to it). Handled by the
     // VM for the same reason: the result is an iterator.
@@ -393,7 +392,8 @@ pub fn register_regexp_prototype(proto: &Gc<Object>, heap: &mut Heap) {
             "{}{}",
             super::PROTO_METHOD_PREFIX,
             "matchAll"
-        )),
+        ))
+        .with_entry(crate::vm::native::VmSlot::MatchAll.entry()),
     ))));
     let _ = proto
         .borrow_mut()
@@ -409,14 +409,18 @@ pub fn register_regexp_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     // The native name is the symbol's own name (`"Symbol.replace"`), not the
     // property name: `RegExp.prototype.replace` does not exist, and dispatch is
     // by native name.
-    for (key, native) in [
-        (super::match_symbol_key(), "Symbol.match"),
-        (super::replace_symbol_key(), "Symbol.replace"),
-        (super::search_symbol_key(), "Symbol.search"),
-        (super::split_symbol_key(), "Symbol.split"),
+    use crate::vm::native::SpecialOp;
+    for (key, native, op) in [
+        (super::match_symbol_key(), "Symbol.match", SpecialOp::RegExpMatch),
+        (super::replace_symbol_key(), "Symbol.replace", SpecialOp::RegExpReplace),
+        (super::search_symbol_key(), "Symbol.search", SpecialOp::RegExpSearch),
+        (super::split_symbol_key(), "Symbol.split", SpecialOp::RegExpSplit),
     ] {
         let desc = super::method_descriptor(Value::Object(
-            heap.alloc(Object::NativeFunction(NativeFunctionObject::new(native))),
+            heap.alloc(Object::NativeFunction(
+                NativeFunctionObject::new(native)
+                    .with_entry(crate::vm::native::NativeEntry::VmSpecial(op)),
+            )),
         ));
         let _ = proto.borrow_mut().define_property(heap, key, desc);
     }
@@ -435,7 +439,11 @@ pub fn register_regexp_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         "dotAll",
     ] {
         let getter = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(&format!("{REGEXP_GETTER_PREFIX}{name}")),
+            NativeFunctionObject::new(&format!("{REGEXP_GETTER_PREFIX}{name}")).with_entry(
+                crate::vm::native::NativeEntry::State(
+                    crate::vm::native::NativeState::RegExpGetter(name),
+                ),
+            ),
         )));
         let desc = PropertyDescriptor {
             value: Value::Undefined,

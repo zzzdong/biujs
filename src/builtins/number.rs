@@ -184,9 +184,18 @@ pub fn number_to_fixed(obj: &Value, args: &[Value]) -> Result<Value, RuntimeErro
     let digits = if args.is_empty() {
         0
     } else {
-        args[0].to_number() as usize
+        super::to_integer_or_infinity_throwing(args.first())? as i64
     };
-    let digits = digits.min(100);
+    if !(0..=100).contains(&digits) {
+        return Err(RuntimeError::RangeError(
+            "toFixed: fractionDigits out of range".to_string(),
+        ));
+    }
+    // ES 20.1.3.3 第 5 步：|x| >= 1e21 时直接返回 ToString(x)，不按定点写。
+    if n.abs() >= 1e21 {
+        return Ok(Value::string(&number_to_string(n)));
+    }
+    let digits = digits as usize;
     Ok(Value::string(&format!("{n:.digits$}")))
 }
 
@@ -202,13 +211,29 @@ pub fn number_to_exponential(obj: &Value, args: &[Value]) -> Result<Value, Runti
             Ok(Value::string("-Infinity"))
         };
     }
+    // Rust 的 `{:e}` 不写正号，JS 必须有 `e+2` 这样的形式。
+    let with_sign = |s: String| -> String {
+        if let Some((mantissa, exp)) = s.split_once('e') {
+            if exp.starts_with('-') || exp.starts_with('+') {
+                s
+            } else {
+                format!("{mantissa}e+{exp}")
+            }
+        } else {
+            s
+        }
+    };
     if args.is_empty() {
-        Ok(Value::string(&format!("{n:e}")))
-    } else {
-        let digits = args[0].to_number() as usize;
-        let digits = digits.min(100);
-        Ok(Value::string(&format!("{n:.digits$e}")))
+        return Ok(Value::string(&with_sign(format!("{n:e}"))));
     }
+    let digits = super::to_integer_or_infinity_throwing(args.first())? as i64;
+    if !(0..=100).contains(&digits) {
+        return Err(RuntimeError::RangeError(
+            "toExponential: fractionDigits out of range".to_string(),
+        ));
+    }
+    let digits = digits as usize;
+    Ok(Value::string(&with_sign(format!("{n:.digits$e}"))))
 }
 
 pub fn number_to_precision(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -226,7 +251,29 @@ pub fn number_to_precision(obj: &Value, args: &[Value]) -> Result<Value, Runtime
     if args.is_empty() {
         return Ok(Value::string(&number_to_string(n)));
     }
-    let prec = args[0].to_number() as usize;
-    let prec = prec.min(100).max(1);
-    Ok(Value::string(&format!("{n:.prec$}")))
+    let prec = super::to_integer_or_infinity_throwing(args.first())? as i64;
+    if !(1..=100).contains(&prec) {
+        return Err(RuntimeError::RangeError(
+            "toPrecision: precision out of range".to_string(),
+        ));
+    }
+    let prec = prec as usize;
+    if n == 0.0 {
+        // `0.toPrecision(3)` 是 "0.00"：精度决定小数位数（符号单独处理）。
+        let digits = prec - 1;
+        return Ok(Value::string(&format!("{:.*}", digits, n)));
+    }
+    let exponent = n.abs().log10().floor() as i64;
+    if exponent < -6 || exponent >= prec as i64 {
+        let mut s = format!("{:.*e}", prec - 1, n);
+        if let Some((mantissa, exp)) = s.split_once('e') {
+            if !exp.starts_with('-') && !exp.starts_with('+') {
+                s = format!("{mantissa}e+{exp}");
+            }
+        }
+        Ok(Value::string(&s))
+    } else {
+        let digits = (prec as i64 - 1 - exponent).max(0) as usize;
+        Ok(Value::string(&format!("{:.*}", digits, n)))
+    }
 }
