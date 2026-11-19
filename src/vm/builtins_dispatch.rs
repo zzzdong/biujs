@@ -8,11 +8,28 @@
 //! 按名字字符串 `match` 本身是一处已知的设计债（ARCHITECTURE §5 第 3 条）：
 //! 由它派生出 arity 表、`__proto__xxx` 前缀约定、`vm_handled_static` 旁路
 //! 名单这一整套约定。搬到这里是为了让它们都在一处，而不是认可这个形状。
+//!
+//! **正在迁走**：`Math` / `console` / `Date` / `Number.prototype` /
+//! `Boolean.prototype` / `Promise`（六静态方法 + `then/catch/finally`） /
+//! `Object.assign` / `Array.isArray,from,of` / `String.fromCharCode,fromCodePoint`
+//! / 五个 `Object.*` 与四个 `Reflect.*` 静态方法 / `String.raw` / `JSON.*` /
+//! `TypedArray.from,of` / `Map.groupBy` / `$262.detachArrayBuffer` /
+//! 七个剩余 `Object.*` 静态方法、`Proxy.revocable`、
+//! `Reflect.get/set/apply/construct`（以及全部 `Reflect.*`）、`Proxy.revocable`
+//! 与剩余纯静态方法已经把实现放进函数对象
+//! （[`crate::vm::native::NativeEntry`]），调用走
+//! `VM::invoke_native`，不再经过本文件。每迁一族就从这里删掉一族，`entry`
+//! 为 `None` 的内建才落到按名分派。静态方法那条按名分支已整体删除
+//! （属性解析 → `invoke_native` → entry 是唯一路径）；原型方法族正逐批迁入，
+//! `Array`/`Map`/`Set`/`TypedArray` 的 `entries/keys/values` 已各用三个独立
+//! slot 区分（同名不同函数对象，`make_iterator_with` 也改为按函数身份识别）；
+//! `Array.prototype` 其余方法统一由 `NativeEntry::VmArray(ArrayOp)` 分发。
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bytecode::Module;
+use crate::vm::native::{ArrayOp, StringOp};
 use crate::vm::object::{JSObject, PromiseState};
 use crate::vm::{
     BOUND_PREFIX, ObjectKind, PropertyDescriptor, PropertyKey, REVOKE_PREFIX,
@@ -370,94 +387,14 @@ impl VM {
             all.extend(args.iter().cloned());
             return self.invoke(&target, this_arg, &all, module);
         }
-        // `String.prototype.<name>`：内建名带着**归属**，所以不必再按接收者
-        // 形状猜是 Array 还是 String 的同名方法。规范要求这些方法先把 `this`
-        // 转成字符串（ES 21.1.3.x 的 `Let S be ? ToString(O)`），而 `ToString`
-        // 可以跑用户代码（`String.prototype.slice.call({toString(){…}}, 1)`），
-        // 所以转换在这里做 —— 内建层没有 `module`。
-        if let Some(method) = name.strip_prefix("String.prototype.") {
-            return self.string_prototype_method(&this, method, args, module);
-        }
-        // `Number.prototype.*` / `Boolean.prototype.*`：归属决定 `toString` /
-        // `valueOf` 的接收者口径（`Number.prototype.toString.call({})` 是
-        // TypeError，不能落到 `Object.prototype.toString`）。
-        if let Some(method) = name.strip_prefix("Number.prototype.") {
-            return crate::builtins::call_prototype_method_owned(
-                "Number",
-                &mut self.heap,
-                &this,
-                method,
-                args,
-            );
-        }
-        if let Some(method) = name.strip_prefix("Boolean.prototype.") {
-            return crate::builtins::call_prototype_method_owned(
-                "Boolean",
-                &mut self.heap,
-                &this,
-                method,
-                args,
-            );
-        }
-        // `Array.prototype.<name>`：共享名（`slice` / `indexOf` / `includes` /
-        // `concat` / `join` …）按**归属**走数组口径 —— `Array.prototype.slice.
-        // call("abc")` 是 `["a","b","c"]`，即使接收者看起来像字符串。
-        if let Some(method) = name.strip_prefix("Array.prototype.") {
-            // `ToObject(this value)`：原语接收者先装箱 ——
-            // `Array.prototype.indexOf.call('ab', 'b')` 的类数组语义来自字符串
-            // 包装对象的索引属性（规范要求 1，不是"不是数组"）。
-            let receiver = match &this {
-                Value::Object(_) | Value::Function(_) => this.clone(),
-                other => crate::builtins::to_object(&mut self.heap, other)?,
-            };
-            // `Array.prototype.toString()`（ES 23.1.3.37）：`Get(O, "join")`，
-            // 可调用就 `Call(join, O)`，否则回落到 `Object.prototype.toString`
-            // —— 于是 `Array.prototype.toString.call(true)` 是 `[object Boolean]`
-            // 而不是 `"true"`，自定义 `join` 的抛出也照样传播
-            // （`S15.4.4.2_A1_T4`）。
-            if method == "toString" {
-                let join_key = PropertyKey::intern(&mut self.heap, "join");
-                let join = self.get_member(&receiver, &join_key, module)?;
-                if join.is_callable() || matches!(join, Value::Function(_)) {
-                    return self.invoke(&join, receiver.clone(), &[], module);
-                }
-                return crate::builtins::object_prototype_to_string(&receiver, &[]);
-            }
-            // `concat` 需要 `ArraySpeciesCreate` + `IsConcatSpreadable`
-            // （Proxy 的 `IsArray`、用户 `valueOf`、`2**53-1` 的 TypeError），
-            // 内建层那份做不到 —— `Array.prototype.concat.call(obj, …)` 走这里。
-            if method == "concat"
-                && !crate::vm::receiver_is_string(&receiver)
-                && self.receiver_concat_like(&receiver)
-            {
-                return self.array_concat_vm(&receiver, args, module);
-            }
-            // 索引类参数（`copyWithin` / `fill` / `slice` / `indexOf` / `join` …）是
-            // `ToIntegerOrInfinity` / `ToString`：对象参数要跑 `valueOf` /
-            // `@@toPrimitive`，Symbol 留给内建层的 `to_number_throwing` 抛
-            // TypeError。**必须在下面三条 VM 快速路径之前**做 —— 它们（读族 /
-            // species 族）都在内建层之上，自己的 `to_js_string()` 不会跑用户代码。
-            let coerced = self.coerce_index_method_args("Array", method, args, module)?;
-            let args: &[Value] = match &coerced {
-                Some(values) => values,
-                None => args,
-            };
-            // VM 侧的通用实现优先（回调族要调 JS；读族要逐步 `[[Get]]`），
-            // 内建层那份是密集数组的快速路径 —— 与 `__proto_method__` 入口同序。
-            if let Some(result) = self.try_array_callback_method(&receiver, method, args, module)? {
-                return Ok(result);
-            }
-            if let Some(result) = self.try_array_read_method(&receiver, method, args, module)? {
-                return Ok(result);
-            }
-            return crate::builtins::call_prototype_method_owned(
-                "Array",
-                &mut self.heap,
-                &receiver,
-                method,
-                args,
-            );
-        }
+        // `String.prototype.*` 已全部迁到 `NativeEntry::VmString`（`string_proto_host`），
+        // 不再从分派名 strip 归属；同名方法与 Array 的由函数对象身份区分。
+        // Number / Boolean 一族已迁到函数对象自带的 `NativeEntry`；归属由
+        // 函数身份决定（`require_number` / `require_boolean` 做 brand check），
+        // 不再需要从分派名里 strip 出 `Owner.prototype.`。
+        // `Array.prototype.*` 已全部迁到 `NativeEntry::VmArray`（`VM::array_proto_host`），
+        // 不再从分派名里 strip 出归属；`Array.prototype.slice.call("abc")` 的
+        // 数组口径由函数对象身份保证。
         // `%TypedArray%.prototype.<name>`：先做 brand check（ES 23.2.3.x 的
         // `ValidateTypedArray`）。以前按接收者形状分派，于是
         // `%TypedArray%.prototype.indexOf.call({}, 1)` 悄悄走了数组那条路。
@@ -489,10 +426,7 @@ impl VM {
             {
                 return Ok(result);
             }
-            // `keys` / `values` / `entries` 返回迭代器，只有 VM 能构造。
-            if matches!(method, "keys" | "values" | "entries") {
-                return self.make_typed_array_iterator(&this, method);
-            }
+            // `keys` / `values` / `entries` 已迁到各自 slot，不再按名字构造。
             let coerced = self.coerce_index_method_args("TypedArray", method, args, module)?;
             let dispatch_args: &[Value] = match &coerced {
                 Some(values) => values,
@@ -531,8 +465,10 @@ impl VM {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 return self.invoke(&this, this_arg, &call_args, module);
             }
-            if let Some(result) = self.try_array_callback_method(&this, method, args, module)? {
-                return Ok(result);
+            if let Some(op) = ArrayOp::from_name(method) {
+                if let Some(result) = self.try_array_callback_method(&this, op, args, module)? {
+                    return Ok(result);
+                }
             }
             // 读族（`join` / `slice` / `includes` / `at` / `concat` / `reverse`）：
             // 同样要在内建层之前截住，否则访问器元素读成空位、类数组接收者走不通。
@@ -545,19 +481,10 @@ impl VM {
             if let Some(result) = self.try_typedarray_callback_method(&this, method, args, module)? {
                 return Ok(result);
             }
-            // TypedArray 的迭代器三件套（ES 23.2.3.x）：`keys` / `values` /
-            // `entries` 返回迭代器，只有 VM 能构造。必须排在数组那条路之后、
-            // 且只认 TypedArray 接收者（`Array.prototype` 有同名方法）。
-            if matches!(method, "keys" | "values" | "entries")
-                && crate::builtins::typedarray::is_typedarray_receiver(&this)
-            {
-                return self.make_typed_array_iterator(&this, method);
-            }
-            // `Promise.prototype.then` has to *call* the handlers, so it is
-            // dispatched here rather than in the builtin table.
-            if let Some(result) = self.try_promise_method(&this, method, args, module)? {
-                return Ok(result);
-            }
+            // TypedArray 的迭代器三件套已迁到独立 slot；上面按接收者形状猜
+            // 归属的分支整段删除。
+            // `Promise.prototype.then/catch/finally` 已迁到 `NativeEntry::Vm`，
+            // 归属由函数身份决定，不再在这里按方法名截住。
             // `String.prototype.replace(re, fn)` — the replacer is user code.
             if let Some(result) = self.try_string_callback_method(&this, method, args, module)? {
                 return Ok(result);
@@ -565,257 +492,11 @@ impl VM {
             if let Some(result) = self.try_match_all_method(&this, method, args, module)? {
                 return Ok(result);
             }
-            // `entries` / `keys` / `values`：返回一个**惰性**迭代器（ES 23.1.3.28-30），
-            // 每一步重新 `ToLength(Get(O, "length"))` 再 `Get(O, k)` —— 所以
-            // `var it = a.values(); a.push(3); it.next()` 能看到新元素，
-            // 边迭代边 `splice` 也会提前结束。
-            if matches!(method, "entries" | "keys" | "values") {
-                // 第 1 步 `Let O be ? ToObject(this value)`：
-                // `values.call(null)` 是 TypeError，不是空迭代器。
-                crate::builtins::require_object_coercible(&this)?;
-                let target = match &this {
-                    Value::Object(_) | Value::Function(_) => this.clone(),
-                    other => crate::builtins::to_object(&mut self.heap, other)?,
-                };
-                return self.make_array_iterator(&target, method);
-            }
+            // Array / Map / Set 的 `entries`/`keys`/`values` 已各自带 slot。
             return crate::builtins::call_prototype_method(&mut self.heap, &this, method, args);
         }
-        // Static methods are stored under their qualified name ("Array.from").
-        if name.contains('.') {
-            // `Reflect.*` reads its key argument through `ToPropertyKey`, which
-            // runs user code (`{ toString() { throw … } }`) — the builtin layer
-            // cannot do that, so the key is converted here and handed on.
-            let converted_args;
-            let args: &[Value] = if matches!(
-                name,
-                "Reflect.get"
-                    | "Reflect.set"
-                    | "Reflect.has"
-                    | "Reflect.deleteProperty"
-                    |                 "Reflect.defineProperty"
-                    | "Reflect.getOwnPropertyDescriptor"
-                    // `Object.getOwnPropertyDescriptor(obj, {toString(){…}})`
-                    // 与 `Object.hasOwn(obj, {[Symbol.toPrimitive](){…}})` 同样
-                    // 要求 key 走 ToPropertyKey（可跑用户代码）。
-                    | "Object.getOwnPropertyDescriptor"
-                    | "Object.hasOwn"
-                    // `Object.defineProperty(obj, {toString(){…}}, desc)` 的 P
-                    // 同样要走 ToPropertyKey；`defineProperties` 的第二参数是
-                    // props 对象，**不能**放进这个名单。
-                    | "Object.defineProperty"
-            ) {
-                converted_args = self.reflect_key_args(args, module)?;
-                &converted_args
-            } else {
-                args
-            };
-            // A proxy receiver turns these `Object.*` / `Reflect.*` operations
-            // into trap calls (ES 10.5.5 – 10.5.19); anything else falls
-            // through to the ordinary implementation.
-            if let Some(result) = self.proxy_static_trap(name, args, module)? {
-                return Ok(result);
-            }
-            // `Reflect.has` 的 `[[HasProperty]]` 要走原型链，而链上每一跳都可能
-            // 是 Proxy（`has` trap 必须生效）—— builtins 层没有 VM，故在这里做。
-            // receiver 本身是 Proxy 的情况已在上面的 `proxy_static_trap` 处理。
-            if name == "Reflect.has" {
-                let target = args.first().cloned().unwrap_or(Value::Undefined);
-                let Value::Object(obj_ref) = target else {
-                    return Err(RuntimeError::TypeError(format!(
-                        "Reflect.has called on {}",
-                        target.type_of()
-                    )));
-                };
-                let key = crate::builtins::reflect::to_key(
-                    &mut self.heap,
-                    args.get(1).unwrap_or(&Value::Undefined),
-                );
-                return Ok(Value::Bool(
-                    self.object_has_property(obj_ref, &key, module)?,
-                ));
-            }
-            // `Object.assign` reads through real `[[Get]]` and writes through
-            // real `[[Set]]` (own or prototype accessors may run), which only
-            // the VM can do.
-            if name == "Object.assign" {
-                return self.object_assign(args, module);
-            }
-            // `String.raw(template, ...subs)`（ES 22.1.2.3）：读 `template.raw`
-            // 用的是真 [[Get]]（可能是 getter），且每个替换值要 ToString（可能触发
-            // `toString`） —— builtins 层拿不到 VM，故在这里做。
-            if name == "String.raw" {
-                return self.string_raw(args, module);
-            }
-            // `String.fromCharCode` / `fromCodePoint`：每个参数都是 `ToNumber`，
-            // 对对象要跑 `valueOf` / `toString`（`{valueOf(){return 1}}` 得到 U+0001，
-            // `S9.7_A3.1_T4`；Symbol 是 TypeError）。内建层只有 `to_number()`。
-            if matches!(name, "String.fromCharCode" | "String.fromCodePoint") {
-                let mut converted = Vec::with_capacity(args.len());
-                for arg in args {
-                    let primitive = match arg {
-                        Value::Object(_) | Value::Function(_) => {
-                            self.to_primitive(arg, "number", module)?
-                        }
-                        other => other.clone(),
-                    };
-                    converted.push(primitive);
-                }
-                return if name == "String.fromCharCode" {
-                    crate::builtins::string_from_char_code(&converted)
-                } else {
-                    crate::builtins::string_from_code_point(&converted)
-                };
-            }
-            // `Object.prototype.toLocaleString`（ES 20.1.3.4）：`Get(O,
-            // "toString")` 后**用原始 this 值**调用它 —— 严格模式下
-            // `true.toLocaleString()` 的 `this` 必须是布尔原语
-            // （`primitive_this_value` 把 `Boolean.prototype.toString`
-            // 换成 `() => typeof this`）。内建层只会自己拆包装。
-            if name == "Object.prototype.toLocaleString" {
-                crate::builtins::require_object_coercible(&this)?;
-                let key = PropertyKey::intern(&mut self.heap, "toString");
-                let boxed = crate::builtins::to_object(&mut self.heap, &this)?;
-                let to_string = self.get_member(&boxed, &key, module)?;
-                if !to_string.is_callable() && !matches!(to_string, Value::Function(_)) {
-                    return Err(RuntimeError::TypeError(
-                        "Object.prototype.toLocaleString: toString is not callable".to_string(),
-                    ));
-                }
-                return self.invoke(&to_string, this, &[], module);
-            }
-            // test262 宿主 hook：`$262.detachArrayBuffer(buf)`（ES 25.1.2.1
-            // 的内部 DetachArrayBuffer）。只有 runner 调用
-            // `install_test_hosts()` 之后才会装上 `$262`，默认引擎不可见。
-            if name == "$262.detachArrayBuffer" {
-                if let Some(Value::Object(obj_ref)) = args.first() {
-                    if let Some(buffer) = obj_ref.borrow_mut().as_array_buffer_mut() {
-                        buffer.detach();
-                    }
-                }
-                return Ok(Value::Undefined);
-            }
-            // `Array.isArray(value)`（ES 23.1.2.2）：`IsArray` 要**看穿 Proxy**
-            // （`Array.isArray(new Proxy([], {}))` 是 true，revoked 是 TypeError），
-            // 内建层只看 `kind()`。
-            if name == "Array.isArray" {
-                let target = args.first().cloned().unwrap_or(Value::Undefined);
-                return Ok(Value::Bool(self.is_array_including_proxies(&target, module)?));
-            }
-            // `Array.from` / `Array.of`：`C = this`、`@@iterator` 协议、`mapfn`、
-            // 逐元素 `CreateDataPropertyOrThrow` —— 全都只有 VM 能做。
-            if name == "Array.from" {
-                let source = args.first().cloned().unwrap_or(Value::Undefined);
-                let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
-                let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
-                return self.array_from(&this, &source, &mapfn, &this_arg, module);
-            }
-            if name == "Array.of" {
-                return self.array_of(&this, args, module);
-            }
-            // `%TypedArray%.from` / `%TypedArray%.of`：迭代、可选回调、再
-            // `new C(len)` —— 三样都只有 VM 能做。
-            if name == "TypedArray.from" {
-                let source = args.first().cloned().unwrap_or(Value::Undefined);
-                let mapfn = args.get(1).cloned().unwrap_or(Value::Undefined);
-                let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
-                return self.typed_array_from(&this, &source, &mapfn, &this_arg, module);
-            }
-            if name == "TypedArray.of" {
-                return self.typed_array_of(&this, args, module);
-            }
-            // `Map.groupBy(items, callbackfn)`: iterates and calls back.
-            if name == "Map.groupBy" {
-                let items = args.first().cloned().unwrap_or(Value::Undefined);
-                let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
-                return self.map_group_by(&items, &callback, module);
-            }
-            // The descriptor arguments are read through [[Get]] first, which
-            // `Promise.resolve` / `Promise.reject` build promises, which only the
-            // VM can register.
-            if let Some(result) = self.promise_static(name, &this, args, module)? {
-                return Ok(result);
-            }
-            // only the VM can do (their fields may be accessors).
-            if name == "Object.defineProperty" && args.len() >= 3 {
-                let descriptor = self.to_property_descriptor(&args[2], module)?;
-                // Array `length` 的 [[Value]] 要走 ES ToNumber（可能跑用户的
-                // valueOf / toString），builtins 层做不到，只能在 VM 层先转换。
-                if matches!(&args[1], Value::String(s) if s.as_str() == "length") {
-                    self.normalize_array_length_value(&args[0], &descriptor, module)?;
-                }
-                return crate::builtins::call_static_method(
-                    name,
-                    &[args[0].clone(), args[1].clone(), descriptor],
-                    &mut self.heap,
-                );
-            }
-            if name == "Object.defineProperties" && args.len() >= 2 {
-                let props = self.to_property_descriptors(&args[1], module)?;
-                let length_key = PropertyKey::intern(&mut self.heap, "length");
-                let length_desc = if let Value::Object(props_ref) = &props {
-                    props_ref
-                        .borrow()
-                        .property_get(&length_key)
-                        .map(|d| d.value)
-                } else {
-                    None
-                };
-                if let Some(descriptor) = length_desc {
-                    self.normalize_array_length_value(&args[0], &descriptor, module)?;
-                }
-                return crate::builtins::call_static_method(
-                    name,
-                    &[args[0].clone(), props],
-                    &mut self.heap,
-                );
-            }
-            // `JSON.stringify` runs `toJSON`/`replacer` and reads through
-            // `[[Get]]`; `JSON.parse`'s reviver is user code.
-            if name == "JSON.stringify" {
-                return self.json_stringify_full(args, module);
-            }
-            if name == "JSON.parse" {
-                return self.json_parse_full(args, module);
-            }
-            if name == "Object.create" && args.len() >= 2 && !args[1].is_undefined() {
-                let props = self.to_property_descriptors(&args[1], module)?;
-                return crate::builtins::call_static_method(
-                    name,
-                    &[args[0].clone(), props],
-                    &mut self.heap,
-                );
-            }
-            // `Reflect.get` / `set` / `apply` / `construct` / `defineProperty`:
-            // the internal methods that can run user code.
-            if let Some(result) = self.reflect_static(name, args, module)? {
-                return Ok(result);
-            }
-            // `Proxy.revocable(t, h)` answers `{ proxy, revoke }`, and `revoke`
-            // has to remember *which* proxy it revokes — a native's only state
-            // is its name, so the VM mints it (`make_revoke`).
-            if name == "Proxy.revocable" {
-                // Same boxing as `new Proxy` above: `f` is an object.
-                let target =
-                    self.as_object_value(&args.first().cloned().unwrap_or(Value::Undefined));
-                let handler =
-                    self.as_object_value(&args.get(1).cloned().unwrap_or(Value::Undefined));
-                let proxy = crate::builtins::proxy::proxy_construct(&mut self.heap, target, handler)?;
-                let revoke = self.make_revoke(proxy.clone());
-                let mut result = crate::vm::object::OrdinaryObject::new();
-                result.set_prototype(Some(self.builtins.object_prototype));
-                for (field, value) in [("proxy", proxy), ("revoke", revoke)] {
-                    let key = PropertyKey::intern(&mut self.heap, field);
-                    let _ = result.define_property(&mut self.heap, key,
-                        PropertyDescriptor::data_descriptor(value),
-                    );
-                }
-                return Ok(Value::Object(
-                    self.heap.alloc(crate::vm::gc::Object::Ordinary(result)),
-                ));
-            }
-            return crate::builtins::call_static_method(name, args, &mut self.heap);
-        }
+        // 静态方法已全部迁到函数对象自带的 `NativeEntry`，这里不再有按名
+        // 的静态分支；`new Object.keys()` 之类现在正确落到 unknown built-in。
         // The `revoke` function of `Proxy.revocable`: its work is one flag on
         // the proxy it names. Everything after revocation throws.
         if let Some(id) = name.strip_prefix(REVOKE_PREFIX) {
@@ -957,6 +638,53 @@ impl VM {
     ///   `ToObject`，但这条路径**不装箱**（热路径），直接在 exec 里调这里。
     ///
     /// 未知方法照旧返回 "unknown prototype method: …"，调用方据此回落到用户方法。
+    /// `String.prototype` 方法的唯一 VM 入口：协议方法先走 `@@match` / `@@replace`
+    /// 等；其余方法在这里做 `ToString(this)` 与参数 `ToPrimitive`（都会跑用户
+    /// 代码），再把字符串交给纯内建层。
+    pub(crate) fn string_proto_host(
+        &mut self,
+        op: StringOp,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let method = op.as_str();
+        if op.uses_protocol() {
+            if let Some(result) = self.try_string_callback_method(this, method, args, module)? {
+                return Ok(result);
+            }
+            if let Some(result) = self.try_match_all_method(this, method, args, module)? {
+                return Ok(result);
+            }
+        }
+        if op == StringOp::Split {
+            return self.string_prototype_split(this, args, module);
+        }
+        crate::builtins::require_object_coercible(this)?;
+        let text = if matches!(op, StringOp::ToString | StringOp::ValueOf) {
+            crate::builtins::require_string(this)?
+        } else {
+            let primitive = match this {
+                Value::Object(_) | Value::Function(_) => {
+                    self.to_primitive(this, "string", module)?
+                }
+                other => other.clone(),
+            };
+            crate::builtins::to_string_throwing(&primitive)?
+        };
+        let coerced = self.coerce_string_method_args(method, args, module)?;
+        let dispatch_args: &[Value] = match &coerced {
+            Some(values) => values,
+            None => args,
+        };
+        crate::builtins::call_prototype_method(
+            &mut self.heap,
+            &Value::string(&text),
+            method,
+            dispatch_args,
+        )
+    }
+
     pub(crate) fn string_prototype_method(
         &mut self,
         this: &Value,
@@ -1501,102 +1229,280 @@ impl VM {
         Ok(Value::string(&out))
     }
 
-    /// `then` / `catch` / `finally`, when the receiver is a promise.
+    /// `Object.*` / `Reflect.*` 静态方法的**唯一** VM 入口。
     ///
-    /// `catch` also works on a non-promise receiver (it is defined as
-    /// `Invoke(this, "then", …)`), so `module` is needed even on that path.
-    pub(crate) fn try_promise_method(
+    /// 以前这些步骤（ToPropertyKey、Proxy trap、描述符 `[[Get]]`、Array.length
+    /// 的 ES ToNumber）在 `call_native_by_name` 里按名字逐条展开；现在由注册
+    /// 时给定的 `name` / `coerce_key` / `desc` 三个事实驱动一次走完，最后落到
+    /// 纯 builtin 表。`call_static_method` 仍是纯实现表，不再负责策略。
+    pub(crate) fn object_static_vm(
         &mut self,
-        this: &Value,
-        method: &str,
+        name: &'static str,
+        coerce_key: bool,
+        desc: crate::vm::native::DescKind,
         args: &[Value],
         module: &Module,
-    ) -> Result<Option<Value>, RuntimeError> {
-        if !matches!(method, "then" | "catch" | "finally") {
-            return Ok(None);
+    ) -> Result<Value, RuntimeError> {
+        use crate::vm::native::DescKind;
+
+        let converted;
+        let args: &[Value] = if coerce_key {
+            converted = self.reflect_key_args(args, module)?;
+            &converted
+        } else {
+            args
+        };
+        if let Some(result) = self.proxy_static_trap(name, args, module)? {
+            return Ok(result);
         }
-        let Some(promise) = self.as_promise(this) else {
-            // `Promise.prototype.catch` 不要求接收者是 promise：规范第 2 步直接
-            // `Invoke(this, "then", « undefined, onRejected »)`，所以任何带
-            // `then` 的接收者都能用（`catch/this-value-obj-coercible`），
-            // `then` 的 getter 抛出也照原样传播（`this-value-then-poisoned`）。
-            if method == "catch" {
-                // 接收者自己带 `catch`（`{ catch() { return 42 } }`）时这不是
-                // `Promise.prototype.catch` 的调用 —— 让分派回落到用户方法
-                // （`ident-name-method-def-catch-escaped` 就是这样被误伤的）。
-                let catch_key = PropertyKey::intern(&mut self.heap, "catch");
-                let existing = self.get_member(this, &catch_key, module)?;
-                if !matches!(existing, Value::Undefined)
-                    && crate::builtins::native_function_name(&existing).is_none()
-                {
-                    return Ok(None);
+        // `Reflect.has` 的 `[[HasProperty]]` 要走原型链，每一跳都可能是 Proxy。
+        if name == "Reflect.has" {
+            let target = args.first().cloned().unwrap_or(Value::Undefined);
+            let Value::Object(obj_ref) = target else {
+                return Err(RuntimeError::TypeError(format!(
+                    "Reflect.has called on {}",
+                    target.type_of()
+                )));
+            };
+            let key = crate::builtins::reflect::to_key(
+                &mut self.heap,
+                args.get(1).unwrap_or(&Value::Undefined),
+            );
+            return Ok(Value::Bool(
+                self.object_has_property(obj_ref, &key, module)?,
+            ));
+        }
+        match desc {
+            // `Reflect.defineProperty` 的描述符由 `reflect_static` 在 VM 里处理，
+            // 只有 `Object.defineProperty` 走这里再落到 builtin 表。
+            DescKind::DefineProperty if name == "Object.defineProperty" && args.len() >= 3 => {
+                let descriptor = self.to_property_descriptor(&args[2], module)?;
+                if matches!(&args[1], Value::String(s) if s.as_str() == "length") {
+                    self.normalize_array_length_value(&args[0], &descriptor, module)?;
                 }
-                let then_key = PropertyKey::well_known("then").expect("well-known name");
-                let then = self.get_member(this, &then_key, module)?;
-                let on_rejected = args.first().cloned().unwrap_or(Value::Undefined);
-                return Ok(Some(self.invoke(
-                    &then,
-                    this.clone(),
-                    &[Value::Undefined, on_rejected],
-                    module,
-                )?));
+                return crate::builtins::call_static_method(
+                    name,
+                    &[args[0].clone(), args[1].clone(), descriptor],
+                    &mut self.heap,
+                );
             }
-            // 其余情况让普通原型分派回答（`then` 对非 promise 就是 TypeError）。
-            return Ok(None);
-        };
-        // A bare `Value::Function(id)` is callable but `is_callable()` only
-        // answers for the boxed form, so box first — that is exactly what
-        // `call_native_by_name` does before handing arguments to the builtin
-        // layer, and this interception runs *before* that.
-        let mut callable = |v: Option<&Value>| -> Option<Value> {
-            v.filter(|v| v.is_callable() || matches!(v, Value::Function(_)))
-                .map(|v| {
-                    let mut boxed = v.clone();
-                    if matches!(boxed, Value::Function(_)) {
-                        boxed = self.as_object_value(&boxed);
-                    }
-                    boxed
-                })
-        };
-        match method {
-            "then" => {
-                let on_fulfilled = callable(args.first());
-                let on_rejected = callable(args.get(1));
-                Ok(Some(self.promise_then(
-                    &promise,
-                    on_fulfilled,
-                    on_rejected,
-                    module,
-                )?))
-            }
-            "catch" => {
-                let on_rejected = callable(args.first());
-                Ok(Some(self.promise_then(&promise, None, on_rejected, module)?))
-            }
-            _ => {
-                // `finally(cb)` (ES 27.2.5.3): returns a *fresh* promise that
-                // settles like the receiver, except that a throwing `cb` rejects
-                // it. The two handlers are natives carrying a registry id; the
-                // callback itself runs when the reaction is drained.
-                let callback = callable(args.first());
-                match callback {
-                    None => Ok(Some(self.promise_then(&promise, None, None, module)?)),
-                    Some(cb) => {
-                        let id = self.state.next_finally_id;
-                        self.state.next_finally_id += 1;
-                        self.state.finally_handlers.insert(id, cb);
-                        let fulfilled = Self::native_fn(&mut self.heap, &format!("__promise_finally__{id}_f"));
-                        let rejected = Self::native_fn(&mut self.heap, &format!("__promise_finally__{id}_r"));
-                        Ok(Some(self.promise_then(
-                            &promise,
-                            Some(fulfilled),
-                            Some(rejected),
-                            module,
-                        )?))
+            DescKind::DefineProperties if args.len() >= 2 => {
+                let props = self.to_property_descriptors(&args[1], module)?;
+                if desc == DescKind::DefineProperties {
+                    let length_key = PropertyKey::intern(&mut self.heap, "length");
+                    let length_desc = if let Value::Object(props_ref) = &props {
+                        props_ref
+                            .borrow()
+                            .property_get(&length_key)
+                            .map(|d| d.value)
+                    } else {
+                        None
+                    };
+                    if let Some(descriptor) = length_desc {
+                        self.normalize_array_length_value(&args[0], &descriptor, module)?;
                     }
                 }
+                return crate::builtins::call_static_method(
+                    name,
+                    &[args[0].clone(), props],
+                    &mut self.heap,
+                );
+            }
+            DescKind::Create if args.len() >= 2 && !args[1].is_undefined() => {
+                let props = self.to_property_descriptors(&args[1], module)?;
+                return crate::builtins::call_static_method(
+                    name,
+                    &[args[0].clone(), props],
+                    &mut self.heap,
+                );
+            }
+            DescKind::None
+            | DescKind::DefineProperty
+            | DescKind::DefineProperties
+            | DescKind::Create => {}
+        }
+        if let Some(result) = self.reflect_static(name, args, module)? {
+            return Ok(result);
+        }
+        crate::builtins::call_static_method(name, args, &mut self.heap)
+    }
+
+    /// `Proxy.revocable(t, h)`：`revoke` 必须记住撤销的是哪个 proxy，内建函数
+    /// 只有名字，所以这个闭包由 VM 铸造（`make_revoke`）。
+    pub(crate) fn proxy_revocable_host(
+        &mut self,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        let target = self.as_object_value(&args.first().cloned().unwrap_or(Value::Undefined));
+        let handler = self.as_object_value(&args.get(1).cloned().unwrap_or(Value::Undefined));
+        let proxy = crate::builtins::proxy::proxy_construct(&mut self.heap, target, handler)?;
+        let revoke = self.make_revoke(proxy.clone());
+        let mut result = crate::vm::object::OrdinaryObject::new();
+        result.set_prototype(Some(self.builtins.object_prototype));
+        for (field, value) in [("proxy", proxy), ("revoke", revoke)] {
+            let key = PropertyKey::intern(&mut self.heap, field);
+            let _ = result.define_property(
+                &mut self.heap,
+                key,
+                PropertyDescriptor::data_descriptor(value),
+            );
+        }
+        Ok(Value::Object(self.heap.alloc(crate::vm::gc::Object::Ordinary(result))))
+    }
+
+    /// test262 宿主 hook：`$262.detachArrayBuffer(buf)`（ES 25.1.2.1 的内部
+    /// DetachArrayBuffer）。默认引擎不可见，只有 runner 装了 `$262` 才有。
+    pub(crate) fn detach_array_buffer_host(
+        &mut self,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        if let Some(Value::Object(obj_ref)) = args.first() {
+            if let Some(buffer) = obj_ref.borrow_mut().as_array_buffer_mut() {
+                buffer.detach();
             }
         }
+        Ok(Value::Undefined)
+    }
+
+    /// `Array.prototype` 方法的**唯一** VM 入口。
+    ///
+    /// 以前这段逻辑在 `call_native_by_name` 的 `"Array.prototype."` 前缀分支里，
+    /// 每次调用都要 strip 字符串再走一遍；现在算法由注册期钉在函数对象上的
+    /// `ArrayOp` 决定，`ToObject` / 参数强转 / 三条 VM 路径 / 内建兜底全在这里。
+    pub(crate) fn array_proto_host(
+        &mut self,
+        op: ArrayOp,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let method = op.as_str();
+        // `ToObject(this value)`：原语接收者先装箱（`indexOf.call('ab','b')`）。
+        let receiver = match this {
+            Value::Object(_) | Value::Function(_) => this.clone(),
+            other => crate::builtins::to_object(&mut self.heap, other)?,
+        };
+        // `Get(O, "join")` 后调用它，可跑用户代码；否则回 Object.prototype.toString。
+        if op == ArrayOp::ToString {
+            let join_key = PropertyKey::intern(&mut self.heap, "join");
+            let join = self.get_member(&receiver, &join_key, module)?;
+            if join.is_callable() || matches!(join, Value::Function(_)) {
+                return self.invoke(&join, receiver.clone(), &[], module);
+            }
+            return crate::builtins::object_prototype_to_string(&receiver, &[]);
+        }
+        // `concat` 的 species / spreadable 检查要在 VM 里做（Proxy / 用户 valueOf）。
+        if op == ArrayOp::Concat
+            && !crate::vm::receiver_is_string(&receiver)
+            && self.receiver_concat_like(&receiver)
+        {
+            return self.array_concat_vm(&receiver, args, module);
+        }
+        // 顺序与规范一致（也与原先 `CallMethod` 的早段拦截一致）：回调族和读族
+        // 自己处理参数强转，宿主不能在它们之前先把 valueOf 跑一遍 —— 否则
+        // `copyWithin(0, {valueOf(){…}})` 里的 valueOf 会被多调用一次。
+        if let Some(result) = self.try_array_callback_method(&receiver, op, args, module)? {
+            return Ok(result);
+        }
+        if let Some(result) = self.try_array_read_method(&receiver, method, args, module)? {
+            return Ok(result);
+        }
+        // species 族（slice / splice / concat / with / toSpliced）在这里才做
+        // `ToIntegerOrInfinity` / `ToString`（对象参数要跑 valueOf / @@toPrimitive）。
+        let coerced = self.coerce_index_method_args("Array", method, args, module)?;
+        let args: &[Value] = match &coerced {
+            Some(values) => values,
+            None => args,
+        };
+        if let Some(result) = self.try_array_species_method(&receiver, method, args, module)? {
+            return Ok(result);
+        }
+        crate::builtins::call_prototype_method_owned(
+            "Array",
+            &mut self.heap,
+            &receiver,
+            method,
+            args,
+        )
+    }
+
+    /// `Array.prototype.entries/keys/values`：先 `ToObject(this)`，再建一个
+    /// 惰性迭代器（每步重新读 length 与下标）。同名方法在 Map/Set/TypedArray
+    /// 上是**不同函数对象**，由各自的 slot 决定，不靠接收者形状猜。
+    pub(crate) fn array_iterator_host(
+        &mut self,
+        kind: &'static str,
+        this: &Value,
+        _module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        crate::builtins::require_object_coercible(this)?;
+        let target = match this {
+            Value::Object(_) | Value::Function(_) => this.clone(),
+            other => crate::builtins::to_object(&mut self.heap, other)?,
+        };
+        self.make_array_iterator(&target, kind)
+    }
+
+    /// `%TypedArray%.prototype.entries/keys/values`：brand check + detached
+    /// check 都留在实现里，同名方法在 Array/Map/Set 上是别的函数对象。
+    pub(crate) fn typed_array_iterator_host(
+        &mut self,
+        kind: &'static str,
+        this: &Value,
+    ) -> Result<Value, RuntimeError> {
+        let detached = match this {
+            Value::Object(o) => o
+                .borrow()
+                .as_typed_array()
+                .is_some_and(|ta| ta.is_detached()),
+            _ => false,
+        };
+        if detached {
+            return Err(RuntimeError::TypeError(format!(
+                "%TypedArray%.prototype.{kind} called on a detached buffer"
+            )));
+        }
+        self.make_typed_array_iterator(this, kind)
+    }
+
+    /// `String.fromCharCode` 的 VM 版本：每个参数先走真 `ToNumber`（对象参数
+    /// 要跑 `valueOf` / `toString`，Symbol 是 TypeError），再把结果交给内建层
+    /// 做 `ToUint16`。内建层的 `to_number_throwing` 不会跑用户代码。
+    pub(crate) fn string_from_char_code_vm(
+        &mut self,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let mut converted = Vec::with_capacity(args.len());
+        for arg in args {
+            let primitive = match arg {
+                Value::Object(_) | Value::Function(_) => {
+                    self.to_primitive(arg, "number", module)?
+                }
+                other => other.clone(),
+            };
+            converted.push(primitive);
+        }
+        crate::builtins::string_from_char_code(&converted)
+    }
+
+    /// `String.fromCodePoint` 的 VM 版本：与上面同样要先跑真 `ToNumber`。
+    pub(crate) fn string_from_code_point_vm(
+        &mut self,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let mut converted = Vec::with_capacity(args.len());
+        for arg in args {
+            let primitive = match arg {
+                Value::Object(_) | Value::Function(_) => {
+                    self.to_primitive(arg, "number", module)?
+                }
+                other => other.clone(),
+            };
+            converted.push(primitive);
+        }
+        crate::builtins::string_from_code_point(&converted)
     }
 
     /// `String.raw(template, ...substitutions)`（ES 22.1.2.3）。
@@ -1604,7 +1510,7 @@ impl VM {
     /// 结果是 `template.raw` 的各段依次与替换值交错拼接：
     /// `raw[0] + sub0 + raw[1] + sub1 + …`。注意用的是 **raw**（未转义的原始串），
     /// 这正是它存在的意义 —— `` String.raw`\n` `` 得到字面的反斜杠 n。
-    fn string_raw(&mut self, args: &[Value], module: &Module) -> Result<Value, RuntimeError> {
+    pub(crate) fn string_raw(&mut self, args: &[Value], module: &Module) -> Result<Value, RuntimeError> {
         let template = args.first().cloned().unwrap_or(Value::Undefined);
         // 1. `ToObject(template)`：非对象（含 undefined / null）是 TypeError。
         let cooked = crate::builtins::to_object(&mut self.heap, &template)?;
@@ -1688,6 +1594,9 @@ impl VM {
             // `set(source, offset)` 的 source 是类数组时，`length` / 每个下标 /
             // 元素 ToNumber 都是可观察操作（getter 与 valueOf 要跑、Symbol 要抛）。
             "set",
+            // `join(separator)` 的 `ToString` 对 Symbol 要抛，内建层用
+            // `to_js_string()` 静默产生 "Symbol(s)"。
+            "join",
         ];
         if !TA_CALLBACK_METHODS.contains(&method) {
             return Ok(None);
@@ -1743,6 +1652,26 @@ impl VM {
 
         let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
         match method {
+            // ES 23.2.3.26：分隔符与元素都走 `ToString`（Symbol 抛 TypeError）。
+            "join" => {
+                let coerced = self.coerce_index_method_args("TypedArray", "join", args, module)?;
+                let join_args = coerced.as_deref().unwrap_or(args);
+                let sep = match join_args.first() {
+                    None | Some(Value::Undefined) => ",".to_string(),
+                    Some(v) => crate::builtins::to_string_throwing(v)?,
+                };
+                let mut out = String::new();
+                for (i, e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(&sep);
+                    }
+                    if e.is_undefined() || matches!(e, Value::Null) {
+                        continue;
+                    }
+                    out.push_str(&crate::builtins::to_string_throwing(e)?);
+                }
+                return Ok(Some(Value::string(&out)));
+            }
             // ES 23.2.3.24 `%TypedArray%.prototype.set(source, offset)` 的
             // 类数组分支：`Get(source, "length")` → `ToInteger(offset)` →
             // 逐下标 `Get` + `ToNumber` → `Set(O, …, true)`。内建层用
@@ -2224,62 +2153,17 @@ impl VM {
     pub(crate) fn try_array_callback_method(
         &mut self,
         receiver: &Value,
-        method: &str,
+        method: crate::vm::native::ArrayOp,
         args: &[Value],
         module: &Module,
     ) -> Result<Option<Value>, RuntimeError> {
-        const CALLBACK_METHODS: &[&str] = &[
-            "map",
-            "filter",
-            "forEach",
-            "some",
-            "every",
-            "reduce",
-            "reduceRight",
-            "find",
-            "findIndex",
-            "flatMap",
-            "sort",
-            // No callback, but they need the generic array-like element list:
-            // `Array.prototype.indexOf.call({length: 2, 0: 'a'}, 'a')`.
-            "indexOf",
-            "lastIndexOf",
-            // ES2023：`findLast` / `findLastIndex` 需要谓词；`toReversed` /
-            // `toSorted` / `toSpliced` / `with` 不需要回调，但同样要那份
-            // 类数组元素清单，且结果要走 `ArraySpeciesCreate`。
-            "findLast",
-            "findLastIndex",
-            "toReversed",
-            "toSorted",
-            "toSpliced",
-            "with",
-            // 没有回调，但要那份"逐元素 `HasProperty` + `[[Get]]`"的实现
-            // （空位是删除、不是写 undefined）。
-            "copyWithin",
-            // `flat` 要走 `ArraySpeciesCreate` 与逐元素 `CreateDataProperty`，
-            // 内建层两样都做不到。
-            "flat",
-            // 栈族四个方法每一步都是对**接收者**的 `Set(..., true)` / `Get` /
-            // `DeletePropertyOrThrow`：原型链上的 setter、冻结的数组、
-            // 不可写的 `length` 全都要能看到，内建层直接改密集存储。
-            "push",
-            "pop",
-            "shift",
-            "unshift",
-            // `fill(value, start, end)` 是逐下标 `Set(O, k, value, true)`
-            // （空位也写），且长度 / 索引的转换都要能抛。
-            "fill",
-            // `toLocaleString` 要**调用每个元素自己的** `toLocaleString`
-            // （用户代码），内建层只能 `to_js_string()`。
-            "toLocaleString",
-        ];
-        if !CALLBACK_METHODS.contains(&method) {
-            return Ok(None);
-        }
+        // 调用方先用 `ArrayOp::from_name` 把方法名换成类型；没换成的名字
+        // 根本不归这一族，直接由调用方继续走别的分派。
         // `Array.prototype.map.call(null, …)` and friends: ToObject raises.
         if matches!(receiver, Value::Undefined | Value::Null) {
             return Err(RuntimeError::TypeError(format!(
-                "Array.prototype.{method} called on null or undefined"
+                "Array.prototype.{} called on null or undefined",
+                method.as_str()
             )));
         }
         // `forEach` also lives on `Map.prototype` / `Set.prototype`, and this
@@ -2305,7 +2189,7 @@ impl VM {
         // `[].sort.call({ get length() { throw … } }, null)` 必须是 TypeError，
         // 而不是长度访问器抛出的那个错误（`comparefn-nonfunction-call-throws`）。
         // 这一步因此要排在 `LengthOfArrayLike` 之前。
-        if method == "sort" {
+        if method == crate::vm::native::ArrayOp::Sort {
             if let Some(cmp) = args.first() {
                 if !cmp.is_undefined()
                     && !(cmp.is_callable() || matches!(cmp, Value::Function(_)))
@@ -2334,10 +2218,7 @@ impl VM {
         };
         // 会 `ArraySpeciesCreate(O, len)` 的方法：`len > 2**32-1` 是 RangeError
         // （`map/15.4.4.19-3-8`：`{0: 9, length: Infinity}`）。
-        const SPECIES_METHODS: &[&str] = &[
-            "map", "filter", "flatMap", "flat", "toReversed", "toSorted", "toSpliced", "with",
-        ];
-        if SPECIES_METHODS.contains(&method) && len_raw > 0xFFFF_FFFF {
+        if method.uses_species() && len_raw > 0xFFFF_FFFF {
             return Err(RuntimeError::RangeError("Invalid array length".to_string()));
         }
         let len = len_raw.min(1 << 24) as usize;
@@ -2346,7 +2227,10 @@ impl VM {
         // must not hit the callable check below. Strings keep their own
         // substring semantics (`"abcab".indexOf("ab")` is 0, not a per-char
         // scan), so a string receiver falls through to the string builtins.
-        if method == "indexOf" || method == "lastIndexOf" {
+        if matches!(
+            method,
+            crate::vm::native::ArrayOp::IndexOf | crate::vm::native::ArrayOp::LastIndexOf
+        ) {
             // `Array.prototype.indexOf.call(x, …)` and `x.indexOf(…)` reach the
             // same dispatch site. Anything that is not array-like — a string
             // (substring search) or a wrapper without `length`
@@ -2366,7 +2250,7 @@ impl VM {
             // 要答 4294967294。这两个方法的扫描从 `fromIndex` 开始而不是从 0，
             // 所以大长度本身不贵（`15.4.4.15-8-9` 一族把匹配放在末尾）。
             return self
-                .array_index_of_live(&target, len_raw.min(usize::MAX as u64) as usize, method, args, module)
+                .array_index_of_live(&target, len_raw.min(usize::MAX as u64) as usize, method.as_str(), args, module)
                 .map(Some);
         }
 
@@ -2374,7 +2258,7 @@ impl VM {
         // `HasProperty` → `[[Get]]` → `Set(..., true)`，空位则
         // `DeletePropertyOrThrow`。四种操作都可观察（Proxy / 访问器 /
         // 非配置属性），而内建层的 `array_copy_within` 只认密集存储。
-        if method == "copyWithin" {
+        if method == crate::vm::native::ArrayOp::CopyWithin {
             if !self.receiver_is_array_like(receiver) {
                 return Ok(None);
             }
@@ -2394,7 +2278,7 @@ impl VM {
         // `Number.prototype.toLocaleString` 也走这条分派。只有类数组接收者
         // 才归数组口径（`[true].toLocaleString()` 里的 `true` 必须落到
         // `Boolean.prototype` 上，否则得到空串）。
-        if method == "toLocaleString" {
+        if method == crate::vm::native::ArrayOp::ToLocaleString {
             if !self.receiver_is_array_like(receiver) {
                 return Ok(None);
             }
@@ -2421,7 +2305,7 @@ impl VM {
         }
 
         // `fill(value, start, end)`（ES 23.1.3.7）：逐下标 `Set(O, k, value, true)`。
-        if method == "fill" {
+        if method == crate::vm::native::ArrayOp::Fill {
             if !self.receiver_is_array_like(receiver) {
                 return Ok(None);
             }
@@ -2449,7 +2333,13 @@ impl VM {
         }
 
         // 栈族：`push` / `pop` / `shift` / `unshift`（ES 23.1.3.20 / .17 / .22 / .29）。
-        if matches!(method, "push" | "pop" | "shift" | "unshift") {
+        if matches!(
+            method,
+            crate::vm::native::ArrayOp::Push
+                | crate::vm::native::ArrayOp::Pop
+                | crate::vm::native::ArrayOp::Shift
+                | crate::vm::native::ArrayOp::Unshift
+        ) {
             if !self.receiver_is_array_like(receiver) {
                 return Ok(None);
             }
@@ -2462,7 +2352,7 @@ impl VM {
             // 见 `array_stack_method` 里的 `iter_len`。
             let raw_len = self.array_like_length_raw(&target, module)?;
             return self
-                .array_stack_method(&target, method, raw_len, args, module)
+                .array_stack_method(&target, method.as_str(), raw_len, args, module)
                 .map(Some);
         }
 
@@ -2504,7 +2394,7 @@ impl VM {
         };
 
         match method {
-            "sort" => {
+            ArrayOp::Sort => {
                 // ES 2020 `Array.prototype.sort`（tc39/ecma262#1585）的四步：
                 //
                 // 1. `len` 已在上面取好；
@@ -2582,28 +2472,13 @@ impl VM {
             // 只有"必须给回调"的方法才在这里拒；`toSorted` / `sort` 的比较器、
             // `toReversed` / `with` / `indexOf` 等都不需要（此前写成通配 `_`，
             // 于是 `[3,1,2].toSorted()` 报 "callback is not a function"）。
-            method
-                if matches!(
-                    method,
-                    "map"
-                        | "filter"
-                        | "forEach"
-                        | "some"
-                        | "every"
-                        | "reduce"
-                        | "reduceRight"
-                        | "find"
-                        | "findIndex"
-                        | "findLast"
-                        | "findLastIndex"
-                        | "flatMap"
-                ) && !callback.is_callable() =>
-            {
+            method if method.needs_callback() && !callback.is_callable() => {
                 Err(RuntimeError::TypeError(format!(
-                    "{method} callback is not a function"
+                    "{} callback is not a function",
+                    method.as_str()
                 )))
             }
-            "forEach" => {
+            ArrayOp::ForEach => {
                 // 逐步 `HasProperty` + `[[Get]]`（ES 23.1.3.13 step 6.a.ii）：
                 // 回调删掉后面的元素 ⇒ 跳过；新加进来的 ⇒ 会被访问。
                 for i in 0..len {
@@ -2614,7 +2489,7 @@ impl VM {
                 }
                 Ok(Some(Value::Undefined))
             }
-            "map" => {
+            ArrayOp::Map => {
                 // Step 5: `A = ? ArraySpeciesCreate(O, len)`. When the default
                 // array is used the result keeps the receiver's length *and*
                 // its holes; with a species constructor only the present
@@ -2675,7 +2550,7 @@ impl VM {
                     }
                 }))
             }
-            "flat" => {
+            ArrayOp::Flat => {
                 // 第 3 步：`depthNum`（缺省 **1**；显式 `undefined` 也是 1，
                 // 其余走 `ToIntegerOrInfinity`，对象参数会跑用户 `valueOf`）。
                 let depth = match args.first() {
@@ -2695,7 +2570,7 @@ impl VM {
                 self.flatten_into_array(&target, receiver, len, 0, depth, 0, module)?;
                 Ok(Some(target))
             }
-            "flatMap" => {
+            ArrayOp::FlatMap => {
                 // Map, then flatten one level (ES 23.1.3.?): a mapped value that
                 // is an array contributes its elements, anything else is
                 // appended as-is. This is the same `call` plumbing `map` uses.
@@ -2748,7 +2623,7 @@ impl VM {
                     }
                 }))
             }
-            "filter" => {
+            ArrayOp::Filter => {
                 // Result length is `len`, so `ArraySpeciesCreate` is asked for it —
                 // that is what makes the `MAX_MATERIALIZED_LEN` cap fire (e.g.
                 // `filter` over a 2**32-length array-like must be a `RangeError`,
@@ -2779,7 +2654,7 @@ impl VM {
                     }
                 }))
             }
-            "some" => {
+            ArrayOp::Some => {
                 for i in 0..len {
                     let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
                         continue;
@@ -2790,7 +2665,7 @@ impl VM {
                 }
                 Ok(Some(Value::Bool(false)))
             }
-            "every" => {
+            ArrayOp::Every => {
                 for i in 0..len {
                     let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
                         continue;
@@ -2801,7 +2676,7 @@ impl VM {
                 }
                 Ok(Some(Value::Bool(true)))
             }
-            "find" => {
+            ArrayOp::Find => {
                 for i in 0..len {
                     let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
                         continue;
@@ -2812,7 +2687,7 @@ impl VM {
                 }
                 Ok(Some(Value::Undefined))
             }
-            "findIndex" => {
+            ArrayOp::FindIndex => {
                 for i in 0..len {
                     let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
                         continue;
@@ -2825,7 +2700,7 @@ impl VM {
             }
             // ── ES2023 ──
             // `findLast` / `findLastIndex`：从**末尾**往前找第一个命中的。
-            "findLast" => {
+            ArrayOp::FindLast => {
                 for i in (0..len).rev() {
                     let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
                         continue;
@@ -2836,7 +2711,7 @@ impl VM {
                 }
                 Ok(Some(Value::Undefined))
             }
-            "findLastIndex" => {
+            ArrayOp::FindLastIndex => {
                 for i in (0..len).rev() {
                     let Some(e) = self.array_live_at(&callback_receiver, i, module)? else {
                         continue;
@@ -2848,7 +2723,7 @@ impl VM {
                 Ok(Some(Value::Number(-1.0)))
             }
             // `toReversed()`：返回**新**数组，元素逆序（不改原数组）。
-            "toReversed" => {
+            ArrayOp::ToReversed => {
                 let entries = self.array_like_entries(receiver, module)?;
                 let mut vals = Self::dense_entries(&entries);
                 vals.reverse();
@@ -2856,7 +2731,7 @@ impl VM {
             }
             // `toSorted(comparefn)`：返回**新**数组。注意 **Array 的默认比较是
             // 字符串序**（与 `TypedArray.prototype.toSorted` 的数值序不同）。
-            "toSorted" => {
+            ArrayOp::ToSorted => {
                 let entries = self.array_like_entries(receiver, module)?;
                 let cmp = args.first().cloned().unwrap_or(Value::Undefined);
                 let mut vals = Self::dense_entries(&entries);
@@ -2889,7 +2764,7 @@ impl VM {
             }
             // `with(index, value)`：返回**新**数组，指定下标换成新值；下标越界
             // 是 RangeError（ES 23.1.3.31）。负下标从末尾算。
-            "with" => {
+            ArrayOp::With => {
                 let entries = self.array_like_entries(receiver, module)?;
                 let mut vals = Self::dense_entries(&entries);
                 let len = vals.len();
@@ -2906,7 +2781,7 @@ impl VM {
             }
             // `toSpliced(start, deleteCount, ...items)`：返回**新**数组，等价于
             // 在副本上做一次 `splice`（不改原数组）。
-            "toSpliced" => {
+            ArrayOp::ToSpliced => {
                 let entries = self.array_like_entries(receiver, module)?;
                 let vals = Self::dense_entries(&entries);
                 let len = vals.len();
@@ -2929,11 +2804,11 @@ impl VM {
                 out.extend_from_slice(&vals[start + delete_count..]);
                 Ok(Some(self.array_result_from(receiver, &out, module)?))
             }
-            "reduce" | "reduceRight" => {
+            ArrayOp::Reduce | ArrayOp::ReduceRight => {
                 // Indices are visited in order (or reverse); presence and value
                 // are re-read at every step, so a callback that deletes a later
                 // element skips it (`reduce` 那一族 `callCnt` 用例）。
-                let indices: Vec<usize> = if method == "reduceRight" {
+                let indices: Vec<usize> = if method == crate::vm::native::ArrayOp::ReduceRight {
                     (0..len).rev().collect()
                 } else {
                     (0..len).collect()
@@ -3729,8 +3604,12 @@ impl VM {
 
         match method {
             "join" => {
+                // `ToString(separator)`：Symbol 必须是 TypeError，不能
+                // `to_js_string()` 静默变成 "Symbol(s)"。
                 let sep = match args.first() {
-                    Some(sep) if !sep.is_undefined() => sep.to_js_string(),
+                    Some(sep) if !sep.is_undefined() => {
+                        crate::builtins::to_string_throwing(sep)?
+                    }
                     _ => ",".to_string(),
                 };
                 let mut out = String::new();

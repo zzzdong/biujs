@@ -2090,6 +2090,13 @@ pub struct NativeFunctionObject {
     /// 目录里都有一份。默认 false，构造器注册时（`link_constructor_prototype`
     /// 与 `Proxy`）显式标 true —— 反过来做（默认可构造、逐个禁）会漏。
     constructible: bool,
+    /// 这个内建的**实现**（见 [`crate::vm::native`]）。
+    ///
+    /// `Some` 表示已迁移：调用点直接调它，不再回查名字。
+    /// `None` 是迁移中的状态：还留在按名分派表里（`call_native_by_name` 等），
+    /// 每迁一族就少一批，最终这个名字只用来算 `Function.prototype.toString`
+    /// 的来源与 `name` 显示串。
+    entry: Option<crate::vm::native::NativeEntry>,
 }
 
 impl NativeFunctionObject {
@@ -2103,9 +2110,21 @@ impl NativeFunctionObject {
                 crate::builtins::wrapper_prototype("Function"),
             ),
             constructible: false,
+            entry: None,
         };
         obj.install_metadata();
         obj
+    }
+
+    /// 装上实现（注册时调用一次）。
+    pub(crate) fn with_entry(mut self, entry: crate::vm::native::NativeEntry) -> Self {
+        self.entry = Some(entry);
+        self
+    }
+
+    /// 这个内建的实现（`None` = 还留在按名分派表里）。
+    pub(crate) fn entry(&self) -> Option<crate::vm::native::NativeEntry> {
+        self.entry
     }
 
     /// `[[Construct]]` 是否存在。

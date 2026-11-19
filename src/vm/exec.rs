@@ -669,10 +669,11 @@ impl VM {
             self.set_value(target, result)?;
             return Ok(Control::Done);
         }
-        // 2. 原生内建：按名字分发（`Function.prototype.bind` 的产物也在其中）。
-        if let Some(name) = crate::builtins::native_function_name(callee) {
+        // 2. 原生内建：走函数对象自带的实现（未迁移的那批仍按名字分发，
+        //    `Function.prototype.bind` 的产物也在其中）。
+        if crate::builtins::is_native_function(callee) {
             let args = self.call_args_vec(args)?;
-            let result = self.call_native_by_name(&name, this, &args, module)?;
+            let result = self.invoke_native(callee, this, &args, module)?;
             self.set_value(target, result)?;
             return Ok(Control::Done);
         }
@@ -831,9 +832,11 @@ impl VM {
         // the instance with `newTarget.prototype` (ES 9.1.14
         // GetPrototypeFromConstructor), which is what makes
         // `class C extends Error {}` produce a real error object.
-        if let Some(name) = crate::builtins::native_function_name(callee) {
+        if crate::builtins::is_native_function(callee) {
             if let Some(new_target) = &new_target_override {
-                if new_target.is_object() {
+                if new_target.is_object()
+                    && let Some(name) = crate::builtins::native_function_name(callee)
+                {
                     return self.native_construct(
                         &name,
                         callee,
@@ -843,7 +846,7 @@ impl VM {
                     );
                 }
             }
-            return self.call_native_by_name(&name, this, args, module);
+            return self.invoke_native(callee, this, args, module);
         }
 
         let (func_id, effective_this, captured_this_new_target, captured_vars) = match callee {
@@ -3129,143 +3132,19 @@ impl VM {
                     return Ok(true);
                 }
 
-                // Array callback methods (`map`, `filter`, `reduce`, `sort`, …)
-                // are executed here so they can call the user function.
-                if let Some(result) =
-                    self.try_array_callback_method(&obj_val, &method_name, &args, module)?
-                {
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(true);
-                }
-                // The read family (`join` / `slice` / `includes` / `at` /
-                // `concat` / `reverse`) reads elements through `[[Get]]`, so it
-                // also has to run here rather than in the builtin layer.
-                if let Some(result) =
-                    self.try_array_read_method(&obj_val, &method_name, &args, module)?
-                {
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(true);
-                }
+                // Array 一族已迁到函数对象自带的 `NativeEntry::VmArray`：回调族、
+                // 读族、species 族统一由 `VM::array_proto_host` 处理，不再在
+                // `CallMethod` 里按方法名抢先拦截。
+                // String 的协议方法与参数强转已并入 `VM::string_proto_host`。
+                // `then` / `catch` / `finally` 已迁到函数对象自带的
+                // `NativeEntry::Vm`，由下面的属性解析 + `invoke_native` 处理。
 
-                // A function replacer for `String.prototype.replace` runs here
-                // for the same reason (it calls user code).
-                if let Some(result) =
-                    self.try_string_callback_method(&obj_val, &method_name, &args, module)?
-                {
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(true);
-                }
-                // `then` / `catch` / `finally` likewise (they call the handler).
-                // This is the second method-call path — a chained call like
-                // `new Promise(f).catch(cb)` comes through here, not through the
-                // one above, and used to silently do nothing.
-                if let Some(result) = self.try_promise_method(&obj_val, &method_name, &args, module)?
-                {
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(true);
-                }
+                // 静态方法已全部带 `NativeEntry`：不再按 `Owner.method` 拼名字
+                // 预先探测纯 builtin 表，统一由下面的属性解析 + `invoke_native`
+                // 分派。这样既少了一次 `format!`，也不会让「名字查不到」和
+                // 「内建真的失败」混在同一个 Err 里。
 
-                // First check: is this a static method on a native function (constructor)?
-                if let Some(name) = crate::builtins::native_function_name(&obj_val) {
-                    let static_method = format!("{}.{}", name, method_name);
-                    // `Object.assign` needs real `[[Get]]`/`[[Set]]` (accessors).
-                    if static_method == "Object.assign" {
-                        let result = self.object_assign(&args, module)?;
-                        self.state.set_register(Register::Rv, result)?;
-                        self.state.jump_offset(1);
-                        return Ok(true);
-                    }
-                    // Statics that read their inputs through `[[Get]]` (a
-                    // descriptor object's fields may be accessors) can only be
-                    // carried out by the VM, which is what the prototype-chain
-                    // lookup below reaches through `call_native_by_name`. Trying
-                    // them against the plain builtin layer first would either
-                    // fail or lose the getter side effects.
-                    let vm_handled_static = matches!(
-                        static_method.as_str(),
-                        // These have to reach `call_native_by_name` because a
-                        // proxy receiver turns them into trap calls; the VM
-                        // falls back to the same builtin for anything else.
-                        "Object.defineProperty"
-                            | "Object.defineProperties"
-                            | "Object.create"
-                            | "Proxy.revocable"
-                            | "Object.getPrototypeOf"
-                            | "Object.setPrototypeOf"
-                            | "Object.isExtensible"
-                            | "Object.preventExtensions"
-                            |                         "Object.getOwnPropertyDescriptor"
-                            | "Object.hasOwn"
-                            | "Object.keys"
-                            | "Object.getOwnPropertyNames"
-                            | "Object.getOwnPropertySymbols"
-                            // 每个参数都要 `ToNumber`，对对象要跑 `valueOf` / `toString`
-                            // （`String.fromCharCode({valueOf(){return 1}})` 是 U+0001）。
-                            | "String.fromCharCode"
-                            | "String.fromCodePoint"
-                            // `Array.from` / `Array.of` 要用 `this` 当 `C`、跑
-                            // `@@iterator` / `mapfn`、逐元素 `CreateDataProperty`。
-                            | "Array.from"
-                            | "Array.of"
-                            // `IsArray` 要看穿 Proxy（revoked 是 TypeError）。
-                            | "Array.isArray"
-                            // test262 宿主对象由 runner 显式安装（默认引擎里
-                            // 没有 `$262`）。
-                            | "$262.detachArrayBuffer"
-                    );
-                    if !vm_handled_static {
-                        // A missing static falls through to the prototype chain,
-                        // but a static that *exists* and fails (RangeError,
-                        // TypeError, …) must propagate rather than be swallowed
-                        // by the fallback.
-                        match crate::builtins::call_static_method(&static_method, &args, &mut self.heap) {
-                            Ok(result) => {
-                                self.state.set_register(Register::Rv, result)?;
-                                self.state.jump_offset(1);
-                                return Ok(true);
-                            }
-                            Err(err) if crate::builtins::is_unknown_builtin(&err) => {}
-                            Err(err) => return Err(err),
-                        }
-                    }
-                }
-
-                // `slice` / `splice` / `concat` are pure enough for the builtin
-                // layer, but their result array comes from `ArraySpeciesCreate`,
-                // whose `Get`s and `Construct` can run user code.
-                //
-                // 参数先按 `ToIntegerOrInfinity` 转换（`slice(start, end)` 的
-                // `{valueOf(){…}}` 要在这里跑），这条路径不经过
-                // `call_native_by_name` 的 Array 分支。
-                if let Some(result) = {
-                    let coerced =
-                        self.coerce_index_method_args("Array", &method_name, &args, module)?;
-                    let dispatch_args: &[Value] = match &coerced {
-                        Some(values) => values,
-                        None => &args,
-                    };
-                    self.try_array_species_method(&obj_val, &method_name, dispatch_args, module)?
-                } {
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(true);
-                }
-
-                // `matchAll` answers an iterator, which the builtin layer cannot
-                // build — and a *primitive* string receiver never reaches the
-                // native dispatch further down (`lookup_property_on_object` only
-                // reads real objects), so it has to be caught here.
-                if let Some(result) =
-                    self.try_match_all_method(&obj_val, &method_name, &args, module)?
-                {
-                    self.state.set_register(Register::Rv, result)?;
-                    self.state.jump_offset(1);
-                    return Ok(true);
-                }
+                // species 族同上，已并入 `VM::array_proto_host`。
 
                 // 先解析方法，再决定用哪条路调它。
                 //
@@ -3286,8 +3165,19 @@ impl VM {
                 // 只读对象），所以 `String.prototype` 这条需要 VM 的路径在这里
                 // 单独接一次：接收者的 `ToString` 与参数的 `ToPrimitive` 都要
                 // 跑用户代码，按名字分派的兜底拿不到 `module`。
-                if crate::builtins::native_function_name(&method_val).is_none() {
+                // 是原生内建吗？只判种类，不复制名字（热路径）。
+                let is_native = crate::builtins::is_native_function(&method_val);
+                if !is_native {
                     if let Value::String(_) = &obj_val {
+                        // 原语接收者查不到属性表：属于 String.prototype 的方法
+                        // 在这里统一走 `string_proto_host`，与对象接收者同源。
+                        if let Some(op) = crate::vm::native::StringOp::from_name(&method_name) {
+                            let result =
+                                self.string_proto_host(op, &obj_val, &args, module)?;
+                            self.state.set_register(Register::Rv, result)?;
+                            self.state.jump_offset(1);
+                            return Ok(true);
+                        }
                         match self.string_prototype_method(&obj_val, &method_name, &args, module) {
                             Ok(result) => {
                                 self.state.set_register(Register::Rv, result)?;
@@ -3300,9 +3190,8 @@ impl VM {
                         }
                     }
                 }
-                let native_method = crate::builtins::native_function_name(&method_val);
                 // 用户（或 Proxy/访问器）提供的可调用值：内建分派无权插手。
-                let user_method = !matches!(method_val, Value::Undefined) && native_method.is_none();
+                let user_method = !matches!(method_val, Value::Undefined) && !is_native;
                 if !user_method {
                     // `Object.prototype.hasOwnProperty(P)` 的 P 走 ToPropertyKey：
                     // 带 `Symbol.toPrimitive` / `toString` 的 key 只有 VM 能转换。
@@ -3326,19 +3215,15 @@ impl VM {
                     } else {
                         &args
                     };
-                    let dispatched = match &native_method {
-                        Some(native) => self.call_native_by_name(
-                            native,
-                            receiver.clone(),
-                            dispatch_args,
-                            module,
-                        ),
-                        None => crate::builtins::call_prototype_method(
+                    let dispatched = if is_native {
+                        self.invoke_native(&method_val, receiver.clone(), dispatch_args, module)
+                    } else {
+                        crate::builtins::call_prototype_method(
                             &mut self.heap,
                             &receiver,
                             &method_name,
                             dispatch_args,
-                        ),
+                        )
                     };
                     match dispatched {
                         Ok(result) => {

@@ -168,9 +168,29 @@ pub fn reflect_prevent_extensions(_heap: &mut Heap, args: &[Value]) -> Result<Va
 /// The `Reflect` namespace object (ES 28.1): an ordinary object with thirteen
 /// methods, none of them enumerable, and `[Symbol.toStringTag] === "Reflect"`.
 ///
-/// Every method is a name-only native: the VM dispatches five of them, and
-/// `call_static_method` the other eight — the closures a prototype/method
-/// descriptor carries are never called, only the name is read.
+/// 这四个方法要跑 `ToPropertyKey` / Proxy trap，实现挂在函数对象上；
+/// 其余仍由 `call_static_method` 按名找纯实现（`get`/`set`/`apply`/`construct`
+/// 这类需要 VM 的还没迁完）。
+fn vm_entry_for(name: &str) -> Option<crate::vm::native::NativeEntry> {
+    use crate::vm::native::VmSlot;
+    Some(match name {
+        "has" => VmSlot::ReflectHas.entry(),
+        "deleteProperty" => VmSlot::ReflectDeleteProperty.entry(),
+        "getOwnPropertyDescriptor" => VmSlot::ReflectGetOwnPropertyDescriptor.entry(),
+        "defineProperty" => VmSlot::ReflectDefineProperty.entry(),
+        "get" => VmSlot::ReflectGet.entry(),
+        "set" => VmSlot::ReflectSet.entry(),
+        "apply" => VmSlot::ReflectApply.entry(),
+        "construct" => VmSlot::ReflectConstruct.entry(),
+        "ownKeys" => VmSlot::ReflectOwnKeys.entry(),
+        "getPrototypeOf" => VmSlot::ReflectGetPrototypeOf.entry(),
+        "setPrototypeOf" => VmSlot::ReflectSetPrototypeOf.entry(),
+        "isExtensible" => VmSlot::ReflectIsExtensible.entry(),
+        "preventExtensions" => VmSlot::ReflectPreventExtensions.entry(),
+        _ => return None,
+    })
+}
+
 pub fn create_reflect_object(heap: &mut Heap) -> Value {
     let mut obj = OrdinaryObject::with_class_name("Reflect");
     // `Reflect` is a namespace object, not a constructor: it has no `prototype`
@@ -185,8 +205,12 @@ pub fn create_reflect_object(heap: &mut Heap) -> Value {
     for name in names {
         let key = PropertyKey::intern(heap, name);
 
+        let mut method = NativeFunctionObject::new(&format!("Reflect.{name}"));
+        if let Some(entry) = vm_entry_for(name) {
+            method = method.with_entry(entry);
+        }
         let value = super::method_descriptor(Value::Object(heap.alloc(
-            Object::NativeFunction(NativeFunctionObject::new(&format!("Reflect.{name}"))),
+            Object::NativeFunction(method),
         )));
         let _ = obj.define_property(heap, key, value);
     }

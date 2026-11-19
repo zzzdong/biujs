@@ -13,146 +13,74 @@ use crate::vm::value::Value;
 // ─────────────────────────────────────────────────────────
 
 pub fn register_array_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::{mark_prototype_method, set_prototype_method_owned};
+    use crate::vm::native::{ArrayOp, VmSlot};
 
-    set_prototype_method_owned("Array", proto, heap, "push", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "pop", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "shift", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "unshift", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "indexOf", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "includes", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "join", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "slice", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "concat", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "splice", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "reverse", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "lastIndexOf", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "fill", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "toString", |this, _args| array_to_string(this));
-    set_prototype_method_owned("Array", proto, heap, "toLocaleString", |this, _args| {
-        array_to_string(this)
-    });
-    set_prototype_method_owned("Array", proto, heap, "at", |_this, _args| Ok(Value::Undefined));
-    set_prototype_method_owned("Array", proto, heap, "flat", |_this, _args| Ok(Value::Undefined));
-    // `flatMap` needs to call back into JS, so the VM dispatches it (next to
-    // `map` / `filter`); this registration is what makes the name resolvable.
-    set_prototype_method_owned("Array", proto, heap, "flatMap", |_this, _args| {
-        Err(RuntimeError::InternalError(
-            "Array.prototype.flatMap is dispatched by the VM".to_string(),
-        ))
-    });
-    // 闭包从不被调用（`set_prototype_method` 只登记名字）；实现住在分派表里。
-    set_prototype_method_owned("Array", proto, heap, "copyWithin", |_, _| {
-        Err(RuntimeError::NotImplemented(
-            "method implemented by the VM".to_string(),
-        ))
-    });
+    // 每个原型方法都自带算法选择器：名字只用于 arity / name / toString，
+    // 实现由 `NativeEntry::VmArray` 在调用时直接分派。
+    let methods: &[(&str, ArrayOp)] = &[
+        ("push", ArrayOp::Push),
+        ("pop", ArrayOp::Pop),
+        ("shift", ArrayOp::Shift),
+        ("unshift", ArrayOp::Unshift),
+        ("indexOf", ArrayOp::IndexOf),
+        ("lastIndexOf", ArrayOp::LastIndexOf),
+        ("includes", ArrayOp::Includes),
+        ("join", ArrayOp::Join),
+        ("slice", ArrayOp::Slice),
+        ("concat", ArrayOp::Concat),
+        ("splice", ArrayOp::Splice),
+        ("reverse", ArrayOp::Reverse),
+        ("fill", ArrayOp::Fill),
+        ("toString", ArrayOp::ToString),
+        ("toLocaleString", ArrayOp::ToLocaleString),
+        ("at", ArrayOp::At),
+        ("flat", ArrayOp::Flat),
+        ("flatMap", ArrayOp::FlatMap),
+        ("copyWithin", ArrayOp::CopyWithin),
+        ("map", ArrayOp::Map),
+        ("filter", ArrayOp::Filter),
+        ("forEach", ArrayOp::ForEach),
+        ("some", ArrayOp::Some),
+        ("every", ArrayOp::Every),
+        ("reduce", ArrayOp::Reduce),
+        ("reduceRight", ArrayOp::ReduceRight),
+        ("find", ArrayOp::Find),
+        ("findIndex", ArrayOp::FindIndex),
+        ("sort", ArrayOp::Sort),
+        ("findLast", ArrayOp::FindLast),
+        ("findLastIndex", ArrayOp::FindLastIndex),
+        ("toReversed", ArrayOp::ToReversed),
+        ("toSorted", ArrayOp::ToSorted),
+        ("toSpliced", ArrayOp::ToSpliced),
+        ("with", ArrayOp::With),
+    ];
+    for (name, op) in methods {
+        super::set_prototype_method_impl(proto, heap, name, VmSlot::ArrayProto(*op).entry());
+    }
 
-    // Callback-driven methods: the VM runs the algorithm so it can call the
-    // user-supplied function for each element.
-    for name in [
-        "map",
-        "filter",
-        "forEach",
-        "some",
-        "every",
-        "reduce",
-        "reduceRight",
-        "find",
-        "findIndex",
-        "sort",
-        // ES2023：`findLast` / `findLastIndex` 需要谓词；`toReversed` /
-        // `toSorted` / `toSpliced` / `with` 不需要回调，但结果要走
-        // `ArraySpeciesCreate`（子类必须拿到子类实例），所以同样归 VM。
-        "findLast",
-        "findLastIndex",
-        "toReversed",
-        "toSorted",
-        "toSpliced",
-        "with",
+    // 迭代器工厂也需要 VM；三个名字各自带 slot，不再由分派口按方法名猜。
+    for (name, slot) in [
+        ("entries", VmSlot::ArrayEntries),
+        ("keys", VmSlot::ArrayKeys),
+        ("values", VmSlot::ArrayValues),
     ] {
-        mark_prototype_method(proto, heap, name);
+        super::set_prototype_method_impl(proto, heap, name, slot.entry());
     }
-
-    // `entries` / `keys` / `values` return iterators, which only the VM can
-    // build: they are dispatched by `call_native_by_name` through the iterator
-    // registry.
-    for name in ["entries", "keys", "values"] {
-        mark_prototype_method(proto, heap, name);
-    }
-}
-
-/// `Array.from(arrayLike)` — copies array-like values / iterables we support.
-///
-/// A `mapFn` would have to call back into JavaScript, which the builtin layer
-/// cannot do; such calls are handled by the VM before reaching here.
-pub fn array_from(heap: &mut Heap, args: &[Value]) -> Result<Value, RuntimeError> {
-    let Some(source) = args.first() else {
-        return Err(RuntimeError::TypeError(
-            "Array.from requires an array-like object".to_string(),
-        ));
-    };
-    // `Array.from` takes the @@iterator path *first* (ES 23.1.2.1): a Set, a Map,
-    // `str.matchAll(re)` and `arr.keys()` are all iterable without being
-    // array-like, and they reach the builtin layer as native iterators. Draining
-    // one needs no VM: its state is right here.
-    if let Some(items) = crate::builtins::typedarray::typedarray_elements(source) {
-        return Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(items,)))));
-    }
-    if let Some(items) = crate::vm::iterator::drain_native_iterator(heap, source) {
-        return Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(items,)))));
-    }
-    let mut out: Vec<Value> = Vec::new();
-    match source {
-        Value::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            if let Some(arr) = borrowed.as_array() {
-                for i in 0..arr.len() {
-                    out.push(arr.get(i).cloned().unwrap_or(Value::Undefined));
-                }
-            } else {
-                // Generic array-like: read `length` and then each index.
-                let len = borrowed
-                    .property_get(&PropertyKey::well_known("length").expect("well-known name"))
-                    .map(|d| d.value.to_number())
-                    .unwrap_or(0.0);
-                let len = len.max(0.0).min((1u32 << 20) as f64) as usize;
-                for i in 0..len {
-                    let key = PropertyKey::element(heap, i as u64);
-                    out.push(
-                        borrowed
-                            .property_get(&key)
-                            .map(|d| d.value)
-                            .unwrap_or(Value::Undefined),
-                    );
-                }
-            }
-        }
-        Value::String(s) => {
-            out.extend(s.chars().map(|c| Value::string(&c.to_string())));
-        }
-        _ => {
-            return Err(RuntimeError::TypeError(format!(
-                "Array.from: {} is not iterable",
-                source.type_of()
-            )));
-        }
-    }
-    Ok(Value::Object(heap.alloc(Object::Array(ArrayObject::from_vec(out,)))))
 }
 
 /// Register `Array` constructor statics.
 pub fn register_array_statics(array_fn: &Value, heap: &mut Heap) {
-    use super::set_static_method;
+    use super::set_static_method_impl;
+    use crate::vm::native::VmSlot;
 
-    set_static_method(array_fn, "isArray", heap, |args| {
-        Ok(Value::Bool(matches!(
-            args.first(),
-            Some(Value::Object(o)) if o.borrow().kind() == crate::vm::ObjectKind::Array
-        )))
-    });
-    set_static_method(array_fn, "of", heap, |_args| Ok(Value::Undefined));
-    set_static_method(array_fn, "from", heap, |_args| Ok(Value::Undefined));
+    // `isArray` 要看穿 Proxy；`from` / `of` 要用 `this` 当构造器并跑迭代协议。
+    for (name, slot) in [
+        ("isArray", VmSlot::ArrayIsArray),
+        ("of", VmSlot::ArrayOf),
+        ("from", VmSlot::ArrayFrom),
+    ] {
+        set_static_method_impl(array_fn, name, heap, slot.entry());
+    }
     register_species_accessor(array_fn, heap);
 }
 
@@ -181,17 +109,6 @@ fn register_species_accessor(array_fn: &Value, heap: &mut Heap) {
     let _ = obj
         .borrow_mut()
         .define_property(heap, super::species_symbol_key(), desc);
-}
-
-/// `Array.prototype.toString()`
-pub fn array_to_string(obj: &Value) -> Result<Value, RuntimeError> {
-    if let Value::Object(obj_ref) = obj {
-        let arr = obj_ref.borrow();
-        if let Some(array_obj) = arr.as_array() {
-            return Ok(Value::string(&array_obj.join_elements()));
-        }
-    }
-    Ok(Value::string("[object Object]"))
 }
 
 // ─────────────────────────────────────────────────────────

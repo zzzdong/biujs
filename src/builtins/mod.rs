@@ -706,12 +706,17 @@ impl Builtins {
                 // `[[ErrorData]]`, which the engine marks with the `[[Class]]`
                 // "Error" (that is also what `Object.prototype.toString`
                 // reports).
-                set_static_method(&fn_val, "isError", heap, |args| {
-                    Ok(Value::Bool(matches!(
-                        args.first(),
-                        Some(Value::Object(o)) if o.borrow().class_name() == "Error"
-                    )))
-                });
+                set_static_method_impl(
+                    &fn_val,
+                    "isError",
+                    heap,
+                    crate::vm::native::NativeEntry::Heap(|_h, _t, args| {
+                        Ok(Value::Bool(matches!(
+                            args.first(),
+                            Some(Value::Object(o)) if o.borrow().class_name() == "Error"
+                        )))
+                    }),
+                );
             }
             globals.insert(PropertyKey::intern(heap, name), method_descriptor(fn_val));
         }
@@ -819,9 +824,14 @@ impl Builtins {
         )));
         typedarray::register_arraybuffer_prototype(&ab_proto, heap);
         Self::link_constructor_prototype(heap, &ab_fn_val, &ab_proto);
-        set_static_method(&ab_fn_val, "isView", heap, |args| {
-            typedarray::arraybuffer_is_view(args)
-        });
+        set_static_method_impl(
+            &ab_fn_val,
+            "isView",
+            heap,
+            crate::vm::native::NativeEntry::Heap(|_h, _t, args| {
+                typedarray::arraybuffer_is_view(args)
+            }),
+        );
         globals.insert(PropertyKey::intern(heap, "ArrayBuffer"), method_descriptor(ab_fn_val));
 
         // `DataView` (ES 25.3): a byte-addressable view over an `ArrayBuffer`.
@@ -853,19 +863,11 @@ impl Builtins {
         )));
         Self::link_constructor_prototype(heap, &ta_ctor, &ta_proto);
         // `%TypedArray%.from` / `%TypedArray%.of`（22.2.2.1 / 22.2.2.2）：要迭代、
-        // 可能回调、还要 `new C(len)`，只有 VM 能做 —— 故登记在这里、由 VM 分派
-        // （限定名 "TypedArray.from" / "TypedArray.of"）。八个具体构造器经
+        // 可能回调、还要 `new C(len)`，实现在 VM。八个具体构造器经
         // `[[Prototype]]` 继承即可，不必各自再登记一份。
-        set_static_method(&ta_ctor, "from", heap, |_args| {
-            Err(RuntimeError::TypeError(
-                "TypedArray.from is dispatched by the VM".to_string(),
-            ))
-        });
-        set_static_method(&ta_ctor, "of", heap, |_args| {
-            Err(RuntimeError::TypeError(
-                "TypedArray.of is dispatched by the VM".to_string(),
-            ))
-        });
+        use crate::vm::native::VmSlot;
+        set_static_method_impl(&ta_ctor, "from", heap, VmSlot::TypedArrayFrom.entry());
+        set_static_method_impl(&ta_ctor, "of", heap, VmSlot::TypedArrayOf.entry());
         let ta_ctor_gc = match &ta_ctor {
             Value::Object(g) => *g,
             _ => unreachable!("刚分配的构造器"),
@@ -958,13 +960,13 @@ impl Builtins {
                 method_descriptor(entries_fn),
             );
         }
-        // `Map.groupBy` (ES2024 `array-grouping`) — iterates + calls back, so
-        // the implementation is the VM's (`call_static_method` never sees it).
-        set_static_method(&map_fn_val, "groupBy", heap, |_args| {
-            Err(RuntimeError::TypeError(
-                "Map.groupBy is dispatched by the VM".to_string(),
-            ))
-        });
+        // `Map.groupBy` (ES2024 `array-grouping`) — iterates + calls back。
+        set_static_method_impl(
+            &map_fn_val,
+            "groupBy",
+            heap,
+            crate::vm::native::VmSlot::MapGroupBy.entry(),
+        );
         register_wrapper_prototype("Map", self.map_prototype);
         // `Map[Symbol.species]` is an accessor returning its receiver
         // (ES 23.1.2.2); like `Array`'s, the getter is dispatched by the VM.
@@ -1358,14 +1360,6 @@ pub fn call_static_method(
     args: &[Value],
     heap: &mut Heap,
 ) -> Result<Value, RuntimeError> {
-    // `Math` is a namespace object, so its methods are dispatched by prefix.
-    if let Some(method) = name.strip_prefix("Math.") {
-        return math::call_math_method(method, args);
-    }
-    // `console` is dispatched the same way (see `console.rs` for why it exists).
-    if let Some(method) = name.strip_prefix("console.") {
-        return console::call_console_method(method, args, heap);
-    }
     match name {
         "Number.isNaN" => number::number_is_nan(args),
         "Number.isFinite" => number::number_is_finite(args),
@@ -1414,14 +1408,10 @@ pub fn call_static_method(
         "Reflect.setPrototypeOf" => reflect::reflect_set_prototype_of(heap, args),
         "Reflect.isExtensible" => reflect::reflect_is_extensible(heap, args),
         "Reflect.preventExtensions" => reflect::reflect_prevent_extensions(heap, args),
-        "Date.now" => date::date_now(args),
-        "Date.parse" => date::date_parse(args),
-        "Date.UTC" => date::date_utc(args),
         "Object.fromEntries" => object::object_from_entries(heap, args),
         "Object.keys" => object::object_keys(heap, args),
         "Object.values" => object::object_values(heap, args),
         "Object.entries" => object::object_entries(heap, args),
-        "Object.assign" => object::object_assign(heap, args),
         "Object.defineProperty" => object::object_define_property(heap, args),
         "Object.defineProperties" => object::object_define_properties(heap, args),
         "Object.create" => object::object_create(heap, args),
@@ -1443,27 +1433,9 @@ pub fn call_static_method(
         "Object.preventExtensions" => object::object_prevent_extensions(args),
         "Object.seal" => object::object_seal(args),
         "Object.freeze" => object::object_freeze(args),
-        "Array.isArray" => Ok(Value::Bool(matches!(
-            args.first(),
-            Some(Value::Object(o)) if o.borrow().kind() == ObjectKind::Array
-        ))),
-        "Array.of" => Ok(array::array_constructor(heap, args)?),
-        "Array.from" => array::array_from(heap, args),
-        "String.fromCharCode" => string::string_from_char_code(args),
-        "String.fromCodePoint" => string::string_from_code_point(args),
-        // Fallbacks for the direct-dispatch path; the VM intercepts both before
-        // reaching here so that `toJSON`/`replacer`/`reviver` can run.
-        "JSON.parse" => {
-            let text = args
-                .first()
-                .map(|v| v.to_js_string())
-                .unwrap_or_else(|| "undefined".to_string());
-            json::json_parse(heap, &text)
-        }
-        "JSON.stringify" => match json::json_stringify(heap, args.first().unwrap_or(&Value::Undefined))? {
-            Some(text) => Ok(Value::string(&text)),
-            None => Ok(Value::Undefined),
-        },
+        // `Array.isArray` / `of` / `from`、`String.fromCharCode` /
+        // `fromCodePoint`、`JSON.parse` / `stringify` 已迁到 `NativeEntry::Vm`，
+        // 这里不再保留纯 builtin 兜底（`toJSON` / `reviver` 必须能跑）。
         "Error.isError" => Ok(Value::Bool(matches!(
             args.first(),
             Some(Value::Object(o)) if o.borrow().class_name() == "Error"
@@ -1583,34 +1555,16 @@ fn call_prototype_method_inner(
         }
     }
     match method_name {
-        // `Number.prototype.*` / `Boolean.prototype.*`：归属已确定，接收者不是对应
-        // 包装值时抛 TypeError（`thisNumberValue` / `thisBooleanValue`），
-        // 不再经由 `dispatch_to_string` 之类"按形状猜"的兜底。
-        "toString" | "valueOf" | "toLocaleString" if owner == Some("Number") => {
-            match method_name {
-                "toString" => number::number_to_string_with_radix(obj, args),
-                "valueOf" => Ok(Value::Number(require_number(obj)?)),
-                _ => Ok(Value::string(&number_to_string(require_number(obj)?))),
-            }
-        }
-        "toString" | "valueOf" if owner == Some("Boolean") => {
-            let b = require_boolean(obj)?;
-            Ok(if method_name == "toString" {
-                Value::string(if b { "true" } else { "false" })
-            } else {
-                Value::Bool(b)
-            })
-        }
+        // Number / Boolean 一族已迁到函数对象自带的 `NativeEntry`；
+        // brand check 在实现的 `require_number` / `require_boolean` 里。
         // `Number.prototype.toString([radix])` takes the radix argument.
         "toString" if matches!(obj, Value::Number(_)) => {
             number::number_to_string_with_radix(obj, args)
         }
         "toString" => {
-            // Date and RegExp both override `toString`, and the name is on every
-            // object — so the receiver decides.
-            if date::is_date_receiver(obj) {
-                date::date_to_string(obj, args)
-            } else if regexp::is_regexp_receiver(obj) {
+            // Date 的方法已自带实现，不再由接收者形状决定；这里只剩 RegExp
+            // 覆盖与通用实现。
+            if regexp::is_regexp_receiver(obj) {
                 regexp::regexp_to_string(obj)
             } else {
                 dispatch_to_string(heap, obj)
@@ -1626,9 +1580,6 @@ fn call_prototype_method_inner(
         // special-cases `undefined`/`null` into `[[object Undefined]]` /
         // `[[object Null]]`, `toLocaleString` starts with `ToObject(this)`.
         "toLocaleString" => {
-            if date::is_date_receiver(obj) {
-                return date::date_to_string(obj, args);
-            }
             require_object_coercible(obj)?;
             // `Array.prototype.toLocaleString` 逐元素 join，不能落到
             // `Object.prototype.toString` 的 `[object Array]`。
@@ -1639,62 +1590,13 @@ fn call_prototype_method_inner(
             }
             dispatch_to_string(heap, obj)
         }
-        "valueOf" => {
-            if date::is_date_receiver(obj) {
-                date::date_value_of(obj)
-            } else {
-                dispatch_value_of(obj)
-            }
-        }
+        "valueOf" => dispatch_value_of(obj),
         // ES Annex B：`__defineGetter__` / `__defineSetter__`。
         "__defineGetter__" => object::object_define_accessor(heap, obj, args, true),
         "__defineSetter__" => object::object_define_accessor(heap, obj, args, false),
         "__lookupGetter__" => object::object_lookup_accessor(heap, obj, args, true),
         "__lookupSetter__" => object::object_lookup_accessor(heap, obj, args, false),
-        "getTime" => date::date_value_of(obj),
-        "toISOString" => date::date_to_iso_string(obj),
-        "toJSON" => date::date_to_json(obj),
-        "toDateString" => date::date_to_date_string(obj),
-        "toTimeString" => date::date_to_time_string(obj),
-        "toUTCString" => date::date_to_utc_string(obj),
-        // No locale data: the `toLocale*` forms are their spec-shaped defaults.
-        "toLocaleDateString" => date::date_to_date_string(obj),
-        "toLocaleTimeString" => date::date_to_time_string(obj),
-        "getFullYear" => date::date_component(obj, 0, false),
-        "getMonth" => date::date_component(obj, 1, false),
-        "getDate" => date::date_component(obj, 2, false),
-        "getDay" => date::date_component(obj, 3, false),
-        "getHours" => date::date_component(obj, 4, false),
-        "getMinutes" => date::date_component(obj, 5, false),
-        "getSeconds" => date::date_component(obj, 6, false),
-        "getMilliseconds" => date::date_component(obj, 7, false),
-        "getTimezoneOffset" => date::date_timezone_offset(obj),
-        "getUTCFullYear" => date::date_component(obj, 0, true),
-        "getUTCMonth" => date::date_component(obj, 1, true),
-        "getUTCDate" => date::date_component(obj, 2, true),
-        "getUTCDay" => date::date_component(obj, 3, true),
-        "getUTCHours" => date::date_component(obj, 4, true),
-        "getUTCMinutes" => date::date_component(obj, 5, true),
-        "getUTCSeconds" => date::date_component(obj, 6, true),
-        "getUTCMilliseconds" => date::date_component(obj, 7, true),
-        "setTime" => date::date_set_time(obj, args),
-        "setFullYear" => date::date_set_full_year(obj, args),
-        "setMonth" => date::date_set_month(obj, args),
-        "setDate" => date::date_set_date(obj, args),
-        // 同一族 set*：start 是首个被覆盖的分量，count 是规范允许的可选参数个数。
-        "setHours" => date::date_set_parts(obj, "setHours", args, 3, 4, false),
-        "setMinutes" => date::date_set_parts(obj, "setMinutes", args, 4, 3, false),
-        "setSeconds" => date::date_set_parts(obj, "setSeconds", args, 5, 2, false),
-        "setMilliseconds" => date::date_set_parts(obj, "setMilliseconds", args, 6, 1, false),
-        "setUTCFullYear" => date::date_set_parts(obj, "setUTCFullYear", args, 0, 3, true),
-        "setUTCMonth" => date::date_set_parts(obj, "setUTCMonth", args, 1, 2, true),
-        "setUTCDate" => date::date_set_parts(obj, "setUTCDate", args, 2, 1, true),
-        "setUTCHours" => date::date_set_parts(obj, "setUTCHours", args, 3, 4, true),
-        "setUTCMinutes" => date::date_set_parts(obj, "setUTCMinutes", args, 4, 3, true),
-        "setUTCSeconds" => date::date_set_parts(obj, "setUTCSeconds", args, 5, 2, true),
-        "setUTCMilliseconds" => {
-            date::date_set_parts(obj, "setUTCMilliseconds", args, 6, 1, true)
-        }
+        // Date 一族已迁到函数对象自带的 `NativeEntry`，不在这里按名字回查。
         // Map / Set prototype methods are deliberately *not* in this table:
         // `get`, `has`, `delete`, … are ordinary property names on any other
         // object (`{ get: function () { … } }`), and `Map.prototype.has` is not
@@ -2043,6 +1945,33 @@ fn new_proto(heap: &mut Heap, parent: Option<Gc<Object>>, _class_name: &str) -> 
 // Helpers
 // ─────────────────────────────────────────────────────────
 
+/// 注册一个**自带实现**的静态方法（迁移目标形状）。
+///
+/// 与 [`set_static_method`] 的区别只有一个：实现是**真的**被存进函数对象的
+/// （`NativeEntry`），调用点不会再按名字回查。名字继续保留，只用于
+/// `Function.prototype.toString` 与 `length` / `name`。
+pub(crate) fn set_static_method_impl(
+    obj: &Value,
+    name: &str,
+    heap: &mut Heap,
+    entry: crate::vm::native::NativeEntry,
+) {
+    let Value::Object(obj_ref) = obj else {
+        return;
+    };
+    let owner = native_function_name(obj).unwrap_or_default();
+    let full = if owner.is_empty() {
+        name.to_string()
+    } else {
+        format!("{owner}.{name}")
+    };
+    let key = PropertyKey::intern(heap, name);
+    let desc = method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
+        crate::vm::object::NativeFunctionObject::new(&full).with_entry(entry),
+    ))));
+    let _ = obj_ref.borrow_mut().define_property(heap, key, desc);
+}
+
 pub fn set_static_method<F>(obj: &Value, name: &str, heap: &mut Heap, _f: F)
 where
     F: Fn(&[Value]) -> Result<Value, RuntimeError> + 'static,
@@ -2266,6 +2195,44 @@ pub fn builtin_arity(registered_name: &str) -> usize {
     }
 }
 
+/// 注册一个**自带实现**的原型方法（迁移目标形状）。
+///
+/// 分派名保持 `__proto_method__<name>`（`length` / `name` 由它派生），但实现
+/// 已经装在函数对象上，`call_prototype_method` 不再参与。
+pub(crate) fn set_prototype_method_impl(
+    proto: &Gc<Object>,
+    heap: &mut Heap,
+    name: &str,
+    entry: crate::vm::native::NativeEntry,
+) {
+    let key = PropertyKey::intern(heap, name);
+    let method_val = Value::Object(heap.alloc(Object::NativeFunction(
+        crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}"))
+            .with_entry(entry),
+    )));
+    let _ = proto
+        .borrow_mut()
+        .define_property(heap, key, method_descriptor(method_val));
+}
+
+/// [`set_prototype_method_impl`] 的显式 arity 版本（`Number.prototype.toString.length`
+/// 是 1，而同名的其它 `toString` 是 0，名字推不出来）。
+pub(crate) fn set_prototype_method_arity_impl(
+    proto: &Gc<Object>,
+    heap: &mut Heap,
+    name: &str,
+    arity: usize,
+    entry: crate::vm::native::NativeEntry,
+) {
+    let key = PropertyKey::intern(heap, name);
+    let mut method =
+        crate::vm::object::NativeFunctionObject::new(&format!("{PROTO_METHOD_PREFIX}{name}"))
+            .with_entry(entry);
+    method.set_length(arity);
+    let value = method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(method))));
+    let _ = proto.borrow_mut().define_property(heap, key, value);
+}
+
 /// Register a prototype method that the VM implements itself.
 ///
 /// The closure is *not* stored: `call_prototype_method` (or the VM, for methods
@@ -2352,26 +2319,6 @@ pub fn require_boolean(value: &Value) -> Result<bool, RuntimeError> {
         }
         _ => Err(incompatible()),
     }
-}
-
-/// [`set_prototype_method_owned`] with an explicit `length`.
-pub fn set_prototype_method_arity_owned<F>(
-    owner: &str,
-    proto: &Gc<Object>,
-    heap: &mut Heap,
-    name: &str,
-    arity: usize,
-    _f: F,
-) where
-    F: Fn(&Value, &[Value]) -> Result<Value, RuntimeError> + 'static,
-{
-    let mut method = crate::vm::object::NativeFunctionObject::new(&format!(
-        "{owner}.prototype.{name}"
-    ));
-    method.set_length(arity);
-    let key = PropertyKey::intern(heap, name);
-    let value = method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(method))));
-    let _ = proto.borrow_mut().define_property(heap, key, value);
 }
 
 /// Like [`set_prototype_method`], but with an explicit `length`, for the few

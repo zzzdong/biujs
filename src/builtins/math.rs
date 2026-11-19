@@ -9,9 +9,10 @@ use crate::vm::value::Value;
 
 /// Build the `Math` namespace object.
 ///
-/// `Math` is a plain object (not a constructor), so it is deliberately *not*
-/// backed by a `NativeFunctionObject`. Its methods carry qualified names
-/// (`"Math.floor"`) which the VM resolves through `call_static_method`.
+/// `Math` is a plain object (not a constructor); each of its methods is a
+/// `NativeFunctionObject` that carries **its own implementation** — the
+/// dispatch name exists only so `Function.prototype.toString` and `name` can
+/// report it.
 pub fn create_math_object(heap: &mut Heap) -> Value {
     let mut math = OrdinaryObject::new();
     // `Math` inherits from `Object.prototype` like any other object: without
@@ -21,18 +22,64 @@ pub fn create_math_object(heap: &mut Heap) -> Value {
         math.set_prototype(Some(object_proto));
     }
 
-    let methods: &[&str] = &[
-        "abs", "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "ceil", "clz32",
-        "cos", "cosh", "exp", "expm1", "floor", "fround", "hypot", "imul", "log", "log10", "log1p",
-        "log2", "max", "min", "pow", "random", "round", "sign", "sin", "sinh", "sqrt", "tan",
-        "tanh", "trunc",
+    // 每个方法一条记录：名字 + 实现。实现是 `fn` 指针（非捕获闭包），
+    // 所以「是哪个方法」由**注册**决定一次，调用点不再解析字符串。
+    let methods: &[(&str, crate::vm::native::HeapImpl)] = &[
+        ("abs", |_h, _t, a| unary(a, f64::abs)),
+        ("acos", |_h, _t, a| unary(a, f64::acos)),
+        ("acosh", |_h, _t, a| unary(a, f64::acosh)),
+        ("asin", |_h, _t, a| unary(a, f64::asin)),
+        ("asinh", |_h, _t, a| unary(a, f64::asinh)),
+        ("atan", |_h, _t, a| unary(a, f64::atan)),
+        ("atanh", |_h, _t, a| unary(a, f64::atanh)),
+        ("cbrt", |_h, _t, a| unary(a, f64::cbrt)),
+        ("ceil", |_h, _t, a| unary(a, f64::ceil)),
+        ("cos", |_h, _t, a| unary(a, f64::cos)),
+        ("cosh", |_h, _t, a| unary(a, f64::cosh)),
+        ("exp", |_h, _t, a| unary(a, f64::exp)),
+        ("expm1", |_h, _t, a| unary(a, f64::exp_m1)),
+        ("floor", |_h, _t, a| unary(a, f64::floor)),
+        ("log", |_h, _t, a| unary(a, f64::ln)),
+        ("log10", |_h, _t, a| unary(a, f64::log10)),
+        ("log1p", |_h, _t, a| unary(a, f64::ln_1p)),
+        ("log2", |_h, _t, a| unary(a, f64::log2)),
+        ("sin", |_h, _t, a| unary(a, f64::sin)),
+        ("sinh", |_h, _t, a| unary(a, f64::sinh)),
+        ("sqrt", |_h, _t, a| unary(a, f64::sqrt)),
+        ("tan", |_h, _t, a| unary(a, f64::tan)),
+        ("tanh", |_h, _t, a| unary(a, f64::tanh)),
+        ("trunc", |_h, _t, a| unary(a, f64::trunc)),
+        ("round", |_h, _t, a| Ok(Value::Number(js_round(to_arg(a, 0))))),
+        ("fround", |_h, _t, a| Ok(Value::Number(to_arg(a, 0) as f32 as f64))),
+        ("sign", |_h, _t, a| Ok(Value::Number(js_sign(to_arg(a, 0))))),
+        ("clz32", |_h, _t, a| {
+            let n = crate::vm::to_uint32(to_arg(a, 0));
+            Ok(Value::Number(n.leading_zeros() as f64))
+        }),
+        ("imul", |_h, _t, a| {
+            let x = crate::vm::to_int32(to_arg(a, 0));
+            let y = crate::vm::to_int32(to_arg(a, 1));
+            Ok(Value::Number(x.wrapping_mul(y) as f64))
+        }),
+        ("atan2", |_h, _t, a| {
+            Ok(Value::Number(to_arg(a, 0).atan2(to_arg(a, 1))))
+        }),
+        ("pow", |_h, _t, a| {
+            Ok(Value::Number(js_pow(to_arg(a, 0), to_arg(a, 1))))
+        }),
+        ("max", |_h, _t, a| Ok(Value::Number(js_max(a)))),
+        ("min", |_h, _t, a| Ok(Value::Number(js_min(a)))),
+        ("hypot", |_h, _t, a| Ok(Value::Number(js_hypot(a)))),
+        ("random", |_h, _t, _a| Ok(Value::Number(pseudo_random()))),
     ];
     // Built-in methods are writable, non-enumerable and configurable (ES 17).
-    for name in methods {
+    for (name, entry) in methods {
         let key = PropertyKey::intern(heap, name);
-
         let value = super::method_descriptor(Value::Object(heap.alloc(
-            Object::NativeFunction(NativeFunctionObject::new(&format!("Math.{name}"))),
+            Object::NativeFunction(
+                NativeFunctionObject::new(&format!("Math.{name}"))
+                    .with_entry(crate::vm::native::NativeEntry::Heap(*entry)),
+            ),
         )));
         let _ = math.define_property(heap, key, value);
     }
@@ -75,99 +122,66 @@ pub fn create_math_object(heap: &mut Heap) -> Value {
     Value::Object(heap.alloc(Object::Ordinary(math)))
 }
 
-/// Dispatch `Math.<name>(...)`.
-pub fn call_math_method(name: &str, args: &[Value]) -> Result<Value, RuntimeError> {
-    let arg = |i: usize| args.get(i).map(|v| v.to_number()).unwrap_or(f64::NAN);
-    let one = |f: fn(f64) -> f64| Ok(Value::Number(f(arg(0))));
+/// `ToNumber` of the `i`-th argument; a missing argument is `NaN` (ES 20.2.2.x).
+fn to_arg(args: &[Value], i: usize) -> f64 {
+    args.get(i).map(|v| v.to_number()).unwrap_or(f64::NAN)
+}
 
-    match name {
-        "abs" => one(f64::abs),
-        "acos" => one(f64::acos),
-        "acosh" => one(f64::acosh),
-        "asin" => one(f64::asin),
-        "asinh" => one(f64::asinh),
-        "atan" => one(f64::atan),
-        "atanh" => one(f64::atanh),
-        "cbrt" => one(f64::cbrt),
-        "ceil" => one(f64::ceil),
-        "cos" => one(f64::cos),
-        "cosh" => one(f64::cosh),
-        "exp" => one(f64::exp),
-        "expm1" => one(f64::exp_m1),
-        "floor" => one(f64::floor),
-        "log" => one(f64::ln),
-        "log10" => one(f64::log10),
-        "log1p" => one(f64::ln_1p),
-        "log2" => one(f64::log2),
-        "round" => Ok(Value::Number(js_round(arg(0)))),
-        "sign" => Ok(Value::Number(if arg(0).is_nan() {
-            f64::NAN
-        } else if arg(0) == 0.0 {
-            arg(0)
-        } else {
-            arg(0).signum()
-        })),
-        "sin" => one(f64::sin),
-        "sinh" => one(f64::sinh),
-        "sqrt" => one(f64::sqrt),
-        "tan" => one(f64::tan),
-        "tanh" => one(f64::tanh),
-        "trunc" => one(f64::trunc),
-        "fround" => Ok(Value::Number(arg(0) as f32 as f64)),
-        "clz32" => {
-            let n = crate::vm::to_uint32(arg(0));
-            Ok(Value::Number(n.leading_zeros() as f64))
-        }
-        "imul" => {
-            let a = crate::vm::to_int32(arg(0));
-            let b = crate::vm::to_int32(arg(1));
-            Ok(Value::Number(a.wrapping_mul(b) as f64))
-        }
-        "atan2" => Ok(Value::Number(arg(0).atan2(arg(1)))),
-        "pow" => Ok(Value::Number(js_pow(arg(0), arg(1)))),
-        "max" => {
-            let mut best = f64::NEG_INFINITY;
-            for v in args {
-                let n = v.to_number();
-                if n.is_nan() {
-                    return Ok(Value::Number(f64::NAN));
-                }
-                // `-0` loses to `+0`; `NaN` already handled above.
-                if n > best || (n == 0.0 && best == 0.0 && n.is_sign_positive()) {
-                    best = n;
-                }
-            }
-            Ok(Value::Number(best))
-        }
-        "min" => {
-            let mut best = f64::INFINITY;
-            for v in args {
-                let n = v.to_number();
-                if n.is_nan() {
-                    return Ok(Value::Number(f64::NAN));
-                }
-                if n < best || (n == 0.0 && best == 0.0 && n.is_sign_negative()) {
-                    best = n;
-                }
-            }
-            Ok(Value::Number(best))
-        }
-        "hypot" => {
-            let mut sum = 0.0f64;
-            for v in args {
-                let n = v.to_number();
-                if n.is_infinite() {
-                    return Ok(Value::Number(f64::INFINITY));
-                }
-                sum += n * n;
-            }
-            Ok(Value::Number(sum.sqrt()))
-        }
-        "random" => Ok(Value::Number(pseudo_random())),
-        _ => Err(RuntimeError::TypeError(format!(
-            "Math.{name} is not implemented"
-        ))),
+/// 一元数学方法：`Math.<name>(x)` ⇒ `f(ToNumber(x))`。
+fn unary(args: &[Value], f: fn(f64) -> f64) -> Result<Value, RuntimeError> {
+    Ok(Value::Number(f(to_arg(args, 0))))
+}
+
+/// ES `Math.sign`: keeps `±0` and `NaN` as they are.
+fn js_sign(x: f64) -> f64 {
+    if x.is_nan() || x == 0.0 {
+        x
+    } else {
+        x.signum()
     }
+}
+
+/// ES `Math.max`: `NaN` wins; `-0` loses to `+0`.
+fn js_max(args: &[Value]) -> f64 {
+    let mut best = f64::NEG_INFINITY;
+    for v in args {
+        let n = v.to_number();
+        if n.is_nan() {
+            return f64::NAN;
+        }
+        if n > best || (n == 0.0 && best == 0.0 && n.is_sign_positive()) {
+            best = n;
+        }
+    }
+    best
+}
+
+/// ES `Math.min`: `NaN` wins; `+0` loses to `-0`.
+fn js_min(args: &[Value]) -> f64 {
+    let mut best = f64::INFINITY;
+    for v in args {
+        let n = v.to_number();
+        if n.is_nan() {
+            return f64::NAN;
+        }
+        if n < best || (n == 0.0 && best == 0.0 && n.is_sign_negative()) {
+            best = n;
+        }
+    }
+    best
+}
+
+/// ES `Math.hypot`: an infinity wins over everything, including `NaN`.
+fn js_hypot(args: &[Value]) -> f64 {
+    let mut sum = 0.0f64;
+    for v in args {
+        let n = v.to_number();
+        if n.is_infinite() {
+            return f64::INFINITY;
+        }
+        sum += n * n;
+    }
+    sum.sqrt()
 }
 
 /// ES `Math.round`: halves round toward `+∞` (and `-0.5` → `-0`).

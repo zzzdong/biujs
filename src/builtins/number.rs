@@ -8,30 +8,36 @@ use crate::vm::value::Value;
 
 use super::number_to_string;
 use super::number_to_string_radix;
-use super::set_prototype_method_owned;
-use super::set_static_method;
+use crate::vm::native::{HeapImpl, NativeEntry};
 
 // ─────────────────────────────────────────────────────────
 // Prototype registration
 // ─────────────────────────────────────────────────────────
 
 pub fn register_number_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    set_prototype_method_owned("Number", proto, heap, "valueOf", |this, _args| number_value_of(this));
-    set_prototype_method_owned("Number", proto, heap, "toLocaleString", |this, _args| {
-        number_to_string_proto(this)
-    });
-    // `Number.prototype.toString.length` is 1 (radix counts despite the
-    // brackets in the heading); every other `toString` is 0.
-    super::set_prototype_method_arity_owned("Number", proto, heap, "toString", 1, |this, args| {
-        number_to_string_with_radix(this, args)
-    });
-    set_prototype_method_owned("Number", proto, heap, "toFixed", |this, args| number_to_fixed(this, args));
-    set_prototype_method_owned("Number", proto, heap, "toExponential", |this, args| {
-        number_to_exponential(this, args)
-    });
-    set_prototype_method_owned("Number", proto, heap, "toPrecision", |this, args| {
-        number_to_precision(this, args)
-    });
+    use super::{set_prototype_method_arity_impl, set_prototype_method_impl};
+
+    // 归属（Number 而非 String/Array）现在由函数对象身份携带，`this` 只做
+    // brand check（`require_number`），分派口不再按接收者形状猜。
+    let methods: &[(&str, HeapImpl)] = &[
+        ("valueOf", |_h, t, _a| number_value_of(t)),
+        ("toLocaleString", |_h, t, _a| number_to_string_proto(t)),
+        ("toFixed", |_h, t, a| number_to_fixed(t, a)),
+        ("toExponential", |_h, t, a| number_to_exponential(t, a)),
+        ("toPrecision", |_h, t, a| number_to_precision(t, a)),
+    ];
+    for (name, entry) in methods {
+        set_prototype_method_impl(proto, heap, name, NativeEntry::Heap(*entry));
+    }
+    // `Number.prototype.toString.length` is 1（radix 算一个形参），
+    // 其他所有 `toString` 都是 0，名字推不出来，只能显式给。
+    set_prototype_method_arity_impl(
+        proto,
+        heap,
+        "toString",
+        1,
+        NativeEntry::Heap(|_h, t, a| number_to_string_with_radix(t, a)),
+    );
 }
 
 fn number_value_of(obj: &Value) -> Result<Value, RuntimeError> {
@@ -82,24 +88,26 @@ pub fn number_constructor(args: &[Value]) -> Result<Value, RuntimeError> {
 // ─────────────────────────────────────────────────────────
 
 pub fn register_number_statics(number_fn: &Value, _proto: &Gc<Object>, heap: &mut Heap) {
-    set_static_method(number_fn, "isNaN", heap, |args| number_is_nan(args));
-    set_static_method(number_fn, "isFinite", heap, |args| number_is_finite(args));
-    set_static_method(number_fn, "isInteger", heap, |args| number_is_integer(args));
-    set_static_method(number_fn, "isSafeInteger", heap, |args| {
-        // ES 20.1.2.5：非 Number 值直接 false，不做 ToNumber（"1" 不是安全整数）。
-        Ok(Value::Bool(match args.first() {
-            Some(Value::Number(n)) => {
-                n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0
-            }
-            _ => false,
-        }))
-    });
-    set_static_method(number_fn, "parseInt", heap, |args| {
-        super::global_parse_int(args)
-    });
-    set_static_method(number_fn, "parseFloat", heap, |args| {
-        super::global_parse_float(args)
-    });
+    use super::set_static_method_impl;
+    let pure: &[(&str, HeapImpl)] = &[
+        ("isNaN", |_h, _t, a| number_is_nan(a)),
+        ("isFinite", |_h, _t, a| number_is_finite(a)),
+        ("isInteger", |_h, _t, a| number_is_integer(a)),
+        ("isSafeInteger", |_h, _t, a| {
+            // ES 20.1.2.5：非 Number 值直接 false，不做 ToNumber。
+            Ok(Value::Bool(match a.first() {
+                Some(Value::Number(n)) => {
+                    n.is_finite() && n.fract() == 0.0 && n.abs() <= 9007199254740991.0
+                }
+                _ => false,
+            }))
+        }),
+        ("parseInt", |_h, _t, a| super::global_parse_int(a)),
+        ("parseFloat", |_h, _t, a| super::global_parse_float(a)),
+    ];
+    for (name, f) in pure {
+        set_static_method_impl(number_fn, name, heap, NativeEntry::Heap(*f));
+    }
 
     // Numeric constants live as own properties of the constructor.
     if let Value::Object(obj_ref) = number_fn {

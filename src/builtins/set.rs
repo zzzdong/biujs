@@ -94,8 +94,6 @@ pub fn register_set_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         "delete",
         "clear",
         "forEach",
-        "entries",
-        "values",
         // `set-methods` (ES2024): the seven operators take a *set-like*
         // argument and drive its `has`/`keys` through user code, so they are
         // VM dispatching as well.
@@ -108,6 +106,15 @@ pub fn register_set_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         "isDisjointFrom",
     ] {
         super::set_set_method(proto, heap, name);
+    }
+    // 迭代器工厂各带 slot：与 Array/Map 的同名方法靠函数身份区分。
+    use crate::vm::native::VmSlot;
+    for (name, slot) in [
+        ("entries", VmSlot::SetEntries),
+        ("keys", VmSlot::SetKeys),
+        ("values", VmSlot::SetValues),
+    ] {
+        super::set_prototype_method_impl(proto, heap, name, slot.entry());
     }
 
     // `Set.prototype.size` is an accessor (ES 23.2.3.9).

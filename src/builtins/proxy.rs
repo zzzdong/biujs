@@ -69,9 +69,8 @@ pub fn proxy_construct(
 /// `prototype` property — instances inherit from their target, so there is
 /// nothing for them to inherit from here.
 ///
-/// `revocable` is registered as a name only: the revoke function has to
-/// remember *which* proxy it belongs to, so the VM mints it (the same trick
-/// `Function.prototype.bind` uses for its wrapper).
+/// `revocable` 的实现带在函数对象上：revoke 要记住撤销的是哪个 proxy，
+/// 由 VM 铸造（与 `Function.prototype.bind` 的包装函数同理）。
 pub fn create_proxy_constructor(heap: &mut Heap) -> Value {
     let ctor = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new("Proxy"))));
     // `Proxy` 没有 `prototype` 属性（实例继承自 target），所以不走
@@ -81,10 +80,11 @@ pub fn create_proxy_constructor(heap: &mut Heap) -> Value {
             nf.set_constructible(true);
         }
     }
-    crate::builtins::set_static_method(&ctor, "revocable", heap, |_args: &[Value]| {
-        Err(RuntimeError::InternalError(
-            "Proxy.revocable is dispatched by the VM".to_string(),
-        ))
-    });
+    crate::builtins::set_static_method_impl(
+        &ctor,
+        "revocable",
+        heap,
+        crate::vm::native::VmSlot::ProxyRevocable.entry(),
+    );
     ctor
 }

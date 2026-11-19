@@ -2,6 +2,7 @@ pub mod iterator;
 pub(crate) mod builtins_dispatch;
 pub(crate) mod exec;
 pub(crate) mod gc;
+pub(crate) mod native;
 pub mod atom;
 pub mod object;
 pub mod property;
@@ -673,7 +674,8 @@ impl VM {
     pub fn install_test_hosts(&mut self) {
         use crate::vm::object::NativeFunctionObject;
         let detach = Value::Object(self.heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new("$262.detachArrayBuffer"),
+            NativeFunctionObject::new("$262.detachArrayBuffer")
+                .with_entry(crate::vm::native::VmSlot::DetachArrayBufferHost.entry()),
         )));
         let mut host = crate::vm::object::OrdinaryObject::with_optional_prototype(Some(
             self.builtins.object_prototype,
@@ -2818,52 +2820,163 @@ impl VM {
     /// `Promise.resolve(value)` / `Promise.reject(reason)` / `Promise.all` /
     /// `race` / `allSettled` / `any` — the statics that need the VM (they either
     /// register a promise or have to call user `then` methods).
-    fn promise_static(
+/// 六个 `Promise` 静态方法各自是一个函数指针，由 `VmSlot::entry()` 在注册期
+/// 解析进 `NativeEntry::Vm`。这里不再按名字 `match`——「是哪个方法」在注册
+/// 时已经由 `VmSlot` 决定。
+pub(crate) fn promise_static_resolve(
+    vm: &mut VM,
+    this: &Value,
+    args: &[Value],
+    module: &Module,
+) -> Result<Value, RuntimeError> {
+    // `Promise.resolve` (27.2.4.6) 与 `PromiseResolve` (27.2.4.7):
+    // `this` 必须是对象；已经是本构造器的 promise 则原样返回，
+    // 其余情况走 capability 的 `[[Resolve]]`。
+    if !matches!(this, Value::Object(_) | Value::Function(_)) {
+        return Err(RuntimeError::TypeError(
+            "Promise.resolve called on a non-object".to_string(),
+        ));
+    }
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    if let Some(existing) = vm.as_promise(&value) {
+        let constructor_key = PropertyKey::intern(&mut vm.heap, "constructor");
+        let constructor = vm.get_member(&value, &constructor_key, module)?;
+        if constructor.strict_eq(this) {
+            return Ok(VM::promise_value(&existing));
+        }
+    }
+    let capability = vm.new_promise_capability(this, module)?;
+    vm.invoke(&capability.resolve, Value::Undefined, &[value], module)?;
+    Ok(capability.promise)
+}
+
+pub(crate) fn promise_static_reject(
+    vm: &mut VM,
+    this: &Value,
+    args: &[Value],
+    module: &Module,
+) -> Result<Value, RuntimeError> {
+    let capability = vm.new_promise_capability(this, module)?;
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    vm.invoke(&capability.reject, Value::Undefined, &[value], module)?;
+    Ok(capability.promise)
+}
+
+// 四个组合方法要读 `this.resolve`（ES 27.2.4.x 第 3 步），所以调用的
+// `this` 必须传进来：`Promise.all.call(BadPromise, it)` 用的是 `BadPromise.resolve`。
+pub(crate) fn promise_static_all(
+    vm: &mut VM,
+    this: &Value,
+    args: &[Value],
+    module: &Module,
+) -> Result<Value, RuntimeError> {
+    vm.promise_aggregate(AggregateKind::All, this, args, module)
+}
+
+pub(crate) fn promise_static_race(
+    vm: &mut VM,
+    this: &Value,
+    args: &[Value],
+    module: &Module,
+) -> Result<Value, RuntimeError> {
+    vm.promise_aggregate(AggregateKind::Race, this, args, module)
+}
+
+pub(crate) fn promise_static_all_settled(
+    vm: &mut VM,
+    this: &Value,
+    args: &[Value],
+    module: &Module,
+) -> Result<Value, RuntimeError> {
+    vm.promise_aggregate(AggregateKind::AllSettled, this, args, module)
+}
+
+pub(crate) fn promise_static_any(
+    vm: &mut VM,
+    this: &Value,
+    args: &[Value],
+    module: &Module,
+) -> Result<Value, RuntimeError> {
+    vm.promise_aggregate(AggregateKind::Any, this, args, module)
+}
+
+    /// 把可调用的参数装箱成回调（裸 `Value::Function(id)` 的 `is_callable()`
+    /// 为假，reaction runner 只认装箱形式）。
+    fn box_callable(&mut self, value: Option<&Value>) -> Option<Value> {
+        value
+            .filter(|v| v.is_callable() || matches!(v, Value::Function(_)))
+            .map(|v| {
+                if matches!(v, Value::Function(_)) {
+                    self.as_object_value(v)
+                } else {
+                    v.clone()
+                }
+            })
+    }
+
+    /// `Promise.prototype.then`（ES 27.2.5.4）。归属由函数身份决定，接收者
+    /// 只在这里做 brand check；`this` 是用户方法时根本不会走到这里。
+    pub(crate) fn promise_proto_then(
         &mut self,
-        name: &str,
         this: &Value,
         args: &[Value],
         module: &Module,
-    ) -> Result<Option<Value>, RuntimeError> {
-        Ok(match name {
-            "Promise.resolve" => {
-                // `Promise.resolve` (27.2.4.6) 与 `PromiseResolve` (27.2.4.7):
-                // `this` 必须是对象；已经是本构造器的 promise 则原样返回，
-                // 其余情况走 capability 的 `[[Resolve]]`。
-                if !matches!(this, Value::Object(_) | Value::Function(_)) {
-                    return Err(RuntimeError::TypeError(
-                        "Promise.resolve called on a non-object".to_string(),
-                    ));
-                }
-                let value = args.first().cloned().unwrap_or(Value::Undefined);
-                if let Some(existing) = self.as_promise(&value) {
-                    let constructor_key = PropertyKey::intern(&mut self.heap, "constructor");
-                    let constructor = self.get_member(&value, &constructor_key, module)?;
-                    if constructor.strict_eq(this) {
-                        return Ok(Some(Self::promise_value(&existing)));
-                    }
-                }
-                let capability = self.new_promise_capability(this, module)?;
-                self.invoke(&capability.resolve, Value::Undefined, &[value], module)?;
-                Some(capability.promise)
-            }
-            "Promise.reject" => {
-                let capability = self.new_promise_capability(this, module)?;
-                let value = args.first().cloned().unwrap_or(Value::Undefined);
-                self.invoke(&capability.reject, Value::Undefined, &[value], module)?;
-                Some(capability.promise)
-            }
-            // 四个组合方法要读 `this.resolve`（ES 27.2.4.x 第 3 步），所以调用的
-            // `this` 必须传进来：`Promise.all.call(BadPromise, it)` 用的是
-            // `BadPromise.resolve`。
-            "Promise.all" => Some(self.promise_aggregate(AggregateKind::All, this, args, module)?),
-            "Promise.race" => Some(self.promise_aggregate(AggregateKind::Race, this, args, module)?),
-            "Promise.allSettled" => {
-                Some(self.promise_aggregate(AggregateKind::AllSettled, this, args, module)?)
-            }
-            "Promise.any" => Some(self.promise_aggregate(AggregateKind::Any, this, args, module)?),
-            _ => None,
-        })
+    ) -> Result<Value, RuntimeError> {
+        let Some(promise) = self.as_promise(this) else {
+            return Err(RuntimeError::TypeError(
+                "Promise.prototype.then called on a non-promise".to_string(),
+            ));
+        };
+        let on_fulfilled = self.box_callable(args.first());
+        let on_rejected = self.box_callable(args.get(1));
+        self.promise_then(&promise, on_fulfilled, on_rejected, module)
+    }
+
+    /// `Promise.prototype.catch`（ES 27.2.5.4）：非 promise 接收者也合法 ——
+    /// 规范第 2 步直接 `Invoke(this, "then", « undefined, onRejected »)`。
+    pub(crate) fn promise_proto_catch(
+        &mut self,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let Some(promise) = self.as_promise(this) else {
+            let then_key = PropertyKey::well_known("then").expect("well-known name");
+            let then = self.get_member(this, &then_key, module)?;
+            let on_rejected = args.first().cloned().unwrap_or(Value::Undefined);
+            return self.invoke(
+                &then,
+                this.clone(),
+                &[Value::Undefined, on_rejected],
+                module,
+            );
+        };
+        let on_rejected = self.box_callable(args.first());
+        self.promise_then(&promise, None, on_rejected, module)
+    }
+
+    /// `Promise.prototype.finally`（ES 27.2.5.3）：回调包成两个 registry id
+    /// 的内建包装函数，真正调用发生在 reaction 出队时。
+    pub(crate) fn promise_proto_finally(
+        &mut self,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let Some(promise) = self.as_promise(this) else {
+            return Err(RuntimeError::TypeError(
+                "Promise.prototype.finally called on a non-promise".to_string(),
+            ));
+        };
+        let Some(callback) = self.box_callable(args.first()) else {
+            return self.promise_then(&promise, None, None, module);
+        };
+        let id = self.state.next_finally_id;
+        self.state.next_finally_id += 1;
+        self.state.finally_handlers.insert(id, callback);
+        let fulfilled = Self::native_fn(&mut self.heap, &format!("__promise_finally__{id}_f"));
+        let rejected = Self::native_fn(&mut self.heap, &format!("__promise_finally__{id}_r"));
+        self.promise_then(&promise, Some(fulfilled), Some(rejected), module)
     }
 
     /// A host function boxed for use as a handler (the reaction runner checks
@@ -5578,18 +5691,20 @@ impl VM {
             )));
         }
         // `Array.prototype[Symbol.iterator]` *is* `Array.prototype.values`
-        // (ES 23.1.3.30), so both names mean "iterate the receiver as an
-        // array-like" and both take the fast path below.
-        let is_default_factory = match crate::builtins::native_function_name(&factory) {
-            Some(name) => {
-                name == crate::vm::iterator::ITERATOR_NATIVE_NAME
-                    // `Array.prototype[Symbol.iterator]` is the same object as
-                    // `Array.prototype.values`, whose native name carries the
-                    // prototype-method prefix.
-                    || name == format!("{}{}", crate::builtins::PROTO_METHOD_PREFIX, "values")
-            }
-            None => false,
-        };
+        // (ES 23.1.3.30)。这里必须比**函数对象身份**，不能比名字：Set/Map/
+        // TypedArray 的 `values` 现在也叫 `__proto_method__values`，但它们要
+        // 走自己的迭代器实现，不能被误认成通用的 array-like 快路径。
+        let array_values_fn = self
+            .builtins
+            .array_prototype
+            .borrow()
+            .property_get(&PropertyKey::well_known("values").expect("well-known name"))
+            .map(|d| d.value);
+        let is_default_factory = array_values_fn
+            .as_ref()
+            .is_some_and(|v| v.strict_eq(&factory))
+            || crate::builtins::native_function_name(&factory).as_deref()
+                == Some(crate::vm::iterator::ITERATOR_NATIVE_NAME);
 
         let state = match &src {
             Value::Object(_) if is_default_factory => {
@@ -6352,39 +6467,6 @@ impl VM {
         }
     }
 
-    fn call_builtin_method(
-        &mut self,
-        obj: &Value,
-        method_name: &str,
-        args: &[Value],
-    ) -> Result<Value, RuntimeError> {
-        // First check: is this a static method on a native function (constructor)?
-        if let Some(name) = crate::builtins::native_function_name(obj) {
-            let static_method = format!("{}.{}", name, method_name);
-            if let Ok(result) =
-                crate::builtins::call_static_method(&static_method, args, &mut self.heap)
-            {
-                return Ok(result);
-            }
-        }
-
-        // Delegate to the builtins module for prototype method dispatching
-        match crate::builtins::call_prototype_method(&mut self.heap, obj, method_name, args) {
-            Ok(result) => Ok(result),
-            Err(_) => {
-                // Fallback: unknown method, try property lookup via prototype chain
-                if let Value::Object(obj_ref) = obj {
-                    let key = PropertyKey::intern(&mut self.heap, method_name);
-                    match crate::vm::prototype::internal_get(obj_ref.clone(), &key, None) {
-                        Ok(v) => Ok(v),
-                        Err(e) => Err(RuntimeError::TypeError(e)),
-                    }
-                } else {
-                    Ok(Value::Undefined)
-                }
-            }
-        }
-    }
 }
 
 /// `finalize` for the JSON serializer (ES 25.5.2.4 step 9 / 25.5.2.5 step 10).
@@ -6552,7 +6634,7 @@ struct State {
     capabilities: HashMap<u64, PromiseCapability>,
     next_capability_id: u64,
     /// Pending `finally` callbacks, keyed by the id embedded in the handler
-    /// names minted by `try_promise_method`.
+    /// names minted by `VM::promise_proto_finally`.
     finally_handlers: HashMap<u64, Value>,
     next_finally_id: u64,
     /// Stack of captured-variable **cells** for active closure scopes.

@@ -282,23 +282,15 @@ pub fn register_symbol_prototype(proto: &Gc<Object>, heap: &mut Heap) {
 /// Register Symbol static methods
 pub fn register_symbol_statics(symbol_fn: &Value, symbol_proto: &Gc<Object>, heap: &mut Heap) {
     if let Value::Object(obj) = symbol_fn {
-        // Symbol.for
-        let for_fn = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
-            "Symbol.for",
-        ))));
-        obj.borrow_mut()
-            .define_property(heap, PropertyKey::well_known("for").expect("well-known name"),
-                super::method_descriptor(for_fn),
-            );
-
-        // Symbol.keyFor
-        let key_for_fn = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
-            "Symbol.keyFor",
-        ))));
-        obj.borrow_mut()
-            .define_property(heap, PropertyKey::well_known("keyFor").expect("well-known name"),
-                super::method_descriptor(key_for_fn),
-            );
+        // `for` / `keyFor` 是纯实现，函数对象自带 `NativeEntry::Heap`。
+        use crate::vm::native::{HeapImpl, NativeEntry};
+        let pure: &[(&str, HeapImpl)] = &[
+            ("for", |_h, _t, a| symbol_for(a)),
+            ("keyFor", |_h, _t, a| symbol_key_for(a)),
+        ];
+        for (name, f) in pure {
+            super::set_static_method_impl(symbol_fn, name, heap, NativeEntry::Heap(*f));
+        }
 
         // Set Symbol.prototype
         obj.borrow_mut().define_property(heap, PropertyKey::well_known("prototype").expect("well-known name"),

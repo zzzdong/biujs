@@ -7,7 +7,7 @@ use crate::vm::value::Value;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::set_static_method;
+use super::{set_static_method, set_static_method_impl};
 
 pub fn object_constructor(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
     match args.first() {
@@ -766,49 +766,6 @@ pub fn object_is_sealed(args: &[Value]) -> Result<Value, RuntimeError> {
     }))
 }
 
-/// `Object.assign(target, ...sources)` — copies own enumerable properties
-/// (string and symbol keys). Values of *own accessor* properties cannot be
-/// invoked at this layer, so the VM wraps the whole builtin (see
-/// `VM::object_assign`) when getters need to run; this function is the
-/// data-property fallback used for direct dispatch.
-pub fn object_assign(heap: &mut super::Heap, args: &[Value]) -> Result<Value, RuntimeError> {
-    let Some(target) = args.first() else {
-        return Err(RuntimeError::TypeError(
-            "Object.assign requires at least 1 argument".to_string(),
-        ));
-    };
-    // ES 19.1.2.1: ToObject(target) — primitive targets are boxed.
-    let target = super::to_object(heap, target)?;
-    for source in args.iter().skip(1) {
-        if matches!(source, Value::Undefined | Value::Null) {
-            continue;
-        }
-        let source = super::to_object(heap, source)?;
-        let Value::Object(source_ref) = &source else {
-            continue;
-        };
-        let entries: Vec<(PropertyKey, Value)> = {
-            let borrowed = source_ref.borrow();
-            borrowed
-                .own_keys()
-                .into_iter()
-                .filter_map(|k| {
-                    borrowed
-                        .property_get(&k)
-                        .filter(|d| d.enumerable && d.is_data_descriptor())
-                        .map(|d| (k, d.value))
-                })
-                .collect()
-        };
-        if let Value::Object(target_ref) = &target {
-            for (key, value) in entries {
-                let _ = target_ref.borrow_mut().property_set(heap, key, value);
-            }
-        }
-    }
-    Ok(target)
-}
-
 /// `Object.defineProperties(obj, props)`
 pub fn object_define_properties(
     heap: &mut super::Heap,
@@ -1135,54 +1092,48 @@ pub fn register_object_prototype(proto: &Gc<Object>, object_fn: &Value, heap: &m
 }
 
 pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins, heap: &mut Heap) {
-    // These closures are never invoked: `set_static_method` registers by name
-    // and dispatch happens through `call_static_method`. The real implementations
-    // need a heap, so the placeholders merely satisfy the registration shape.
-    set_static_method(object_fn, "keys", heap, |_args| Ok(Value::Undefined));
-    set_static_method(object_fn, "values", heap, |_args| Ok(Value::Undefined));
-    set_static_method(object_fn, "entries", heap, |_args| Ok(Value::Undefined));
-    set_static_method(object_fn, "assign", heap, |_args| Ok(Value::Undefined));
-    // 闭包从不被调用（`set_static_method` 按名注册，真正走 `call_static_method`
-    // 的按名分派）；实现需要 heap，住在分派表里。
-    set_static_method(object_fn, "defineProperty", heap, |_args| {
-        Err(RuntimeError::NotImplemented(
-            "method implemented by the VM".to_string(),
-        ))
-    });
-    set_static_method(object_fn, "defineProperties", heap, |_args| {
-        Err(RuntimeError::NotImplemented(
-            "method implemented by the VM".to_string(),
-        ))
-    });
-    set_static_method(object_fn, "getOwnPropertyDescriptor", heap, |_args| {
-        Ok(Value::Undefined)
-    });
-    set_static_method(object_fn, "getOwnPropertyNames", heap, |_args| {
-        Ok(Value::Undefined)
-    });
-    set_static_method(object_fn, "getOwnPropertySymbols", heap, |_args| {
-        Ok(Value::Undefined)
-    });
-    set_static_method(object_fn, "getPrototypeOf", heap, |_args| {
-        Ok(Value::Undefined)
-    });
-    set_static_method(object_fn, "setPrototypeOf", heap, |args| {
-        object_set_prototype_of(args)
-    });
-    set_static_method(object_fn, "create", heap, |_args| Ok(Value::Undefined));
-    set_static_method(object_fn, "hasOwn", heap, |_args| Ok(Value::Undefined));
-    set_static_method(object_fn, "is", heap, |args| object_is(args));
-    // The integrity verbs forward to the same implementations `call_native`
-    // dispatches to, so the two paths cannot drift apart: the static method is
-    // only ever reached directly (`Object.freeze` referenced as a value), but
-    // answering `false` there while the VM path answered `true` would be a bug
-    // no test would pin down cleanly.
-    set_static_method(object_fn, "isExtensible", heap, |args| object_is_extensible(args));
-    set_static_method(object_fn, "isFrozen", heap, |args| object_is_frozen(args));
-    set_static_method(object_fn, "isSealed", heap, |args| object_is_sealed(args));
-    set_static_method(object_fn, "preventExtensions", heap, |args| {
-        object_prevent_extensions(args)
-    });
-    set_static_method(object_fn, "seal", heap, |args| object_seal(args));
-    set_static_method(object_fn, "freeze", heap, |args| object_freeze(args));
+    // 纯静态方法：实现就是普通的 `fn` 指针，注册时放进函数对象。
+    use crate::vm::native::{HeapImpl, NativeEntry};
+    let pure: &[(&str, HeapImpl)] = &[
+        ("fromEntries", |h, _t, a| object_from_entries(h, a)),
+        ("values", |h, _t, a| object_values(h, a)),
+        ("entries", |h, _t, a| object_entries(h, a)),
+        ("getOwnPropertyDescriptors", |h, _t, a| {
+            object_get_own_property_descriptors(h, a)
+        }),
+        ("is", |_h, _t, a| object_is(a)),
+        ("isFrozen", |_h, _t, a| object_is_frozen(a)),
+        ("isSealed", |_h, _t, a| object_is_sealed(a)),
+        ("seal", |_h, _t, a| object_seal(a)),
+        ("freeze", |_h, _t, a| object_freeze(a)),
+    ];
+    for (name, f) in pure {
+        set_static_method_impl(object_fn, name, heap, NativeEntry::Heap(*f));
+    }
+    // `assign` 要走真实的 `[[Get]]` / `[[Set]]`（访问器、Proxy trap），实现在 VM。
+    set_static_method_impl(
+        object_fn,
+        "assign",
+        heap,
+        crate::vm::native::VmSlot::ObjectAssign.entry(),
+    );
+    // 下面几个要先在 VM 里做 ToPropertyKey / Proxy trap / 描述符 [[Get]]，
+    // 再落到纯 builtin 表 —— 统一由 `VM::object_static_vm` 串起来。
+    use crate::vm::native::VmSlot;
+    for (name, slot) in [
+        ("defineProperty", VmSlot::ObjectDefineProperty),
+        ("defineProperties", VmSlot::ObjectDefineProperties),
+        ("getOwnPropertyDescriptor", VmSlot::ObjectGetOwnPropertyDescriptor),
+        ("create", VmSlot::ObjectCreate),
+        ("hasOwn", VmSlot::ObjectHasOwn),
+        ("keys", VmSlot::ObjectKeys),
+        ("getOwnPropertyNames", VmSlot::ObjectGetOwnPropertyNames),
+        ("getOwnPropertySymbols", VmSlot::ObjectGetOwnPropertySymbols),
+        ("getPrototypeOf", VmSlot::ObjectGetPrototypeOf),
+        ("setPrototypeOf", VmSlot::ObjectSetPrototypeOf),
+        ("isExtensible", VmSlot::ObjectIsExtensible),
+        ("preventExtensions", VmSlot::ObjectPreventExtensions),
+    ] {
+        set_static_method_impl(object_fn, name, heap, slot.entry());
+    }
 }

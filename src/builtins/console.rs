@@ -3,8 +3,8 @@
 //! Deliberately *not* part of ES — it is a host extension — but it is the one
 //! thing a script cannot do without: without it the only way to observe a value
 //! is to `throw` it. `console.log` is what makes the engine usable for everyday
-//! scripts, so it is registered as an ordinary global object whose methods carry
-//! the `console.` prefix the VM dispatches on (exactly like `Math.`).
+//! scripts, so it is registered as an ordinary global object whose methods
+//! carry their own implementation (same shape as `Math`).
 //!
 //! Scope is the everyday surface: `log`/`info`/`debug`/`trace` go to stdout,
 //! `warn`/`error` to stderr, and arguments are joined with a space the way the
@@ -14,14 +14,10 @@
 
 use crate::RuntimeError;
 use crate::vm::gc::{Heap, Object};
+use crate::vm::native::{HeapImpl, NativeEntry};
 use crate::vm::object::{NativeFunctionObject, OrdinaryObject};
 use crate::vm::property::{PropertyDescriptor, PropertyKey};
 use crate::vm::value::Value;
-
-/// The methods the object exposes.
-const METHODS: &[&str] = &[
-    "log", "info", "debug", "trace", "warn", "error", "time", "timeEnd",
-];
 
 /// Labels handed to `console.time`, with the instant they were started.
 ///
@@ -35,12 +31,24 @@ thread_local! {
 
 /// Build the `console` object: a plain namespace object (not a constructor).
 pub fn create_console_object(heap: &mut Heap) -> Value {
+    // 「是哪个方法」在注册时定一次（每条一个 `fn` 指针），调用点不再 match 名字。
+    let methods: &[(&str, HeapImpl)] = &[
+        ("log", |h, _t, a| print_line(h, a, Channel::Out)),
+        ("info", |h, _t, a| print_line(h, a, Channel::Out)),
+        ("debug", |h, _t, a| print_line(h, a, Channel::Out)),
+        ("trace", |h, _t, a| print_line(h, a, Channel::Out)),
+        ("warn", |h, _t, a| print_line(h, a, Channel::Err)),
+        ("error", |h, _t, a| print_line(h, a, Channel::Err)),
+        ("time", |_h, _t, a| time(a)),
+        ("timeEnd", |_h, _t, a| time_end(a)),
+    ];
     let mut console = OrdinaryObject::new();
-    for name in METHODS {
+    for (name, entry) in methods {
         let key = PropertyKey::intern(heap, name);
 
         let value = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(&format!("console.{name}")),
+            NativeFunctionObject::new(&format!("console.{name}"))
+                .with_entry(NativeEntry::Heap(*entry)),
         )));
         let _ = console.define_property(heap, key,
             PropertyDescriptor {
@@ -56,43 +64,50 @@ pub fn create_console_object(heap: &mut Heap) -> Value {
     Value::Object(heap.alloc(Object::Ordinary(console)))
 }
 
-/// Dispatch a `console.<method>` call. Each method prints its arguments joined
-/// by a space and answers `undefined`.
-pub fn call_console_method(
-    name: &str,
-    args: &[Value],
+/// 诊断信息走 stderr，这样 `> out.txt` 不会把它们吞掉。
+#[derive(Clone, Copy)]
+enum Channel {
+    Out,
+    Err,
+}
+
+/// `console.log` / `info` / `debug` / `trace` / `warn` / `error`: arguments
+/// joined by a space, answer `undefined`.
+fn print_line(
     heap: &mut Heap,
+    args: &[Value],
+    channel: Channel,
 ) -> Result<Value, RuntimeError> {
-    match name {
-        "time" => {
-            let label = args.first().map(|v| v.to_js_string()).unwrap_or_else(|| "default".to_string());
-            TIMERS.with(|timers| {
-                timers.borrow_mut().insert(label, std::time::Instant::now());
-            });
-            return Ok(Value::Undefined);
-        }
-        "timeEnd" => {
-            let label = args.first().map(|v| v.to_js_string()).unwrap_or_else(|| "default".to_string());
-            let started = TIMERS.with(|timers| timers.borrow_mut().remove(&label));
-            match started {
-                Some(instant) => println!("{label}: {:.3}ms", instant.elapsed().as_secs_f64() * 1000.0),
-                None => eprintln!("Timer '{label}' does not exist"),
-            }
-            return Ok(Value::Undefined);
-        }
-        _ => {}
-    }
-    if !METHODS.contains(&name) {
-        return Err(RuntimeError::TypeError(format!(
-            "console.{name} is not a function"
-        )));
-    }
     let line: Vec<String> = args.iter().map(|v| format_arg(heap, v)).collect();
     let line = line.join(" ");
-    match name {
-        // Diagnostics belong on stderr so they survive `> out.txt`.
-        "warn" | "error" => eprintln!("{line}"),
-        _ => println!("{line}"),
+    match channel {
+        Channel::Err => eprintln!("{line}"),
+        Channel::Out => println!("{line}"),
+    }
+    Ok(Value::Undefined)
+}
+
+/// `console.time(label)`: remember the instant under `label`.
+fn time(args: &[Value]) -> Result<Value, RuntimeError> {
+    let label = args
+        .first()
+        .map(|v| v.to_js_string())
+        .unwrap_or_else(|| "default".to_string());
+    TIMERS.with(|timers| {
+        timers.borrow_mut().insert(label, std::time::Instant::now());
+    });
+    Ok(Value::Undefined)
+}
+
+/// `console.timeEnd(label)`: print the elapsed time (or report an unknown label).
+fn time_end(args: &[Value]) -> Result<Value, RuntimeError> {
+    let label = args
+        .first()
+        .map(|v| v.to_js_string())
+        .unwrap_or_else(|| "default".to_string());
+    match TIMERS.with(|timers| timers.borrow_mut().remove(&label)) {
+        Some(instant) => println!("{label}: {:.3}ms", instant.elapsed().as_secs_f64() * 1000.0),
+        None => eprintln!("Timer '{label}' does not exist"),
     }
     Ok(Value::Undefined)
 }

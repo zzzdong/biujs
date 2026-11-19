@@ -8,7 +8,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::RuntimeError;
 use crate::vm::gc::{Gc, Heap, Object};
 use crate::vm::object::JSObject;
 use crate::vm::value::Value;
@@ -21,16 +20,18 @@ pub const PROMISE_SPECIES_NATIVE: &str = "__promise_species__";
 /// before the ordinary prototype dispatch, so these are registered for lookups
 /// (`p.then` must be a function) but never reached.
 pub fn register_promise_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method;
-    for name in ["then", "catch", "finally"] {
-        set_prototype_method(proto, heap, name, |_this, _args| {
-            Err(RuntimeError::InternalError(
-                "Promise methods are dispatched by the VM".to_string(),
-            ))
-        });
+    use super::set_prototype_method_impl;
+    use crate::vm::native::VmSlot;
+
+    // 三个方法都要回调用户函数 / 入微任务队列，走 `NativeEntry::Vm`。
+    // 归属由函数身份决定：`obj.then` 若是用户自己的函数，根本不会到这里。
+    for (name, slot) in [
+        ("then", VmSlot::PromiseThen),
+        ("catch", VmSlot::PromiseCatch),
+        ("finally", VmSlot::PromiseFinally),
+    ] {
+        set_prototype_method_impl(proto, heap, name, slot.entry());
     }
-    let _ = proto;
-    let _ = Value::Undefined;
 }
 
 /// `Promise.resolve` / `Promise.reject` as own properties of the constructor.
@@ -39,25 +40,19 @@ pub fn register_promise_prototype(proto: &Gc<Object>, heap: &mut Heap) {
 /// claim them — without this they are `undefined` and the interception never
 /// runs.
 pub fn register_promise_statics(ctor: &Value, heap: &mut Heap) {
-    let Value::Object(obj_ref) = ctor else {
-        return;
-    };
-    for name in ["resolve", "reject", "all", "race", "allSettled", "any"] {
-        let key = crate::vm::property::PropertyKey::intern(heap, name);
-        let value = Value::Object(heap.alloc(Object::NativeFunction(
-            crate::vm::object::NativeFunctionObject::new(&format!("Promise.{name}")),
-        )));
-        let _ = obj_ref.borrow_mut().define_property(
-            heap,
-            key,
-            crate::vm::property::PropertyDescriptor {
-                value,
-                writable: true,
-                enumerable: false,
-                configurable: true,
-                getter: None,
-                setter: None,
-            },
-        );
+    use super::set_static_method_impl;
+    use crate::vm::native::VmSlot;
+
+    // 六个静态方法需要 VM（建 promise / 入微任务队列 / 读 `this.resolve`）。
+    // 这里只登记符号，`VmSlot::entry()` 在 vm/native.rs 里解析成函数指针。
+    for (name, slot) in [
+        ("resolve", VmSlot::PromiseResolve),
+        ("reject", VmSlot::PromiseReject),
+        ("all", VmSlot::PromiseAll),
+        ("race", VmSlot::PromiseRace),
+        ("allSettled", VmSlot::PromiseAllSettled),
+        ("any", VmSlot::PromiseAny),
+    ] {
+        set_static_method_impl(ctor, name, heap, slot.entry());
     }
 }

@@ -30,11 +30,14 @@ pub fn register_json(heap: &mut Heap) -> Value {
         json.set_prototype(Some(proto));
     }
 
+    // `toJSON` / `replacer` / `reviver` 都是用户代码，实现在 VM。
     let parse = Value::Object(heap.alloc(Object::NativeFunction(
-        crate::vm::object::NativeFunctionObject::new("JSON.parse"),
+        crate::vm::object::NativeFunctionObject::new("JSON.parse")
+            .with_entry(crate::vm::native::VmSlot::JsonParse.entry()),
     )));
     let stringify = Value::Object(heap.alloc(Object::NativeFunction(
-        crate::vm::object::NativeFunctionObject::new("JSON.stringify"),
+        crate::vm::object::NativeFunctionObject::new("JSON.stringify")
+            .with_entry(crate::vm::native::VmSlot::JsonStringify.entry()),
     )));
     let _ = json.define_property(heap, PropertyKey::well_known("parse").expect("well-known name"), super::method_descriptor(parse));
     let _ = json.define_property(heap, PropertyKey::well_known("stringify").expect("well-known name"),

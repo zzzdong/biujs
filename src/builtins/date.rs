@@ -16,18 +16,9 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike, Utc};
 
 use crate::RuntimeError;
 use crate::vm::gc::{Gc, Heap, Object};
-use crate::vm::object::{DateObject, JSObject, NativeFunctionObject};
-use crate::vm::property::{PropertyDescriptor, PropertyKey};
+use crate::vm::native::NativeEntry;
+use crate::vm::object::DateObject;
 use crate::vm::value::Value;
-
-/// True when `this` is a `Date` instance.
-///
-/// Needed as a dispatch guard: `valueOf` / `toString` exist on every object, so
-/// the shared prototype-method dispatch may only claim them for a real Date.
-pub fn is_date_receiver(this: &Value) -> bool {
-    matches!(this, Value::Object(obj)
-        if obj.borrow().kind() == crate::vm::property::ObjectKind::Date)
-}
 
 /// Downcast a receiver to `DateObject`, raising the TypeError the spec asks for
 /// when a Date method is applied to something else.
@@ -84,15 +75,6 @@ fn parts(ms: i64, utc: bool) -> Option<(i32, u32, u32, u32, u32, u32, u32, u32)>
             local.timestamp_subsec_millis(),
         ))
     }
-}
-
-pub fn date_component(this: &Value, index: usize, utc: bool) -> Result<Value, RuntimeError> {
-    // Dispatch entry: the method name is only used for error messages.
-    component(this, "Date.prototype.get*", index, utc)
-}
-
-pub fn date_timezone_offset(this: &Value) -> Result<Value, RuntimeError> {
-    timezone_offset(this)
 }
 
 fn component(this: &Value, method: &str, index: usize, utc: bool) -> Result<Value, RuntimeError> {
@@ -294,93 +276,70 @@ pub fn date_utc(args: &[Value]) -> Result<Value, RuntimeError> {
 
 // ── prototype registration ─────────────────────────────────────────────────
 
+/// `Date.prototype` 的每个方法都自带实现（不再由 `call_prototype_method`
+/// 按名字回查）。表里一条就是一个函数对象；`fn` 指针是注册期常量，调用零分派。
 pub fn register_date_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method;
-    // Conversions
-    set_prototype_method(proto, heap, "getTime", |this, _| component(this, "getTime", 8, false));
-    set_prototype_method(proto, heap, "valueOf", |this, _| date_value_of(this));
-    set_prototype_method(proto, heap, "toISOString", |this, _| date_to_iso_string(this));
-    set_prototype_method(proto, heap, "toJSON", |this, _| date_to_json(this));
-    set_prototype_method(proto, heap, "toString", |this, _| date_to_string(this, &[]));
-    set_prototype_method(proto, heap, "toDateString", |this, _| date_to_date_string(this));
-    set_prototype_method(proto, heap, "toTimeString", |this, _| date_to_time_string(this));
-    set_prototype_method(proto, heap, "toUTCString", |this, _| date_to_utc_string(this));
-    set_prototype_method(proto, heap, "toLocaleString", |this, _| date_to_string(this, &[]));
-    set_prototype_method(proto, heap, "toLocaleDateString", |this, _| date_to_date_string(this));
-    set_prototype_method(proto, heap, "toLocaleTimeString", |this, _| date_to_time_string(this));
-    // Local components
-    set_prototype_method(proto, heap, "getFullYear", |this, _| component(this, "getFullYear", 0, false));
-    set_prototype_method(proto, heap, "getMonth", |this, _| component(this, "getMonth", 1, false));
-    set_prototype_method(proto, heap, "getDate", |this, _| component(this, "getDate", 2, false));
-    set_prototype_method(proto, heap, "getDay", |this, _| component(this, "getDay", 3, false));
-    set_prototype_method(proto, heap, "getHours", |this, _| component(this, "getHours", 4, false));
-    set_prototype_method(proto, heap, "getMinutes", |this, _| component(this, "getMinutes", 5, false));
-    set_prototype_method(proto, heap, "getSeconds", |this, _| component(this, "getSeconds", 6, false));
-    set_prototype_method(proto, heap, "getMilliseconds", |this, _| {
-        component(this, "getMilliseconds", 7, false)
-    });
-    set_prototype_method(proto, heap, "getTimezoneOffset", |this, _| timezone_offset(this));
-    // UTC components
-    set_prototype_method(proto, heap, "getUTCFullYear", |this, _| component(this, "getUTCFullYear", 0, true));
-    set_prototype_method(proto, heap, "getUTCMonth", |this, _| component(this, "getUTCMonth", 1, true));
-    set_prototype_method(proto, heap, "getUTCDate", |this, _| component(this, "getUTCDate", 2, true));
-    set_prototype_method(proto, heap, "getUTCDay", |this, _| component(this, "getUTCDay", 3, true));
-    set_prototype_method(proto, heap, "getUTCHours", |this, _| component(this, "getUTCHours", 4, true));
-    set_prototype_method(proto, heap, "getUTCMinutes", |this, _| component(this, "getUTCMinutes", 5, true));
-    set_prototype_method(proto, heap, "getUTCSeconds", |this, _| component(this, "getUTCSeconds", 6, true));
-    // Setters
-    set_prototype_method(proto, heap, "setTime", |this, args| date_set_time(this, args));
-    set_prototype_method(proto, heap, "setFullYear", |this, args| date_set_full_year(this, args));
-    set_prototype_method(proto, heap, "setMonth", |this, args| date_set_month(this, args));
-    set_prototype_method(proto, heap, "setDate", |this, args| date_set_date(this, args));
+    use super::set_prototype_method_impl;
 
-    // 之前这一组只存在于按名字分派的设想里，原型上根本没有属性，于是
-    // `Date.prototype.setHours` 是 undefined、`Object.getOwnPropertyDescriptor`
-    // 也查不到（test262 `15.2.3.3-4-135/141..151`）。补注册并给出真实实现。
-    set_prototype_method(proto, heap, "getUTCMilliseconds", |this, _| {
-        component(this, "getUTCMilliseconds", 7, true)
-    });
-    for (name, start, count, utc) in [
-        ("setHours", 3, 4, false),
-        ("setMinutes", 4, 3, false),
-        ("setSeconds", 5, 2, false),
-        ("setMilliseconds", 6, 1, false),
-        ("setUTCFullYear", 0, 3, true),
-        ("setUTCMonth", 1, 2, true),
-        ("setUTCDate", 2, 1, true),
-        ("setUTCHours", 3, 4, true),
-        ("setUTCMinutes", 4, 3, true),
-        ("setUTCSeconds", 5, 2, true),
-        ("setUTCMilliseconds", 6, 1, true),
-    ] {
-        set_prototype_method(proto, heap, name, move |this, args| {
-            date_set_parts(this, name, args, start, count, utc)
-        });
+    // Conversions / string forms
+    let methods: &[(&str, crate::vm::native::HeapImpl)] = &[
+        ("getTime", |_h, t, _a| component(t, "getTime", 8, false)),
+        ("valueOf", |_h, t, _a| date_value_of(t)),
+        ("toISOString", |_h, t, _a| date_to_iso_string(t)),
+        ("toJSON", |_h, t, _a| date_to_json(t)),
+        ("toString", |_h, t, _a| date_to_string(t, &[])),
+        ("toDateString", |_h, t, _a| date_to_date_string(t)),
+        ("toTimeString", |_h, t, _a| date_to_time_string(t)),
+        ("toUTCString", |_h, t, _a| date_to_utc_string(t)),
+        ("toLocaleString", |_h, t, _a| date_to_string(t, &[])),
+        ("toLocaleDateString", |_h, t, _a| date_to_date_string(t)),
+        ("toLocaleTimeString", |_h, t, _a| date_to_time_string(t)),
+        // Local components
+        ("getFullYear", |_h, t, _a| component(t, "getFullYear", 0, false)),
+        ("getMonth", |_h, t, _a| component(t, "getMonth", 1, false)),
+        ("getDate", |_h, t, _a| component(t, "getDate", 2, false)),
+        ("getDay", |_h, t, _a| component(t, "getDay", 3, false)),
+        ("getHours", |_h, t, _a| component(t, "getHours", 4, false)),
+        ("getMinutes", |_h, t, _a| component(t, "getMinutes", 5, false)),
+        ("getSeconds", |_h, t, _a| component(t, "getSeconds", 6, false)),
+        ("getMilliseconds", |_h, t, _a| component(t, "getMilliseconds", 7, false)),
+        ("getTimezoneOffset", |_h, t, _a| timezone_offset(t)),
+        // UTC components
+        ("getUTCFullYear", |_h, t, _a| component(t, "getUTCFullYear", 0, true)),
+        ("getUTCMonth", |_h, t, _a| component(t, "getUTCMonth", 1, true)),
+        ("getUTCDate", |_h, t, _a| component(t, "getUTCDate", 2, true)),
+        ("getUTCDay", |_h, t, _a| component(t, "getUTCDay", 3, true)),
+        ("getUTCHours", |_h, t, _a| component(t, "getUTCHours", 4, true)),
+        ("getUTCMinutes", |_h, t, _a| component(t, "getUTCMinutes", 5, true)),
+        ("getUTCSeconds", |_h, t, _a| component(t, "getUTCSeconds", 6, true)),
+        ("getUTCMilliseconds", |_h, t, _a| component(t, "getUTCMilliseconds", 7, true)),
+        // Setters
+        ("setTime", |_h, t, a| date_set_time(t, a)),
+        ("setFullYear", |_h, t, a| date_set_full_year(t, a)),
+        ("setMonth", |_h, t, a| date_set_month(t, a)),
+        ("setDate", |_h, t, a| date_set_date(t, a)),
+        ("setHours", |_h, t, a| date_set_parts(t, "setHours", a, 3, 4, false)),
+        ("setMinutes", |_h, t, a| date_set_parts(t, "setMinutes", a, 4, 3, false)),
+        ("setSeconds", |_h, t, a| date_set_parts(t, "setSeconds", a, 5, 2, false)),
+        ("setMilliseconds", |_h, t, a| date_set_parts(t, "setMilliseconds", a, 6, 1, false)),
+        ("setUTCFullYear", |_h, t, a| date_set_parts(t, "setUTCFullYear", a, 0, 3, true)),
+        ("setUTCMonth", |_h, t, a| date_set_parts(t, "setUTCMonth", a, 1, 2, true)),
+        ("setUTCDate", |_h, t, a| date_set_parts(t, "setUTCDate", a, 2, 1, true)),
+        ("setUTCHours", |_h, t, a| date_set_parts(t, "setUTCHours", a, 3, 4, true)),
+        ("setUTCMinutes", |_h, t, a| date_set_parts(t, "setUTCMinutes", a, 4, 3, true)),
+        ("setUTCSeconds", |_h, t, a| date_set_parts(t, "setUTCSeconds", a, 5, 2, true)),
+        ("setUTCMilliseconds", |_h, t, a| date_set_parts(t, "setUTCMilliseconds", a, 6, 1, true)),
+    ];
+    for (name, entry) in methods {
+        set_prototype_method_impl(proto, heap, name, NativeEntry::Heap(*entry));
     }
 }
 
 pub fn register_date_statics(ctor: &Value, heap: &mut Heap) {
-    let Value::Object(obj_ref) = ctor else {
-        return;
-    };
-    for name in ["now", "parse", "UTC"] {
-        let key = PropertyKey::intern(heap, name);
-        let value = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(&format!("Date.{name}")),
-        )));
-        let _ = obj_ref.borrow_mut().define_property(
-            heap,
-            key,
-            PropertyDescriptor {
-                value,
-                writable: true,
-                enumerable: false,
-                configurable: true,
-                getter: None,
-                setter: None,
-            },
-        );
-    }
+    use super::set_static_method_impl;
+    set_static_method_impl(ctor, "now", heap, NativeEntry::Heap(|_h, _t, a| date_now(a)));
+    set_static_method_impl(ctor, "parse", heap, NativeEntry::Heap(|_h, _t, a| date_parse(a)));
+    set_static_method_impl(ctor, "UTC", heap, NativeEntry::Heap(|_h, _t, a| date_utc(a)));
 }
 
 // ── instance behaviour ─────────────────────────────────────────────────────

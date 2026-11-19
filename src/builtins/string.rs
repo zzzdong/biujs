@@ -34,69 +34,47 @@ pub fn is_js_whitespace(c: char) -> bool {
 }
 
 pub fn register_string_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method_owned;
+    use crate::vm::native::{StringOp, VmSlot};
 
-    super::set_prototype_method_owned("String", proto, heap, "valueOf", |this, _args| string_value_of(this));
-    super::set_prototype_method_owned("String", proto, heap, "toString", |this, _args| string_to_string(this));
-    super::set_prototype_method_owned("String", proto, heap, "charAt", |this, args| string_char_at(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "charCodeAt", |this, args| {
-        string_char_code_at(this, args)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "concat", |this, args| string_concat(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "includes", |this, args| string_includes(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "indexOf", |this, args| string_index_of(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "slice", |this, args| string_slice(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "substring", |this, args| {
-        string_substring(this, args)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "toUpperCase", |this, _args| string_to_upper(this));
-    super::set_prototype_method_owned("String", proto, heap, "toLowerCase", |this, _args| string_to_lower(this));
-    super::set_prototype_method_owned("String", proto, heap, "trim", |this, _args| string_trim_both(this));
-    super::set_prototype_method_owned("String", proto, heap, "split", |_this, _args| Ok(Value::Undefined));
-    super::set_prototype_method_owned("String", proto, heap, "match", |_this, _args| Ok(Value::Undefined));
-    // `matchAll` answers an *iterator*, which only the VM can mint (iterators
-    // live in its registry so `next()` can find its state), so the method is
-    // marked for the VM rather than implemented here.
-    super::mark_prototype_method(proto, heap, "matchAll");
-    super::set_prototype_method_owned("String", proto, heap, "search", |_this, _args| Ok(Value::Undefined));
-    // A RegExp argument is routed to the regex-aware implementation in the
-    // dispatch (`call_prototype_method`), not here — the closure is not what runs.
-    super::set_prototype_method_owned("String", proto, heap, "replace", |this, args| {
-        string_replace(this, args, false)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "replaceAll", |this, args| {
-        string_replace(this, args, true)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "startsWith", |this, args| string_starts_with(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "endsWith", |this, args| string_ends_with(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "repeat", |this, args| string_repeat(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "trimStart", |this, _args| {
-        string_trim(this, true)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "trimEnd", |this, _args| {
-        string_trim(this, false)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "codePointAt", |this, args| {
-        string_code_point_at(this, args)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "at", |this, args| string_at(this, args));
-    super::set_prototype_method_owned("String", proto, heap, "normalize", |this, args| {
-        string_normalize(this, args)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "toLocaleLowerCase", |this, _args| string_to_lower(this));
-    super::set_prototype_method_owned("String", proto, heap, "toLocaleUpperCase", |this, _args| string_to_upper(this));
-    super::set_prototype_method_owned("String", proto, heap, "localeCompare", |this, args| {
-        string_locale_compare(this, args)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "padStart", |this, args| {
-        string_pad(this, args, true)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "padEnd", |this, args| {
-        string_pad(this, args, false)
-    });
-    super::set_prototype_method_owned("String", proto, heap, "lastIndexOf", |this, args| {
-        string_last_index_of(this, args)
-    });
+    // 每个方法都自带算法选择器：`ToString(this)`、参数强转、协议分派全在
+    // `VM::string_proto_host` 里按这个身份完成，不再按名字猜归属。
+    let methods: &[(&str, StringOp)] = &[
+        ("valueOf", StringOp::ValueOf),
+        ("toString", StringOp::ToString),
+        ("charAt", StringOp::CharAt),
+        ("charCodeAt", StringOp::CharCodeAt),
+        ("concat", StringOp::Concat),
+        ("includes", StringOp::Includes),
+        ("indexOf", StringOp::IndexOf),
+        ("slice", StringOp::Slice),
+        ("substring", StringOp::Substring),
+        ("toUpperCase", StringOp::ToUpperCase),
+        ("toLowerCase", StringOp::ToLowerCase),
+        ("trim", StringOp::Trim),
+        ("split", StringOp::Split),
+        ("match", StringOp::Match),
+        ("matchAll", StringOp::MatchAll),
+        ("search", StringOp::Search),
+        ("replace", StringOp::Replace),
+        ("replaceAll", StringOp::ReplaceAll),
+        ("startsWith", StringOp::StartsWith),
+        ("endsWith", StringOp::EndsWith),
+        ("repeat", StringOp::Repeat),
+        ("trimStart", StringOp::TrimStart),
+        ("trimEnd", StringOp::TrimEnd),
+        ("codePointAt", StringOp::CodePointAt),
+        ("at", StringOp::At),
+        ("normalize", StringOp::Normalize),
+        ("toLocaleLowerCase", StringOp::ToLocaleLowerCase),
+        ("toLocaleUpperCase", StringOp::ToLocaleUpperCase),
+        ("localeCompare", StringOp::LocaleCompare),
+        ("padStart", StringOp::PadStart),
+        ("padEnd", StringOp::PadEnd),
+        ("lastIndexOf", StringOp::LastIndexOf),
+    ];
+    for (name, op) in methods {
+        super::set_prototype_method_impl(proto, heap, name, VmSlot::StringProto(*op).entry());
+    }
 }
 
 /// `String.fromCharCode(...)` — each argument is `ToUint16`-truncated, so a
@@ -132,20 +110,20 @@ pub fn string_from_code_point(args: &[Value]) -> Result<Value, RuntimeError> {
 
 /// Register the `String` constructor's static methods.
 pub fn register_string_statics(string_fn: &Value, heap: &mut Heap) {
-    super::set_static_method(string_fn, "fromCharCode", heap, |args| {
-        string_from_char_code(args)
-    });
-    super::set_static_method(string_fn, "fromCodePoint", heap, |args| {
-        string_from_code_point(args)
-    });
-    // `String.raw`（ES 22.1.2.3）：模板字面量的标签函数。闭包**永不被调用** ——
-    // 它要读 `template.raw`（可能触发 getter）并逐个 ToString 替换值，只有 VM 能
-    // 做，故由 VM 按限定名 "String.raw" 分派。
-    super::set_static_method(string_fn, "raw", heap, |_args| {
-        Err(RuntimeError::TypeError(
-            "String.raw is dispatched by the VM".to_string(),
-        ))
-    });
+    // 两个方法的参数都要跑真 `ToNumber`（对象参数的 valueOf 等），实现在 VM。
+    for (name, slot) in [
+        ("fromCharCode", crate::vm::native::VmSlot::StringFromCharCode),
+        ("fromCodePoint", crate::vm::native::VmSlot::StringFromCodePoint),
+    ] {
+        super::set_static_method_impl(string_fn, name, heap, slot.entry());
+    }
+    // `String.raw`（ES 22.1.2.3）：读 `template.raw` 可能触发 getter，实现在 VM。
+    super::set_static_method_impl(
+        string_fn,
+        "raw",
+        heap,
+        crate::vm::native::VmSlot::StringRaw.entry(),
+    );
 }
 
 /// `IsRegExp` 检查：`{startsWith,endsWith,includes}` 的第一个参数是正则时抛
@@ -272,16 +250,6 @@ pub fn string_last_index_of(obj: &Value, args: &[Value]) -> Result<Value, Runtim
         i -= 1;
     }
     Ok(Value::Number(-1.0))
-}
-
-/// `String.prototype.valueOf` / `toString` (ES 21.1.3.26 / .27) return
-/// `[[StringData]]` and reject any other receiver — no `ToString` coercion.
-fn string_value_of(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&super::require_string(obj)?))
-}
-
-fn string_to_string(obj: &Value) -> Result<Value, RuntimeError> {
-    Ok(Value::string(&super::require_string(obj)?))
 }
 
 // ─────────────────────────────────────────────────────────

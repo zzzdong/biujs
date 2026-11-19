@@ -33,7 +33,8 @@ IR（SSA 形态 + CFG）──────────────────�
 
 - `src/vm/exec.rs`（**3404 行**）：`step`（`Halt` / `Ret` 之外全部指令用它分派）、`to_primitive`、`enter_call` / `invoke*` / `open_frame` / `drive_bytecode_frame`、`json_*`、`run_instruction` 与 17 个 `run_<group>`。
 - `src/vm/proxy.rs`（748 行）：`Proxy` 对象与 `proxy_static_trap` 等 9 个静态 trap 钩子。
-- `src/vm/builtins_dispatch.rs`（1083 行）：按名字字符串的内建分派（arity 表 / 前缀约定 / 旁路名单）。
+- `src/vm/native.rs`（82 行）：**内建实现载体** `NativeEntry`（函数对象自带实现）与唯一调用入口 `VM::invoke_native`。
+- `src/vm/builtins_dispatch.rs`（3963 行）：仍在按名字字符串分派的那部分内建（arity 表 / 前缀约定 / 旁路名单），**正在被 `native.rs` 逐族取代**。
 
 > 拆分现状（2026-10-11）：P0-4 已拆完三步 —— `run_instruction` 的 1740 行巨型 match 先按语义切成 17 个 `run_<group>`，再把 Proxy（`proxy_static_trap` 等）与内建分派搬出，最后把整个执行循环（`step` + `run_*`）搬进 `exec.rs` 子模块。mod.rs 由 11269 行降到 6288 行。逻辑未改，全量零回退（16567 / 7843 / 3141，护栏 7/0/22）。
 
@@ -152,9 +153,77 @@ pub struct Gc<T> { ptr: NonNull<RefCell<T>> }   // Copy，无 Drop、无引用�
 
 `src/builtins/` 20 个文件。`mod.rs` 负责注册全局与原型。
 
-**分派是按名字字符串做的**：`call_native_by_name` / `call_prototype_method` 里
-`match name`。由此派生出 arity 表、`__proto__xxx` 前缀约定、`vm_handled_static`
-旁路名单等一整套约定 —— 这是一处已知的设计债（对应"调用分派应该走 entry point"）。
+**分派正在从「按名字字符串」迁到「函数对象自带实现」**（`src/vm/native.rs`）：
+
+```rust
+// 注册时把实现放进函数对象；调用点只做一次间接调用
+NativeFunctionObject::new("Math.max").with_entry(NativeEntry::Heap(impl_fn))
+// exec.rs / CallMethod 的唯一入口
+VM::invoke_native(callee, this, args, module)
+```
+
+这么改的理由：分派的键必须是**函数对象身份**，不能是接收者的类型 ——
+`Array.prototype.slice` 可以被取出挂到任意对象上调用，规范里它与
+`String.prototype.slice` 是两个不同的函数对象。按名字分派把这个身份压成了字符串，
+于是归属（`__map_method__` / `Owner.prototype.x`）、捕获状态（`__promise_resolve__<id>`）、
+arity、`name` 显示串各自需要一个解码器，四张表 + 三次前缀 strip 都是同一个根因。
+
+已迁移：`Math`、`console`（全部方法）、`Date`（原型方法与 `Date.now/parse/UTC`）、
+`Number.prototype` 与 `Boolean.prototype`（含 `Number.prototype.toString.length === 1`
+的显式 arity）、`Promise` 六个静态方法与 `Promise.prototype.then/catch/finally`（首个
+`NativeEntry::Vm`：`builtins/` 只登记 `VmSlot` 符号，`vm/native.rs` 在注册期
+解析成函数指针）、`Object.assign`、`Array.isArray/from/of`、
+`String.fromCharCode/fromCodePoint`、`Object.defineProperty/defineProperties/create/
+getOwnPropertyDescriptor/hasOwn` 与 `Reflect.has/deleteProperty/
+getOwnPropertyDescriptor/defineProperty`（九个名字共用一个
+`VM::object_static_vm`：注册期给定 ToPropertyKey / Proxy trap / 描述符策略）、
+`String.raw`、`JSON.stringify/parse`、`TypedArray.from/of`、`Map.groupBy`、
+`$262.detachArrayBuffer`、`Object.keys/getOwnPropertyNames/getOwnPropertySymbols/
+getPrototypeOf/setPrototypeOf/isExtensible/preventExtensions`（后七个与前面
+九个共用 `VM::object_static_vm`）、`Proxy.revocable`、全部 `Reflect.*` 静态方法，以及剩余纯静态方法
+（`Object.values/entries/fromEntries/is/freeze/seal/isFrozen/isSealed`、`Number.*`、
+`Symbol.for/keyFor`、`Error.isError`、`ArrayBuffer.isView`）。
+`call_native_by_name` 的 ToPropertyKey 名单已清空，`Object.prototype.toLocaleString`
+那条从未被注册名命中的死分支也已删除。`CallMethod` 的早段静态探测（连同
+`defer_to_native_dispatch` 名单与每次调用的 `format!("Owner.method")`）、
+`call_native_by_name` 的整个 `name.contains('.')` 分支、死代码
+`call_builtin_method` 全部删除：静态方法现在只有「属性解析 → `invoke_native`
+→ entry」一条路。清理时发现 `Object.getOwnPropertyDescriptors` 以前只靠早段
+探测的按名兜底才能调用（原型上压根没注册），补上 Heap entry 后反而多过 4 条。`catch` 对非 promise 接收者的处理也因此
+简化：用户自己的 `catch` 方法由属性解析天然优先，不再需要在分派口特判。
+原型方法族开始迁移：`Array.prototype.entries/keys/values` 三者各带一个
+`VmSlot`，同名方法在 Map/Set/TypedArray 上是**不同函数对象**，靠函数身份
+区分，不再由分派口按接收者形状猜。12 个迭代器工厂（Array/Map/Set/TypedArray
+各 3 个）已完成。迁移中发现 `VM::make_iterator_with` 原来靠
+`native_function_name == "__proto_method__values"` 判断「是不是通用的 array-like
+快路径」——迁移后四个家族名字撞车，Set 的展开与 `union` 会错误地走 array-like
+得到空数组；改成与 `Array.prototype.values` 的**函数对象身份**比较后修复；随之删掉
+`call_native_by_name` 里三处「按 `keys/values/entries` 名字 + 接收者形状猜归属」
+的死分支（约 26 行）。Array 回调族的第一步已完成：`try_array_callback_method` 的 `method: &str`
+换成穷尽的 `ArrayOp`，`CALLBACK_METHODS` / `SPECIES_METHODS` 两张名单与
+`match method` 的字符串分支全部消失（名字只在错误信息里由 `as_str()` 取）。
+`ArrayOp` 已接到 `NativeEntry::VmArray`：`Array.prototype` 全部 35 个方法
+（27 个算法 + 8 个读族/字符串族特殊方法）注册时带 `VmSlot::ArrayProto(op)`，
+`VM::array_proto_host` 取代 `call_native_by_name` 的 `"Array.prototype."` 分支
+（`ToObject` → `toString`/`concat` 特例 → 参数强转 → species/回调/读族 → builtin 兜底）。
+`CallMethod` 的三处早段拦截已删除。第一次直接删时 Array 掉 3 条，定位到原因是
+host 在回调/读族之前先做了参数强转，导致 `copyWithin` 的 `valueOf` 多跑一次、
+`slice` 走了 species 而非读族；把 host 顺序改成「回调 → 读族 → 强转 → species
+→ builtin」后 Array 变成 2579/49（基线 2577/51，+2/-2）。全量 17710/833
+（上次 17699/844）。护栏 memory 由 2 变 3：多的一条是
+`TypedArray/copyWithin/coerced-values-end-detached-prototype.js`，与本族改动
+无关但仍需核对。
+
+`String.prototype` 全部 32 个方法也已迁入 `NativeEntry::VmString(StringOp)`：
+`VM::string_proto_host` 统一做协议分派（`@@match`/`@@replace`/…）、`ToString(this)`、
+参数 `ToPrimitive` 与内建兜底；`call_native_by_name` 的 `"String.prototype."`
+分支和 `CallMethod` 的 `try_string_callback_method` / `try_match_all_method`
+早段拦截已删除，原语字符串接收者改走同一个 host。String 套件 991/64（基线
+987/68，+4/-4）；全量仍是 17710/833，逐套件相对基线**全部为改善、无回退**。
+迁移中的状态是
+`NativeFunctionObject.entry == None`：
+这类内建仍走 `call_native_by_name` / `call_native` / `call_static_method` /
+`call_prototype_method` 四条旧路径，每迁一族就少一批，最后一条回退与四张表一起删。
 
 ## 5. 已知的结构性弱点（下一阶段的输入）
 
@@ -164,7 +233,7 @@ pub struct Gc<T> { ptr: NonNull<RefCell<T>> }   // Copy，无 Drop、无引用�
 |---|---|---|
 | 1 | **P1 已有堆与句柄，但还没有回收器**：`Heap` 只在 VM 析构时整片释放，单次 `run` 内不回收 | 临时垃圾一直留到 run 结束 ⇒ 单用例内存峰值上升（实测 `TEST262_MEMORY_MB` 曾须 256→384（P2 mark-sweep + 宿主侧入根落地后已**降回 256** 且回到原头条））。正解是 P2 的 mark-sweep，见 `docs/GC-DESIGN.md` |
 | 2 | 闭包是 `HashMap<String, Value>` 的**创建时快照** | "闭包共享可变单元"不成立（`counter()` 仍返回 `0,0,0`）—— 这是**语义 bug**，不是性能问题 |
-| 3 | 内建分派按名字字符串 | arity 表 / 前缀约定 / 旁路名单；加一个原型方法要动多处 |
+| 3 | 内建分派按名字字符串（**迁移中**，已迁 `Math` / `console` / `Date` / `Number.prototype` / `Boolean.prototype` / `Promise`（六静态方法 + `then/catch/finally`） / `Object.assign` / `Array.isArray,from,of` / `String.fromCharCode,fromCodePoint` / 五个 `Object.*` 与四个 `Reflect.*` 静态方法 / `String.raw` / `JSON.*` / `TypedArray.from,of` / `Map.groupBy` / `$262.detachArrayBuffer` / 七个剩余 `Object.*` 静态方法 / `Proxy.revocable` / 全部 `Reflect.*` / 剩余纯静态方法（`Object.values,entries,fromEntries,is,freeze,seal,isFrozen,isSealed`、`Number.*`、`Symbol.for,keyFor`、`Error.isError`、`ArrayBuffer.isView`） | arity 表 / 前缀约定 / 旁路名单；加一个原型方法要动多处。目标形状见 §4 的 `NativeEntry` |
 | 4 | `Value::Function(u32)` 双表示 | `strict_eq` 特判、`materialize_function`、`callable_func_id` |
 | 5 | `src/vm/mod.rs` 曾 11269 行（现已拆到 6288 行 + `exec.rs` 3404 行） | 单文件过大，改动定位与 review 都困难 |
 | 6 | 属性存储是 `HashMap<String, Value>` | 属性访问是哈希查找；没有 shape / 内联缓存 |

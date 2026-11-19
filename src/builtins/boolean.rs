@@ -8,10 +8,17 @@ use crate::vm::value::Value;
 // ─────────────────────────────────────────────────────────
 
 pub fn register_boolean_prototype(proto: &Gc<Object>, heap: &mut Heap) {
-    use super::set_prototype_method_owned;
+    use super::set_prototype_method_impl;
+    use crate::vm::native::{HeapImpl, NativeEntry};
 
-    set_prototype_method_owned("Boolean", proto, heap, "valueOf", |this, _args| boolean_value_of(this));
-    set_prototype_method_owned("Boolean", proto, heap, "toString", |this, _args| boolean_to_string(this));
+    // 归属写在函数对象上，`thisBooleanValue` 留在实现里做 brand check。
+    let methods: &[(&str, HeapImpl)] = &[
+        ("valueOf", |_h, t, _a| boolean_value_of(t)),
+        ("toString", |_h, t, _a| boolean_to_string(t)),
+    ];
+    for (name, entry) in methods {
+        set_prototype_method_impl(proto, heap, name, NativeEntry::Heap(*entry));
+    }
 }
 
 // ─────────────────────────────────────────────────────────

@@ -128,14 +128,20 @@ pub fn register_map_prototype(proto: &Gc<Object>, heap: &mut Heap) {
         "delete",
         "clear",
         "forEach",
-        "entries",
-        "keys",
-        "values",
         // `upsert` (ES2026, already in the pinned test262).
         "getOrInsert",
         "getOrInsertComputed",
     ] {
         super::set_map_method(proto, heap, name);
+    }
+    // 迭代器工厂各带 slot：与 Array/Set 的同名方法靠函数身份区分。
+    use crate::vm::native::VmSlot;
+    for (name, slot) in [
+        ("entries", VmSlot::MapEntries),
+        ("keys", VmSlot::MapKeys),
+        ("values", VmSlot::MapValues),
+    ] {
+        super::set_prototype_method_impl(proto, heap, name, slot.entry());
     }
 
     // `size` is an accessor (ES 23.1.3.9): a getter with no setter.
