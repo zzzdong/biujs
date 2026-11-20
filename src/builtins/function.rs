@@ -128,11 +128,8 @@ pub fn setup_function_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     {
         let key = PropertyKey::intern(heap, "toString");
         let value = super::method_descriptor(Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new(FUNCTION_PROTO_TO_STRING_NATIVE).with_entry(
-                crate::vm::native::NativeEntry::VmSpecial(
-                    crate::vm::native::SpecialOp::FunctionToString,
-                ),
-            ),
+            NativeFunctionObject::new(FUNCTION_PROTO_TO_STRING_NATIVE)
+                .with_entry(crate::vm::native::VmSlot::FunctionToString.entry()),
         ))));
         p.define_property(heap, key, value).ok();
     }

@@ -81,7 +81,7 @@ impl Compiler {
         {
             let mut builder = FunctionBuilder::new(&mut unit, &mut main_func);
             let symbols = SymbolTable::new();
-            let mut lower = JSASTLower::new_script(&mut builder, symbols);
+            let mut lower = JSASTLower::new_script(&mut builder, symbols, source);
             lower.lower_program(&program);
         }
         // FunctionBuilder dropped, borrows released
@@ -95,7 +95,7 @@ impl Compiler {
         let function_count = unit.functions.len();
         // 每个函数的**声明属性**：先一次性读出来，免得与下面的可变借用来回交错。
         // 匿名函数的 `name` 是 `""`，不是 `Name` 的 *debug* `Display` 打的占位符。
-        let metas: Vec<(String, usize, FnFlags)> = unit
+        let metas: Vec<(String, usize, FnFlags, String)> = unit
             .functions
             .iter()
             .map(|func| {
@@ -107,6 +107,7 @@ impl Compiler {
                         r#async: func.signature.is_async,
                         derived_ctor: func.signature.is_derived_ctor,
                     },
+                    func.signature.source.clone().unwrap_or_default(),
                 )
             })
             .collect();
@@ -178,13 +179,14 @@ impl Compiler {
                 .iter()
                 .rposition(|code| matches!(code.opcode(), crate::bytecode::Opcode::Ret))
                 .map(|idx| offset + idx);
-            let (name, arity, flags) = metas[idx].clone();
+            let (name, arity, flags, source) = metas[idx].clone();
             code_blocks.push(CodeBlock {
                 start: offset,
                 name,
                 arity,
                 flags,
                 exit_pc,
+                source,
             });
             all_codes.extend(func_codes);
             // 绝对 pc 操作数平移：`DelayedJump` 的跳转目标与 `ResumeExc` 的区域

@@ -40,6 +40,8 @@ pub struct FuncSignature {
     /// `[[ConstructorKind]] = derived`): its `this` is uninitialized until
     /// `super()` binds it.
     pub is_derived_ctor: bool,
+    /// 函数源码片段（`Function.prototype.toString` 的来源；合成函数为 None）。
+    pub source: Option<String>,
 }
 impl FuncSignature {
     pub fn new(name: impl Into<Name>, params: Vec<FuncParam>) -> Self {
@@ -51,6 +53,7 @@ impl FuncSignature {
             is_generator: false,
             is_async: false,
             is_derived_ctor: false,
+            source: None,
         }
     }
 
@@ -63,6 +66,7 @@ impl FuncSignature {
             is_generator: false,
             is_async: false,
             is_derived_ctor: false,
+            source: None,
         }
     }
 

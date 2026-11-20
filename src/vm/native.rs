@@ -181,6 +181,8 @@ pub(crate) enum VmSlot {
     MatchAll,
     ErrorToString,
     ForInKeys,
+    NumberCtor,
+    FunctionToString,
 }
 
 /// Map/Set/WeakMap/WeakSet 原型方法。方法归属由枚举变体固定，调用期不再从
@@ -394,7 +396,6 @@ pub(crate) enum SpecialOp {
     FunctionProto,
     FunctionHasInstance,
     ObjectToString,
-    FunctionToString,
     ObjectProtoGet,
     ObjectProtoSet,
     ThrowTypeError,
@@ -513,18 +514,28 @@ impl StringOp {
             .expect("StringOp is in ALL")
     }
 
-    /// 要先走 `@@match` / `@@replace` / `@@search` / `@@split` 协议的六个方法。
-    pub(crate) fn uses_protocol(self) -> bool {
-        matches!(
-            self,
-            Self::Match
-                | Self::MatchAll
-                | Self::Search
-                | Self::Split
-                | Self::Replace
-                | Self::ReplaceAll
-        )
+    /// 除 `matchAll`（单独走 `try_match_all_method`）外的协议方法。
+    pub(crate) fn protocol_op(self) -> Option<StringProtocolOp> {
+        Some(match self {
+            Self::Match => StringProtocolOp::Match,
+            Self::Search => StringProtocolOp::Search,
+            Self::Split => StringProtocolOp::Split,
+            Self::Replace => StringProtocolOp::Replace,
+            Self::ReplaceAll => StringProtocolOp::ReplaceAll,
+            _ => return None,
+        })
     }
+}
+
+/// `String.prototype` 里走 `@@match` / `@@replace` / `@@search` / `@@split`
+/// 协议的五个方法。注册期由 `StringOp` 决定，调用期不再解析字符串。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StringProtocolOp {
+    Match,
+    Search,
+    Split,
+    Replace,
+    ReplaceAll,
 }
 
 /// `Object.*` / `Reflect.*` 静态方法里「描述符参数要跑用户代码」的那几种。
@@ -564,8 +575,7 @@ impl VmSlot {
         }
         if matches!(self, VmSlot::MatchAll) {
             return NativeEntry::Vm(|vm, this, args, module| {
-                vm.try_match_all_method(this, "matchAll", args, module)
-                    .map(|v| v.unwrap_or(Value::Undefined))
+                vm.try_match_all_method(this, args, module)
             });
         }
         if matches!(self, VmSlot::ErrorToString) {
@@ -575,6 +585,12 @@ impl VmSlot {
         }
         if matches!(self, VmSlot::ForInKeys) {
             return NativeEntry::Vm(|vm, _this, args, _module| vm.for_in_keys(args));
+        }
+        if matches!(self, VmSlot::NumberCtor) {
+            return NativeEntry::Vm(|vm, _this, args, module| vm.number_call(args, module));
+        }
+        if matches!(self, VmSlot::FunctionToString) {
+            return NativeEntry::Vm(|vm, this, _args, _module| vm.function_to_string_host(this));
         }
         let f: VmImpl = match self {
             VmSlot::PromiseResolve => |vm, this, args, module| {
@@ -852,7 +868,9 @@ impl VmSlot {
             | VmSlot::LegacyProto(_)
             | VmSlot::MatchAll
             | VmSlot::ErrorToString
-            | VmSlot::ForInKeys => unreachable!(),
+            | VmSlot::ForInKeys
+            | VmSlot::NumberCtor
+            | VmSlot::FunctionToString => unreachable!(),
         };
         NativeEntry::Vm(f)
     }

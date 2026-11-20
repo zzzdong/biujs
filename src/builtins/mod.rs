@@ -783,7 +783,8 @@ impl Builtins {
         globals.insert(PropertyKey::intern(heap, "Boolean"), method_descriptor(bool_fn_val));
 
         let number_fn_val = Value::Object(heap.alloc(Object::NativeFunction(
-            NativeFunctionObject::new("Number"),
+            NativeFunctionObject::new("Number")
+                .with_entry(crate::vm::native::VmSlot::NumberCtor.entry()),
         )));
         number::register_number_statics(&number_fn_val, &self.number_prototype, heap);
         number::register_number_prototype(&self.number_prototype, heap);

@@ -30,7 +30,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bytecode::Module;
-use crate::vm::native::{ArrayOp, CollectionOp, SpecialOp, StringOp};
+use crate::vm::native::{ArrayOp, CollectionOp, SpecialOp, StringOp, StringProtocolOp};
 use crate::vm::object::JSObject;
 use crate::vm::{ObjectKind, PropertyDescriptor, PropertyKey, RuntimeError, Value, VM};
 
@@ -86,6 +86,40 @@ impl VM {
     ) -> Result<Value, RuntimeError> {
         let boxed_args: Vec<Value> = args.iter().map(|a| self.as_object_value(a)).collect();
         crate::builtins::call_native(name, &boxed_args, &mut self.heap)
+    }
+
+    /// `Function.prototype.toString`：用户函数返回编译时记录的源码片段，
+    /// 内建函数继续用 NativeFunction 语法形式。
+    pub(crate) fn function_to_string_host(&self, this: &Value) -> Result<Value, RuntimeError> {
+        if let Value::Object(obj_ref) = this {
+            let id = match &*obj_ref.borrow() {
+                crate::vm::gc::Object::Function(func) => Some(func.func_id),
+                _ => None,
+            };
+            if let Some(id) = id {
+                if let Some(source) = self.function_sources.get(&id) {
+                    return Ok(Value::string(source.as_ref()));
+                }
+            }
+        }
+        crate::builtins::function_prototype_to_string(this)
+    }
+
+    /// `Number(value)` 的函数调用路径：对象参数要走真 ToPrimitive(hint number)
+    ///（用户的 `valueOf` / `toString` 可抛），内建层只做静态 `to_number()`。
+    pub(crate) fn number_call(
+        &mut self,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let Some(value) = args.first() else {
+            return Ok(Value::Number(0.0));
+        };
+        let primitive = match value {
+            Value::Object(_) | Value::Function(_) => self.to_primitive(value, "number", module)?,
+            other => other.clone(),
+        };
+        Ok(Value::Number(crate::builtins::to_number_throwing(&primitive)?))
     }
 
     /// `for (x in obj)` 的键枚举：OwnPropertyKeys 沿原型链逐层取，跳过重复，
@@ -178,13 +212,9 @@ impl VM {
     pub(crate) fn try_match_all_method(
         &mut self,
         receiver: &Value,
-        method: &str,
         args: &[Value],
         module: &Module,
-    ) -> Result<Option<Value>, RuntimeError> {
-        if method != "matchAll" && method != "Symbol.matchAll" {
-            return Ok(None);
-        }
+    ) -> Result<Value, RuntimeError> {
         crate::builtins::require_object_coercible(receiver)?;
         let matches = crate::builtins::match_all_matches(
             &mut self.heap,
@@ -195,7 +225,7 @@ impl VM {
         let snapshot_val = Value::Object(self.heap.alloc(
             crate::vm::gc::Object::Array(crate::vm::object::ArrayObject::from_vec(matches)),
         ));
-        Ok(Some(self.make_iterator(snapshot_val, module)?))
+        self.make_iterator(snapshot_val, module)
     }
 
     /// Species-aware wrapper for `slice` / `splice` / `concat`.
@@ -390,7 +420,6 @@ impl VM {
                 Ok(Value::Bool(self.ordinary_has_instance(&value, this, module)?))
             }
             Op::ObjectToString => self.object_prototype_to_string(this, args, module),
-            Op::FunctionToString => crate::builtins::function_prototype_to_string(this),
             Op::ObjectProtoGet => crate::builtins::object_proto_getter(&mut self.heap, this),
             Op::ObjectProtoSet => crate::builtins::object_proto_setter(this, args),
             Op::ThrowTypeError => Err(RuntimeError::TypeError(
@@ -479,13 +508,15 @@ impl VM {
         module: &Module,
     ) -> Result<Value, RuntimeError> {
         let method = op.as_str();
-        if op.uses_protocol() {
-            if let Some(result) = self.try_string_callback_method(this, method, args, module)? {
+        if let Some(protocol_op) = op.protocol_op() {
+            if let Some(result) =
+                self.try_string_callback_method(this, protocol_op, args, module)?
+            {
                 return Ok(result);
             }
-            if let Some(result) = self.try_match_all_method(this, method, args, module)? {
-                return Ok(result);
-            }
+        }
+        if op == StringOp::MatchAll {
+            return self.try_match_all_method(this, args, module);
         }
         if op == StringOp::Split {
             return self.string_prototype_split(this, args, module);
@@ -798,7 +829,7 @@ impl VM {
     pub(crate) fn try_string_callback_method(
         &mut self,
         this: &Value,
-        method: &str,
+        op: StringProtocolOp,
         args: &[Value],
         module: &Module,
     ) -> Result<Option<Value>, RuntimeError> {
@@ -809,15 +840,12 @@ impl VM {
         // `"ab".replace(/a/, "x")` 走的是同一条路（后者由
         // `RegExp.prototype[@@replace]` 实现）。以前四个方法都是"看参数形状"
         // 直接强转字符串，自定义对象上的 `@@replace` 完全看不到。
-        let symbol = match method {
-            "match" => Some(crate::builtins::match_symbol_key()),
-            "search" => Some(crate::builtins::search_symbol_key()),
-            "split" => Some(crate::builtins::split_symbol_key()),
-            "replace" | "replaceAll" => Some(crate::builtins::replace_symbol_key()),
-            _ => None,
-        };
-        let Some(symbol_key) = symbol else {
-            return Ok(None);
+        use StringProtocolOp as P;
+        let symbol_key = match op {
+            P::Match => crate::builtins::match_symbol_key(),
+            P::Search => crate::builtins::search_symbol_key(),
+            P::Split => crate::builtins::split_symbol_key(),
+            P::Replace | P::ReplaceAll => crate::builtins::replace_symbol_key(),
         };
         let search = args.first().cloned().unwrap_or(Value::Undefined);
         // GetMethod only applies to an **object** argument (ES 2024 text:
@@ -834,15 +862,23 @@ impl VM {
         }
         // `match` / `search` 在参数没有对应方法时按规范 `RegExpCreate(参数)`
         // 再走一次（`"abc".match("b")` 等价于 `"abc".match(/b/)`）。
-        if matches!(method, "match" | "search") {
+        if matches!(op, P::Match | P::Search) {
+            // RegExpCreate 的 pattern 走 ToString（可跑用户 toString/valueOf），
+            // 内建层的 `to_js_string()` 只会给出 "[object Object]"。
+            let pattern = if matches!(search, Value::Object(_) | Value::Function(_)) {
+                let primitive = self.to_primitive(&search, "string", module)?;
+                Value::string(&crate::builtins::to_string_throwing(&primitive)?)
+            } else {
+                search.clone()
+            };
             let created =
-                crate::builtins::regexp_construct_value(&mut self.heap, &[search], None)?;
+                crate::builtins::regexp_construct_value(&mut self.heap, &[pattern], None)?;
             let protocol = self.get_member(&created, &symbol_key, module)?;
             let mut call_args = vec![this.clone()];
             call_args.extend(args.iter().skip(1).cloned());
             return Ok(Some(self.invoke(&protocol, created, &call_args, module)?));
         }
-        if !matches!(method, "replace" | "replaceAll") {
+        if !matches!(op, P::Replace | P::ReplaceAll) {
             return Ok(None);
         }
         // 走到这里说明 `replace` / `replaceAll` 的参数是没有 `@@replace` 的
@@ -864,7 +900,7 @@ impl VM {
             other => other,
         };
         let search = args.first().cloned().unwrap_or(Value::Undefined);
-        let mut global = method == "replaceAll";
+        let mut global = op == P::ReplaceAll;
 
         // Collect the matches: a RegExp contributes its captures (all of them
         // when `g`), anything else is a plain substring search.

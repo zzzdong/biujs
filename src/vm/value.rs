@@ -475,11 +475,16 @@ fn string_numeric_literal(text: &str) -> f64 {
     if text.is_empty() {
         return 0.0;
     }
-    let (sign, digits) = match text.strip_prefix('-') {
-        Some(rest) => (-1.0, rest),
-        None => (1.0, text.strip_prefix('+').unwrap_or(text)),
+    let (sign, digits, signed) = match text.strip_prefix('-') {
+        Some(rest) => (-1.0, rest, true),
+        None => match text.strip_prefix('+') {
+            Some(rest) => (1.0, rest, true),
+            None => (1.0, text, false),
+        },
     };
-    if digits.eq_ignore_ascii_case("infinity") {
+    // ES ToNumber(string)：只有 "Infinity" 这个大小写形式；Rust 的 parse
+    // 接受 "inf"/"INFINITY"，这里必须挡掉。
+    if digits == "Infinity" {
         return sign * f64::INFINITY;
     }
     let radix = match digits.as_bytes() {
@@ -488,6 +493,10 @@ fn string_numeric_literal(text: &str) -> f64 {
         [b'0', b'b' | b'B', ..] => Some(2),
         _ => None,
     };
+    // StringNumericLiteral 的 Hex/Octal/Binary 分支没有符号前缀。
+    if radix.is_some() && signed {
+        return f64::NAN;
+    }
     if let Some(radix) = radix {
         let body = &digits[2..];
         if body.is_empty() {
@@ -503,6 +512,10 @@ fn string_numeric_literal(text: &str) -> f64 {
             }
         }
         return sign * acc;
+    }
+    // Rust 还接受 "inf" / "infinity" 等拼写，JS 的 StringNumericLiteral 不接受。
+    if digits.eq_ignore_ascii_case("infinity") || digits.eq_ignore_ascii_case("inf") {
+        return f64::NAN;
     }
     sign * digits.parse::<f64>().unwrap_or(f64::NAN)
 }

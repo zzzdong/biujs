@@ -1,5 +1,6 @@
 //! JSASTLower: transforms oxc AST to IR.
 use oxc_ast::ast::*;
+use oxc_span::GetSpan;
 
 use crate::bytecode::{Opcode, Primitive};
 use crate::compiler::ir::{
@@ -657,10 +658,16 @@ pub struct JSASTLower<'a> {
     /// which is how they are told apart from the parameters — a parameter *is*
     /// visible to the defaults that follow it.
     in_param_default: bool,
+    /// 完整脚本文本；函数 span 从这里切片得到 `Function.prototype.toString` 的源码。
+    source: &'a str,
 }
 
 impl<'a> JSASTLower<'a> {
-    pub fn new(builder: &'a mut dyn InstBuilder, symbols: SymbolTable<Variable>) -> Self {
+    pub fn new(
+        builder: &'a mut dyn InstBuilder,
+        symbols: SymbolTable<Variable>,
+        source: &'a str,
+    ) -> Self {
         // The innermost scope of the incoming table is where this function's
         // parameters and `var`s live (a nested function gets a *clone* of the
         // outer table, with the captured names removed).
@@ -683,14 +690,29 @@ impl<'a> JSASTLower<'a> {
             script_consts: std::collections::HashSet::new(),
             captured_locals: std::collections::HashSet::new(),
             in_param_default: false,
+            source,
         }
     }
 
     /// Create the lowerer for the script's top level.
-    pub fn new_script(builder: &'a mut dyn InstBuilder, symbols: SymbolTable<Variable>) -> Self {
-        let mut lower = Self::new(builder, symbols);
+    pub fn new_script(
+        builder: &'a mut dyn InstBuilder,
+        symbols: SymbolTable<Variable>,
+        source: &'a str,
+    ) -> Self {
+        let mut lower = Self::new(builder, symbols, source);
         lower.is_script = true;
         lower
+    }
+
+    /// 从完整脚本文本里切出 AST span 对应的源码（`Function.prototype.toString`）。
+    fn source_slice(&self, start: u32, end: u32) -> String {
+        let (start, end) = (start as usize, end as usize);
+        let slice = self.source.get(start..end).unwrap_or("").to_string();
+        if slice.contains("/* a */ f") && std::env::var("BIUJS_DEBUG_FN_SOURCE").is_ok() {
+            eprintln!("[source-slice] span={start}..{end} slice={slice:?}");
+        }
+        slice
     }
 
     /// Whether a binding declared right here becomes a script-level global.
@@ -1280,7 +1302,9 @@ impl<'a> JSASTLower<'a> {
                     &instance_fields,
                     false,
                     false,
-                    has_heritage,));
+                    has_heritage,
+                    Some(self.source_slice(class.span.start, class.span.end)),
+                ));
                 self.emit_closure_vars(&captured);
             }
         }
@@ -1288,6 +1312,10 @@ impl<'a> JSASTLower<'a> {
         // 4. If no constructor, create a default one
         let constructor_id = constructor_id.unwrap_or_else(|| {
             let func_sig = FuncSignature::new(ctor_name.clone().unwrap_or_default(), vec![]);
+            let func_sig = FuncSignature {
+                source: Some(self.source_slice(class.span.start, class.span.end)),
+                ..func_sig
+            };
             // The default constructor of a derived class forwards every
             // argument: `constructor(...args) { super(...args); }` (ES 14.5.15).
             let func_sig = if has_heritage {
@@ -1304,7 +1332,7 @@ impl<'a> JSASTLower<'a> {
             // object and the property landed under "[object Object]".
             let symbols = self.nested_function_symbols(&[]);
             let mut func_builder = FunctionBuilder::new(self.builder.module_mut(), &mut func);
-            let mut func_lower = JSASTLower::new(&mut func_builder, symbols);
+            let mut func_lower = JSASTLower::new(&mut func_builder, symbols, self.source);
             let entry = func_lower.create_block("default_ctor");
             func_lower.builder.set_entry(entry);
             func_lower.builder.switch_to_block(entry);
@@ -1405,7 +1433,9 @@ impl<'a> JSASTLower<'a> {
                         &[],
                         func.generator,
                 func.r#async,
-                false,);
+                false,
+                Some(self.source_slice(func.span.start, func.span.end)),
+            );
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
@@ -1427,7 +1457,9 @@ impl<'a> JSASTLower<'a> {
                         &[],
                         func.generator,
                 func.r#async,
-                false,);
+                false,
+                Some(self.source_slice(func.span.start, func.span.end)),
+            );
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
@@ -1449,7 +1481,9 @@ impl<'a> JSASTLower<'a> {
                         &[],
                         func.generator,
                 func.r#async,
-                false,);
+                false,
+                Some(self.source_slice(func.span.start, func.span.end)),
+            );
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
@@ -1475,7 +1509,9 @@ impl<'a> JSASTLower<'a> {
                         &[],
                         func.generator,
                 func.r#async,
-                false,);
+                false,
+                Some(self.source_slice(func.span.start, func.span.end)),
+            );
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
@@ -3818,7 +3854,9 @@ impl<'a> JSASTLower<'a> {
             &[],
             false,
             arrow.r#async,
-            false,);
+            false,
+            Some(self.source_slice(arrow.span.start, arrow.span.end)),
+        );
 
         // At runtime, capture the current `this` value. No `load_this` here on
         // purpose: in a derived constructor `this` is still uninitialized, and
@@ -3857,7 +3895,9 @@ impl<'a> JSASTLower<'a> {
                 &[],
                 func.generator,
                 func.r#async,
-                false,);
+                false,
+                Some(self.source_slice(func.span.start, func.span.end)),
+            );
             self.emit_closure_vars(&captured);
             self.builder.make_func_obj(func_val)
         } else {
@@ -4019,7 +4059,9 @@ impl<'a> JSASTLower<'a> {
                     &[],
                     func.generator,
                     func.r#async,
-                    false,);
+                    false,
+                    Some(self.source_slice(func.span.start, func.span.end)),
+                );
                 return Some((name, func_id_val));
             }
             let captured = self.free_idents_of_function(&func.params, body);
@@ -4034,7 +4076,9 @@ impl<'a> JSASTLower<'a> {
                 &[],
                 func.generator,
                 func.r#async,
-                false,);
+                false,
+                Some(self.source_slice(func.span.start, func.span.end)),
+            );
             self.emit_closure_vars(&captured);
             Some((name, self.builder.make_func_obj(func_id_val)))
         } else {
@@ -4061,6 +4105,7 @@ impl<'a> JSASTLower<'a> {
         is_generator: bool,
         is_async: bool,
         is_derived_ctor: bool,
+        source: Option<String>,
     ) -> Value {
         // During hoisting, there may be no current block yet
         let curr = self.builder.try_current_block();
@@ -4099,6 +4144,7 @@ impl<'a> JSASTLower<'a> {
         } else {
             func_sig
         };
+        let func_sig = FuncSignature { source, ..func_sig };
         let func_id = self.builder.module_mut().declare_function(func_sig.clone());
 
         let mut func = IrFunction::new(func_id, func_sig);
@@ -4106,7 +4152,7 @@ impl<'a> JSASTLower<'a> {
         let symbols = self.nested_function_symbols(captured_names);
 
         let mut func_builder = FunctionBuilder::new(self.builder.module_mut(), &mut func);
-        let mut func_lower = JSASTLower::new(&mut func_builder, symbols);
+        let mut func_lower = JSASTLower::new(&mut func_builder, symbols, self.source);
 
         // Set up arrow function this capture if provided
         func_lower.arrow_this_var = captured_this;
@@ -4165,9 +4211,15 @@ impl<'a> JSASTLower<'a> {
             if let BindingPattern::BindingIdentifier(_) = &param.pattern
                 && !param_cell
             {
-                func_lower
-                    .symbols
-                    .insert(param_name.clone(), Variable::new(arg));
+                // ES FunctionDeclarationInstantiation：默认值在自己的初始化器
+                // 里读同名形参是 TDZ（`function f(x = x) {}` 调用时 ReferenceError）。
+                // 有默认值的形参先以未初始化绑定入表，默认值求完再标记初始化。
+                let var = if param.initializer.is_some() {
+                    Variable::uninitialized(arg)
+                } else {
+                    Variable::new(arg)
+                };
+                func_lower.symbols.insert(param_name.clone(), var);
             }
 
             if let Some(init) = &param.initializer {
@@ -4200,6 +4252,9 @@ impl<'a> JSASTLower<'a> {
                 func_lower
                     .symbols
                     .insert(param_name, Variable::new(func_lower.builder.alloc()));
+            } else if param.initializer.is_some() {
+                // 默认值（或无默认值的实参路径）已经写入 arg 寄存器，TDZ 结束。
+                func_lower.symbols.mark_initialized(&param_name);
             }
 
             // Destructuring parameter (`function f([a, b]) {}`): bind after

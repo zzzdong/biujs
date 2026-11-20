@@ -334,6 +334,15 @@ impl VM {
         hint: &str,
         module: &Module,
     ) -> Result<Value, RuntimeError> {
+        // 裸 `Value::Function(id)` 在 JS 里是对象：先装箱，否则 `"" + fn`
+        // 会绕过 Function.prototype.toString，直接得到内建占位串。
+        let boxed;
+        let val = if matches!(val, Value::Function(_)) {
+            boxed = self.as_object_value(val);
+            &boxed
+        } else {
+            val
+        };
         if !val.is_object() {
             return Ok(val.clone());
         }
@@ -3693,10 +3702,14 @@ impl VM {
                 let captured_new_target = self.current_new_target();
                 // `fn.length` / `fn.name` come from the compiler's per-function
                 // metadata, exactly as for ordinary functions.
-                let (arrow_name, arrow_arity) = self
+                let (arrow_name, arrow_arity, arrow_source) = self
                     .code(func_id)
-                    .map(|block| (block.name.clone(), block.arity))
+                    .map(|block| (block.name.clone(), block.arity, block.source.clone()))
                     .unwrap_or_default();
+                if !arrow_source.is_empty() {
+                    self.function_sources
+                        .insert(func_id, std::rc::Rc::from(arrow_source));
+                }
                 let obj_val = crate::vm::object::new_arrow_function_object(
                     &mut self.heap,
                     func_id,

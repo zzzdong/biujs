@@ -264,6 +264,9 @@ pub struct VM {
     /// is created once and shared, otherwise `F.prototype.x = 1` would be lost the
     /// next time `F` is materialized.
     func_objs: HashMap<u32, Value>,
+    /// 每个 bytecode 函数的源码（`Function.prototype.toString` 用）。
+    /// 单独放 VM 上而不是 FunctionObject 里：Object 有 256 B 硬预算。
+    function_sources: HashMap<u32, Rc<str>>,
     /// Instruction budget for the current run (`None` = unlimited).
     step_limit: Option<u64>,
     /// Instructions executed so far in the current run.
@@ -520,6 +523,7 @@ impl VM {
             test_hosts: false,
             current_code: None,
             func_objs: HashMap::new(),
+            function_sources: HashMap::new(),
             step_limit: Some(DEFAULT_STEP_LIMIT),
             steps: 0,
             timeout: None,
@@ -569,6 +573,7 @@ impl VM {
         // 换 realm：整个 `State` 换成新的（堆不换，它归 VM）。
         self.state = State::new(&mut self.heap);
         self.func_objs.clear();
+        self.function_sources.clear();
         self.current_code = Some(module.code_blocks.clone());
         self.bound_functions.clear();
         self.next_bound_id = 0;
@@ -723,10 +728,13 @@ impl VM {
         func_id: u32,
         captured_vars: Vec<(String, EnvCell)>,
     ) -> Value {
-        let (name, arity) = self
+        let (name, arity, source) = self
             .code(func_id)
-            .map(|block| (block.name.clone(), block.arity))
+            .map(|block| (block.name.clone(), block.arity, block.source.clone()))
             .unwrap_or_default();
+        if !source.is_empty() {
+            self.function_sources.insert(func_id, Rc::from(source));
+        }
         let obj = crate::vm::object::new_function_object(&mut self.heap, func_id, &name, arity);
         if let Value::Object(ref obj_ref) = obj {
             let mut borrowed = obj_ref.borrow_mut();
@@ -742,10 +750,13 @@ impl VM {
         if let Some(v) = self.func_objs.get(&id) {
             return v.clone();
         }
-        let (name, arity) = self
+        let (name, arity, source) = self
             .code(id)
-            .map(|block| (block.name.clone(), block.arity))
+            .map(|block| (block.name.clone(), block.arity, block.source.clone()))
             .unwrap_or_default();
+        if !source.is_empty() {
+            self.function_sources.insert(id, Rc::from(source));
+        }
         // `fn.length` / `fn.name` / `fn.prototype` are installed by the
         // constructor (non-writable, non-enumerable, configurable).
         let obj = crate::vm::object::new_function_object(&mut self.heap, id, &name, arity);

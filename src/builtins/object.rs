@@ -463,12 +463,19 @@ pub fn object_proto_getter(
 }
 
 pub fn object_proto_setter(this: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    // Annex B.2.2.1.2：与 `Object.setPrototypeOf` 不同，`__proto__` setter
-    // 失败时静默返回 `undefined`，不抛 TypeError。
-    let _ = object_set_prototype_of(&[
-        this.clone(),
-        args.first().cloned().unwrap_or(Value::Undefined),
-    ]);
+    // Annex B.2.2.1.2：原语接收者、非对象/非 null 的右值、以及自引用赋值
+    // 都静默返回；但 SetImmutablePrototype 失败（不可扩展 / 环）必须抛 TypeError。
+    let proto = args.first().cloned().unwrap_or(Value::Undefined);
+    if !matches!(this, Value::Object(_)) {
+        return Ok(Value::Undefined);
+    }
+    if !matches!(proto, Value::Object(_) | Value::Null) {
+        return Ok(Value::Undefined);
+    }
+    if matches!((this, &proto), (Value::Object(a), Value::Object(b)) if crate::vm::gc::Gc::ptr_eq(a, b)) {
+        return Ok(Value::Undefined);
+    }
+    object_set_prototype_of(&[this.clone(), proto])?;
     Ok(Value::Undefined)
 }
 

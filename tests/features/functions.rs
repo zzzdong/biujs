@@ -661,13 +661,13 @@ fn accessors_and_class_methods_use_the_spec_name() {
 
 #[test]
 fn function_to_string_is_function_syntax() {
-    // 引擎不保留源码，取规范允许的 NativeFunction 形式：它必须是**函数语法**
-    // 且带上自己的 name，而不是 `[object Function]`。
+    // 引擎现在保留函数源码；返回原始声明文本（ES 19.2.3.5 允许实现自定义
+    // 形式，但源码形式更精确），而不是 `[object Function]`。
     let js = r#"
         function f(a) {}
         f.toString()
     "#;
-    assert_eq!(eval_string(js), "function f() { [native code] }");
+    assert_eq!(eval_string(js), "function f(a) {}");
 }
 
 #[test]

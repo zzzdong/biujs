@@ -54,6 +54,8 @@ pub struct CodeBlock {
     ///
     /// `None` = 这个函数没有尾 `Ret`（手搭的 `Module`，单测里常见）。
     pub exit_pc: Option<usize>,
+    /// 函数源码片段（`Function.prototype.toString` 用；合成函数为空）。
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1938,6 +1940,7 @@ mod tests {
                     ..FnFlags::default()
                 },
                 exit_pc: Some(3),
+                source: String::new(),
             }],
             vec![Instr::Halt {}],
             HashMap::new(),
