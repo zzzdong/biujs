@@ -715,6 +715,43 @@ impl<'a> JSASTLower<'a> {
         slice
     }
 
+    /// 把对象字面量 / 类成员定义的完整源码挂到刚创建的函数上。
+    /// `Function.prototype.toString` 要返回 `get f() {}` / `f() {}` 这样的
+    /// 完整语法，而 Function 表达式自身的 span 只覆盖参数与函数体。
+    fn set_function_source(&mut self, value: &Value, span: oxc_span::Span) {
+        let Value::Function(id) = value else {
+            return;
+        };
+        let raw = self.source_slice(span.start, span.end);
+        let owned = raw.trim_start();
+        let trimmed = if let Some(rest) = owned.strip_prefix("static") {
+            // `static /* comment */ m() {}` 的源码要去掉 `static` 与它后面的
+            // 注释，从方法名/访问器关键字开始。
+            let mut rest = rest.trim_start();
+            loop {
+                if let Some(after) = rest.strip_prefix("/*") {
+                    if let Some(end) = after.find("*/") {
+                        rest = after[end + 2..].trim_start();
+                        continue;
+                    }
+                }
+                if let Some(after) = rest.strip_prefix("//") {
+                    if let Some(end) = after.find('\n') {
+                        rest = after[end + 1..].trim_start();
+                        continue;
+                    }
+                }
+                break;
+            }
+            rest
+        } else {
+            owned
+        };
+        if let Some(func) = self.builder.module_mut().functions.get_mut(id.as_usize()) {
+            func.signature.source = Some(trimmed.to_string());
+        }
+    }
+
     /// Whether a binding declared right here becomes a script-level global.
     fn at_script_scope(&self) -> bool {
         self.is_script && self.scope_depth == 0
@@ -1147,20 +1184,24 @@ impl<'a> JSASTLower<'a> {
             Method {
                 key: MemberKey,
                 func: &'a Function<'a>,
+                def_span: oxc_span::Span,
             },
             Accessor {
                 key: MemberKey,
                 is_get: bool,
                 func: &'a Function<'a>,
+                def_span: oxc_span::Span,
             },
             StaticMethod {
                 key: MemberKey,
                 func: &'a Function<'a>,
+                def_span: oxc_span::Span,
             },
             StaticAccessor {
                 key: MemberKey,
                 is_get: bool,
                 func: &'a Function<'a>,
+                def_span: oxc_span::Span,
             },
             StaticField {
                 key: MemberKey,
@@ -1201,16 +1242,17 @@ impl<'a> JSASTLower<'a> {
                     let is_get = method_def.kind == MethodDefinitionKind::Get;
                     let key = self.lower_member_key(&method_def.key, method_def.computed);
                     let func = method_def.value.as_ref();
+                    let def_span = method_def.span;
                     members.push(if method_def.r#static {
                         if is_accessor {
-                            Member::StaticAccessor { key, is_get, func }
+                            Member::StaticAccessor { key, is_get, func, def_span }
                         } else {
-                            Member::StaticMethod { key, func }
+                            Member::StaticMethod { key, func, def_span }
                         }
                     } else if is_accessor {
-                        Member::Accessor { key, is_get, func }
+                        Member::Accessor { key, is_get, func, def_span }
                     } else {
-                        Member::Method { key, func }
+                        Member::Method { key, func, def_span }
                     });
                 }
                 _ => {}
@@ -1419,7 +1461,7 @@ impl<'a> JSASTLower<'a> {
         for member in &members {
             match member {
                 Member::Constructor(_) => {}
-                Member::Method { key, func } => {
+                Member::Method { key, func, def_span } => {
                     let name = static_member_name(key, None);
                     let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
@@ -1434,8 +1476,9 @@ impl<'a> JSASTLower<'a> {
                         func.generator,
                 func.r#async,
                 false,
-                Some(self.source_slice(func.span.start, func.span.end)),
+                None,
             );
+                self.set_function_source(&func_val, *def_span);
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
@@ -1443,7 +1486,7 @@ impl<'a> JSASTLower<'a> {
                     let desc = self.method_descriptor(func_val);
                     self.define_member(proto, key, desc);
                 }
-                Member::StaticMethod { key, func } => {
+                Member::StaticMethod { key, func, def_span } => {
                     let name = static_member_name(key, None);
                     let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
@@ -1458,8 +1501,9 @@ impl<'a> JSASTLower<'a> {
                         func.generator,
                 func.r#async,
                 false,
-                Some(self.source_slice(func.span.start, func.span.end)),
+                None,
             );
+                self.set_function_source(&func_val, *def_span);
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
@@ -1467,7 +1511,7 @@ impl<'a> JSASTLower<'a> {
                     let desc = self.method_descriptor(func_val);
                     self.define_member(func_obj, key, desc);
                 }
-                Member::Accessor { key, is_get, func } => {
+                Member::Accessor { key, is_get, func, def_span } => {
                     let name = static_member_name(key, Some(*is_get));
                     let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
@@ -1482,8 +1526,9 @@ impl<'a> JSASTLower<'a> {
                         func.generator,
                 func.r#async,
                 false,
-                Some(self.source_slice(func.span.start, func.span.end)),
+                None,
             );
+                self.set_function_source(&func_val, *def_span);
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, instance_super_proto.clone());
@@ -1495,7 +1540,7 @@ impl<'a> JSASTLower<'a> {
                     let desc = self.accessor_descriptor(getter, setter, false);
                     self.define_member(proto, key, desc);
                 }
-                Member::StaticAccessor { key, is_get, func } => {
+                Member::StaticAccessor { key, is_get, func, def_span } => {
                     let name = static_member_name(key, Some(*is_get));
                     let captured = self.free_idents_of_function(&func.params, func.body.as_ref().unwrap());
                     let func_val = self.lower_function_inner(
@@ -1510,8 +1555,9 @@ impl<'a> JSASTLower<'a> {
                         func.generator,
                 func.r#async,
                 false,
-                Some(self.source_slice(func.span.start, func.span.end)),
+                None,
             );
+                self.set_function_source(&func_val, *def_span);
                     self.emit_closure_vars(&captured);
                     let func_val = self.builder.make_func_obj(func_val);
                     let func_val = self.attach_super_proto(func_val, static_super_proto.clone());
@@ -3624,6 +3670,7 @@ impl<'a> JSASTLower<'a> {
                             let name = static_member_name(&key, Some(true));
                             let hint = self.name_hint(name);
                             let getter = self.lower_expression_named(&p.value, hint);
+                            self.set_function_source(&getter, p.span);
                             let getter = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(getter, super_proto.clone())
@@ -3637,6 +3684,7 @@ impl<'a> JSASTLower<'a> {
                             let name = static_member_name(&key, Some(false));
                             let hint = self.name_hint(name);
                             let setter = self.lower_expression_named(&p.value, hint);
+                            self.set_function_source(&setter, p.span);
                             let setter = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(setter, super_proto.clone())
@@ -3658,6 +3706,9 @@ impl<'a> JSASTLower<'a> {
                                 MemberKey::Dynamic(value) => Some(value.clone()),
                             };
                             let value = self.lower_expression_named(&p.value, hint);
+                            if p.method {
+                                self.set_function_source(&value, p.span);
+                            }
                             let value = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(value, super_proto.clone())

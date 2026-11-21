@@ -91,6 +91,9 @@ impl VM {
     /// `Function.prototype.toString`：用户函数返回编译时记录的源码片段，
     /// 内建函数继续用 NativeFunction 语法形式。
     pub(crate) fn function_to_string_host(&self, this: &Value) -> Result<Value, RuntimeError> {
+        // Proxy of a function is callable, but ES requires its own
+        // implementation-dependent **NativeFunction** source (not the target's
+        // source), so pass the proxy through to the native-form fallback.
         if let Value::Object(obj_ref) = this {
             let id = match &*obj_ref.borrow() {
                 crate::vm::gc::Object::Function(func) => Some(func.func_id),

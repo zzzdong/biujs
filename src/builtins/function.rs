@@ -44,8 +44,9 @@ pub fn function_prototype_to_string(obj: &Value) -> Result<Value, RuntimeError> 
         let borrowed = obj_ref.borrow();
         if !matches!(
             borrowed.kind(),
-            ObjectKind::Function | ObjectKind::NativeFunction
-        ) {
+            ObjectKind::Function | ObjectKind::NativeFunction | ObjectKind::Proxy
+        ) || !obj.is_callable()
+        {
             return Err(RuntimeError::TypeError(
                 "Function.prototype.toString called on non-function".to_string(),
             ));

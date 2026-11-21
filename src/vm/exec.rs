@@ -1693,28 +1693,133 @@ impl VM {
         let value = self.get_member(holder, name, module)?;
         let _root_value = self.root(&value);
         if matches!(&value, Value::Object(_)) {
-            let is_array = matches!(&value, Value::Object(o) if o.borrow().kind() == ObjectKind::Array);
-            let keys: Vec<PropertyKey> = if is_array {
-                (0..self.array_like_elements(&value).map(|v| v.len()).unwrap_or(0))
-                    .map(|i| PropertyKey::element(&mut self.heap, i as u64))
+            // ES IsArray 要看穿 Proxy（`Array.isArray(new Proxy([], {}))`）。
+            let is_array = self.is_array_including_proxies(&value, module)?;
+            let keys: Vec<(PropertyKey, bool)> = if is_array {
+                // `length` 是真 `[[Get]]`（Proxy 的 get trap 可抛 / 可 coercion）。
+                let length_key = PropertyKey::well_known("length").expect("well-known name");
+                let length_val = self.get_member(&value, &length_key, module)?;
+                let len = crate::builtins::to_number_throwing(&length_val)?;
+                let len = if len.is_nan() || len <= 0.0 {
+                    0
+                } else if len >= usize::MAX as f64 {
+                    usize::MAX
+                } else {
+                    len as usize
+                };
+                (0..len)
+                    .map(|i| (PropertyKey::element(&mut self.heap, i as u64), true))
                     .collect()
             } else {
-                crate::builtins::own_enumerable_string_keys(&mut self.heap, &value)
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect()
+                // OwnPropertyKeys 必须走 Proxy 的 ownKeys trap。
+                let owned = match self.proxy_static_trap("Reflect.ownKeys", &[value.clone()], module)? {
+                    Some(result) => result,
+                    None => {
+                        let obj_ref = match &value {
+                            Value::Object(o) => o,
+                            _ => unreachable!(),
+                        };
+                        let keys = obj_ref.borrow().own_keys();
+                        Value::Object(self.heap.alloc(Object::Array(
+                            crate::vm::object::ArrayObject::from_vec(
+                                keys
+                                    .into_iter()
+                                    .map(|key| match key {
+                                        PropertyKey::Str(atom) => {
+                                            let text = self.heap.resolve(atom).to_string();
+                                            Value::string(&text)
+                                        }
+                                        PropertyKey::Symbol(id) => {
+                                            crate::builtins::symbol_value_by_id(id)
+                                        }
+                                        PropertyKey::Index(i) => Value::string(&i.to_string()),
+                                    })
+                                    .collect(),
+                            ),
+                        )))
+                    }
+                };
+                let items = self.array_like_elements(&owned).unwrap_or_default();
+                let mut out = Vec::new();
+                for item in items {
+                    let key = match item {
+                        Value::String(text) => PropertyKey::intern(&mut self.heap, &text),
+                        Value::Symbol(sym) => PropertyKey::Symbol(sym.id),
+                        _ => continue,
+                    };
+                    let key_value = match &key {
+                        PropertyKey::Str(atom) => {
+                            let text = self.heap.resolve(*atom).to_string();
+                            Value::string(&text)
+                        }
+                        PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(*id),
+                        PropertyKey::Index(i) => Value::string(&i.to_string()),
+                    };
+                    // enumerable 要在任何 reviver 调用**之前**快照：前面的回调
+                    // 可能已经删掉了后面的属性，那时仍要按原始清单访问。
+                    let enumerable = if let Some(desc) = self.proxy_static_trap(
+                        "Reflect.getOwnPropertyDescriptor",
+                        &[value.clone(), key_value],
+                        module,
+                    )? {
+                        let enumerable_key = PropertyKey::intern(&mut self.heap, "enumerable");
+                        self.get_member(&desc, &enumerable_key, module)?.to_boolean()
+                    } else if let Value::Object(obj_ref) = &value {
+                        obj_ref.borrow().property_get(&key).map(|d| d.enumerable).unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    out.push((key, enumerable));
+                }
+                out
             };
-            for key in keys {
+            for (key, enumerable) in keys {
+                if !enumerable {
+                    continue;
+                }
+                let key_value = match &key {
+                    PropertyKey::Str(atom) => {
+                        let text = self.heap.resolve(*atom).to_string();
+                        Value::string(&text)
+                    }
+                    PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(*id),
+                    PropertyKey::Index(i) => Value::string(&i.to_string()),
+                };
                 let new_element = self.json_internalize(&value, &key, reviver, module)?;
                 if matches!(new_element, Value::Undefined) {
                     self.delete_member(&value, &key, module)?;
-                } else if let Value::Object(obj_ref) = &value {
-                    // `CreateDataProperty` (not `[[Set]]`): a failure — e.g. a
-                    // non-configurable property the reviver created — is
-                    // ignored, and the existing value simply stays.
-                    let _ = obj_ref.borrow_mut().define_property(&mut self.heap, key,
-                        crate::vm::property::PropertyDescriptor::data_descriptor(new_element),
-                    );
+                } else {
+                    // CreateDataProperty：Proxy 走 defineProperty trap；普通对象
+                    // 的失败（如不可配置属性）按规范忽略。
+                    let mut desc = crate::vm::object::OrdinaryObject::new();
+                    for (name, field) in [
+                        ("value", new_element.clone()),
+                        ("writable", Value::Bool(true)),
+                        ("enumerable", Value::Bool(true)),
+                        ("configurable", Value::Bool(true)),
+                    ] {
+                        let field_key = PropertyKey::intern(&mut self.heap, name);
+                        let _ = desc.define_property(
+                            &mut self.heap,
+                            field_key,
+                            crate::vm::property::PropertyDescriptor::data_descriptor(field),
+                        );
+                    }
+                    let desc_val = Value::Object(self.heap.alloc(Object::Ordinary(desc)));
+                    let trap_result = self.proxy_static_trap(
+                        "Reflect.defineProperty",
+                        &[value.clone(), key_value, desc_val],
+                        module,
+                    )?;
+                    if trap_result.is_none() {
+                        if let Value::Object(obj_ref) = &value {
+                            let _ = obj_ref.borrow_mut().define_property(
+                                &mut self.heap,
+                                key,
+                                crate::vm::property::PropertyDescriptor::data_descriptor(new_element),
+                            );
+                        }
+                    }
                 }
             }
         }

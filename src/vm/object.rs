@@ -2576,7 +2576,28 @@ impl RegExpObject {
 
     /// Translate the JS flags onto the Rust builder.
     fn compile(source: &str, flags: &str) -> Option<regex::Regex> {
-        let mut builder = regex::RegexBuilder::new(source);
+        // JS 的 `\uXXXX` 与 Rust regex 的 `\u{XXXX}` 不同；test262 harness
+        // 自己也用这种转义（nativeFunctionMatcher.js），不翻译会让校验器
+        // 自己抛 TypeError。
+        let mut translated = String::with_capacity(source.len());
+        let chars: Vec<char> = source.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\\'
+                && i + 5 < chars.len()
+                && chars[i + 1] == 'u'
+                && chars[i + 2..i + 6].iter().all(|c| c.is_ascii_hexdigit())
+            {
+                let hex: String = chars[i + 2..i + 6].iter().collect();
+                let value = u32::from_str_radix(&hex, 16).ok()?;
+                translated.push_str(&format!("\\u{{{value:x}}}"));
+                i += 6;
+            } else {
+                translated.push(chars[i]);
+                i += 1;
+            }
+        }
+        let mut builder = regex::RegexBuilder::new(&translated);
         builder
             .case_insensitive(flags.contains('i'))
             .multi_line(flags.contains('m'))
