@@ -40,6 +40,8 @@ pub struct FuncSignature {
     /// `[[ConstructorKind]] = derived`): its `this` is uninitialized until
     /// `super()` binds it.
     pub is_derived_ctor: bool,
+    /// 对象/类的方法（含 getter/setter）：不是构造器，也没有 `prototype`。
+    pub is_method: bool,
     /// 函数源码片段（`Function.prototype.toString` 的来源；合成函数为 None）。
     pub source: Option<String>,
 }
@@ -53,6 +55,7 @@ impl FuncSignature {
             is_generator: false,
             is_async: false,
             is_derived_ctor: false,
+            is_method: false,
             source: None,
         }
     }
@@ -66,6 +69,7 @@ impl FuncSignature {
             is_generator: false,
             is_async: false,
             is_derived_ctor: false,
+            is_method: false,
             source: None,
         }
     }
@@ -79,6 +83,13 @@ impl FuncSignature {
     /// Mark the function as `async`.
     pub fn as_async(mut self) -> Self {
         self.is_async = true;
+        self
+    }
+
+    /// Mark an object/class method (including accessors): no `prototype`,
+    /// not constructible.
+    pub fn as_method(mut self) -> Self {
+        self.is_method = true;
         self
     }
 

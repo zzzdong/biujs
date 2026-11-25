@@ -852,7 +852,13 @@ impl Object {
     }
 
     pub fn own_keys(&self) -> Vec<PropertyKey> {
-        forward!(self, own_keys)
+        let mut keys: Vec<PropertyKey> = forward!(self, own_keys);
+        // `__isClassCtor__` / `__superProto__` 是编译器用来实现 super 语义的
+        // 内部标记，不是 JS 可见的自有属性（ES OwnPropertyKeys 不能列出来）。
+        keys.retain(|key| {
+            !key.is("__isClassCtor__") && !key.is("__superProto__")
+        });
+        keys
     }
 
     pub fn get_prototype(&self) -> Option<Gc<Object>> {

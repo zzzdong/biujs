@@ -389,11 +389,19 @@ impl VM {
                 // No trap: the same operation on the target. It is a *recursive*
                 // dispatch rather than a fallthrough to the builtin layer, so a
                 // target that is itself a proxy still gets its own trap called.
-                if !Self::is_proxy(&self.proxy_parts(&receiver, trap_name)?.0) {
+                let target = self.proxy_parts(&receiver, trap_name)?.0;
+                if trap_name == "getOwnPropertyDescriptor" {
+                    return Ok(Some(crate::builtins::call_static_method(
+                        "Object.getOwnPropertyDescriptor",
+                        &[target, args.get(1).cloned().unwrap_or(Value::Undefined)],
+                        &mut self.heap,
+                    )?));
+                }
+                if !Self::is_proxy(&target) {
                     return Ok(None);
                 }
                 let mut forwarded = args.to_vec();
-                forwarded[0] = self.proxy_parts(&receiver, trap_name)?.0;
+                forwarded[0] = target;
                 return self.proxy_static_trap(name, &forwarded, module);
             }
         };
@@ -536,21 +544,41 @@ impl VM {
                     }
                     return Ok(Some(Value::Undefined));
                 }
+                // ToPropertyDescriptor 先校验 trap 结果是不是合法描述符。
+                let normalized = self.to_property_descriptor(&result, module)?;
+                let cfg_key = PropertyKey::well_known("configurable").expect("well-known name");
+                let writable_key = PropertyKey::well_known("writable").expect("well-known name");
+                let reported_configurable = self.get_member(&result, &cfg_key, module)?.to_boolean();
+                let reported_writable = self.get_member(&result, &writable_key, module)?.to_boolean();
                 if let Some(desc) = &target_desc {
                     if !desc.configurable {
-                        let reported = self.get_member(
-                            &result,
-                            &PropertyKey::well_known("configurable").expect("well-known name"),
-                            module,
-                        )?;
-                        if reported.to_boolean() {
+                        if reported_configurable {
                             return Err(RuntimeError::TypeError(
                                 "'getOwnPropertyDescriptor' on proxy: trap reported a non-configurable property as configurable"
                                     .to_string(),
                             ));
                         }
+                        // 不可配置且可写的数据属性不能被报告成不可写。
+                        if desc.writable && !reported_writable {
+                            return Err(RuntimeError::TypeError(
+                                "'getOwnPropertyDescriptor' on proxy: trap reported a non-configurable writable property as non-writable"
+                                    .to_string(),
+                            ));
+                        }
+                    } else if !reported_configurable {
+                        // 可配置 / 不存在的属性不能被报告成不可配置。
+                        return Err(RuntimeError::TypeError(
+                            "'getOwnPropertyDescriptor' on proxy: trap reported a configurable property as non-configurable"
+                                .to_string(),
+                        ));
                     }
+                } else if !reported_configurable {
+                    return Err(RuntimeError::TypeError(
+                        "'getOwnPropertyDescriptor' on proxy: trap reported an absent property as non-configurable"
+                            .to_string(),
+                    ));
                 }
+                let _ = normalized;
                 Ok(Some(result))
             }
             "ownKeys" => {
@@ -568,8 +596,12 @@ impl VM {
                 })?;
                 let mut keys: Vec<PropertyKey> = Vec::new();
                 for item in items {
+                    // ES 10.5.11：ownKeys trap 的结果必须是 String / Symbol 的
+                    // List；数字等值不做 ToPropertyKey，直接 TypeError。
                     match item {
-                        Value::String(text) => keys.push(PropertyKey::intern(&mut self.heap, &text)),
+                        Value::String(text) => {
+                            keys.push(PropertyKey::intern(&mut self.heap, &text));
+                        }
                         Value::Symbol(sym) => keys.push(PropertyKey::Symbol(sym.id)),
                         _ => {
                             return Err(RuntimeError::TypeError(
@@ -647,6 +679,16 @@ impl VM {
                 // built from the descriptor, not the one the caller passed.
                 let descriptor =
                     self.to_property_descriptor(args.get(2).unwrap_or(&Value::Undefined), module)?;
+                // 不变量必须在调用 trap **之前**采样：trap 自己正常修改了目标
+                // 后，事后再读会把它刚写的 non-configurable 当成违规。
+                let target_desc = Self::proxy_target_descriptor(
+                    &target,
+                    &crate::builtins::reflect::to_key(&mut self.heap, &key),
+                );
+                let extensible = match &target {
+                    Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
+                    _ => false,
+                };
                 let answer = self
                     .invoke(
                         &trap,
@@ -656,14 +698,6 @@ impl VM {
                     )?
                     .to_boolean();
                 if answer {
-                    let target_desc = Self::proxy_target_descriptor(
-                        &target,
-                        &crate::builtins::reflect::to_key(&mut self.heap, &key),
-                    );
-                    let extensible = match &target {
-                        Value::Object(obj_ref) => obj_ref.borrow().is_extensible(),
-                        _ => false,
-                    };
                     // ES 10.5.6: a non-configurable property cannot be
                     // redefined, and a non-extensible target gains no property.
                     let forbidden = match &target_desc {

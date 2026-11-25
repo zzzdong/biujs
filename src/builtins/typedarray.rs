@@ -1118,7 +1118,14 @@ pub fn register_arraybuffer_statics(ctor: &Value) {
 /// 那一项见 [`register_typedarray_bytes_per_element`]。
 pub fn register_typedarray_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     use crate::vm::native::VmSlot;
-    super::set_prototype_method_impl(proto, heap, "set", VmSlot::TypedArrayProto("set").entry());
+    // ES 23.2.3.24：set(source, offset = 0)，length 是 1。
+    super::set_prototype_method_arity_impl(
+        proto,
+        heap,
+        "set",
+        1,
+        VmSlot::TypedArrayProto("set").entry(),
+    );
     // 下面这两个闭包**永不被调用**：`set_prototype_method` 只登记名字，实际分派
     // 在 `call_prototype_method` 里按名字走（`ta_subarray` / `ta_slice`）。留着
     // 只是为了满足签名，别被它误导成"subarray/slice 返回 undefined"。

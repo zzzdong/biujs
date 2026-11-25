@@ -60,7 +60,8 @@ pub use map::{
 };
 pub use number::{
     number_constructor, number_is_finite, number_is_integer, number_is_nan, number_to_exponential,
-    number_to_fixed, number_to_precision,
+    number_to_exponential_ready, number_to_fixed, number_to_fixed_ready, number_to_precision,
+    number_to_precision_ready,
 };
 pub use object::{
     OBJECT_PROTO_GET_NATIVE, OBJECT_PROTO_SET_NATIVE, OBJECT_TO_STRING_NATIVE,
@@ -698,13 +699,24 @@ impl Builtins {
             ("SyntaxError", self.syntax_error_prototype),
         ];
 
+        let mut error_ctor: Option<crate::vm::gc::Gc<Object>> = None;
         for (name, proto) in error_constructors {
             let fn_val = Value::Object(heap.alloc(Object::NativeFunction(
                 NativeFunctionObject::new(name),
             )));
+            // ES 20.5.6.2：%TypeError% 等 NativeError 构造器的 [[Prototype]]
+            // 是 %Error%，不是 %Function.prototype%。
+            if name != "Error" {
+                if let (Value::Object(obj_ref), Some(base)) = (&fn_val, error_ctor) {
+                    obj_ref.borrow_mut().set_prototype(Some(base));
+                }
+            }
 
             Self::link_constructor_prototype(heap, &fn_val, &proto);
             if name == "Error" {
+                if let Value::Object(obj_ref) = &fn_val {
+                    error_ctor = Some(*obj_ref);
+                }
                 // `Error.isError(value)`: true for objects carrying
                 // `[[ErrorData]]`, which the engine marks with the `[[Class]]`
                 // "Error" (that is also what `Object.prototype.toString`

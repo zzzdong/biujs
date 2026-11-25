@@ -183,6 +183,16 @@ pub(crate) enum VmSlot {
     ForInKeys,
     NumberCtor,
     FunctionToString,
+    ObjectSeal,
+    ObjectFreeze,
+    NumberToFixed,
+    NumberToExponential,
+    NumberToPrecision,
+    ObjectValues,
+    ObjectEntries,
+    ObjectGetOwnPropertyDescriptors,
+    ObjectIsSealed,
+    ObjectIsFrozen,
 }
 
 /// Map/Set/WeakMap/WeakSet 原型方法。方法归属由枚举变体固定，调用期不再从
@@ -592,6 +602,56 @@ impl VmSlot {
         if matches!(self, VmSlot::FunctionToString) {
             return NativeEntry::Vm(|vm, this, _args, _module| vm.function_to_string_host(this));
         }
+        if matches!(self, VmSlot::NumberToFixed) {
+            return NativeEntry::Vm(|vm, this, args, module| {
+                vm.number_format_host("toFixed", this, args, module)
+            });
+        }
+        if matches!(self, VmSlot::NumberToExponential) {
+            return NativeEntry::Vm(|vm, this, args, module| {
+                vm.number_format_host("toExponential", this, args, module)
+            });
+        }
+        if matches!(self, VmSlot::NumberToPrecision) {
+            return NativeEntry::Vm(|vm, this, args, module| {
+                vm.number_format_host("toPrecision", this, args, module)
+            });
+        }
+        if matches!(self, VmSlot::ObjectValues) {
+            return NativeEntry::Vm(|vm, _this, args, module| {
+                vm.object_enumerate_host("values", args, module)
+            });
+        }
+        if matches!(self, VmSlot::ObjectEntries) {
+            return NativeEntry::Vm(|vm, _this, args, module| {
+                vm.object_enumerate_host("entries", args, module)
+            });
+        }
+        if matches!(self, VmSlot::ObjectGetOwnPropertyDescriptors) {
+            return NativeEntry::Vm(|vm, _this, args, module| {
+                vm.object_descriptor_query("getOwnPropertyDescriptors", args, module)
+            });
+        }
+        if matches!(self, VmSlot::ObjectIsSealed) {
+            return NativeEntry::Vm(|vm, _this, args, module| {
+                vm.object_descriptor_query("isSealed", args, module)
+            });
+        }
+        if matches!(self, VmSlot::ObjectIsFrozen) {
+            return NativeEntry::Vm(|vm, _this, args, module| {
+                vm.object_descriptor_query("isFrozen", args, module)
+            });
+        }
+        if matches!(self, VmSlot::ObjectSeal) {
+            return NativeEntry::Vm(|vm, _this, args, module| {
+                vm.object_integrity_vm(args, false, module)
+            });
+        }
+        if matches!(self, VmSlot::ObjectFreeze) {
+            return NativeEntry::Vm(|vm, _this, args, module| {
+                vm.object_integrity_vm(args, true, module)
+            });
+        }
         let f: VmImpl = match self {
             VmSlot::PromiseResolve => |vm, this, args, module| {
                 crate::vm::VM::promise_static_resolve(vm, this, args, module)
@@ -726,7 +786,7 @@ impl VmSlot {
             // 下面七个只需要 Proxy trap + 纯 builtin 表，共用 `object_static_vm`
             // 的 `DescKind::None` 路径。
             VmSlot::ObjectKeys => |vm, _this, args, module| {
-                vm.object_static_vm("Object.keys", false, DescKind::None, args, module)
+                vm.object_enumerate_host("keys", args, module)
             },
             VmSlot::ObjectGetOwnPropertyNames => |vm, _this, args, module| {
                 vm.object_static_vm(
@@ -738,6 +798,29 @@ impl VmSlot {
                 )
             },
             VmSlot::ObjectGetOwnPropertySymbols => |vm, _this, args, module| {
+                // ES 19.1.2.7：非对象参数直接得到空数组，不做 ToObject。
+                if matches!(
+                    args.first(),
+                    None | Some(crate::vm::Value::Undefined | crate::vm::Value::Null)
+                ) {
+                    return vm.object_static_vm(
+                        "Object.getOwnPropertySymbols",
+                        false,
+                        DescKind::None,
+                        args,
+                        module,
+                    );
+                }
+                if !matches!(
+                    args.first(),
+                    Some(crate::vm::Value::Object(_) | crate::vm::Value::Function(_))
+                ) {
+                    return Ok(crate::vm::Value::Object(vm.heap.alloc(
+                        crate::vm::gc::Object::Array(
+                            crate::vm::object::ArrayObject::from_vec(Vec::new()),
+                        ),
+                    )));
+                }
                 vm.object_static_vm(
                     "Object.getOwnPropertySymbols",
                     false,
@@ -870,7 +953,17 @@ impl VmSlot {
             | VmSlot::ErrorToString
             | VmSlot::ForInKeys
             | VmSlot::NumberCtor
-            | VmSlot::FunctionToString => unreachable!(),
+            | VmSlot::FunctionToString
+            | VmSlot::ObjectSeal
+            | VmSlot::ObjectFreeze
+            | VmSlot::NumberToFixed
+            | VmSlot::NumberToExponential
+            | VmSlot::NumberToPrecision
+            | VmSlot::ObjectValues
+            | VmSlot::ObjectEntries
+            | VmSlot::ObjectGetOwnPropertyDescriptors
+            | VmSlot::ObjectIsSealed
+            | VmSlot::ObjectIsFrozen => unreachable!(),
         };
         NativeEntry::Vm(f)
     }

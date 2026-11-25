@@ -1575,7 +1575,25 @@ impl JSObject for ArrayObject {
             if desc.configurable {
                 return Err(PropertyError::type_error("Cannot redefine property: length is non-configurable"));
             }
-            let n = desc.value.to_number();
+            // length 的 enumerable 恒为 false，不能改成 true。
+            if desc.enumerable {
+                return Err(PropertyError::type_error(
+                    "Cannot redefine property: length is non-enumerable",
+                ));
+            }
+            // 非 writable 的 length 不能重新变回 writable。
+            if !self.length_writable && desc.writable {
+                return Err(PropertyError::type_error(
+                    "Cannot redefine property: length is non-writable",
+                ));
+            }
+            // 描述片段里没有 value 时沿用当前长度，而不是把 undefined
+            // 当成 0 把数组截断。
+            let n = if matches!(desc.value, Value::Undefined) {
+                self.length as f64
+            } else {
+                desc.value.to_number()
+            };
             // `validate_array_length` already builds the right error
             // (`RangeError`); the `String` channel of `define_property`
             // would flatten it into a TypeError, so it travels prefixed and
@@ -1950,7 +1968,13 @@ delegate_js_object!(FunctionObject, base, ObjectKind::Function, "Function", "fun
 /// rather than as the boxed function object, so that no `Rc` cycle is created
 /// (the value compares equal to the boxed form and is boxed on demand by
 /// property access).
-pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usize) -> Value {
+pub fn new_function_object(
+    heap: &mut Heap,
+    func_id: u32,
+    name: &str,
+    arity: usize,
+    is_method: bool,
+) -> Value {
     let func_obj = FunctionObject::new(func_id, name);
     let obj_ref: Gc<Object> = heap.alloc(Object::Function(func_obj));
 
@@ -1985,7 +2009,7 @@ pub fn new_function_object(heap: &mut Heap, func_id: u32, name: &str, arity: usi
         None => new_ordinary_object(heap),
     };
 
-    if let Value::Object(ref proto_ref) = proto_obj {
+    if !is_method && let Value::Object(ref proto_ref) = proto_obj {
         // `F.prototype.constructor` — writable, non-enumerable, configurable.
         proto_ref.borrow_mut().define_property(
             heap,
@@ -2320,8 +2344,16 @@ impl PrimitiveWrapperObject {
     /// 赋值 / 删除要拦住的键：ES 对 String exotic 的**所有**规范索引都拒绝写，
     /// 不只是字符串长度内的那些（与委托前的口径一致）。
     fn is_virtual_key(&self, key: &PropertyKey) -> bool {
-        matches!(self.primitive, Value::String(_))
-            && (key.is("length") || key.array_index().is_some())
+        let Value::String(text) = &self.primitive else {
+            return false;
+        };
+        if key.is("length") {
+            return true;
+        }
+        // 只有落在被包装字符串范围内的索引才是虚拟只读属性；
+        // `str[5] = "de"`（超出长度）必须能创建普通可写自有属性。
+        let len = text.chars().count();
+        key.array_index().is_some_and(|i| (i as usize) < len)
     }
 }
 
@@ -2402,19 +2434,26 @@ impl JSObject for PrimitiveWrapperObject {
                 // 索引键用 `Index`（与读路径的 `Index` 同一个键）。
                 keys.push(PropertyKey::from_index(i as u32));
             }
-            // `length` is installed when the wrapper is created (ES 22.1.5.1),
-            // so it precedes every property added afterwards — putting it last
-            // made `Reflect.ownKeys(new String(""))` answer `["a","b","length"]`
-            // after `str.a = 1; str.b = 2`.
-            keys.push(PropertyKey::well_known("length").expect("well-known name"));
         }
         let wraps_string = matches!(self.primitive, Value::String(_));
-        keys.extend(
-            self.base
-                .own_keys()
-                .into_iter()
-                .filter(|key| !wraps_string || !key.is("length")),
-        );
+        let base_keys = self.base.own_keys();
+        if wraps_string {
+            // String exotic 的 OrdinaryOwnPropertyKeys：所有数组索引（含
+            // 后来添加的 str[5]）排在最前，接着是 length，最后是其余字符串键。
+            for key in base_keys.iter().filter(|k| k.array_index().is_some()) {
+                if !keys.contains(key) {
+                    keys.push(key.clone());
+                }
+            }
+            keys.push(PropertyKey::well_known("length").expect("well-known name"));
+            for key in base_keys.iter().filter(|k| {
+                k.array_index().is_none() && !k.is("length")
+            }) {
+                keys.push(key.clone());
+            }
+        } else {
+            keys.extend(base_keys);
+        }
         keys
     }
 
@@ -3073,14 +3112,23 @@ impl TypedArrayKind {
     /// Store `value` (after ToNumber) at `index`, wrapping the way the element
     /// type does — clamping for `Uint8ClampedArray`, modulo for the rest.
     pub fn write(self, data: &mut [u8], index: usize, value: f64) {
+        // Rust 的 float → int `as` 是饱和转换，ES 的 ToInt8/16/32 与
+        // ToUint8/16/32 是模 2^n 回绕（NaN / ±Inf → 0）。
+        fn modulo(value: f64, range: f64) -> f64 {
+            if !value.is_finite() {
+                return 0.0;
+            }
+            let r = value.trunc() % range;
+            if r < 0.0 { r + range } else { r }
+        }
         let size = self.bytes_per_element();
         let at = index * size;
         if at + size > data.len() {
             return;
         }
         let bytes = match self {
-            Self::Int8 => (value as i8).to_le_bytes().to_vec(),
-            Self::Uint8 => (value as u8).to_le_bytes().to_vec(),
+            Self::Int8 => (modulo(value, 256.0) as u8 as i8).to_le_bytes().to_vec(),
+            Self::Uint8 => (modulo(value, 256.0) as u8).to_le_bytes().to_vec(),
             // Clamping rounds to nearest, ties away from zero (ES 25.1.1.5).
             Self::Uint8Clamped => {
                 let clamped = if value.is_nan() || value <= 0.0 {
@@ -3099,10 +3147,10 @@ impl TypedArrayKind {
                 };
                 (clamped as u8).to_le_bytes().to_vec()
             }
-            Self::Int16 => (value as i16).to_le_bytes().to_vec(),
-            Self::Uint16 => (value as u16).to_le_bytes().to_vec(),
-            Self::Int32 => (value as i32).to_le_bytes().to_vec(),
-            Self::Uint32 => (value as u32).to_le_bytes().to_vec(),
+            Self::Int16 => (modulo(value, 65_536.0) as u16 as i16).to_le_bytes().to_vec(),
+            Self::Uint16 => (modulo(value, 65_536.0) as u16).to_le_bytes().to_vec(),
+            Self::Int32 => (modulo(value, 4_294_967_296.0) as u32 as i32).to_le_bytes().to_vec(),
+            Self::Uint32 => (modulo(value, 4_294_967_296.0) as u32).to_le_bytes().to_vec(),
             Self::Float32 => (value as f32).to_le_bytes().to_vec(),
             Self::Float64 => value.to_le_bytes().to_vec(),
         };

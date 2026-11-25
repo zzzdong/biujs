@@ -728,14 +728,22 @@ impl VM {
         func_id: u32,
         captured_vars: Vec<(String, EnvCell)>,
     ) -> Value {
-        let (name, arity, source) = self
+        let (name, arity, source, is_method) = self
             .code(func_id)
-            .map(|block| (block.name.clone(), block.arity, block.source.clone()))
+            .map(|block| {
+                (
+                    block.name.clone(),
+                    block.arity,
+                    block.source.clone(),
+                    block.flags.method,
+                )
+            })
             .unwrap_or_default();
         if !source.is_empty() {
             self.function_sources.insert(func_id, Rc::from(source));
         }
-        let obj = crate::vm::object::new_function_object(&mut self.heap, func_id, &name, arity);
+        let obj =
+            crate::vm::object::new_function_object(&mut self.heap, func_id, &name, arity, is_method);
         if let Value::Object(ref obj_ref) = obj {
             let mut borrowed = obj_ref.borrow_mut();
             borrowed.set_prototype(Some(self.builtins.function_prototype));
@@ -750,16 +758,23 @@ impl VM {
         if let Some(v) = self.func_objs.get(&id) {
             return v.clone();
         }
-        let (name, arity, source) = self
+        let (name, arity, source, is_method) = self
             .code(id)
-            .map(|block| (block.name.clone(), block.arity, block.source.clone()))
+            .map(|block| {
+                (
+                    block.name.clone(),
+                    block.arity,
+                    block.source.clone(),
+                    block.flags.method,
+                )
+            })
             .unwrap_or_default();
         if !source.is_empty() {
             self.function_sources.insert(id, Rc::from(source));
         }
         // `fn.length` / `fn.name` / `fn.prototype` are installed by the
         // constructor (non-writable, non-enumerable, configurable).
-        let obj = crate::vm::object::new_function_object(&mut self.heap, id, &name, arity);
+        let obj = crate::vm::object::new_function_object(&mut self.heap, id, &name, arity, is_method);
         // Attach Function.prototype so `f.call`, `f.bind`, … resolve.
         if let Value::Object(ref obj_ref) = obj {
             obj_ref
@@ -4038,11 +4053,19 @@ pub(crate) fn promise_static_any(
     /// JS Abstract Relational Comparison (ECMAScript 13.10.1)
     ///
     /// Returns true if x < y using ToPrimitive with number coercion.
+    /// ES 的字符串关系比较按 UTF-16 code unit 序列逐位比较，不是 Rust 的
+    /// UTF-8 字节序（`"\u{10000}"` 的 UTF-8 比 `"\uFFFF"` 大，但 UTF-16 小）。
+    fn js_string_less(xs: &str, ys: &str) -> bool {
+        let xs: Vec<u16> = xs.encode_utf16().collect();
+        let ys: Vec<u16> = ys.encode_utf16().collect();
+        xs < ys
+    }
+
     fn js_abstract_relational(x: &Value, y: &Value) -> Result<bool, RuntimeError> {
         // ToPrimitive: for basic types, use the value directly
         // String comparison has priority when both are strings
         match (x, y) {
-            (Value::String(xs), Value::String(ys)) => Ok(xs < ys),
+            (Value::String(xs), Value::String(ys)) => Ok(Self::js_string_less(xs, ys)),
             _ => {
                 // Convert to numbers and compare
                 let nx = x.to_number();
@@ -4054,6 +4077,15 @@ pub(crate) fn promise_static_any(
                 Ok(nx < ny)
             }
         }
+    }
+
+    /// `x < y` 在 ES 里结果是 undefined（NaN 或字符串外的不可比类型）时，
+    /// `x >= y` / `x <= y` 必须得到 false，而不是把 `!undefined` 当 true。
+    fn js_relational_is_nan(x: &Value, y: &Value) -> bool {
+        if matches!((x, y), (Value::String(_), Value::String(_))) {
+            return false;
+        }
+        x.to_number().is_nan() || y.to_number().is_nan()
     }
 
     /// Coerce both operands with ToPrimitive (hint "number") for relational
@@ -4511,9 +4543,12 @@ pub(crate) fn promise_static_any(
                 let boxed = self.materialize_function(*id);
                 self.delete_member(&boxed, key, module)
             }
-            _ => Err(RuntimeError::TypeError(
-                "Cannot delete property of a non-object".to_string(),
-            )),
+            // `delete "abc"[100]` 先 ToObject 再 [[Delete]]（结果总是 true）；
+            // null/undefined 的 ToObject 按规范抛 TypeError。
+            other => {
+                let boxed = crate::builtins::to_object(&mut self.heap, other)?;
+                self.delete_member(&boxed, key, module)
+            }
         }
     }
 
@@ -6212,6 +6247,18 @@ pub(crate) fn promise_static_any(
             Value::Function(id) => self.materialize_function(*id),
             other => other.clone(),
         };
+        if let Value::Object(obj_ref) = &boxed_ctor {
+            let is_method = obj_ref
+                .borrow()
+                .as_function()
+                .and_then(|func| self.code(func.func_id))
+                .is_some_and(|block| block.flags.method);
+            if is_method {
+                return Err(RuntimeError::TypeError(
+                    "Method cannot be invoked as a constructor".to_string(),
+                ));
+            }
+        }
         // ES 9.1.14 `GetPrototypeFromConstructor`: with a `new.target`, its
         // `prototype` is what the instance inherits from.
         let from = new_target.unwrap_or(&boxed_ctor);

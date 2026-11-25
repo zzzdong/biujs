@@ -125,6 +125,40 @@ impl VM {
         Ok(Value::Number(crate::builtins::to_number_throwing(&primitive)?))
     }
 
+    /// `Number.prototype.toFixed/toExponential/toPrecision`：参数转换必须
+    /// 先跑真 `ToIntegerOrInfinity`（对象参数的 `valueOf` / `@@toPrimitive`
+    /// 可抛），转换完成才检查 this 的 NaN/Infinity。
+    pub(crate) fn number_format_host(
+        &mut self,
+        method: &str,
+        this: &Value,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let n = crate::builtins::require_number(this)?;
+        let arg = args.first().filter(|v| !v.is_undefined());
+        let value = match method {
+            "toFixed" => {
+                let digits = self.to_integer_or_infinity_arg(arg, 0, module)?;
+                return crate::builtins::number_to_fixed_ready(n, Some(digits));
+            }
+            "toExponential" => match arg {
+                None => None,
+                Some(_) => Some(self.to_integer_or_infinity_arg(arg, 0, module)?),
+            },
+            _ => match arg {
+                None => None,
+                Some(_) => Some(self.to_integer_or_infinity_arg(arg, 1, module)?),
+            },
+        };
+        match method {
+            "toExponential" => {
+                crate::builtins::number_to_exponential_ready(n, value)
+            }
+            _ => crate::builtins::number_to_precision_ready(n, value),
+        }
+    }
+
     /// `for (x in obj)` 的键枚举：OwnPropertyKeys 沿原型链逐层取，跳过重复，
     /// 只保留 enumerable。`null` / `undefined` 不抛、直接得到空列表。
     pub(crate) fn for_in_keys(&mut self, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -348,6 +382,20 @@ impl VM {
             return Ok(result);
         }
         let coerced = self.coerce_index_method_args("TypedArray", method, args, module)?;
+        // 参数转换期间用户代码可能 detach buffer；ES ValidateTypedArray 要求
+        // 每次 coercion 之后再复查。
+        let detached = match this {
+            Value::Object(obj_ref) => obj_ref
+                .borrow()
+                .as_typed_array()
+                .is_some_and(|ta| ta.is_detached()),
+            _ => false,
+        };
+        if detached {
+            return Err(RuntimeError::TypeError(format!(
+                "%TypedArray%.prototype.{method} called on a detached buffer"
+            )));
+        }
         let dispatch_args: &[Value] = match &coerced {
             Some(values) => values,
             None => args,
@@ -443,7 +491,10 @@ impl VM {
             Op::ArrayIteratorFactory => self.make_iterator(this.clone(), module),
             Op::TaToStringTag => crate::builtins::typedarray::ta_to_string_tag(this),
             Op::StringCtor => {
-                let primitive = self.to_primitive(&args[0], "string", module)?;
+                let Some(value) = args.first() else {
+                    return Ok(Value::string(""));
+                };
+                let primitive = self.to_primitive(value, "string", module)?;
                 Ok(Value::string(&primitive.to_js_string()))
             }
             Op::ProxyCtor => Err(RuntimeError::TypeError(
@@ -613,8 +664,8 @@ impl VM {
     ) -> Result<Option<Vec<Value>>, RuntimeError> {
         const ARRAY: &[(&str, &str)] = &[
             ("copyWithin", "nnn"),
-            // `fill(value, start, end)`：`value` 可以为任意值（含对象）。
-            ("fill", "xnn"),
+            // `fill(value, start, end)`：value 走 ToNumber（对象可跑用户代码）。
+            ("fill", "nnn"),
             ("slice", "nn"),
             // `splice(start, deleteCount, ...items)`：items 不转换。
             ("splice", "nn"),
@@ -1096,6 +1147,344 @@ impl VM {
         }
         out.push_str(&text[last..]);
         Ok(Value::string(&out))
+    }
+
+    fn integrity_key_value(&mut self, key: &PropertyKey) -> Value {
+        match key {
+            PropertyKey::Str(atom) => {
+                let text = self.heap.resolve(*atom).to_string();
+                Value::string(&text)
+            }
+            PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(*id),
+            PropertyKey::Index(i) => Value::string(&i.to_string()),
+        }
+    }
+
+    fn descriptor_object(&mut self, desc: &PropertyDescriptor) -> Value {
+        let mut obj = crate::vm::object::OrdinaryObject::new();
+        for (name, field) in [
+            ("value", desc.value.clone()),
+            ("writable", Value::Bool(desc.writable)),
+            ("enumerable", Value::Bool(desc.enumerable)),
+            ("configurable", Value::Bool(desc.configurable)),
+        ] {
+            let key = PropertyKey::intern(&mut self.heap, name);
+            let _ = obj.define_property(
+                &mut self.heap,
+                key,
+                PropertyDescriptor::data_descriptor(field),
+            );
+        }
+        Value::Object(self.heap.alloc(crate::vm::gc::Object::Ordinary(obj)))
+    }
+
+    fn value_to_key(&mut self, value: &Value) -> Option<PropertyKey> {
+        match value {
+            Value::String(text) => Some(PropertyKey::intern(&mut self.heap, text)),
+            Value::Symbol(sym) => Some(PropertyKey::Symbol(sym.id)),
+            _ => None,
+        }
+    }
+
+    /// `Object.getOwnPropertyDescriptors` / `isSealed` / `isFrozen`：
+    /// OwnPropertyKeys 与 [[GetOwnProperty]] 都要走 Proxy trap。
+    pub(crate) fn object_descriptor_query(
+        &mut self,
+        method: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let value = args.first().cloned().unwrap_or(Value::Undefined);
+        // ES 19.1.2.5/19.1.2.6：isSealed/isFrozen 对非对象直接返回 true。
+        if method != "getOwnPropertyDescriptors" && !matches!(value, Value::Object(_) | Value::Function(_)) {
+            return Ok(Value::Bool(true));
+        }
+        let target = crate::builtins::to_object(&mut self.heap, &value)?;
+        let keys_value = match self.proxy_static_trap("Reflect.ownKeys", &[target.clone()], module)? {
+            Some(result) => result,
+            None => {
+                let keys = match &target {
+                    Value::Object(obj_ref) => obj_ref.borrow().own_keys(),
+                    _ => Vec::new(),
+                };
+                let values = keys
+                    .iter()
+                    .map(|key| self.integrity_key_value(key))
+                    .collect::<Vec<_>>();
+                Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
+                    crate::vm::object::ArrayObject::from_vec(values),
+                )))
+            }
+        };
+        let items = self.array_like_elements(&keys_value).unwrap_or_default();
+        let mut descriptors: Vec<(PropertyKey, Value)> = Vec::new();
+        let mut all_sealed = true;
+        let mut all_frozen = true;
+        for item in items {
+            let Some(key) = self.value_to_key(&item) else { continue };
+            let key_value = self.integrity_key_value(&key);
+            let desc = if let Some(value) = self.proxy_static_trap(
+                "Reflect.getOwnPropertyDescriptor",
+                &[target.clone(), key_value],
+                module,
+            )? {
+                if value.is_undefined() { None } else { Some(value) }
+            } else if let Value::Object(obj_ref) = &target {
+                obj_ref.borrow().property_get(&key).map(|d| self.descriptor_object(&d))
+            } else {
+                None
+            };
+            let Some(desc) = desc else { continue };
+            let cfg_key = PropertyKey::intern(&mut self.heap, "configurable");
+            let writable_key = PropertyKey::intern(&mut self.heap, "writable");
+            let configurable = self.get_member(&desc, &cfg_key, module)?.to_boolean();
+            let writable = self.get_member(&desc, &writable_key, module)?.to_boolean();
+            if configurable {
+                all_sealed = false;
+                all_frozen = false;
+            } else if writable {
+                all_frozen = false;
+            }
+            descriptors.push((key, desc));
+        }
+        let extensible = if let Some(result) =
+            self.proxy_static_trap("Reflect.isExtensible", &[target.clone()], module)?
+        {
+            result.to_boolean()
+        } else if let Value::Object(obj_ref) = &target {
+            obj_ref.borrow().is_extensible()
+        } else {
+            false
+        };
+        match method {
+            "isSealed" => Ok(Value::Bool(!extensible && all_sealed)),
+            "isFrozen" => Ok(Value::Bool(!extensible && all_frozen)),
+            _ => {
+                let mut result = crate::vm::object::OrdinaryObject::new();
+                for (key, desc) in descriptors {
+                    let _ = result.define_property(
+                        &mut self.heap,
+                        key,
+                        PropertyDescriptor::data_descriptor(desc),
+                    );
+                }
+                Ok(Value::Object(self.heap.alloc(crate::vm::gc::Object::Ordinary(result))))
+            }
+        }
+    }
+
+    /// `Object.values` / `Object.entries`：OwnPropertyKeys → 每个键的
+    /// GetOwnPropertyDescriptor → `[[Get]]` 都必须可观察（Proxy trap、accessor
+    /// 抛错、以及回调里增删键都要按快照顺序生效）。
+    pub(crate) fn object_enumerate_host(
+        &mut self,
+        kind: &str,
+        args: &[Value],
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let source = crate::builtins::to_object(
+            &mut self.heap,
+            &args.first().cloned().unwrap_or(Value::Undefined),
+        )?;
+        let keys_value = match self.proxy_static_trap("Reflect.ownKeys", &[source.clone()], module)? {
+            Some(result) => result,
+            None => {
+                let keys = match &source {
+                    Value::Object(obj_ref) => obj_ref.borrow().own_keys(),
+                    _ => Vec::new(),
+                };
+                let values = keys
+                    .iter()
+                    .map(|key| self.integrity_key_value(key))
+                    .collect::<Vec<_>>();
+                Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
+                    crate::vm::object::ArrayObject::from_vec(values),
+                )))
+            }
+        };
+        let items = self.array_like_elements(&keys_value).unwrap_or_default();
+        let mut out = Vec::new();
+        for item in items {
+            let Some(key) = self.value_to_key(&item) else { continue };
+            let key_value = self.integrity_key_value(&key);
+            let enumerable = if let Some(desc) = self.proxy_static_trap(
+                "Reflect.getOwnPropertyDescriptor",
+                &[source.clone(), key_value.clone()],
+                module,
+            )? {
+                if desc.is_undefined() {
+                    continue;
+                }
+                let key = PropertyKey::intern(&mut self.heap, "enumerable");
+                self.get_member(&desc, &key, module)?.to_boolean()
+            } else if let Value::Object(obj_ref) = &source {
+                obj_ref.borrow().property_get(&key).map(|d| d.enumerable).unwrap_or(false)
+            } else {
+                false
+            };
+            if !enumerable {
+                continue;
+            }
+            let name = match &key {
+                PropertyKey::Str(atom) => Value::string(&self.heap.resolve(*atom).to_string()),
+                PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(*id),
+                PropertyKey::Index(i) => Value::string(&i.to_string()),
+            };
+            if kind == "keys" {
+                if !matches!(name, Value::Symbol(_)) {
+                    out.push(name);
+                }
+                continue;
+            }
+            let value = self.get_member(&source, &key, module)?;
+            if kind == "values" {
+                out.push(value);
+            } else {
+                out.push(Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
+                    crate::vm::object::ArrayObject::from_vec(vec![name, value]),
+                ))));
+            }
+        }
+        Ok(Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
+            crate::vm::object::ArrayObject::from_vec(out),
+        ))))
+    }
+
+    /// `Object.seal` / `Object.freeze` 的可观察路径：OwnPropertyKeys、
+    /// GetOwnPropertyDescriptor、DefineProperty、PreventExtensions 都要走
+    /// Proxy trap；描述符修改失败（non-configurable）按规范忽略。
+    pub(crate) fn object_integrity_vm(
+        &mut self,
+        args: &[Value],
+        freeze: bool,
+        module: &Module,
+    ) -> Result<Value, RuntimeError> {
+        let Some(target) = args.first().cloned() else {
+            return Ok(Value::Undefined);
+        };
+        let Value::Object(obj_ref) = &target else {
+            return Ok(target);
+        };
+        let keys_value = match self.proxy_static_trap("Reflect.ownKeys", &[target.clone()], module)? {
+            Some(result) => result,
+            None => {
+                // 没有 ownKeys trap 时 Reflect.ownKeys 转发给 target；这里也
+                // 必须从 target 取键，而不是从 proxy 自己（其 own_keys 为空）。
+                let key_source = if obj_ref.borrow().is_proxy() {
+                    self.proxy_parts(&target, "ownKeys")?.0
+                } else {
+                    target.clone()
+                };
+                let keys = match &key_source {
+                    Value::Object(o) => o.borrow().own_keys(),
+                    _ => Vec::new(),
+                };
+                let values = keys
+                    .iter()
+                    .map(|key| self.integrity_key_value(key))
+                    .collect::<Vec<_>>();
+                Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
+                    crate::vm::object::ArrayObject::from_vec(values),
+                )))
+            }
+        };
+        let items = self.array_like_elements(&keys_value).unwrap_or_default();
+        let is_proxy = obj_ref.borrow().is_proxy();
+        for item in items {
+            let Some(key) = self.value_to_key(&item) else { continue };
+            let key_value = self.integrity_key_value(&key);
+            if is_proxy {
+                // Proxy 的 [[GetOwnProperty]] / [[DefineOwnProperty]] 都必须
+                // 走 trap（没有 trap 就转发到 target），不能直接改 proxy 自己的
+                // 描述符表。
+                let desc = match self.proxy_static_trap(
+                    "Reflect.getOwnPropertyDescriptor",
+                    &[target.clone(), key_value.clone()],
+                    module,
+                )? {
+                    Some(value) => value,
+                    None => {
+                        let t = self.proxy_parts(&target, "getOwnPropertyDescriptor")?.0;
+                        match &t {
+                            Value::Object(o) => match o.borrow().property_get(&key) {
+                                Some(d) => self.descriptor_object(&d),
+                                None => continue,
+                            },
+                            _ => continue,
+                        }
+                    }
+                };
+                if desc.is_undefined() {
+                    continue;
+                }
+                let configurable_key = PropertyKey::intern(&mut self.heap, "configurable");
+                if !self.get_member(&desc, &configurable_key, module)?.to_boolean() {
+                    continue;
+                }
+                // ES 20.1.2.6/20.1.2.7：DefinePropertyOrThrow 的描述符只含
+                // `{[[Configurable]]: false}`（freeze 再加 writable）。
+                let mut patch = crate::vm::object::OrdinaryObject::new();
+                let cfg_key = PropertyKey::intern(&mut self.heap, "configurable");
+                let _ = patch.define_property(
+                    &mut self.heap,
+                    cfg_key,
+                    PropertyDescriptor::data_descriptor(Value::Bool(false)),
+                );
+                if freeze {
+                    let writable_key = PropertyKey::intern(&mut self.heap, "writable");
+                    if matches!(
+                        self.get_member(&desc, &writable_key, module)?,
+                        Value::Bool(_)
+                    ) {
+                        let _ = patch.define_property(
+                            &mut self.heap,
+                            writable_key,
+                            PropertyDescriptor::data_descriptor(Value::Bool(false)),
+                        );
+                    }
+                }
+                let patch_val =
+                    Value::Object(self.heap.alloc(crate::vm::gc::Object::Ordinary(patch)));
+                let _ = self.proxy_static_trap(
+                    "Reflect.defineProperty",
+                    &[target.clone(), key_value, patch_val],
+                    module,
+                )?;
+            } else {
+                let Some(mut desc) = obj_ref.borrow().property_get(&key) else {
+                    continue;
+                };
+                if !desc.configurable {
+                    continue;
+                }
+                desc.configurable = false;
+                if freeze && desc.writable {
+                    desc.writable = false;
+                }
+                let _ = obj_ref
+                    .borrow_mut()
+                    .define_property(&mut self.heap, key, desc);
+            }
+        }
+        if let Some(result) =
+            self.proxy_static_trap("Reflect.preventExtensions", &[target.clone()], module)?
+        {
+            if !result.to_boolean() {
+                return Err(RuntimeError::TypeError(format!(
+                    "Object.{}: proxy preventExtensions trap returned false",
+                    if freeze { "freeze" } else { "seal" }
+                )));
+            }
+        } else {
+            // 普通对象还要打上 sealed / frozen 标记：`is_sealed` /
+            // `is_frozen` 读的是对象头上的完整性状态，不只是逐个描述符。
+            if freeze {
+                let _ = obj_ref.borrow_mut().freeze();
+            } else {
+                let _ = obj_ref.borrow_mut().seal();
+            }
+        }
+        Ok(target)
     }
 
     /// `Object.*` / `Reflect.*` 静态方法的**唯一** VM 入口。
@@ -1588,11 +1977,9 @@ impl VM {
             // `source_numbers()` 只查自有描述符，getter / valueOf 全看不到。
             "set" => {
                 let source = args.first().cloned().unwrap_or(Value::Undefined);
-                if !matches!(source, Value::Object(_) | Value::Function(_)) {
-                    return Err(RuntimeError::TypeError(
-                        "TypedArray.prototype.set: source is not array-like".to_string(),
-                    ));
-                }
+                // ES SetTypedArrayFromArrayLike 第 1 步是 ToObject(source)：
+                // 字符串等原语也有索引属性，null/undefined 才抛 TypeError。
+                let source = crate::builtins::to_object(&mut self.heap, &source)?;
                 // 先读 source 的 length（`array_like_length_raw` 走 `[[Get]]`，
                 // Symbol 长度是 TypeError），再转 offset —— 每次转换都跑用户代码。
                 let src_len = self.array_like_length_raw(&source, module)?.min(1 << 24);
@@ -1615,7 +2002,20 @@ impl VM {
                         "set: a viewed ArrayBuffer was detached".to_string(),
                     ));
                 }
-                let mut values = Vec::with_capacity(src_len as usize);
+                let Value::Object(target_ref) = receiver else {
+                    return Ok(None);
+                };
+                // 长度检查在任何元素读取之前（ES 第 8 步），不然后面的
+                // valueOf 会多跑一次。
+                {
+                    let ta = target_ref.borrow();
+                    let ta = ta.as_typed_array().expect("checked by caller");
+                    if (offset as u64).saturating_add(src_len) > ta.length as u64 {
+                        return Err(RuntimeError::RangeError(
+                            "Source is too large".to_string(),
+                        ));
+                    }
+                }
                 let mut keep = self.roots();
                 for k in 0..src_len {
                     let key = PropertyKey::element(&mut self.heap, k);
@@ -1627,24 +2027,13 @@ impl VM {
                         }
                         other => other.clone(),
                     };
-                    values.push(crate::builtins::to_number_throwing(&primitive)?);
-                }
-                let Value::Object(target_ref) = receiver else {
-                    return Ok(None);
-                };
-                {
-                    let ta = target_ref.borrow();
-                    let ta = ta.as_typed_array().expect("checked by caller");
-                    if (offset as u64).saturating_add(src_len) > ta.length as u64 {
-                        return Err(RuntimeError::RangeError(
-                            "Source is too large".to_string(),
-                        ));
+                    let number = crate::builtins::to_number_throwing(&primitive)?;
+                    // 边读边写：ToNumber 抛错时，之前的元素必须已经写进目标。
+                    {
+                        let mut ta = target_ref.borrow_mut();
+                        let ta = ta.as_typed_array_mut().expect("checked by caller");
+                        ta.set_element(offset as usize + k as usize, Value::Number(number));
                     }
-                }
-                let mut ta = target_ref.borrow_mut();
-                let ta = ta.as_typed_array_mut().expect("checked by caller");
-                for (k, value) in values.into_iter().enumerate() {
-                    ta.set_element(offset as usize + k, Value::Number(value));
                 }
                 return Ok(Some(Value::Undefined));
             }

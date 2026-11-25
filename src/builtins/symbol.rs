@@ -247,6 +247,46 @@ pub fn register_symbol_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     super::set_prototype_method_impl(proto, heap, "toString", crate::vm::native::VmSlot::LegacyProto("toString").entry());
     super::set_prototype_method_impl(proto, heap, "valueOf", crate::vm::native::VmSlot::LegacyProto("valueOf").entry());
 
+    // ES 20.4.3.3 `Symbol.prototype[@@toPrimitive]`：先 thisSymbolValue
+    //（Symbol wrapper 解包），再原样返回那个 Symbol。
+    let to_primitive = Value::Object(heap.alloc(Object::NativeFunction(
+        NativeFunctionObject::new("Symbol.toPrimitive").with_entry(
+            crate::vm::native::NativeEntry::Heap(|_h, this, _args| symbol_to_primitive(this)),
+        ),
+    )));
+    if let Value::Object(fn_ref) = &to_primitive {
+        for (name, value) in [
+            ("name", Value::string("[Symbol.toPrimitive]")),
+            ("length", Value::Number(1.0)),
+        ] {
+            let key = PropertyKey::intern(heap, name);
+            let _ = fn_ref.borrow_mut().define_property(
+                heap,
+                key,
+                PropertyDescriptor {
+                    value,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    getter: None,
+                    setter: None,
+                },
+            );
+        }
+    }
+    let _ = proto.borrow_mut().define_property(
+        heap,
+        crate::builtins::to_primitive_symbol_key(),
+        PropertyDescriptor {
+            value: to_primitive,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            getter: None,
+            setter: None,
+        },
+    );
+
     // `Symbol.prototype.description` is an accessor: the getter unwraps the
     // symbol and returns its description (or undefined).
     let getter = Value::Object(heap.alloc(Object::NativeFunction(NativeFunctionObject::new(
@@ -340,6 +380,21 @@ pub fn symbol_value_of(obj: &Value) -> Result<Value, RuntimeError> {
         Value::Symbol(_) => Ok(obj.clone()),
         _ => Err(RuntimeError::TypeError(
             "Symbol.prototype.valueOf requires a Symbol".to_string(),
+        )),
+    }
+}
+
+/// `Symbol.prototype[@@toPrimitive]`：thisSymbolValue 后原样返回 Symbol。
+pub fn symbol_to_primitive(obj: &Value) -> Result<Value, RuntimeError> {
+    let value = if let Value::Object(_) = obj {
+        obj.to_primitive("default")
+    } else {
+        obj.clone()
+    };
+    match value {
+        Value::Symbol(_) => Ok(value),
+        _ => Err(RuntimeError::TypeError(
+            "Symbol.prototype[Symbol.toPrimitive] requires a Symbol".to_string(),
         )),
     }
 }

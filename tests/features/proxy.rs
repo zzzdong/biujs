@@ -235,7 +235,7 @@ fn own_keys_trap_feeds_every_key_listing() {
          var frozen = Object.freeze({{ d: 1 }});
          var growing = new Proxy(frozen, {{ ownKeys: function () {{ return ['d', 'e']; }} }});
          if (name_of(function () {{ Object.keys(growing); }}) !== 'TypeError') throw new Error('grow');
-         // The list may only hold strings and symbols.
+         // ownKeys trap 只能返回字符串 / Symbol；数字必须抛 TypeError。
          var junk = new Proxy(target, {{ ownKeys: function () {{ return [1]; }} }});
          if (name_of(function () {{ Object.keys(junk); }}) !== 'TypeError') throw new Error('junk');"
     ))

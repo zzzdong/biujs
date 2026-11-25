@@ -41,8 +41,10 @@ impl Atom {
 /// 驻留，于是 id 就是下标。新增名字时插到正确位置，不要追加到末尾。
 pub const WELL_KNOWN: &[&str] = &[
     "BYTES_PER_ELEMENT",
-    // 编译器给 class 构造器打的内部标记（`builtins::CLASS_CTOR_FLAG`）。
+    // 编译器给 class 构造器 / 方法打的内部标记，不能出现在 JS 可见的
+    // OwnPropertyKeys 列表里。
     "__isClassCtor__",
+    "__superProto__",
     "__value__",
     "add",
     "arguments",

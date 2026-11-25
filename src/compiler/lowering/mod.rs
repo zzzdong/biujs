@@ -658,6 +658,10 @@ pub struct JSASTLower<'a> {
     /// which is how they are told apart from the parameters — a parameter *is*
     /// visible to the defaults that follow it.
     in_param_default: bool,
+    /// 下一个被 lowering 的函数是方法/访问器时的完整定义 span。
+    /// 在 `lower_function_inner` 里消费，避免函数被 `MakeFuncObj` 装箱后
+    /// 再也拿不到 func id。
+    pending_function_source: Option<(oxc_span::Span, bool)>,
     /// 完整脚本文本；函数 span 从这里切片得到 `Function.prototype.toString` 的源码。
     source: &'a str,
 }
@@ -690,6 +694,7 @@ impl<'a> JSASTLower<'a> {
             script_consts: std::collections::HashSet::new(),
             captured_locals: std::collections::HashSet::new(),
             in_param_default: false,
+            pending_function_source: None,
             source,
         }
     }
@@ -708,11 +713,7 @@ impl<'a> JSASTLower<'a> {
     /// 从完整脚本文本里切出 AST span 对应的源码（`Function.prototype.toString`）。
     fn source_slice(&self, start: u32, end: u32) -> String {
         let (start, end) = (start as usize, end as usize);
-        let slice = self.source.get(start..end).unwrap_or("").to_string();
-        if slice.contains("/* a */ f") && std::env::var("BIUJS_DEBUG_FN_SOURCE").is_ok() {
-            eprintln!("[source-slice] span={start}..{end} slice={slice:?}");
-        }
-        slice
+        self.source.get(start..end).unwrap_or("").to_string()
     }
 
     /// 把对象字面量 / 类成员定义的完整源码挂到刚创建的函数上。
@@ -749,6 +750,7 @@ impl<'a> JSASTLower<'a> {
         };
         if let Some(func) = self.builder.module_mut().functions.get_mut(id.as_usize()) {
             func.signature.source = Some(trimmed.to_string());
+            func.signature.is_method = true;
         }
     }
 
@@ -788,6 +790,19 @@ impl<'a> JSASTLower<'a> {
     fn throw_tdz(&mut self, name: &str) -> Value {
         let message = self.builder.load_constant(crate::bytecode::Constant::String(
             std::sync::Arc::new(format!("Cannot access '{name}' before initialization")),
+        ));
+        let ctor = self
+            .builder
+            .load_external_variable("ReferenceError".to_string());
+        let error = self.builder.new_(ctor, vec![message]);
+        self.builder.throw_value(error);
+        Value::Primitive(Primitive::Undefined)
+    }
+
+    /// `delete super.x` raises a ReferenceError (ES 13.5.1).
+    fn throw_delete_super(&mut self) -> Value {
+        let message = self.builder.load_constant(crate::bytecode::Constant::String(
+            std::sync::Arc::new("Delete of a super property is not allowed".to_string()),
         ));
         let ctor = self
             .builder
@@ -2930,6 +2945,19 @@ impl<'a> JSASTLower<'a> {
     /// `delete target` — removes a property and reports whether it existed.
     fn lower_delete(&mut self, expr: &Expression<'_>) -> Value {
         match expr.get_inner_expression() {
+            // ES 13.5.1：Delete of a super property is a ReferenceError。
+            // 计算键仍要先求值（ToPropertyKey 可跑用户代码）。
+            Expression::StaticMemberExpression(member)
+                if matches!(member.object.get_inner_expression(), Expression::Super(_)) =>
+            {
+                self.throw_delete_super()
+            }
+            Expression::ComputedMemberExpression(member)
+                if matches!(member.object.get_inner_expression(), Expression::Super(_)) =>
+            {
+                let _ = self.lower_expression(&member.expression);
+                self.throw_delete_super()
+            }
             Expression::StaticMemberExpression(member) => {
                 let object = self.lower_expression(&member.object);
                 self.builder
@@ -3669,8 +3697,8 @@ impl<'a> JSASTLower<'a> {
                             // name for the same reason as class accessors.
                             let name = static_member_name(&key, Some(true));
                             let hint = self.name_hint(name);
+                            self.pending_function_source = Some((p.span, true));
                             let getter = self.lower_expression_named(&p.value, hint);
-                            self.set_function_source(&getter, p.span);
                             let getter = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(getter, super_proto.clone())
@@ -3683,8 +3711,8 @@ impl<'a> JSASTLower<'a> {
                         PropertyKind::Set => {
                             let name = static_member_name(&key, Some(false));
                             let hint = self.name_hint(name);
+                            self.pending_function_source = Some((p.span, true));
                             let setter = self.lower_expression_named(&p.value, hint);
-                            self.set_function_source(&setter, p.span);
                             let setter = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(setter, super_proto.clone())
@@ -3705,10 +3733,10 @@ impl<'a> JSASTLower<'a> {
                                 MemberKey::Static(name) => self.name_hint(Some(name.clone())),
                                 MemberKey::Dynamic(value) => Some(value.clone()),
                             };
-                            let value = self.lower_expression_named(&p.value, hint);
                             if p.method {
-                                self.set_function_source(&value, p.span);
+                                self.pending_function_source = Some((p.span, true));
                             }
+                            let value = self.lower_expression_named(&p.value, hint);
                             let value = match &home {
                                 Some(super_proto) => {
                                     self.attach_super_proto(value, super_proto.clone())
@@ -4195,7 +4223,19 @@ impl<'a> JSASTLower<'a> {
         } else {
             func_sig
         };
-        let func_sig = FuncSignature { source, ..func_sig };
+        let mut func_sig = FuncSignature { source, ..func_sig };
+        if let Some((span, is_method)) = self.pending_function_source.take() {
+            let raw = self.source_slice(span.start, span.end);
+            let mut text = raw.trim_start();
+            if let Some(rest) = text.strip_prefix("static") {
+                text = rest.trim_start();
+                while let Some(after) = text.strip_prefix("/*").and_then(|s| s.find("*/").map(|e| &s[e + 2..])) {
+                    text = after.trim_start();
+                }
+            }
+            func_sig.source = Some(text.to_string());
+            func_sig.is_method = is_method;
+        }
         let func_id = self.builder.module_mut().declare_function(func_sig.clone());
 
         let mut func = IrFunction::new(func_id, func_sig);

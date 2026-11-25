@@ -1124,16 +1124,7 @@ pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins, h
     use crate::vm::native::{HeapImpl, NativeEntry};
     let pure: &[(&str, HeapImpl)] = &[
         ("fromEntries", |h, _t, a| object_from_entries(h, a)),
-        ("values", |h, _t, a| object_values(h, a)),
-        ("entries", |h, _t, a| object_entries(h, a)),
-        ("getOwnPropertyDescriptors", |h, _t, a| {
-            object_get_own_property_descriptors(h, a)
-        }),
         ("is", |_h, _t, a| object_is(a)),
-        ("isFrozen", |_h, _t, a| object_is_frozen(a)),
-        ("isSealed", |_h, _t, a| object_is_sealed(a)),
-        ("seal", |_h, _t, a| object_seal(a)),
-        ("freeze", |_h, _t, a| object_freeze(a)),
     ];
     for (name, f) in pure {
         set_static_method_impl(object_fn, name, heap, NativeEntry::Heap(*f));
@@ -1161,9 +1152,16 @@ pub fn register_object_statics(object_fn: &Value, _builtins: &super::Builtins, h
         ("getOwnPropertyDescriptor", VmSlot::ObjectGetOwnPropertyDescriptor),
         ("create", VmSlot::ObjectCreate),
         ("hasOwn", VmSlot::ObjectHasOwn),
+        ("seal", VmSlot::ObjectSeal),
+        ("freeze", VmSlot::ObjectFreeze),
         ("keys", VmSlot::ObjectKeys),
+        ("values", VmSlot::ObjectValues),
+        ("entries", VmSlot::ObjectEntries),
         ("getOwnPropertyNames", VmSlot::ObjectGetOwnPropertyNames),
         ("getOwnPropertySymbols", VmSlot::ObjectGetOwnPropertySymbols),
+        ("getOwnPropertyDescriptors", VmSlot::ObjectGetOwnPropertyDescriptors),
+        ("isSealed", VmSlot::ObjectIsSealed),
+        ("isFrozen", VmSlot::ObjectIsFrozen),
         ("getPrototypeOf", VmSlot::ObjectGetPrototypeOf),
         ("setPrototypeOf", VmSlot::ObjectSetPrototypeOf),
         ("isExtensible", VmSlot::ObjectIsExtensible),

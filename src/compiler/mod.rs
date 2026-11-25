@@ -106,6 +106,7 @@ impl Compiler {
                         generator: func.signature.is_generator,
                         r#async: func.signature.is_async,
                         derived_ctor: func.signature.is_derived_ctor,
+                        method: func.signature.is_method,
                     },
                     func.signature.source.clone().unwrap_or_default(),
                 )

@@ -450,7 +450,18 @@ impl VM {
         // `length` 恒为 0。
         let length_key = PropertyKey::well_known("length").expect("well-known name");
         let name_key = PropertyKey::well_known("name").expect("well-known name");
-        let target_length = self.get_member(&target, &length_key, module)?;
+        // ES 2024 BoundFunctionCreate：只有 target **自有**的 `length`
+        // 参与计算；原型链上的 `length`（`bar.__proto__ = {length: 42}`）
+        // 不算，否则 `bound.length` 会错误地变成 41。
+        let has_own_length = match &target {
+            Value::Object(obj_ref) => obj_ref.borrow().property_get(&length_key).is_some(),
+            _ => false,
+        };
+        let target_length = if has_own_length {
+            self.get_member(&target, &length_key, module)?
+        } else {
+            Value::Number(0.0)
+        };
         // `ToIntegerOrInfinity` 用 f64 表达：`Infinity` 必须原样保留
         // （`instance-length-tointeger` 断言 `length` 仍是 Infinity），
         // 所以不能用 `i64` 的饱和转换。
@@ -1323,24 +1334,57 @@ impl VM {
                 continue;
             }
             let source = crate::builtins::to_object(&mut self.heap, source)?;
-            let keys: Vec<PropertyKey> = match &source {
-                Value::Object(src_ref) => {
-                    let borrowed = src_ref.borrow();
-                    borrowed
-                        .own_keys()
+            // ES 19.1.2.1：OwnPropertyKeys 与 [[GetOwnProperty]] 都要走
+            // Proxy trap；静态 own_keys 会让 Proxy 源看起来是空的。
+            let keys_value = match self.proxy_static_trap("Reflect.ownKeys", &[source.clone()], module)? {
+                Some(result) => result,
+                None => {
+                    let keys = match &source {
+                        Value::Object(src_ref) => src_ref.borrow().own_keys(),
+                        _ => Vec::new(),
+                    };
+                    let values = keys
                         .into_iter()
-                        .filter(|k| {
-                            borrowed
-                                .property_get(k)
-                                .is_some_and(|d| d.enumerable)
+                        .map(|key| match key {
+                            PropertyKey::Str(atom) => {
+                                let text = self.heap.resolve(atom).to_string();
+                                Value::string(&text)
+                            }
+                            PropertyKey::Symbol(id) => crate::builtins::symbol_value_by_id(id),
+                            PropertyKey::Index(i) => Value::string(&i.to_string()),
                         })
-                        .collect()
+                        .collect::<Vec<_>>();
+                    Value::Object(self.heap.alloc(crate::vm::gc::Object::Array(
+                        crate::vm::object::ArrayObject::from_vec(values),
+                    )))
                 }
-                _ => continue,
             };
-            for key in keys {
+            let items = self.array_like_elements(&keys_value).unwrap_or_default();
+            for key_value in items {
+                let key = crate::builtins::reflect::to_key(&mut self.heap, &key_value);
+                let enumerable = if let Some(desc) = self.proxy_static_trap(
+                    "Reflect.getOwnPropertyDescriptor",
+                    &[source.clone(), key_value],
+                    module,
+                )? {
+                    if desc.is_undefined() {
+                        continue;
+                    }
+                    let enumerable_key = PropertyKey::intern(&mut self.heap, "enumerable");
+                    self.get_member(&desc, &enumerable_key, module)?.to_boolean()
+                } else if let Value::Object(src_ref) = &source {
+                    src_ref
+                        .borrow()
+                        .property_get(&key)
+                        .is_some_and(|d| d.enumerable)
+                } else {
+                    false
+                };
+                if !enumerable {
+                    continue;
+                }
                 let value = self.get_member(&source, &key, module)?;
-                self.set_member(&target, key.clone(), value, module)?;
+                self.set_member(&target, key, value, module)?;
             }
         }
         Ok(target)
@@ -2444,10 +2488,12 @@ impl VM {
             Instr::GreaterEqual { dst, lhs, rhs } => {
                 let lhs = self.get_value(lhs)?;
                 let rhs = self.get_value(rhs)?;
-                // lhs >= rhs  ⟺  !(lhs < rhs)
+                // lhs >= rhs  ⟺  !(lhs < rhs)，但 `lhs < rhs` 为 undefined
+                //（NaN 参与）时结果是 false，不能取反成 true。
                 let (lhs, rhs) = self.coerce_for_relational(lhs, rhs, module)?;
+                let nan = Self::js_relational_is_nan(&lhs, &rhs);
                 let less = Self::js_abstract_relational(&lhs, &rhs)?;
-                self.set_value(dst, Value::Bool(!less))?;
+                self.set_value(dst, Value::Bool(!nan && !less))?;
             }
             Instr::Less { dst, lhs, rhs } => {
                 let lhs = self.get_value(lhs)?;
@@ -2459,10 +2505,11 @@ impl VM {
             Instr::LessEqual { dst, lhs, rhs } => {
                 let lhs = self.get_value(lhs)?;
                 let rhs = self.get_value(rhs)?;
-                // lhs <= rhs  ⟺  !(rhs < lhs)
+                // lhs <= rhs  ⟺  !(rhs < lhs)，NaN 同样得 false。
                 let (lhs, rhs) = self.coerce_for_relational(lhs, rhs, module)?;
+                let nan = Self::js_relational_is_nan(&lhs, &rhs);
                 let less = Self::js_abstract_relational(&rhs, &lhs)?;
-                self.set_value(dst, Value::Bool(!less))?;
+                self.set_value(dst, Value::Bool(!nan && !less))?;
             }
             Instr::Equal { dst, lhs, rhs } => {
                 let lhs = self.get_value(lhs)?;
@@ -3295,6 +3342,21 @@ impl VM {
                 // 是原生内建吗？只判种类，不复制名字（热路径）。
                 let is_native = crate::builtins::is_native_function(&method_val);
                 if !is_native {
+                    // 原语 Number 也查不到属性表：这三个格式化方法的参数
+                    // ToInteger 可跑用户代码，必须走同一个 VM host。
+                    if let Value::Number(_) = &obj_val
+                        && matches!(method_name.as_str(), "toFixed" | "toExponential" | "toPrecision")
+                    {
+                        let result = self.number_format_host(
+                            &method_name,
+                            &obj_val,
+                            &args,
+                            module,
+                        )?;
+                        self.state.set_register(Register::Rv, result)?;
+                        self.state.jump_offset(1);
+                        return Ok(true);
+                    }
                     if let Value::String(_) = &obj_val {
                         // 原语接收者查不到属性表：属于 String.prototype 的方法
                         // 在这里统一走 `string_proto_host`，与对象接收者同源。
@@ -3661,6 +3723,14 @@ impl VM {
                         return Err(RuntimeError::TypeError("not a constructor".to_string()));
                     }
                 };
+                if self
+                    .code(func_id)
+                    .is_some_and(|block| block.flags.method)
+                {
+                    return Err(RuntimeError::TypeError(
+                        "Method cannot be invoked as a constructor".to_string(),
+                    ));
+                }
 
                 // 2. Create new ordinary object
                 let new_obj_val = Value::Object(self.heap.alloc(Object::Ordinary(
@@ -3915,10 +3985,19 @@ impl VM {
                         args.push(self.state.raw_stack_value(index));
                     }
 
-                    // `String(value)` is ToString(value): objects convert
-                    // through ToPrimitive (hint "string"), which can call user
-                    // code, so it must run in the VM rather than as a native.
-                    let result = if name == "String" && args.len() == 1 {
+                    // `CallNative` 也必须尊重函数对象自带的 entry：否则
+                    // `Number(obj)` / `String(obj)` 这类需要 VM ToPrimitive 的
+                    // 构造器会被名字分派到纯内建表，用户 valueOf 全部看不到。
+                    let has_entry = match &callable {
+                        Value::Object(obj_ref) => obj_ref
+                            .borrow()
+                            .as_native_function()
+                            .is_some_and(|f| f.entry().is_some()),
+                        _ => false,
+                    };
+                    let result = if has_entry {
+                        self.invoke_native(&callable, Value::Undefined, &args, module)
+                    } else if name == "String" && args.len() == 1 {
                         let primitive = self.to_primitive(&args[0], "string", module)?;
                         Ok(Value::string(&primitive.to_js_string()))
                     } else if let Some(value) = self.reflect_static(&name, &args, module)? {

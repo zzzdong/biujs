@@ -20,6 +20,8 @@ pub struct FnFlags {
     pub r#async: bool,
     /// 带 `extends` 的类的构造器：`this` 在 `super()` 之前是未绑定的。
     pub derived_ctor: bool,
+    /// 对象/类的方法（含 getter/setter）：没有 `prototype`，也不是构造器。
+    pub method: bool,
 }
 
 /// 一个函数的自包含描述。

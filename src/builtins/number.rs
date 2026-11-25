@@ -22,12 +22,17 @@ pub fn register_number_prototype(proto: &Gc<Object>, heap: &mut Heap) {
     let methods: &[(&str, HeapImpl)] = &[
         ("valueOf", |_h, t, _a| number_value_of(t)),
         ("toLocaleString", |_h, t, _a| number_to_string_proto(t)),
-        ("toFixed", |_h, t, a| number_to_fixed(t, a)),
-        ("toExponential", |_h, t, a| number_to_exponential(t, a)),
-        ("toPrecision", |_h, t, a| number_to_precision(t, a)),
     ];
     for (name, entry) in methods {
         set_prototype_method_impl(proto, heap, name, NativeEntry::Heap(*entry));
+    }
+    use crate::vm::native::VmSlot;
+    for (name, slot) in [
+        ("toFixed", VmSlot::NumberToFixed),
+        ("toExponential", VmSlot::NumberToExponential),
+        ("toPrecision", VmSlot::NumberToPrecision),
+    ] {
+        set_prototype_method_impl(proto, heap, name, slot.entry());
     }
     // `Number.prototype.toString.length` is 1（radix 算一个形参），
     // 其他所有 `toString` 都是 0，名字推不出来，只能显式给。
@@ -169,111 +174,134 @@ pub fn number_is_integer(args: &[Value]) -> Result<Value, RuntimeError> {
 // Prototype methods
 // ─────────────────────────────────────────────────────────
 
-pub fn number_to_fixed(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    let n = super::require_number(obj)?;
-    if n.is_nan() {
-        return Ok(Value::string("NaN"));
-    }
-    if n.is_infinite() {
-        return if n.is_sign_positive() {
-            Ok(Value::string("Infinity"))
-        } else {
-            Ok(Value::string("-Infinity"))
-        };
-    }
-    let digits = if args.is_empty() {
-        0
-    } else {
-        super::to_integer_or_infinity_throwing(args.first())? as i64
-    };
-    if !(0..=100).contains(&digits) {
+fn half_up(value: f64, digits: i64) -> f64 {
+    let factor = 10f64.powi(digits as i32);
+    (value.abs() * factor + 0.5).floor() / factor
+}
+
+/// `Number.prototype.toFixed`，参数已由 VM 做过可观察的 ToIntegerOrInfinity。
+pub fn number_to_fixed_ready(n: f64, digits: Option<i64>) -> Result<Value, RuntimeError> {
+    let d = digits.unwrap_or(0);
+    if !(0..=100).contains(&d) {
         return Err(RuntimeError::RangeError(
             "toFixed: fractionDigits out of range".to_string(),
         ));
     }
-    // ES 20.1.3.3 第 5 步：|x| >= 1e21 时直接返回 ToString(x)，不按定点写。
+    if n.is_nan() {
+        return Ok(Value::string("NaN"));
+    }
+    if n.is_infinite() {
+        return Ok(Value::string(if n > 0.0 { "Infinity" } else { "-Infinity" }));
+    }
     if n.abs() >= 1e21 {
         return Ok(Value::string(&number_to_string(n)));
     }
-    let digits = digits as usize;
-    Ok(Value::string(&format!("{n:.digits$}")))
+    let rounded = half_up(n, d);
+    let text = format!("{:.*}", d as usize, rounded);
+    Ok(Value::string(&if n < 0.0 && rounded != 0.0 {
+        format!("-{text}")
+    } else {
+        text
+    }))
+}
+
+/// `Number.prototype.toExponential`；`None` 表示参数省略/undefined。
+pub fn number_to_exponential_ready(n: f64, digits: Option<i64>) -> Result<Value, RuntimeError> {
+    // NaN / Infinity 在范围检查之前返回（参数仍已由 VM 转换过）。
+    if n.is_nan() {
+        return Ok(Value::string("NaN"));
+    }
+    if n.is_infinite() {
+        return Ok(Value::string(if n > 0.0 { "Infinity" } else { "-Infinity" }));
+    }
+    if let Some(d) = digits {
+        if !(0..=100).contains(&d) {
+            return Err(RuntimeError::RangeError(
+                "toExponential: fractionDigits out of range".to_string(),
+            ));
+        }
+    }
+    let Some(d) = digits else {
+        // Rust 的 `{:e}` 给最短十进制数字，对应 ES 的 undefined 分支。
+        let s = format!("{n:e}");
+        return Ok(Value::string(&if let Some((m, e)) = s.split_once('e') {
+            let exp = e.parse::<i64>().unwrap_or(0);
+            format!("{m}e{}{}", if exp < 0 { "-" } else { "+" }, exp.abs())
+        } else {
+            s
+        }));
+    };
+    if n == 0.0 {
+        return Ok(Value::string(&if d == 0 {
+            "0e+0".to_string()
+        } else {
+            format!("0.{}e+0", "0".repeat(d as usize))
+        }));
+    }
+    let mut exponent = n.abs().log10().floor() as i64;
+    let mut mantissa = half_up(n / 10f64.powi(exponent as i32), d);
+    if mantissa >= 10.0 {
+        mantissa /= 10.0;
+        exponent += 1;
+    }
+    let sign = if n < 0.0 { "-" } else { "" };
+    Ok(Value::string(&format!(
+        "{sign}{:.*}e{}{}",
+        d as usize,
+        mantissa,
+        if exponent < 0 { "-" } else { "+" },
+        exponent.abs()
+    )))
+}
+
+/// `Number.prototype.toPrecision`；`None` 表示省略/undefined。
+pub fn number_to_precision_ready(n: f64, prec: Option<i64>) -> Result<Value, RuntimeError> {
+    if n.is_nan() {
+        return Ok(Value::string("NaN"));
+    }
+    if n.is_infinite() {
+        return Ok(Value::string(if n > 0.0 { "Infinity" } else { "-Infinity" }));
+    }
+    if let Some(p) = prec {
+        if !(1..=100).contains(&p) {
+            return Err(RuntimeError::RangeError(
+                "toPrecision: precision out of range".to_string(),
+            ));
+        }
+    }
+    let Some(p) = prec else {
+        return Ok(Value::string(&number_to_string(n)));
+    };
+    if n == 0.0 {
+        return Ok(Value::string(&format!("{:.*}", (p - 1) as usize, 0.0)));
+    }
+    let exponent = n.abs().log10().floor() as i64;
+    let sign = if n < 0.0 { "-" } else { "" };
+    if exponent < -6 || exponent >= p {
+        let v = number_to_exponential_ready(n, Some(p - 1))?;
+        return Ok(v);
+    }
+    let digits = (p - 1 - exponent).max(0);
+    let rounded = half_up(n, digits);
+    Ok(Value::string(&format!("{sign}{:.*}", digits as usize, rounded)))
+}
+
+
+/// 纯内建兜底（无 VM，参数转换不跑用户代码；正常入口走 VmSlot）。
+pub fn number_to_fixed(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    let n = super::require_number(obj)?;
+    let d = args.first().map(|v| v.to_number() as i64).unwrap_or(0);
+    number_to_fixed_ready(n, Some(d))
 }
 
 pub fn number_to_exponential(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let n = super::require_number(obj)?;
-    if n.is_nan() {
-        return Ok(Value::string("NaN"));
-    }
-    if n.is_infinite() {
-        return if n.is_sign_positive() {
-            Ok(Value::string("Infinity"))
-        } else {
-            Ok(Value::string("-Infinity"))
-        };
-    }
-    // Rust 的 `{:e}` 不写正号，JS 必须有 `e+2` 这样的形式。
-    let with_sign = |s: String| -> String {
-        if let Some((mantissa, exp)) = s.split_once('e') {
-            if exp.starts_with('-') || exp.starts_with('+') {
-                s
-            } else {
-                format!("{mantissa}e+{exp}")
-            }
-        } else {
-            s
-        }
-    };
-    if args.is_empty() {
-        return Ok(Value::string(&with_sign(format!("{n:e}"))));
-    }
-    let digits = super::to_integer_or_infinity_throwing(args.first())? as i64;
-    if !(0..=100).contains(&digits) {
-        return Err(RuntimeError::RangeError(
-            "toExponential: fractionDigits out of range".to_string(),
-        ));
-    }
-    let digits = digits as usize;
-    Ok(Value::string(&with_sign(format!("{n:.digits$e}"))))
+    let d = args.first().filter(|v| !v.is_undefined()).map(|v| v.to_number() as i64);
+    number_to_exponential_ready(n, d)
 }
 
 pub fn number_to_precision(obj: &Value, args: &[Value]) -> Result<Value, RuntimeError> {
     let n = super::require_number(obj)?;
-    if n.is_nan() {
-        return Ok(Value::string("NaN"));
-    }
-    if n.is_infinite() {
-        return if n.is_sign_positive() {
-            Ok(Value::string("Infinity"))
-        } else {
-            Ok(Value::string("-Infinity"))
-        };
-    }
-    if args.is_empty() {
-        return Ok(Value::string(&number_to_string(n)));
-    }
-    let prec = super::to_integer_or_infinity_throwing(args.first())? as i64;
-    if !(1..=100).contains(&prec) {
-        return Err(RuntimeError::RangeError(
-            "toPrecision: precision out of range".to_string(),
-        ));
-    }
-    let prec = prec as usize;
-    if n == 0.0 {
-        // `0.toPrecision(3)` 是 "0.00"：精度决定小数位数（符号单独处理）。
-        let digits = prec - 1;
-        return Ok(Value::string(&format!("{:.*}", digits, n)));
-    }
-    let exponent = n.abs().log10().floor() as i64;
-    if exponent < -6 || exponent >= prec as i64 {
-        let mut s = format!("{:.*e}", prec - 1, n);
-        if let Some((mantissa, exp)) = s.split_once('e') {
-            if !exp.starts_with('-') && !exp.starts_with('+') {
-                s = format!("{mantissa}e+{exp}");
-            }
-        }
-        Ok(Value::string(&s))
-    } else {
-        let digits = (prec as i64 - 1 - exponent).max(0) as usize;
-        Ok(Value::string(&format!("{:.*}", digits, n)))
-    }
+    let p = args.first().filter(|v| !v.is_undefined()).map(|v| v.to_number() as i64);
+    number_to_precision_ready(n, p)
 }
